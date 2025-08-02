@@ -15,21 +15,23 @@
 		<img alt="Contributors" src="https://img.shields.io/github/contributors/dmtrKovalenko/fff.nvim?color=%23DDB6F2&label=CONTRIBUTORS&logo=git&style=for-the-badge&logoColor=D9E0EE&labelColor=302D41"/></a>
 </p>
 
-**FFF** stands for ~freakin fast fuzzy file~ picker (pick 3) is an opinionated fuzzy file picker for neovim with a dedicated rust backend runtime that keep tracks about the file index, monitor for file changes, and provides comprehensive typo-resistant fuzzy search and sorts the files in a way you expect it to be sorted.
+**FFF** stands for ~freakin fast fuzzy file finder~  (pick 3) and it is an opinionated fuzzy file picker for neovim. Just for files, but we'll try to solve file picking completely.
+
+It comes with a dedicated rust backend runtime that keep tracks of the file index, your file access and modifications, git status, and provides a comprehensive typo-resistant fuzzy search experience.
 
 ## Features
 
 - Works out of the box with no additional configuration
 - [Typo resistant fuzzy search](https://github.com/saghen/frizbee)
-- Git status integration allowing to take adavantage of last modified times within a session
-- Separate file index maintained by a backend allows 2-4 milliseconds search time for 50k files codebase
+- Git status integration allowing to take adavantage of last modified times within a worktree
+- Separate file index maintained by a dedicaged backend allows <10 milliseconds search time for 50k files codebase
 - Display images in previews (for now requires snacks.nvim)
 - Smart in a plenty of different ways hopefully helpful for your workflow
 
 ## Installation
 
 > [!NOTE]  
-> Although we'll try to make sure to keep 100% backward compatibiility, by using should understand that silly bugs, and breaking changes may happen.
+> Although we'll try to make sure to keep 100% backward compatibiility, by using you should understand that silly bugs and breaking changes may happen.
 > And also we hope for your contributions and feedback to make this plugin ideal for everyone.
 
 ### Prerequisites
