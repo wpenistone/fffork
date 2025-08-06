@@ -114,9 +114,17 @@ pub fn fuzzy_search_files(
 pub fn access_file(_: &Lua, file_path: String) -> LuaResult<bool> {
     let frecency = FRECENCY.read().map_err(|_| Error::AcquireFrecencyLock)?;
     if let Some(ref tracker) = *frecency {
-        let file_key = FileKey { path: file_path };
+        let file_key = FileKey {
+            path: file_path.clone(),
+        };
         tracker.track_access(&file_key)?;
     }
+
+    let file_picker = FILE_PICKER.read().map_err(|_| Error::AcquireItemLock)?;
+    if let Some(ref picker) = *file_picker {
+        picker.update_single_file_frecency(&file_path)?;
+    }
+
     Ok(true)
 }
 
@@ -128,8 +136,7 @@ pub fn get_scan_progress(lua: &Lua, _: ()) -> LuaResult<LuaValue> {
     let progress = picker.get_scan_progress();
 
     let table = lua.create_table()?;
-    table.set("total_files", progress.total_files)?;
-    table.set("scanned_files", progress.scanned_files)?;
+    table.set("scanned_files_count", progress.scanned_files_count)?;
     table.set("is_scanning", progress.is_scanning)?;
     Ok(LuaValue::Table(table))
 }
@@ -149,6 +156,16 @@ pub fn refresh_git_status(_: &Lua, _: ()) -> LuaResult<Vec<FileItem>> {
         .ok_or_else(|| Error::FilePickerMissing)?;
 
     Ok(picker.refresh_git_status())
+}
+
+pub fn update_single_file_frecency(_: &Lua, file_path: String) -> LuaResult<bool> {
+    let file_picker = FILE_PICKER.read().map_err(|_| Error::AcquireItemLock)?;
+    let picker = file_picker
+        .as_ref()
+        .ok_or_else(|| Error::FilePickerMissing)?;
+
+    picker.update_single_file_frecency(&file_path)?;
+    Ok(true)
 }
 
 pub fn stop_background_monitor(_: &Lua, _: ()) -> LuaResult<bool> {
@@ -183,14 +200,26 @@ pub fn wait_for_initial_scan(_: &Lua, timeout_ms: Option<u64>) -> LuaResult<bool
         .as_ref()
         .ok_or_else(|| Error::FilePickerMissing)?;
 
-    let timeout = Duration::from_millis(timeout_ms.unwrap_or(5000)); // Default 5s timeout
+    let timeout_ms = timeout_ms.unwrap_or(500);
+    let timeout_duration = Duration::from_millis(timeout_ms);
     let start_time = std::time::Instant::now();
+    let mut sleep_duration = Duration::from_millis(1);
 
-    while picker.is_scan_active() && start_time.elapsed() < timeout {
-        std::thread::sleep(Duration::from_millis(50));
+    while picker.is_scan_active() {
+        if start_time.elapsed() >= timeout_duration {
+            ::tracing::warn!("wait_for_initial_scan timed out after {}ms", timeout_ms);
+            return Ok(false);
+        }
+
+        std::thread::sleep(sleep_duration);
+        sleep_duration = std::cmp::min(sleep_duration * 2, Duration::from_millis(50));
     }
 
-    Ok(!picker.is_scan_active())
+    ::tracing::debug!(
+        "wait_for_initial_scan completed in {:?}",
+        start_time.elapsed()
+    );
+    Ok(true)
 }
 
 pub fn init_tracing(

@@ -6,7 +6,6 @@ local icons = require('fff.file_picker.icons')
 local git_utils = require('fff.git_utils')
 local main = require('fff.main')
 
--- Initialize preview with main config
 if main.config and main.config.preview then preview.setup(main.config.preview) end
 
 M.state = {
@@ -38,9 +37,6 @@ M.state = {
   search_debounce_ms = 50, -- Debounce delay for search
 
   last_preview_file = nil,
-
-  render_timer = nil,
-  render_debounce_ms = 5, -- Faster rendering for better responsiveness
 }
 
 --- Create the picker UI
@@ -494,12 +490,6 @@ function M.update_results_sync()
 end
 
 function M.render_debounced()
-  if M.state.render_timer then
-    M.state.render_timer:stop()
-    M.state.render_timer:close()
-    M.state.render_timer = nil
-  end
-
   vim.schedule(function()
     if M.state.active then
       M.render_list()
@@ -855,16 +845,14 @@ function M.clear_preview()
 end
 
 --- Update status information on the right side of input using virtual text
-function M.update_status()
+function M.update_status(progress)
   if not M.state.active or not M.state.ns_id then return end
-
-  local progress = file_picker.get_scan_progress()
-  local search_metadata = file_picker.get_search_metadata()
-
   local status_info
-  if progress.is_scanning then
-    status_info = 'Scanning...'
+
+  if progress and progress.is_scanning then
+    status_info = string.format('Indexing files %d', progress.scanned_files_count)
   else
+    local search_metadata = file_picker.get_search_metadata()
     status_info = string.format('%d/%d', search_metadata.total_matched, search_metadata.total_files)
   end
 
@@ -1011,12 +999,6 @@ function M.close()
     M.state.search_timer:close()
     M.state.search_timer = nil
   end
-
-  if M.state.render_timer then
-    M.state.render_timer:stop()
-    M.state.render_timer:close()
-    M.state.render_timer = nil
-  end
 end
 
 function M.open(opts)
@@ -1046,32 +1028,31 @@ function M.open(opts)
   end
 
   M.state.active = true
-
   vim.cmd('startinsert!')
 
-  local progress = file_picker.get_scan_progress()
-  if not progress.is_scanning then file_picker.scan_files() end
-
-  vim.defer_fn(function() M.monitor_scan_progress() end, 0)
+  M.monitor_scan_progress(0)
 end
 
---- Monitor scan progress and auto-refresh when complete
-function M.monitor_scan_progress()
+function M.monitor_scan_progress(iteration)
   if not M.state.active then return end
 
   local progress = file_picker.get_scan_progress()
 
   if progress.is_scanning then
-    M.update_status()
+    M.update_status(progress)
 
-    vim.defer_fn(function() M.monitor_scan_progress() end, 500)
+    local timeout
+    if iteration < 10 then
+      timeout = 100
+    elseif iteration < 20 then
+      timeout = 300
+    else
+      timeout = 500
+    end
+
+    vim.defer_fn(function() M.monitor_scan_progress(iteration + 1) end, timeout)
   else
     M.update_results()
-
-    vim.defer_fn(function()
-      local refreshed = file_picker.refresh_git_status()
-      if refreshed and #refreshed > 0 then M.update_results() end
-    end, 500) -- Wait 500ms for git status to complete
   end
 end
 
