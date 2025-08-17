@@ -5,6 +5,230 @@ local preview = require('fff.file_picker.preview')
 local icons = require('fff.file_picker.icons')
 local git_utils = require('fff.git_utils')
 local main = require('fff.main')
+local utils = require('fff.utils')
+
+local function get_prompt_position()
+  local config = M.state.config
+
+  if config and config.layout and config.layout.prompt_position then
+    local terminal_width = vim.o.columns
+    local terminal_height = vim.o.lines
+
+    return utils.resolve_config_value(
+      config.layout.prompt_position,
+      terminal_width,
+      terminal_height,
+      function(value) return utils.is_one_of(value, { 'top', 'bottom' }) end,
+      'bottom',
+      'layout.prompt_position'
+    )
+  end
+
+  return 'bottom'
+end
+
+local function get_preview_position()
+  local config = M.state.config
+
+  if config and config.layout and config.layout.preview_position then
+    local terminal_width = vim.o.columns
+    local terminal_height = vim.o.lines
+
+    return utils.resolve_config_value(
+      config.layout.preview_position,
+      terminal_width,
+      terminal_height,
+      function(value) return utils.is_one_of(value, { 'left', 'right', 'top', 'bottom' }) end,
+      'right',
+      'layout.preview_position'
+    )
+  end
+
+  return 'right'
+end
+
+--- Function-based config options:
+--- config.layout.width: number|function(terminal_width, terminal_height): number
+--- config.layout.height: number|function(terminal_width, terminal_height): number
+--- config.layout.preview_size: number|function(terminal_width, terminal_height): number
+--- config.layout.preview_position: string|function(terminal_width, terminal_height): string
+--- config.layout.prompt_position: string|function(terminal_width, terminal_height): string
+
+--- @class LayoutConfig
+--- @field total_width number
+--- @field total_height number
+--- @field start_col number
+--- @field start_row number
+--- @field preview_position string|function Preview position ('left'|'right'|'top'|'bottom') or function(terminal_width, terminal_height): string
+--- @field prompt_position string
+--- @field debug_enabled boolean
+--- @field preview_width number
+--- @field preview_height number
+--- @field separator_width number
+--- @field file_info_height number
+
+--- Calculate layout dimensions and positions for all windows
+--- @param cfg LayoutConfig
+--- @return table Layout configuration
+function M.calculate_layout_dimensions(cfg)
+  local BORDER_SIZE = 2
+  local PROMPT_HEIGHT = 2
+  local SEPARATOR_WIDTH = 1
+  local SEPARATOR_HEIGHT = 1
+
+  if not utils.is_one_of(cfg.preview_position, { 'left', 'right', 'top', 'bottom' }) then
+    error('Invalid preview position: ' .. tostring(cfg.preview_position))
+  end
+
+  local layout = {}
+  local preview_enabled = M.enabled_preview()
+
+  -- Section 1: Base dimensions and bounds checking
+  local total_width = math.max(0, cfg.total_width - BORDER_SIZE)
+  local total_height = math.max(0, cfg.total_height - BORDER_SIZE - PROMPT_HEIGHT)
+
+  -- Section 2: Calculate dimensions based on preview position
+  if cfg.preview_position == 'left' then
+    local separator_width = preview_enabled and SEPARATOR_WIDTH or 0
+    local list_width = math.max(0, total_width - cfg.preview_width - separator_width)
+    local list_height = total_height
+
+    layout.list_col = cfg.start_col + cfg.preview_width + 3 -- +3 for borders and separator
+    layout.list_width = list_width
+    layout.list_height = list_height
+    layout.input_col = layout.list_col
+    layout.input_width = list_width
+
+    if preview_enabled then
+      layout.preview = {
+        col = cfg.start_col + 1,
+        row = cfg.start_row + 1,
+        width = cfg.preview_width,
+        height = list_height,
+      }
+    end
+  elseif cfg.preview_position == 'right' then
+    local separator_width = preview_enabled and SEPARATOR_WIDTH or 0
+    local list_width = math.max(0, total_width - cfg.preview_width - separator_width)
+    local list_height = total_height
+
+    layout.list_col = cfg.start_col + 1
+    layout.list_width = list_width
+    layout.list_height = list_height
+    layout.input_col = layout.list_col
+    layout.input_width = list_width
+
+    if preview_enabled then
+      layout.preview = {
+        col = cfg.start_col + list_width + 3, -- +3 for borders and separator (matches original)
+        row = cfg.start_row + 1,
+        width = cfg.preview_width,
+        height = list_height,
+      }
+    end
+  elseif cfg.preview_position == 'top' then
+    local separator_height = preview_enabled and SEPARATOR_HEIGHT or 0
+    local list_height = math.max(0, total_height - cfg.preview_height - separator_height)
+
+    layout.list_col = cfg.start_col + 1
+    layout.list_width = total_width
+    layout.list_height = list_height
+    layout.input_col = layout.list_col
+    layout.input_width = total_width
+    layout.list_start_row = cfg.start_row + (preview_enabled and (cfg.preview_height + separator_height) or 0) + 1
+
+    if preview_enabled then
+      layout.preview = {
+        col = cfg.start_col + 1,
+        row = cfg.start_row + 1,
+        width = total_width,
+        height = cfg.preview_height,
+      }
+    end
+  else
+    local separator_height = preview_enabled and SEPARATOR_HEIGHT or 0
+    local list_height = math.max(0, total_height - cfg.preview_height - separator_height)
+
+    layout.list_col = cfg.start_col + 1
+    layout.list_width = total_width
+    layout.list_height = list_height
+    layout.input_col = layout.list_col
+    layout.input_width = total_width
+    layout.list_start_row = cfg.start_row + 1
+
+    if preview_enabled then
+      layout.preview = {
+        col = cfg.start_col + 1,
+        width = total_width,
+        height = cfg.preview_height,
+      }
+    end
+  end
+
+  -- Section 3: Position prompt and adjust row positions
+  if cfg.preview_position == 'left' or cfg.preview_position == 'right' then
+    if cfg.prompt_position == 'top' then
+      layout.input_row = cfg.start_row + 1
+      layout.list_row = cfg.start_row + PROMPT_HEIGHT + 1
+    else
+      layout.list_row = cfg.start_row + 1
+      layout.input_row = cfg.start_row + cfg.total_height - BORDER_SIZE
+    end
+
+    if layout.preview then
+      if cfg.prompt_position == 'top' then
+        layout.preview.row = cfg.start_row + 1
+        layout.preview.height = cfg.total_height - BORDER_SIZE
+      else
+        layout.preview.row = cfg.start_row + 1
+        layout.preview.height = cfg.total_height - BORDER_SIZE
+      end
+    end
+  else
+    local list_start_row = layout.list_start_row
+    if cfg.prompt_position == 'top' then
+      layout.input_row = list_start_row
+      layout.list_row = list_start_row + BORDER_SIZE
+      layout.list_height = math.max(0, layout.list_height - BORDER_SIZE)
+    else
+      layout.list_row = list_start_row
+      layout.input_row = list_start_row + layout.list_height + 1
+    end
+
+    if cfg.preview_position == 'bottom' and layout.preview then
+      if cfg.prompt_position == 'top' then
+        layout.preview.row = layout.list_row + layout.list_height + 1
+      else
+        layout.preview.row = layout.input_row + PROMPT_HEIGHT
+      end
+    end
+  end
+
+  -- Section 4: Position debug panel (if enabled)
+  if cfg.debug_enabled and preview_enabled and layout.preview then
+    if cfg.preview_position == 'left' or cfg.preview_position == 'right' then
+      layout.file_info = {
+        width = layout.preview.width,
+        height = cfg.file_info_height,
+        col = layout.preview.col,
+        row = layout.preview.row,
+      }
+      layout.preview.row = layout.preview.row + cfg.file_info_height + SEPARATOR_HEIGHT + 1
+      layout.preview.height = math.max(3, layout.preview.height - cfg.file_info_height - SEPARATOR_HEIGHT - 1)
+    else
+      layout.file_info = {
+        width = layout.preview.width,
+        height = cfg.file_info_height,
+        col = layout.preview.col,
+        row = layout.preview.row,
+      }
+      layout.preview.row = layout.preview.row + cfg.file_info_height + SEPARATOR_HEIGHT + 1
+      layout.preview.height = math.max(3, layout.preview.height - cfg.file_info_height - SEPARATOR_HEIGHT - 1)
+    end
+  end
+
+  return layout
+end
 
 if main.config and main.config.preview then preview.setup(main.config.preview) end
 
@@ -39,7 +263,6 @@ M.state = {
   last_preview_file = nil,
 }
 
---- Create the picker UI
 function M.create_ui()
   local config = M.state.config
 
@@ -50,21 +273,59 @@ function M.create_ui()
     and main.config.debug
     and main.config.debug.show_scores
 
-  local width = math.floor(vim.o.columns * config.width)
-  local height = math.floor(vim.o.lines * config.height)
+  local terminal_width = vim.o.columns
+  local terminal_height = vim.o.lines
+
+  -- Calculate width and height (support function or number)
+  local width_ratio = utils.resolve_config_value(
+    config.layout.width,
+    terminal_width,
+    terminal_height,
+    utils.is_valid_ratio,
+    0.8,
+    'layout.width'
+  )
+  local height_ratio = utils.resolve_config_value(
+    config.layout.height,
+    terminal_width,
+    terminal_height,
+    utils.is_valid_ratio,
+    0.8,
+    'layout.height'
+  )
+
+  local width = math.floor(terminal_width * width_ratio)
+  local height = math.floor(terminal_height * height_ratio)
   local col = math.floor((vim.o.columns - width) / 2)
   local row = math.floor((vim.o.lines - height) / 2)
 
-  local preview_width = M.enabled_preview() and math.floor(width * config.preview.width) or 0
-  local list_width = width - preview_width - 3 -- Account for separators
-  local list_height = height - 4 -- Same as list window height
+  local prompt_position = get_prompt_position()
+  local preview_position = get_preview_position()
 
-  local file_info_height = 0
-  local preview_height = list_height
-  if debug_enabled_in_preview then
-    file_info_height = 10 -- Fixed height of 10 lines for file info
-    preview_height = list_height - file_info_height -- No subtraction needed - borders are handled by window positioning
-  end
+  local preview_size_ratio = utils.resolve_config_value(
+    config.layout.preview_size,
+    terminal_width,
+    terminal_height,
+    utils.is_valid_ratio,
+    0.4,
+    'layout.preview_size'
+  )
+
+  local layout_config = {
+    total_width = width,
+    total_height = height,
+    start_col = col,
+    start_row = row,
+    preview_position = preview_position,
+    prompt_position = prompt_position,
+    debug_enabled = debug_enabled_in_preview,
+    preview_width = M.enabled_preview() and math.floor(width * preview_size_ratio) or 0,
+    preview_height = M.enabled_preview() and math.floor(height * preview_size_ratio) or 0,
+    separator_width = 3,
+    file_info_height = debug_enabled_in_preview and 10 or 0,
+  }
+
+  local layout = M.calculate_layout_dimensions(layout_config)
 
   M.state.input_buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_option(M.state.input_buf, 'bufhidden', 'wipe')
@@ -84,25 +345,34 @@ function M.create_ui()
     M.state.file_info_buf = nil
   end
 
-  M.state.list_win = vim.api.nvim_open_win(M.state.list_buf, false, {
+  -- Create list window with conditional title based on prompt position
+  local list_window_config = {
     relative = 'editor',
-    width = list_width,
-    height = list_height, -- Use calculated list height
-    col = col + 1,
-    row = row + 1,
+    width = layout.list_width,
+    height = layout.list_height,
+    col = layout.list_col,
+    row = layout.list_row,
     border = 'single',
     style = 'minimal',
-    title = ' Files ',
-    title_pos = 'left',
-  })
+  }
 
-  if debug_enabled_in_preview then
+  local title = ' ' .. (M.state.config.title or 'FFFiles') .. ' '
+  -- Only add title if prompt is at bottom - when prompt is top, title should be on input
+  if prompt_position == 'bottom' then
+    list_window_config.title = title
+    list_window_config.title_pos = 'left'
+  end
+
+  M.state.list_win = vim.api.nvim_open_win(M.state.list_buf, false, list_window_config)
+
+  -- Create file info window if debug enabled
+  if debug_enabled_in_preview and layout.file_info then
     M.state.file_info_win = vim.api.nvim_open_win(M.state.file_info_buf, false, {
       relative = 'editor',
-      width = preview_width,
-      height = file_info_height,
-      col = col + list_width + 3,
-      row = row + 1,
+      width = layout.file_info.width,
+      height = layout.file_info.height,
+      col = layout.file_info.col,
+      row = layout.file_info.row,
       border = 'single',
       style = 'minimal',
       title = ' File Info ',
@@ -112,32 +382,39 @@ function M.create_ui()
     M.state.file_info_win = nil
   end
 
-  local preview_row = debug_enabled_in_preview and (row + file_info_height + 3) or (row + 1)
-  local preview_height_adj = debug_enabled_in_preview and preview_height or (list_height + 2)
-
-  if M.enabled_preview() then
+  -- Create preview window
+  if M.enabled_preview() and layout.preview then
     M.state.preview_win = vim.api.nvim_open_win(M.state.preview_buf, false, {
       relative = 'editor',
-      width = preview_width,
-      height = preview_height_adj,
-      col = col + list_width + 3,
-      row = preview_row,
+      width = layout.preview.width,
+      height = layout.preview.height,
+      col = layout.preview.col,
+      row = layout.preview.row,
       border = 'single',
       style = 'minimal',
-      title = ' PREVIEW TEST TITLE ',
+      title = ' Preview ',
       title_pos = 'left',
     })
   end
 
-  M.state.input_win = vim.api.nvim_open_win(M.state.input_buf, false, {
+  -- Create input window with conditional title based on prompt position
+  local input_window_config = {
     relative = 'editor',
-    width = list_width,
+    width = layout.input_width,
     height = 1,
-    col = col + 1,
-    row = row + height - 2,
+    col = layout.input_col,
+    row = layout.input_row,
     border = 'single',
     style = 'minimal',
-  })
+  }
+
+  -- Add title if prompt is at top - title appears above the prompt
+  if prompt_position == 'top' then
+    input_window_config.title = title
+    input_window_config.title_pos = 'left'
+  end
+
+  M.state.input_win = vim.api.nvim_open_win(M.state.input_buf, false, input_window_config)
 
   M.setup_buffers()
   M.setup_windows()
@@ -295,9 +572,7 @@ function M.focus_input_win()
   vim.api.nvim_win_call(M.state.input_win, function() vim.cmd('startinsert!') end)
 end
 
---- Toggle debug display
 function M.toggle_debug()
-  local main = require('fff.main')
   local old_debug_state = main.config.debug.show_scores
   main.config.debug.show_scores = not main.config.debug.show_scores
   local status = main.config.debug.show_scores and 'enabled' or 'disabled'
@@ -387,18 +662,35 @@ function M.update_results_sync()
     end
   end
 
+  local prompt_position = get_prompt_position()
+
+  -- Calculate dynamic max_results based on visible window height
+  local dynamic_max_results = M.state.config.max_results
+  if M.state.list_win and vim.api.nvim_win_is_valid(M.state.list_win) then
+    local win_height = vim.api.nvim_win_get_height(M.state.list_win)
+    dynamic_max_results = win_height
+  else
+    dynamic_max_results = M.state.config.max_results or 100
+  end
+
   local results = file_picker.search_files(
     M.state.query,
-    M.state.config.max_results,
+    dynamic_max_results,
     M.state.config.max_threads,
-    M.state.current_file_cache
+    M.state.current_file_cache,
+    prompt_position == 'bottom'
   )
 
   -- because the actual files could be different even with same count
   M.state.items = results
   M.state.filtered_items = results
-  M.state.cursor = 1
-  M.state.top = 1
+
+  if prompt_position == 'bottom' then
+    M.state.cursor = #results > 0 and #results or 1
+  else
+    M.state.cursor = 1
+  end
+
   M.render_debounced()
 end
 
@@ -465,145 +757,135 @@ local function format_file_display(item, max_width)
   return filename, display_path
 end
 
---- Render the list
 function M.render_list()
   if not M.state.active then return end
 
   local items = M.state.filtered_items
-  local lines = {}
-
-  local main = require('fff.main')
   local max_path_width = main.config.ui and main.config.ui.max_path_width or 80
   local debug_enabled = main.config and main.config.debug and main.config.debug.show_scores
   local win_height = vim.api.nvim_win_get_height(M.state.list_win)
+  local win_width = vim.api.nvim_win_get_width(M.state.list_win)
   local display_count = math.min(#items, win_height)
-  local empty_lines_needed = win_height - display_count
+  local empty_lines_needed = 0
 
-  for i = 1, empty_lines_needed do
-    table.insert(lines, '')
-  end
-
-  local end_idx = math.min(#items, display_count)
-  local items_to_show = {}
-  for i = 1, end_idx do
-    table.insert(items_to_show, items[i])
-  end
-
-  local reversed_items = {}
-  for i = #items_to_show, 1, -1 do
-    table.insert(reversed_items, items_to_show[i])
-  end
-
-  local line_data = {}
-
-  for i, item in ipairs(reversed_items) do
-    local icon, icon_hl_group = icons.get_icon_display(item.name, item.extension, false)
-    local frecency = ''
-    local total_frecency = (item.total_frecency_score or 0)
-    local access_frecency = (item.access_frecency_score or 0)
-    local mod_frecency = (item.modification_frecency_score or 0)
-
-    if total_frecency > 0 and debug_enabled then
-      local indicator = ''
-      if mod_frecency >= 8 then -- High modification frecency (recently modified git file)
-        indicator = '🔥' -- Fire for recently modified
-      elseif access_frecency >= 8 then -- High access frecency (recently accessed)
-        indicator = '⭐' -- Star for frequently accessed
-      elseif total_frecency >= 4 then -- Medium total frecency
-        indicator = '✨' -- Sparkle for moderate activity
-      elseif total_frecency >= 1 then -- Low frecency
-        indicator = '•' -- Dot for minimal activity
-      end
-      frecency = string.format(' %s%d', indicator, total_frecency)
-    end
-
-    local suffix = frecency
-    local current_indicator = ''
-    if item.is_current_file then current_indicator = ' (current)' end
-
-    local available_width = math.max(max_path_width - #icon - 1 - #suffix - #current_indicator, 40)
-    local filename, dir_path = format_file_display(item, available_width)
-
-    local line
-    if dir_path ~= '' then
-      line = string.format('%s %s %s%s%s', icon, filename, dir_path, suffix, current_indicator)
+  local prompt_position = get_prompt_position()
+  local cursor_line = 0
+  if #items > 0 then
+    if prompt_position == 'bottom' then
+      empty_lines_needed = win_height - display_count
+      cursor_line = empty_lines_needed + M.state.cursor
     else
-      line = string.format('%s %s%s%s', icon, filename, suffix, current_indicator)
+      cursor_line = M.state.cursor
+    end
+    cursor_line = math.max(1, math.min(cursor_line, win_height))
+  end
+
+  local padded_lines = {}
+  if prompt_position == 'bottom' then
+    for _ = 1, empty_lines_needed do
+      table.insert(padded_lines, string.rep(' ', win_width + 5))
+    end
+  end
+
+  local icon_data = {}
+  local path_data = {}
+
+  for i = 1, display_count do
+    local item = items[i]
+
+    local icon, icon_hl_group = icons.get_icon_display(item.name, item.extension, false)
+    icon_data[i] = { icon, icon_hl_group }
+
+    local frecency = ''
+    if debug_enabled then
+      local total_frecency = (item.total_frecency_score or 0)
+      local access_frecency = (item.access_frecency_score or 0)
+      local mod_frecency = (item.modification_frecency_score or 0)
+
+      if total_frecency > 0 then
+        local indicator = ''
+        if mod_frecency >= 6 then
+          indicator = '🔥'
+        elseif access_frecency >= 4 then
+          indicator = '⭐'
+        elseif total_frecency >= 3 then
+          indicator = '✨'
+        elseif total_frecency >= 1 then
+          indicator = '•'
+        end
+        frecency = string.format(' %s%d', indicator, total_frecency)
+      end
     end
 
+    local current_indicator = item.is_current_file and ' (current)' or ''
+    local available_width = math.max(max_path_width - #icon - 1 - #frecency - #current_indicator, 40)
+
+    local filename, dir_path = format_file_display(item, available_width)
+    path_data[i] = { filename, dir_path }
+
+    local line = string.format('%s %s %s%s%s', icon, filename, dir_path, frecency, current_indicator)
     if item.is_current_file then line = string.format('\027[90m%s\027[0m', line) end
 
-    table.insert(lines, line)
-    line_data[i] = {
-      filename_len = #filename,
-      dir_path_len = #dir_path,
-      icon_highlight = {
-        hl_group = icon_hl_group,
-        icon_length = vim.fn.strdisplaywidth(icon),
-        git_status = item.git_status,
-      },
-    }
-  end
-
-  local win_width = vim.api.nvim_win_get_width(M.state.list_win)
-  local padded_lines = {}
-  for _, line in ipairs(lines) do
     local line_len = vim.fn.strdisplaywidth(line)
-    local padding = math.max(0, win_width - line_len + 5) -- +5 extra to ensure full coverage
-    local padded_line = line .. string.rep(' ', padding)
-    table.insert(padded_lines, padded_line)
+    local padding = math.max(0, win_width - line_len + 5)
+    table.insert(padded_lines, line .. string.rep(' ', padding))
   end
 
   vim.api.nvim_buf_set_option(M.state.list_buf, 'modifiable', true)
   vim.api.nvim_buf_set_lines(M.state.list_buf, 0, -1, false, padded_lines)
   vim.api.nvim_buf_set_option(M.state.list_buf, 'modifiable', false)
 
-  if #items > 0 then
-    -- cursor=1 means first/best item, which appears at the last line after reversal
-    local cursor_line = empty_lines_needed + (display_count - M.state.cursor + 1)
+  vim.api.nvim_buf_clear_namespace(M.state.list_buf, M.state.ns_id, 0, -1)
 
-    if cursor_line > 0 and cursor_line <= win_height then
-      vim.api.nvim_win_set_cursor(M.state.list_win, { cursor_line, 0 })
+  if #items > 0 and cursor_line > 0 and cursor_line <= win_height then
+    vim.api.nvim_win_set_cursor(M.state.list_win, { cursor_line, 0 })
 
-      vim.api.nvim_buf_clear_namespace(M.state.list_buf, M.state.ns_id, 0, -1)
+    -- Cursor line highlighting
+    vim.api.nvim_buf_add_highlight(
+      M.state.list_buf,
+      M.state.ns_id,
+      M.state.config.hl.active_file,
+      cursor_line - 1,
+      0,
+      -1
+    )
 
-      vim.api.nvim_buf_add_highlight(
-        M.state.list_buf,
-        M.state.ns_id,
-        M.state.config.hl.active_file,
-        cursor_line - 1,
-        0,
-        -1
-      )
+    -- Fill remaining width for cursor line
+    local current_line = padded_lines[cursor_line] or ''
+    local line_len = vim.fn.strdisplaywidth(current_line)
+    local remaining_width = math.max(0, win_width - line_len)
 
-      local current_line = vim.api.nvim_buf_get_lines(M.state.list_buf, cursor_line - 1, cursor_line, false)[1] or ''
-      local line_len = vim.fn.strdisplaywidth(current_line)
-      local remaining_width = math.max(0, vim.api.nvim_win_get_width(M.state.list_win) - line_len)
-
-      if remaining_width > 0 then
-        vim.api.nvim_buf_set_extmark(M.state.list_buf, M.state.ns_id, cursor_line - 1, -1, {
-          virt_text = { { string.rep(' ', remaining_width), M.state.config.hl.active_file } },
-          virt_text_pos = 'eol',
-        })
-      end
+    if remaining_width > 0 then
+      vim.api.nvim_buf_set_extmark(M.state.list_buf, M.state.ns_id, cursor_line - 1, -1, {
+        virt_text = { { string.rep(' ', remaining_width), M.state.config.hl.active_file } },
+        virt_text_pos = 'eol',
+      })
     end
 
-    for line_idx, line_content in ipairs(lines) do
-      if line_content ~= '' then -- Skip empty lines
-        local content_line_idx = line_idx - empty_lines_needed
+    for i = 1, display_count do
+      local item = items[i]
 
-        local icon_info = line_data[content_line_idx].icon_highlight
-        if icon_info and icon_info.hl_group and icon_info.icon_length > 0 then
+      local line_idx = empty_lines_needed + i
+      local is_cursor_line = line_idx == cursor_line
+      local line_content = padded_lines[line_idx]
+
+      if line_content then
+        local icon, icon_hl_group = unpack(icon_data[i])
+        local filename, dir_path = unpack(path_data[i])
+
+        -- Icon highlighting
+        if icon_hl_group and vim.fn.strdisplaywidth(icon) > 0 then
           vim.api.nvim_buf_add_highlight(
             M.state.list_buf,
             M.state.ns_id,
-            icon_info.hl_group,
+            icon_hl_group,
             line_idx - 1,
             0,
-            icon_info.icon_length
+            vim.fn.strdisplaywidth(icon)
           )
         end
 
+        -- Frecency highlighting
         if debug_enabled then
           local star_start, star_end = line_content:find('⭐%d+')
           if star_start then
@@ -618,47 +900,28 @@ function M.render_list()
           end
         end
 
-        local debug_start, debug_end = line_content:find('%[%d+|[^%]]*%]')
-        if debug_start then
+        local icon_match = line_content:match('^%S+')
+        if icon_match and #filename > 0 and #dir_path > 0 then
+          local prefix_len = #icon_match + 1 + #filename + 1
           vim.api.nvim_buf_add_highlight(
             M.state.list_buf,
             M.state.ns_id,
-            M.state.config.hl.debug,
+            'Comment',
             line_idx - 1,
-            debug_start - 1,
-            debug_end
+            prefix_len,
+            prefix_len + #dir_path
           )
         end
 
-        local icon_match = line_content:match('^%S+') -- First non-space sequence (icon)
-        if icon_match then
-          local filename_len = line_data[content_line_idx].filename_len
-          local dir_path_len = line_data[content_line_idx].dir_path_len
-
-          if filename_len > 0 and dir_path_len > 0 then
-            local prefix_len = #icon_match + 1 + filename_len + 1 -- icon + space + filename + space
-
-            vim.api.nvim_buf_add_highlight(
-              M.state.list_buf,
-              M.state.ns_id,
-              'Comment',
-              line_idx - 1,
-              prefix_len,
-              prefix_len + dir_path_len
-            )
-          end
-        end
-
-        local is_cursor_line = line_idx == cursor_line
-        local border_char = ' ' -- render space so it is highlighted
+        local border_char = ' '
         local border_hl = nil
 
-        if icon_info and icon_info.git_status and git_utils.should_show_border(icon_info.git_status) then
-          border_char = git_utils.get_border_char(icon_info.git_status)
+        if item.git_status and git_utils.should_show_border(item.git_status) then
+          border_char = git_utils.get_border_char(item.git_status)
           if is_cursor_line then
-            border_hl = git_utils.get_border_highlight_selected(icon_info.git_status)
+            border_hl = git_utils.get_border_highlight_selected(item.git_status)
           else
-            border_hl = git_utils.get_border_highlight(icon_info.git_status)
+            border_hl = git_utils.get_border_highlight(item.git_status)
           end
         end
 
@@ -696,30 +959,58 @@ function M.update_preview()
   end
 
   if M.state.last_preview_file == item.path then return end
-
-  local preview = require('fff.file_picker.preview')
   preview.clear()
 
   M.state.last_preview_file = item.path
 
-  local relative_path = item.relative_path or item.path -- Use relative path if available
-  local win_width = vim.api.nvim_win_get_width(M.state.preview_win)
-  local max_title_width = win_width - 4 -- Account for border and padding
+  local relative_path = item.relative_path or item.path
+  local max_title_width = vim.api.nvim_win_get_width(M.state.preview_win)
 
   local title
-  if #relative_path <= max_title_width then
+  local target_length = max_title_width
+
+  if #relative_path + 2 <= target_length then
     title = string.format(' %s ', relative_path)
   else
-    local filename = vim.fn.fnamemodify(relative_path, ':t')
-    local dirname = vim.fn.fnamemodify(relative_path, ':h')
-    local available_dir_width = max_title_width - #filename - 6 -- Account for '.../' and spaces
+    local available_chars = target_length - 2
 
-    if available_dir_width > 10 then
-      local truncated_dir = '...' .. dirname:sub(-available_dir_width + 3)
-      title = string.format(' %s/%s ', truncated_dir, filename)
+    local filename = vim.fn.fnamemodify(relative_path, ':t')
+    if available_chars <= 3 then
+      title = filename
     else
-      if #filename > max_title_width - 4 then filename = filename:sub(1, max_title_width - 7) .. '...' end
-      title = string.format(' %s ', filename)
+      if #filename + 5 <= available_chars then
+        local normalized_path = vim.fs.normalize(relative_path)
+        local path_parts = vim.split(normalized_path, '[/\\]', { plain = false })
+
+        local segments = {}
+        for _, part in ipairs(path_parts) do
+          if part ~= '' then table.insert(segments, part) end
+        end
+
+        local segments_to_show = { filename }
+        local current_length = #filename + 4 -- 4 for '../' prefix and spaces
+
+        for i = #segments - 1, 1, -1 do
+          local segment = segments[i]
+          local new_length = current_length + #segment + 1 -- +1 for '/'
+
+          if new_length <= available_chars then
+            table.insert(segments_to_show, 1, segment)
+            current_length = new_length
+          else
+            break
+          end
+        end
+
+        if #segments_to_show == #segments then
+          title = string.format(' %s ', table.concat(segments_to_show, '/'))
+        else
+          title = string.format(' ../%s ', table.concat(segments_to_show, '/'))
+        end
+      else
+        local truncated_filename = filename:sub(1, available_chars - 3) .. '...'
+        title = string.format(' %s ', truncated_filename)
+      end
     end
   end
 
@@ -800,28 +1091,26 @@ function M.update_status(progress)
   })
 end
 
---- Move cursor up (towards worse results, which are visually higher)
 function M.move_up()
   if not M.state.active then return end
+  if #M.state.filtered_items == 0 then return end
 
-  if M.state.cursor < #M.state.filtered_items then
-    M.state.cursor = M.state.cursor + 1
-    M.render_list()
-    M.update_preview()
-    M.update_status()
-  end
+  M.state.cursor = math.max(M.state.cursor - 1, 1)
+
+  M.render_list()
+  M.update_preview()
+  M.update_status()
 end
 
---- Move cursor down (towards better results, which are visually lower)
 function M.move_down()
   if not M.state.active then return end
+  if #M.state.filtered_items == 0 then return end
 
-  if M.state.cursor > 1 then
-    M.state.cursor = M.state.cursor - 1
-    M.render_list()
-    M.update_preview()
-    M.update_status()
-  end
+  M.state.cursor = math.min(M.state.cursor + 1, #M.state.filtered_items)
+
+  M.render_list()
+  M.update_preview()
+  M.update_status()
 end
 
 --- Scroll preview up by half window height
@@ -916,7 +1205,6 @@ function M.close()
   M.state.items = {}
   M.state.filtered_items = {}
   M.state.cursor = 1
-  M.state.top = 1
   M.state.query = ''
   M.state.ns_id = nil
   M.state.last_preview_file = nil

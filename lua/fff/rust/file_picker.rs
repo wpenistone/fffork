@@ -161,11 +161,15 @@ impl FilePicker {
         max_results: usize,
         max_threads: usize,
         current_file: Option<&'a str>,
+        reverse_order: bool,
     ) -> SearchResult<'a> {
         let max_threads = max_threads.max(1);
         debug!(
-            "Fuzzy search: query='{}', max_results={}, max_threads={}, current_file={:?}",
-            query, max_results, max_threads, current_file
+            ?query,
+            ?max_results,
+            ?max_threads,
+            ?current_file,
+            "Fuzzy search",
         );
 
         let total_files = files.len();
@@ -178,17 +182,19 @@ impl FilePicker {
             max_threads,
             current_file,
             max_results,
+            reverse_order,
         };
 
         let time = std::time::Instant::now();
         let (items, scores, total_matched) = match_and_score_files(files, &context);
+
         debug!(
-            "Fuzzy search completed in {:?}: found {} results for query '{}', top result {:?}",
-            time.elapsed(),
-            total_matched,
-            query,
-            items.first(),
+            ?query,
+            completed_in = ?time.elapsed(),
+            top_position = ?items.first(),
+            "Fuzzy search completed",
         );
+
         SearchResult {
             items,
             scores,
