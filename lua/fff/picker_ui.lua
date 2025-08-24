@@ -1,10 +1,10 @@
 local M = {}
 
+local conf = require('fff.conf')
 local file_picker = require('fff.file_picker')
 local preview = require('fff.file_picker.preview')
 local icons = require('fff.file_picker.icons')
 local git_utils = require('fff.git_utils')
-local main = require('fff.main')
 local utils = require('fff.utils')
 
 local function get_prompt_position()
@@ -230,7 +230,8 @@ function M.calculate_layout_dimensions(cfg)
   return layout
 end
 
-if main.config and main.config.preview then preview.setup(main.config.preview) end
+local preview_config = conf.get().preview
+if preview_config then preview.setup(preview_config) end
 
 M.state = {
   active = false,
@@ -268,10 +269,7 @@ function M.create_ui()
 
   if not M.state.ns_id then M.state.ns_id = vim.api.nvim_create_namespace('fff_picker_status') end
 
-  local debug_enabled_in_preview = M.enabled_preview()
-    and main.config
-    and main.config.debug
-    and main.config.debug.show_scores
+  local debug_enabled_in_preview = M.enabled_preview() and config and config.debug and config.debug.show_scores
 
   local terminal_width = vim.o.columns
   local terminal_height = vim.o.lines
@@ -431,10 +429,14 @@ function M.create_ui()
   return true
 end
 
---- Setup buffer options
 function M.setup_buffers()
+  vim.api.nvim_buf_set_name(M.state.input_buf, 'fffile search')
+  vim.api.nvim_buf_set_name(M.state.list_buf, 'fffiles list')
+  vim.api.nvim_buf_set_name(M.state.preview_buf, 'fffile preview')
+
   vim.api.nvim_buf_set_option(M.state.input_buf, 'buftype', 'prompt')
   vim.api.nvim_buf_set_option(M.state.input_buf, 'filetype', 'fff_input')
+
   vim.fn.prompt_setprompt(M.state.input_buf, M.state.config.prompt)
 
   -- Changing the contents of the input buffer will trigger Neovim to guess the language in order to provide
@@ -582,12 +584,8 @@ function M.focus_input_win()
 end
 
 function M.toggle_debug()
-  local old_debug_state = main.config.debug.show_scores
-  main.config.debug.show_scores = not main.config.debug.show_scores
-  local status = main.config.debug.show_scores and 'enabled' or 'disabled'
-  vim.notify('FFF debug scores ' .. status, vim.log.levels.INFO)
-
-  if old_debug_state ~= main.config.debug.show_scores then
+  local config_changed = conf.toggle_debug()
+  if config_changed then
     local current_query = M.state.query
     local current_items = M.state.items
     local current_cursor = M.state.cursor
@@ -769,9 +767,10 @@ end
 function M.render_list()
   if not M.state.active then return end
 
+  local config = conf.get()
   local items = M.state.filtered_items
-  local max_path_width = main.config.ui and main.config.ui.max_path_width or 80
-  local debug_enabled = main.config and main.config.debug and main.config.debug.show_scores
+  local max_path_width = config.ui and config.ui.max_path_width or 80
+  local debug_enabled = config and config.debug and config.debug.show_scores
   local win_height = vim.api.nvim_win_get_height(M.state.list_win)
   local win_width = vim.api.nvim_win_get_width(M.state.list_win)
   local display_count = math.min(#items, win_height)
@@ -1245,7 +1244,8 @@ function M.open(opts)
     end
   end
 
-  M.state.config = vim.tbl_deep_extend('force', main.config or {}, opts or {})
+  local config = conf.get()
+  M.state.config = vim.tbl_deep_extend('force', config or {}, opts or {})
 
   if not M.create_ui() then
     vim.notify('Failed to create picker UI', vim.log.levels.ERROR)
