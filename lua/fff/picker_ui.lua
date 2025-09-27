@@ -931,7 +931,6 @@ function M.render_list()
         local filename, dir_path = unpack(path_data[i])
 
         local score = file_picker.get_file_score(i)
-        if score and score.current_file_penalty ~= 0 then vim.print(score.current_file_penalty) end
         local is_current_file = score and score.current_file_penalty and score.current_file_penalty < 0
 
         -- Icon highlighting
