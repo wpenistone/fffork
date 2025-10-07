@@ -12,7 +12,7 @@ end
 local base_path = debug.getinfo(1).source:match('@?(.*/)')
 
 local paths = {
-  download.get_binary_path(),
+  download.get_binary_cpath_component(),
   base_path .. '../../../target/release/lib?' .. get_lib_extension(),
   base_path .. '../../../target/release/?' .. get_lib_extension(),
 }

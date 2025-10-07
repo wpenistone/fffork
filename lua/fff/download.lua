@@ -187,4 +187,11 @@ function M.get_binary_path()
   return get_binary_path(plugin_dir)
 end
 
+function M.get_binary_cpath_component()
+  local plugin_dir = vim.fn.fnamemodify(debug.getinfo(1, 'S').source:sub(2), ':h:h')
+  local binary_dir = get_binary_dir(plugin_dir)
+  local extension = system.get_lib_extension()
+  return binary_dir .. '/lib?.' .. extension
+end
+
 return M
