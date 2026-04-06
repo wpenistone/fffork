@@ -333,9 +333,9 @@ fn handle_debounced_events(
                             debug!(
                                 "on_create_or_modify({:?}) -> Some({})",
                                 path,
-                                file.path.display()
+                                file.path_str()
                             );
-                            files_to_update.push(file.path.clone());
+                            files_to_update.push(PathBuf::from(file.path_str()));
                         }
                         None => {
                             error!("on_create_or_modify({:?}) -> None (file not added!)", path);

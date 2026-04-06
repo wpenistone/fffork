@@ -75,7 +75,7 @@ fn build_bigram(files: &mut [fff::FileItem]) -> fff::BigramFilter {
     let (index, binary_indices) = fff::build_bigram_index(files, &budget);
 
     for &i in &binary_indices {
-        files[i].is_binary = true;
+        files[i].set_binary(true);
     }
 
     index
@@ -125,7 +125,7 @@ fn main() {
     eprint!("[1/3] Scanning files... ");
     let t = Instant::now();
     let mut files = fff::scan_files(&canonical);
-    let non_binary = files.iter().filter(|f| !f.is_binary).count();
+    let non_binary = files.iter().filter(|f| !f.is_binary()).count();
     eprintln!(
         "{} files in {:.2}s ({} non-binary)",
         files.len(),

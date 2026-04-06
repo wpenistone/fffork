@@ -342,15 +342,11 @@ fn plain_text_binary_files_are_skipped() {
     // In production, binary detection by content happens during bigram build
     // and sets is_binary = true. Simulate that here with new_raw.
     let meta = fs::metadata(&binary_path).unwrap();
-    let binary_file = FileItem::new_raw(
-        binary_path,
-        "binary.dat".to_string(),
-        "binary.dat".to_string(),
-        meta.len(),
-        0,
-        None,
-        true,
-    );
+    let binary_file = {
+        let p = binary_path.to_string_lossy().into_owned();
+        let rs = (p.len() - "binary.dat".len()) as u16;
+        FileItem::new_raw(p, rs, rs, meta.len(), 0, None, true)
+    };
 
     let text_file = create_file(tmp.path(), "text.txt", "match this text\n");
 
@@ -369,7 +365,7 @@ fn plain_text_binary_files_are_skipped() {
 
     // Only the text file should be searched, not the binary one
     assert_eq!(result.files.len(), 1);
-    assert!(result.files[0].relative_path.contains("text.txt"));
+    assert!(result.files[0].relative_path().contains("text.txt"));
 }
 
 #[test]
@@ -1028,9 +1024,9 @@ fn grep_with_extension_constraint() {
     // Should only search .rs files
     for file in &result.files {
         assert!(
-            file.relative_path.ends_with(".rs"),
+            file.relative_path().ends_with(".rs"),
             "should only match .rs files, got: {}",
-            file.relative_path
+            file.relative_path()
         );
     }
     assert!(
@@ -1185,7 +1181,7 @@ fn grep_with_path_constraint() {
     );
 
     assert_eq!(result.matches.len(), 1);
-    assert!(result.files[0].relative_path.starts_with("src/"));
+    assert!(result.files[0].relative_path().starts_with("src/"));
 }
 
 // ── Negated constraint tests ───────────────────────────────────────────
@@ -1218,9 +1214,9 @@ fn grep_with_negated_extension_constraint() {
         result.matches.len()
     );
     assert!(
-        result.files[0].relative_path.ends_with(".ts"),
+        result.files[0].relative_path().ends_with(".ts"),
         "should only match .ts file, got: {}",
-        result.files[0].relative_path
+        result.files[0].relative_path()
     );
 }
 
@@ -1252,9 +1248,9 @@ fn grep_with_negated_path_constraint() {
         result.matches.len()
     );
     assert!(
-        result.files[0].relative_path.starts_with("tests/"),
+        result.files[0].relative_path().starts_with("tests/"),
         "should only match tests/ file, got: {}",
-        result.files[0].relative_path
+        result.files[0].relative_path()
     );
 }
 
@@ -1288,9 +1284,9 @@ fn grep_with_negated_text_constraint() {
     );
     for file in &result.files {
         assert!(
-            !file.relative_path.contains("test"),
+            !file.relative_path().contains("test"),
             "should not match files with 'test' in path, got: {}",
-            file.relative_path
+            file.relative_path()
         );
     }
 }
@@ -1666,9 +1662,9 @@ fn fuzzy_with_extension_constraint() {
     // Should only search .rs files
     for file in &result.files {
         assert!(
-            file.relative_path.ends_with(".rs"),
+            file.relative_path().ends_with(".rs"),
             "should only match .rs files, got: {}",
-            file.relative_path
+            file.relative_path()
         );
     }
 }

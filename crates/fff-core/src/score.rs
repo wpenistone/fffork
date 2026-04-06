@@ -36,8 +36,8 @@ impl<'a> FileItems<'a> {
 
     fn relative_paths(&self) -> Vec<&'a str> {
         match self {
-            FileItems::All(s) => s.iter().map(|f| f.relative_path.as_str()).collect(),
-            FileItems::Filtered(v) => v.iter().map(|f| f.relative_path.as_str()).collect(),
+            FileItems::All(s) => s.iter().map(|f| f.relative_path()).collect(),
+            FileItems::Filtered(v) => v.iter().map(|f| f.relative_path()).collect(),
         }
     }
 
@@ -175,12 +175,12 @@ pub fn match_and_score_files<'a>(
 
         for (i, path_match) in path_matches.iter().enumerate() {
             let file = working_files.index(path_match.index as usize);
-            let filename_start = (file.relative_path.len() - file.file_name.len()) as u16;
+            let filename_start = file.filename_offset_in_relative() as u16;
             let match_start_approx = path_match.match_end_col.saturating_sub(main_needle_len - 1);
 
             if match_start_approx < filename_start {
                 fallback_indices.push(i as u32);
-                fallback_filenames.push(file.file_name.as_str());
+                fallback_filenames.push(file.file_name());
             }
         }
 
@@ -212,7 +212,7 @@ pub fn match_and_score_files<'a>(
             let file = working_files.index(file_idx);
 
             let base_score = path_match.score as i32;
-            let frecency_boost = base_score.saturating_mul(file.total_frecency_score) / 100;
+            let frecency_boost = base_score.saturating_mul(file.total_frecency_score()) / 100;
 
             // Give modified/dirty files a 15% boost to make them appear higher in results
             let git_status_boost = if file.git_status.is_some_and(is_modified_status) {
@@ -222,9 +222,9 @@ pub fn match_and_score_files<'a>(
             };
 
             let distance_penalty =
-                calculate_distance_penalty(context.current_file, &file.relative_path);
+                calculate_distance_penalty(context.current_file, file.relative_path());
 
-            let filename_start = (file.relative_path.len() - file.file_name.len()) as u16;
+            let filename_start = file.filename_offset_in_relative() as u16;
             let match_start_approx = path_match.match_end_col.saturating_sub(main_needle_len - 1);
 
             let end_col_filename_match = match_start_approx >= filename_start;
@@ -246,8 +246,8 @@ pub fn match_and_score_files<'a>(
             let is_filename_match = end_col_filename_match || simd_filename_match.is_some();
             let is_exact_filename = simd_filename_match.is_some_and(|m| m.exact)
                 || (end_col_filename_match
-                    && main_needle_len as usize == file.file_name.len()
-                    && main_needle.eq_ignore_ascii_case(file.file_name.as_bytes()));
+                    && main_needle_len as usize == file.file_name().len()
+                    && main_needle.eq_ignore_ascii_case(file.file_name().as_bytes()));
 
             let mut has_special_filename_bonus = false;
             let filename_bonus = if is_exact_filename {
@@ -266,7 +266,7 @@ pub fn match_and_score_files<'a>(
                 } else {
                     max_bonus
                 }
-            } else if !is_filename_match && is_special_entry_point_file(&file.file_name) {
+            } else if !is_filename_match && is_special_entry_point_file(file.file_name()) {
                 // 5% bonus for special file but not as much as file name to avoid situations
                 // when you have /user_service/server.rs and /user_service/server/mod.rs
                 has_special_filename_bonus = true;
@@ -280,7 +280,7 @@ pub fn match_and_score_files<'a>(
                 let last_same_query_match = context
                     .last_same_query_match
                     .as_ref()
-                    .filter(|m| m.file_path.as_os_str() == file.path.as_os_str());
+                    .filter(|m| m.file_path.as_os_str() == file.as_path().as_os_str());
 
                 match last_same_query_match {
                     // if we request a combo match without a boost we have to render it anyway
@@ -367,8 +367,8 @@ pub(crate) fn score_filtered_by_frecency<'a>(
     context: &ScoringContext,
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
     let score_file = |file: &'a FileItem| {
-        let total_frecency_score =
-            file.access_frecency_score + file.modification_frecency_score.saturating_mul(4);
+        let total_frecency_score = file.access_frecency_score as i32
+            + (file.modification_frecency_score as i32).saturating_mul(4);
 
         // Give modified/dirty files a boost even in frecency-only mode
         let git_status_boost = if file.git_status.is_some_and(is_modified_status) {
@@ -417,7 +417,7 @@ fn calculate_current_file_penalty(
     let mut penalty = 0i32;
 
     if let Some(current) = context.current_file
-        && file.relative_path.as_str() == current
+        && file.relative_path() == current
     {
         penalty -= match file.git_status {
             Some(status) if is_modified_status(status) => base_score / 2,
@@ -500,14 +500,13 @@ mod tests {
     use super::*;
     use crate::types::PaginationArgs;
     use fff_query_parser::QueryParser;
-    use std::path::PathBuf;
 
     fn create_test_file(path: &str, score: i32, modified: u64) -> (FileItem, Score) {
-        let file_name = path.split('/').next_back().unwrap_or(path).to_string();
+        let filename_start = path.rfind('/').map(|i| i + 1).unwrap_or(0) as u16;
         let file = FileItem::new_raw(
-            PathBuf::from(path),
             path.to_string(),
-            file_name,
+            0,
+            filename_start,
             0,
             modified,
             None,
@@ -581,9 +580,9 @@ mod tests {
         assert_eq!(scores[2].total, 200, "Third should be third highest");
 
         // Verify the files match
-        assert_eq!(items[0].relative_path, "file4.rs");
-        assert_eq!(items[1].relative_path, "file6.rs");
-        assert_eq!(items[2].relative_path, "file2.rs");
+        assert_eq!(items[0].relative_path(), "file4.rs");
+        assert_eq!(items[1].relative_path(), "file6.rs");
+        assert_eq!(items[2].relative_path(), "file2.rs");
     }
 
     #[test]
@@ -677,9 +676,9 @@ mod tests {
         assert_eq!(scores[0].total, 200);
         assert_eq!(scores[1].total, 100);
         assert_eq!(scores[2].total, 50);
-        assert_eq!(items[0].relative_path, "file2.rs");
-        assert_eq!(items[1].relative_path, "file1.rs");
-        assert_eq!(items[2].relative_path, "file3.rs");
+        assert_eq!(items[0].relative_path(), "file2.rs");
+        assert_eq!(items[1].relative_path(), "file1.rs");
+        assert_eq!(items[2].relative_path(), "file3.rs");
     }
 }
 
@@ -688,19 +687,10 @@ mod filename_bonus_tests {
     use super::*;
     use crate::types::PaginationArgs;
     use fff_query_parser::QueryParser;
-    use std::path::PathBuf;
 
     fn make_file(path: &str) -> FileItem {
-        let file_name = path.split('/').next_back().unwrap_or(path).to_string();
-        FileItem::new_raw(
-            PathBuf::from(path),
-            path.to_string(),
-            file_name,
-            0,
-            0,
-            None,
-            false,
-        )
+        let filename_start = path.rfind('/').map(|i| i + 1).unwrap_or(0) as u16;
+        FileItem::new_raw(path.to_string(), 0, filename_start, 0, 0, None, false)
     }
 
     fn search(files: &[FileItem], query: &str) -> Vec<(String, Score)> {
@@ -724,7 +714,7 @@ mod filename_bonus_tests {
         items
             .iter()
             .zip(scores.iter())
-            .map(|(f, s)| (f.relative_path.clone(), s.clone()))
+            .map(|(f, s)| (f.relative_path().to_string(), s.clone()))
             .collect()
     }
 

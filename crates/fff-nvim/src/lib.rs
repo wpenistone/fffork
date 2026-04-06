@@ -244,7 +244,7 @@ pub fn fuzzy_search_files(
 
         let path = expand_tilde(pure_query);
         if path.is_absolute() && path.is_file() {
-            if let Ok(idx) = files.binary_search_by(|f| f.path.as_path().cmp(&path)) {
+            if let Ok(idx) = files.binary_search_by(|f| f.as_path().cmp(&path)) {
                 let found = SearchResult {
                     items: vec![&files[idx]],
                     scores: vec![Score {

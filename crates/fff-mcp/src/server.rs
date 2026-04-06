@@ -313,8 +313,8 @@ impl FffServer {
                 let mut current_file = "";
                 for m in fuzzy_result.matches.iter().take(3) {
                     let file = fuzzy_result.files[m.file_index];
-                    if file.relative_path.as_str() != current_file {
-                        current_file = &file.relative_path;
+                    if file.relative_path() != current_file {
+                        current_file = file.relative_path();
                         lines.push(current_file.to_string());
                     }
                     lines.push(format!(" {}: {}", m.line_number, m.line_content));
@@ -349,7 +349,7 @@ impl FffServer {
                     if score.base_score > query_len * 10 {
                         return Ok(CallToolResult::success(vec![Content::text(format!(
                             "0 content matches. But there is a relevant file path: {}",
-                            top.relative_path
+                            top.relative_path()
                         ))]));
                     }
                 }
@@ -470,11 +470,14 @@ impl FffServer {
 
         if page_offset == 0 {
             if is_exact_match {
-                lines.push(format!("→ Read {} (exact match!)", top_item.relative_path));
+                lines.push(format!(
+                    "→ Read {} (exact match!)",
+                    top_item.relative_path()
+                ));
             } else if scores.len() < 2 || scores[0].total > scores[1].total.saturating_mul(2) {
                 lines.push(format!(
                     "→ Read {} (best match — Read this file directly)",
-                    top_item.relative_path
+                    top_item.relative_path()
                 ));
             }
         }
@@ -489,8 +492,8 @@ impl FffServer {
         for item in &items {
             lines.push(format!(
                 "{}{}",
-                item.relative_path,
-                file_suffix(item.git_status, item.total_frecency_score)
+                item.relative_path(),
+                file_suffix(item.git_status, item.total_frecency_score())
             ));
         }
 

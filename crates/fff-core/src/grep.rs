@@ -1287,17 +1287,17 @@ fn prepare_files_to_search<'a>(
     let prefiltered: Vec<&FileItem> = if constraints.is_empty() {
         files
             .iter()
-            .filter(|f| !f.is_binary && f.size > 0 && f.size <= options.max_file_size)
+            .filter(|f| !f.is_binary() && f.size > 0 && f.size <= options.max_file_size)
             .collect()
     } else {
         match apply_constraints(files, constraints) {
             Some(constrained) => constrained
                 .into_iter()
-                .filter(|f| !f.is_binary && f.size > 0 && f.size <= options.max_file_size)
+                .filter(|f| !f.is_binary() && f.size > 0 && f.size <= options.max_file_size)
                 .collect(),
             None => files
                 .iter()
-                .filter(|f| !f.is_binary && f.size > 0 && f.size <= options.max_file_size)
+                .filter(|f| !f.is_binary() && f.size > 0 && f.size <= options.max_file_size)
                 .collect(),
         }
     };
@@ -1310,12 +1310,12 @@ fn prepare_files_to_search<'a>(
     // skipping the O(n log n) sort saves ~200ms per query.
     let needs_sort = sorted_files
         .iter()
-        .any(|f| f.total_frecency_score != 0 || f.modified != 0);
+        .any(|f| f.total_frecency_score() != 0 || f.modified != 0);
 
     if needs_sort {
         sort_with_buffer(&mut sorted_files, |a, b| {
-            b.total_frecency_score
-                .cmp(&a.total_frecency_score)
+            b.total_frecency_score()
+                .cmp(&a.total_frecency_score())
                 .then(b.modified.cmp(&a.modified))
         });
     }
@@ -1824,7 +1824,7 @@ pub fn grep_search<'a>(
                     let file_idx = base + bit;
                     if file_idx < files.len() {
                         let f = unsafe { files.get_unchecked(file_idx) };
-                        if !f.is_binary && f.size <= options.max_file_size {
+                        if !f.is_binary() && f.size <= options.max_file_size {
                             result.push(f);
                         }
                     }
@@ -1835,12 +1835,12 @@ pub fn grep_search<'a>(
             let total_searchable = files.len();
             let needs_sort = result
                 .iter()
-                .any(|f| f.total_frecency_score != 0 || f.modified != 0);
+                .any(|f| f.total_frecency_score() != 0 || f.modified != 0);
 
             if needs_sort {
                 sort_with_buffer(&mut result, |a, b| {
-                    b.total_frecency_score
-                        .cmp(&a.total_frecency_score)
+                    b.total_frecency_score()
+                        .cmp(&a.total_frecency_score())
                         .then(b.modified.cmp(&a.modified))
                 });
             }
@@ -2111,33 +2111,24 @@ mod tests {
         let meta3 = std::fs::metadata(&file3_path).unwrap();
 
         let files = vec![
-            FileItem::new_raw(
-                file1_path,
-                "grep.rs".to_string(),
-                "grep.rs".to_string(),
-                meta1.len(),
-                0,
-                None,
-                false,
-            ),
-            FileItem::new_raw(
-                file2_path,
-                "matcher.rs".to_string(),
-                "matcher.rs".to_string(),
-                meta2.len(),
-                0,
-                None,
-                false,
-            ),
-            FileItem::new_raw(
-                file3_path,
-                "other.rs".to_string(),
-                "other.rs".to_string(),
-                meta3.len(),
-                0,
-                None,
-                false,
-            ),
+            {
+                let p = file1_path.to_string_lossy().into_owned();
+                let rs = (p.len() - "grep.rs".len()) as u16;
+                let fs = rs;
+                FileItem::new_raw(p, rs, fs, meta1.len(), 0, None, false)
+            },
+            {
+                let p = file2_path.to_string_lossy().into_owned();
+                let rs = (p.len() - "matcher.rs".len()) as u16;
+                let fs = rs;
+                FileItem::new_raw(p, rs, fs, meta2.len(), 0, None, false)
+            },
+            {
+                let p = file3_path.to_string_lossy().into_owned();
+                let rs = (p.len() - "other.rs".len()) as u16;
+                let fs = rs;
+                FileItem::new_raw(p, rs, fs, meta3.len(), 0, None, false)
+            },
         ];
 
         let options = super::GrepSearchOptions {

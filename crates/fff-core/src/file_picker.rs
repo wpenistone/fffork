@@ -147,7 +147,7 @@ impl FileSync {
     /// Find file index by path using binary search on the sorted base portion.
     #[inline]
     fn find_file_index(&self, path: &Path) -> Result<usize, usize> {
-        self.files[..self.base_count].binary_search_by(|f| f.path.as_path().cmp(path))
+        self.files[..self.base_count].binary_search_by(|f| f.as_path().cmp(path))
     }
 
     /// Find a file in the overflow portion by path (linear scan).
@@ -155,7 +155,7 @@ impl FileSync {
     fn find_overflow_index(&self, path: &Path) -> Option<usize> {
         self.files[self.base_count..]
             .iter()
-            .position(|f| f.path == path)
+            .position(|f| f.as_path() == path)
             .map(|pos| self.base_count + pos)
     }
 
@@ -199,7 +199,7 @@ impl FileSync {
     /// Insert a file in sorted order (by path).
     /// Returns true if inserted, false if file already exists.
     fn insert_file_sorted(&mut self, file: FileItem) -> bool {
-        match self.find_file_index(&file.path) {
+        match self.find_file_index(file.as_path()) {
             Ok(_) => false, // File already exists
             Err(position) => {
                 self.insert_file(position, file);
@@ -227,12 +227,6 @@ impl FileItem {
             .to_string_lossy()
             .into_owned();
 
-        let name = path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-
         let (size, modified) = match metadata {
             Some(metadata) => {
                 let size = metadata.len();
@@ -251,10 +245,17 @@ impl FileItem {
         // Files not caught here are detected when content is first loaded.
         let is_binary = is_known_binary_extension(&path);
 
+        let path_string = path.to_string_lossy().into_owned();
+        let relative_start = (path_string.len() - relative_path.len()) as u16;
+        let filename_start = path_string
+            .rfind(std::path::MAIN_SEPARATOR)
+            .map(|i| i + 1)
+            .unwrap_or(relative_start as usize) as u16;
+
         Self::new_raw(
-            path,
-            relative_path,
-            name,
+            path_string,
+            relative_start,
+            filename_start,
             size,
             modified,
             git_status,
@@ -267,10 +268,9 @@ impl FileItem {
         tracker: &FrecencyTracker,
         mode: FFFMode,
     ) -> Result<(), Error> {
-        self.access_frecency_score = tracker.get_access_score(&self.path, mode) as i32;
+        self.access_frecency_score = tracker.get_access_score(self.as_path(), mode) as i16;
         self.modification_frecency_score =
-            tracker.get_modification_score(self.modified, self.git_status, mode) as i32;
-        self.total_frecency_score = self.access_frecency_score + self.modification_frecency_score;
+            tracker.get_modification_score(self.modified, self.git_status, mode) as i16;
 
         Ok(())
     }
@@ -499,7 +499,7 @@ impl FilePicker {
         // Apply git status synchronously.
         if let Ok(Some(git_cache)) = walk.git_handle.join() {
             for file in self.sync_data.files.iter_mut() {
-                file.git_status = git_cache.lookup_status(&file.path);
+                file.git_status = git_cache.lookup_status(file.as_path());
             }
         }
 
@@ -733,7 +733,7 @@ impl FilePicker {
 
     /// Add a file to the picker's files in sorted order (used by background watcher)
     pub fn add_file_sorted(&mut self, file: FileItem) -> Option<&FileItem> {
-        let path = file.path.clone();
+        let path = PathBuf::from(file.path_str());
 
         if self.sync_data.insert_file_sorted(file) {
             // File was inserted, look it up
@@ -764,9 +764,9 @@ impl FilePicker {
         if let Ok(pos) = self.sync_data.find_file_index(path) {
             let file = self.sync_data.get_file_mut(pos)?;
 
-            if file.is_deleted {
+            if file.is_deleted() {
                 // Resurrect tombstoned file.
-                file.is_deleted = false;
+                file.set_deleted(false);
                 debug!(
                     "on_create_or_modify: resurrected tombstoned file at index {}",
                     pos
@@ -856,7 +856,7 @@ impl FilePicker {
         match self.sync_data.find_file_index(path) {
             Ok(index) => {
                 let file = &mut self.sync_data.files[index];
-                file.is_deleted = true;
+                file.set_deleted(true);
                 file.invalidate_mmap(&self.cache_budget);
                 if let Some(ref overlay) = self.bigram_overlay {
                     overlay.write().delete_file(index);
@@ -885,7 +885,7 @@ impl FilePicker {
         let dir_path = dir.as_ref();
         // Use the safe retain_files method which maintains both indices
         self.sync_data
-            .retain_files(|file| !file.path.starts_with(dir_path))
+            .retain_files(|file| !file.as_path().starts_with(dir_path))
     }
 
     /// Use this to prevent any substantial background threads from acquiring the locks
@@ -932,7 +932,7 @@ impl FilePicker {
                     let mode = self.mode;
                     BACKGROUND_THREAD_POOL.install(|| {
                         self.sync_data.files.par_iter_mut().for_each(|file| {
-                            file.git_status = git_cache.lookup_status(&file.path);
+                            file.git_status = git_cache.lookup_status(file.as_path());
                             if let Some(frecency) = frecency_ref {
                                 let _ = file.update_frecency_scores(frecency, mode);
                             }
@@ -1155,7 +1155,7 @@ fn spawn_scan_and_watcher(
                     {
                         for &idx in &content_binary {
                             if let Some(file) = picker.sync_data.get_file_mut(idx) {
-                                file.is_binary = true;
+                                file.set_binary(true);
                             }
                         }
 
@@ -1203,13 +1203,13 @@ pub fn warmup_mmaps(files: &[FileItem], budget: &ContentCacheBudget) {
     // they naturally sink past the partition boundary.
     if all.len() > max_files {
         all.select_nth_unstable_by(max_files, |a, b| {
-            let a_ok = !a.is_binary && a.size > 0;
-            let b_ok = !b.is_binary && b.size > 0;
+            let a_ok = !a.is_binary() && a.size > 0;
+            let b_ok = !b.is_binary() && b.size > 0;
             match (a_ok, b_ok) {
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
                 (false, false) => std::cmp::Ordering::Equal,
-                (true, true) => b.total_frecency_score.cmp(&a.total_frecency_score),
+                (true, true) => b.total_frecency_score().cmp(&a.total_frecency_score()),
             }
         });
     }
@@ -1225,7 +1225,7 @@ pub fn warmup_mmaps(files: &[FileItem], budget: &ContentCacheBudget) {
                 return;
             }
 
-            if file.is_binary || file.size == 0 || file.size > max_file_size {
+            if file.is_binary() || file.size == 0 || file.size > max_file_size {
                 return;
             }
 
@@ -1265,7 +1265,7 @@ pub fn build_bigram_index(
 
     BACKGROUND_THREAD_POOL.install(|| {
         files.par_iter().enumerate().for_each(|(i, file)| {
-            if file.is_binary || file.size == 0 || file.size > max_file_size {
+            if file.is_binary() || file.size == 0 || file.size > max_file_size {
                 return;
             }
             // Use cached content if available (no extra memory).
@@ -1279,7 +1279,7 @@ pub fn build_bigram_index(
                 }
                 data = Some(cached);
                 owned = None;
-            } else if let Ok(read_data) = std::fs::read(&file.path) {
+            } else if let Ok(read_data) = std::fs::read(file.as_path()) {
                 if detect_binary_content(&read_data) {
                     content_binary.lock().unwrap().push(i);
                     return;
@@ -1389,7 +1389,7 @@ pub fn scan_files(base_path: &Path) -> Vec<FileItem> {
     });
 
     let mut files = files.into_inner();
-    files.sort_unstable_by(|a, b| a.path.as_os_str().cmp(b.path.as_os_str()));
+    files.sort_unstable_by(|a, b| a.path_str().cmp(b.path_str()));
     files
 }
 
@@ -1522,7 +1522,7 @@ fn walk_filesystem(
     drop(frecency);
 
     BACKGROUND_THREAD_POOL.install(|| {
-        files.par_sort_unstable_by(|a, b| a.path.as_os_str().cmp(b.path.as_os_str()));
+        files.par_sort_unstable_by(|a, b| a.path_str().cmp(b.path_str()));
     });
 
     let total_time = scan_start.elapsed();
@@ -1567,7 +1567,7 @@ fn apply_git_status(
 
         BACKGROUND_THREAD_POOL.install(|| {
             picker.sync_data.files.par_iter_mut().for_each(|file| {
-                file.git_status = git_cache.lookup_status(&file.path);
+                file.git_status = git_cache.lookup_status(file.as_path());
                 if let Some(frecency) = frecency_ref {
                     let _ = file.update_frecency_scores(frecency, mode);
                 }
