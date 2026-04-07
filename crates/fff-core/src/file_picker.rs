@@ -319,6 +319,15 @@ pub struct FilePicker {
     cancelled: Arc<AtomicBool>,
     bigram_index: Option<Arc<BigramFilter>>,
     bigram_overlay: Option<Arc<parking_lot::RwLock<BigramOverlay>>>,
+    // This is a soft lock that we use to prevent rescan be triggered while the
+    // bigram indexing is in progress. This allows to keep some of the unsafe magic
+    // relying on the immutabillity of the files vec after the index without worrying
+    // that the vec is going to be dropped before the indexing is finished
+    //
+    // In addition to that rescan is likely triggered by something unnecessary
+    // before the indexing is finished it means that fff is dogfooded the index either
+    // by the UI rendering preview or simply by walking the directory. Which is not good anyway
+    post_scan_busy: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for FilePicker {
@@ -411,6 +420,7 @@ impl FilePicker {
             has_explicit_cache_budget: has_explicit_budget,
             is_scanning: Arc::new(AtomicBool::new(false)),
             mode: options.mode,
+            post_scan_busy: Arc::new(AtomicBool::new(false)),
             scanned_files_count: Arc::new(AtomicUsize::new(0)),
             sync_data: FileSync::new(),
             warmup_mmap_cache: options.warmup_mmap_cache,
@@ -445,6 +455,7 @@ impl FilePicker {
         let watcher_ready = Arc::clone(&picker.watcher_ready);
         let synced_files_count = Arc::clone(&picker.scanned_files_count);
         let cancelled = Arc::clone(&picker.cancelled);
+        let post_scan_busy = Arc::clone(&picker.post_scan_busy);
         let path = picker.base_path.clone();
 
         {
@@ -463,6 +474,7 @@ impl FilePicker {
             shared_picker,
             shared_frecency,
             cancelled,
+            post_scan_busy,
         );
 
         Ok(())
@@ -908,6 +920,14 @@ impl FilePicker {
             return Ok(());
         }
 
+        // The post-scan warmup + bigram phase holds a raw pointer into the
+        // current files Vec. Replacing sync_data now would free that memory.
+        // Skip — the background watcher will retry on the next event.
+        if self.post_scan_busy.load(Ordering::Acquire) {
+            debug!("Post-scan bigram build in progress, skipping rescan");
+            return Ok(());
+        }
+
         self.is_scanning.store(true, Ordering::Relaxed);
         self.scanned_files_count.store(0, Ordering::Relaxed);
 
@@ -1003,6 +1023,7 @@ fn spawn_scan_and_watcher(
     shared_picker: SharedPicker,
     shared_frecency: SharedFrecency,
     cancelled: Arc<AtomicBool>,
+    post_scan_busy: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
         // scan_signal is already `true` (set by the caller before spawning)
@@ -1094,6 +1115,7 @@ fn spawn_scan_and_watcher(
         watcher_ready.store(true, Ordering::Release);
 
         if warmup_mmap_cache && !cancelled.load(Ordering::Acquire) {
+            post_scan_busy.store(true, Ordering::Release);
             let phase_start = std::time::Instant::now();
 
             // Scale cache limits based on repo size (skip if caller provided an explicit budget).
@@ -1110,7 +1132,9 @@ fn spawn_scan_and_watcher(
             }
 
             // SAFETY: The file index Vec is not resized between the initial scan
-            // completing and the warmup + bigram phase finishing.
+            // completing and the warmup + bigram phase finishing because
+            // `post_scan_busy` prevents concurrent rescans from replacing
+            // sync_data while we hold the raw pointer.
             let files_snapshot: Option<(&[FileItem], Arc<ContentCacheBudget>)> =
                 if !cancelled.load(Ordering::Acquire) {
                     let guard = shared_picker.read().ok();
@@ -1120,7 +1144,9 @@ fn spawn_scan_and_watcher(
                             let ptr = files.as_ptr();
                             let len = files.len();
                             let budget = Arc::clone(&picker.cache_budget);
-                            // SAFETY: see comment above — Vec is stable during this window.
+                            // SAFETY: post_scan_busy flag blocks trigger_rescan and
+                            // background watcher rescans from replacing sync_data,
+                            // so the Vec backing this slice stays alive.
                             let static_files: &[FileItem] =
                                 unsafe { std::slice::from_raw_parts(ptr, len) };
                             (static_files, budget)
@@ -1170,6 +1196,8 @@ fn spawn_scan_and_watcher(
                     }
                 }
             }
+
+            post_scan_busy.store(false, Ordering::Release);
 
             info!(
                 "Post-scan warmup + bigram total: {:.2}s",

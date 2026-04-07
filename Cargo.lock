@@ -725,6 +725,7 @@ dependencies = [
  "globset",
  "heed",
  "ignore",
+ "libc",
  "libmimalloc-sys",
  "memchr",
  "memmap2",
