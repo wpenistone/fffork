@@ -102,9 +102,10 @@ pub struct FuzzySearchOptions<'a> {
 #[derive(Debug, Clone)]
 struct FileSync {
     /// All files: `files[..base_count]` are sorted by path (base index, used
-    /// for binary search and bigram); `files[base_count..]` are overflow files
-    /// added since the last full reindex. Deletions in the base use tombstones
-    /// (`is_deleted = true`) to keep bigram indices stable.
+    /// for binary search and bigram);
+    ///
+    /// `files[base_count..]` are overflow files added since the last full reindex.
+    /// Deletions in the base use tombstones (`is_deleted = true`) to keep bigram indices stable.
     files: Vec<FileItem>,
     /// Number of base files (the sorted prefix used for binary search / bigram).
     base_count: usize,
@@ -152,6 +153,8 @@ impl FileSync {
 
     /// Find a file in the overflow portion by path (linear scan).
     /// Returns the absolute index into `files`.
+    ///
+    /// the overflowed items are not ordered so we can not use binary search
     fn find_overflow_index(&self, path: &Path) -> Option<usize> {
         self.files[self.base_count..]
             .iter()
@@ -1307,8 +1310,9 @@ pub fn build_bigram_index(
     let skip_index = skip_builder.compress(Some(12));
     index.set_skip_index(skip_index);
 
-    // The builder just freed ~276 MB (for 500k files) of atomic bitsets.
-    // Hint the allocator to return those pages to the OS.
+    // The builders' flat buffers were freed by compress() above (single
+    // deallocation each). Hint the allocator to return pages from other
+    // per-thread allocations (file reads, sort buffers) during the build.
     hint_allocator_collect();
 
     info!(
@@ -1650,9 +1654,11 @@ pub(crate) fn detect_binary_content(content: &[u8]) -> bool {
 fn hint_allocator_collect() {
     #[cfg(feature = "mimalloc-collect")]
     {
-        // Collect every rayon worker thread's mimalloc heap — the bigram
-        // builder allocated across all of them.
-        rayon::broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true) });
+        // Collect BACKGROUND_THREAD_POOL workers — that's where the bigram
+        // builder allocated memory. `rayon::broadcast` would target the global
+        // pool, which is the wrong set of threads.
+        BACKGROUND_THREAD_POOL.broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true) });
+
         // Main thread too.
         unsafe { libmimalloc_sys::mi_collect(true) };
     }

@@ -1,4 +1,3 @@
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 
 use ahash::AHashMap;
@@ -13,13 +12,13 @@ const MAX_BIGRAM_COLUMNS: usize = 5000;
 const NO_COLUMN: u16 = u16::MAX;
 
 /// Temporary sync dense builder for the bigram index.
-/// Uses AtomicU64 for lock-free concurrent writes during the parallel build phase.
+/// Builds from the many threads reading file contents in parallel
 pub struct BigramIndexBuilder {
     // we use lookup as atomics only in the builder because it is filled by the rayon threads
     // the actual index uses pure u16 for the allocations
     lookup: Vec<AtomicU16>,
     /// Per-column bitset data, lazily allocated via OnceLock.
-    col_data: Vec<OnceLock<Box<[AtomicU64]>>>,
+    col_data: Vec<AtomicU64>,
     next_column: AtomicU16,
     words: usize,
     file_count: usize,
@@ -31,8 +30,8 @@ impl BigramIndexBuilder {
         let words = file_count.div_ceil(64);
         let mut lookup = Vec::with_capacity(65536);
         lookup.resize_with(65536, || AtomicU16::new(NO_COLUMN));
-        let mut col_data = Vec::with_capacity(MAX_BIGRAM_COLUMNS);
-        col_data.resize_with(MAX_BIGRAM_COLUMNS, OnceLock::new);
+        let mut col_data = Vec::with_capacity(MAX_BIGRAM_COLUMNS * words);
+        col_data.resize_with(MAX_BIGRAM_COLUMNS * words, || AtomicU64::new(0));
         Self {
             lookup,
             col_data,
@@ -67,12 +66,8 @@ impl BigramIndexBuilder {
 
     #[inline]
     fn column_bitset(&self, col: u16) -> &[AtomicU64] {
-        let words = self.words;
-        self.col_data[col as usize].get_or_init(|| {
-            let mut v = Vec::with_capacity(words);
-            v.resize_with(words, || AtomicU64::new(0));
-            v.into_boxed_slice()
-        })
+        let start = col as usize * self.words;
+        &self.col_data[start..start + self.words]
     }
 
     pub(crate) fn add_file_content(&self, skip_builder: &Self, file_idx: usize, content: &[u8]) {
@@ -84,8 +79,8 @@ impl BigramIndexBuilder {
         let word_idx = file_idx / 64;
         let bit_mask = 1u64 << (file_idx % 64);
 
-        // Stack-local dedup bitsets: 1024 × u64 = 8 KB each, covers all 65536
-        // possible bigram keys. Fits comfortably in L1 cache.
+        // Stack-local dedup bitsets: 1024 × u64 = 8 KB each, covers all 65536 bigrams with margin
+        // have to fit in L1 cache
         let mut seen_consec = [0u64; 1024];
         let mut seen_skip = [0u64; 1024];
 
@@ -105,7 +100,7 @@ impl BigramIndexBuilder {
             }
         }
 
-        // Main loop: consecutive (i-1, i) and skip-1 (i-2, i) in one pass.
+        // Main loop: consecutive (i-1, i) and skip-1 (i-2, i)
         for i in 2..len {
             let cur = bytes[i];
 
@@ -169,9 +164,8 @@ impl BigramIndexBuilder {
         let populated = self.populated.load(Ordering::Relaxed);
         let dense_bytes = words * 8; // cost of one dense column
 
-        // Destructure so we can incrementally free col_data entries.
         let old_lookup = self.lookup;
-        let mut col_data = self.col_data;
+        let col_data = self.col_data;
 
         let mut lookup: Vec<u16> = vec![NO_COLUMN; 65536];
         let mut dense_data: Vec<u64> = Vec::with_capacity(cols * words);
@@ -182,16 +176,14 @@ impl BigramIndexBuilder {
             if old_col == NO_COLUMN || old_col as usize >= cols {
                 continue;
             }
-            // by taking this we drop the bitset in the end of the loop effectively
-            // controlling the memory consumtpion, so we do not grow another bitset during the loop
-            let Some(bitset) = col_data[old_col as usize].take() else {
-                continue;
-            };
+
+            let col_start = old_col as usize * words;
+            let bitset = &col_data[col_start..col_start + words];
 
             // count set bits to decide if this column is worth keeping.
             let mut popcount = 0u32;
-            for w in 0..words {
-                popcount += bitset[w].load(Ordering::Relaxed).count_ones();
+            for column in bitset.iter().take(words) {
+                popcount += column.load(Ordering::Relaxed).count_ones();
             }
 
             // drop bigrams appearing in too few files
@@ -217,13 +209,13 @@ impl BigramIndexBuilder {
             lookup[key] = dense_idx;
             dense_count += 1;
 
-            for w in 0..words {
-                dense_data.push(bitset[w].load(Ordering::Relaxed));
+            for column in bitset.iter().take(words) {
+                dense_data.push(column.load(Ordering::Relaxed));
             }
         }
 
-        drop(col_data);
-        drop(old_lookup);
+        // col_data + old_lookup dropped here — single deallocation each,
+        // no fragmentation.
 
         BigramFilter {
             lookup,

@@ -25,6 +25,8 @@ pub enum Error {
     EnvOpen(#[source] heed::Error),
     #[error("Failed to create frecency database: {0}")]
     DbCreate(#[source] heed::Error),
+    #[error("Failed to open frecency database: {0}")]
+    DbOpen(#[source] heed::Error),
     #[error("Failed to clear stale readers for frecency database: {0}")]
     DbClearStaleReaders(#[source] heed::Error),
 
