@@ -52,5 +52,11 @@ lto = "fat"
 codegen-units = 1
 strip = true
 
+[profile.ci]
+inherits = "release"
+# we use lto=fat locally for better SIMD for the march=native but
+# on CI when we cross compiling we should not exclude any cpu flags checking
+lto = "thin"
+
 [profile.bench]
 inherits = "release"
