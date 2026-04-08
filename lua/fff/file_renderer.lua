@@ -241,7 +241,7 @@ function M.apply_highlights(item, ctx, item_idx, buf, ns_id, line_idx, line_cont
 
   -- 9. Query match
   if ctx.query and ctx.query ~= '' then
-    local match_start, match_end = string.find(line_content, ctx.query, 1)
+    local match_start, match_end = string.find(line_content, ctx.query, 1, true)
     if match_start and match_end then
       vim.api.nvim_buf_set_extmark(
         buf,
