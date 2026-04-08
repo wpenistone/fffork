@@ -69,7 +69,6 @@ fn main() {
         ("long_rare", "user_authentication", 100),
         ("typo_resistant", "contrlr", 200),
         ("path_like", "src/lib", 150),
-        ("single_char", "a", 300),
         ("two_char", "st", 300),
         ("partial_word", "test", 200),
         ("deep_path", "drivers/net", 100),

@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::constraints::Constrainable;
 use crate::query_tracker::QueryMatchEntry;
 use fff_query_parser::{FFFQuery, FuzzyQuery, Location};
+use neo_frizbee::Matchable;
 
 /// Cached file contents — mmap on Unix, heap buffer on Windows.
 ///
@@ -215,7 +216,23 @@ impl FileItem {
             self.flags &= !FileItemFlags::DELETED;
         }
     }
+}
 
+impl Matchable for FileItem {
+    #[inline]
+    fn match_str(&self) -> Option<&str> {
+        (!self.is_deleted()).then(|| self.relative_path())
+    }
+}
+
+impl Matchable for &FileItem {
+    #[inline]
+    fn match_str(&self) -> Option<&str> {
+        (!self.is_deleted()).then(|| self.relative_path())
+    }
+}
+
+impl FileItem {
     /// Invalidate the cached content so the next `get_content()` call creates a fresh one.
     ///
     /// Call this when the background watcher detects that the file has been modified.

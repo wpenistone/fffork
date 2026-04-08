@@ -466,9 +466,6 @@ pub struct BigramOverlay {
     /// from base query results.
     tombstones: Vec<u64>,
 
-    /// Bigram sets for files added after the base was built (overflow files).
-    added: Vec<Vec<u16>>,
-
     /// Original files count this overlay was created for.
     base_file_count: usize,
 }
@@ -479,13 +476,8 @@ impl BigramOverlay {
         Self {
             modified: AHashMap::new(),
             tombstones: vec![0u64; words],
-            added: Vec::new(),
             base_file_count,
         }
-    }
-
-    pub(crate) fn add_file(&mut self, content: &[u8]) {
-        self.added.push(extract_bigrams(content));
     }
 
     pub(crate) fn modify_file(&mut self, file_idx: usize, content: &[u8]) {
@@ -517,40 +509,13 @@ impl BigramOverlay {
             .collect()
     }
 
-    // TODO implement the bigram for overlays as well
-    #[allow(dead_code)]
-    pub(crate) fn query_added(&self, pattern_bigrams: &[u16]) -> Vec<usize> {
-        if pattern_bigrams.is_empty() {
-            return (0..self.added.len()).collect();
-        }
-        self.added
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, bigrams)| {
-                pattern_bigrams
-                    .iter()
-                    .all(|pb| bigrams.contains(pb))
-                    .then_some(idx)
-            })
-            .collect()
+    /// Number of base files this overlay was created for.
+    pub(crate) fn base_file_count(&self) -> usize {
+        self.base_file_count
     }
 
     /// Get the tombstone bitset for clearing base candidates.
     pub(crate) fn tombstones(&self) -> &[u64] {
         &self.tombstones
-    }
-
-    /// Remove an overflow entry by index (when the file is deleted).
-    pub(crate) fn remove_added(&mut self, idx: usize) {
-        if idx < self.added.len() {
-            self.added.remove(idx);
-        }
-    }
-
-    /// Update an existing overflow entry's bigrams.
-    pub(crate) fn update_added(&mut self, idx: usize, bigrams: Vec<u16>) {
-        if idx < self.added.len() {
-            self.added[idx] = bigrams;
-        }
     }
 }

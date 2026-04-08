@@ -1807,11 +1807,19 @@ pub fn grep_search<'a>(
         None
     };
 
+    // Overflow files (added after the bigram index was built) are not in
+    // the candidate bitset. They're few by definition, so just search all
+    // of them directly via memchr — no bigram tracking needed.
+    let overflow_start = bigram_overlay
+        .map(|o| o.base_file_count())
+        .unwrap_or(files.len());
+
     // it is important that this step is coming as early as possible
     let (files_to_search, filtered_file_count) = match bigram_candidates {
         Some(ref candidates) if constraints_from_query.is_empty() => {
             // this call is essentially free and much more efficient than allowing a recollection
-            let cap = BigramFilter::count_candidates(candidates);
+            let overflow_count = files.len().saturating_sub(overflow_start);
+            let cap = BigramFilter::count_candidates(candidates) + overflow_count;
             let mut result: Vec<&FileItem> = Vec::with_capacity(cap);
             for (word_idx, &word) in candidates.iter().enumerate() {
                 if word == 0 {
@@ -1829,6 +1837,14 @@ pub fn grep_search<'a>(
                         }
                     }
                     bits &= bits - 1;
+                }
+            }
+
+            // Append all overflow files — they're not in the bigram index
+            // so we search them unconditionally (typically few files).
+            for f in &files[overflow_start..] {
+                if !f.is_binary() && !f.is_deleted() && f.size <= options.max_file_size {
+                    result.push(f);
                 }
             }
 

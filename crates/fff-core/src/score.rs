@@ -34,13 +34,6 @@ impl<'a> FileItems<'a> {
         self.len() == 0
     }
 
-    fn relative_paths(&self) -> Vec<&'a str> {
-        match self {
-            FileItems::All(s) => s.iter().map(|f| f.relative_path()).collect(),
-            FileItems::Filtered(v) => v.iter().map(|f| f.relative_path()).collect(),
-        }
-    }
-
     /// Index into the file list. Panics if out of bounds (like slice indexing).
     #[inline]
     fn index(&self, index: usize) -> &'a FileItem {
@@ -55,6 +48,10 @@ impl<'a> FileItems<'a> {
 /// Single part: use optimized batch matching.
 /// Multiple parts: each part must match, scores are summed (Nucleo-style).
 /// Parts with less than 2 characters are skipped.
+///
+/// Files are passed directly to frizbee via the `Matchable` trait —
+/// deleted files return `None` from `match_str()` and are skipped
+/// without any intermediate allocation.
 #[inline]
 fn match_fuzzy_parts(
     fuzzy_parts: &[&str],
@@ -62,8 +59,6 @@ fn match_fuzzy_parts(
     options: &neo_frizbee::Config,
     max_threads: usize,
 ) -> Vec<neo_frizbee::Match> {
-    let haystack: Vec<&str> = working_files.relative_paths();
-
     // Filter out parts that are too short (< 2 chars)
     let valid_parts: Vec<&str> = fuzzy_parts
         .iter()
@@ -76,16 +71,21 @@ fn match_fuzzy_parts(
         return vec![];
     }
 
+    let first_part_matches = match working_files {
+        FileItems::All(files) => {
+            neo_frizbee::match_list_parallel(valid_parts[0], files, options, max_threads)
+        }
+        FileItems::Filtered(files) => {
+            neo_frizbee::match_list_parallel(valid_parts[0], files, options, max_threads)
+        }
+    };
+
     if valid_parts.len() == 1 {
-        let matches =
-            neo_frizbee::match_list_parallel(valid_parts[0], &haystack, options, max_threads);
-        return matches;
+        return first_part_matches;
     }
 
     // Multiple parts - match first part, then filter by remaining parts
-    // TODO figure out if we can move this logic to my frizbee fork at least
-    let mut matches =
-        neo_frizbee::match_list_parallel(valid_parts[0], &haystack, options, max_threads);
+    let mut matches = first_part_matches;
     for part in valid_parts[1..].iter() {
         let mut part_options = *options;
         part_options.max_typos = options.max_typos.map(|t| t.min(part.len() as u16));
@@ -93,8 +93,9 @@ fn match_fuzzy_parts(
         matches = matches
             .into_iter()
             .filter_map(|mut m| {
-                let path = haystack.get(m.index as usize)?;
-                let part_matches = neo_frizbee::match_list(part, &[*path], &part_options);
+                let file = working_files.index(m.index as usize);
+                let path = file.relative_path();
+                let part_matches = neo_frizbee::match_list(part, &[path], &part_options);
                 let part_match = part_matches.first()?;
 
                 // Sum scores
@@ -176,7 +177,7 @@ pub fn match_and_score_files<'a>(
         for (i, path_match) in path_matches.iter().enumerate() {
             let file = working_files.index(path_match.index as usize);
             let filename_start = file.filename_offset_in_relative() as u16;
-            let match_start_approx = path_match.match_end_col.saturating_sub(main_needle_len - 1);
+            let match_start_approx = path_match.end_col.saturating_sub(main_needle_len - 1);
 
             if match_start_approx < filename_start {
                 fallback_indices.push(i as u32);
@@ -225,7 +226,7 @@ pub fn match_and_score_files<'a>(
                 calculate_distance_penalty(context.current_file, file.relative_path());
 
             let filename_start = file.filename_offset_in_relative() as u16;
-            let match_start_approx = path_match.match_end_col.saturating_sub(main_needle_len - 1);
+            let match_start_approx = path_match.end_col.saturating_sub(main_needle_len - 1);
 
             let end_col_filename_match = match_start_approx >= filename_start;
             let simd_filename_match = if !end_col_filename_match {
@@ -401,8 +402,16 @@ pub(crate) fn score_filtered_by_frecency<'a>(
     };
 
     let results: Vec<_> = match files {
-        FileItems::All(s) => s.par_iter().map(&score_file).collect(),
-        FileItems::Filtered(v) => v.iter().map(|&file| score_file(file)).collect(),
+        FileItems::All(s) => s
+            .par_iter()
+            .filter(|f| !f.is_deleted())
+            .map(&score_file)
+            .collect(),
+        FileItems::Filtered(v) => v
+            .iter()
+            .filter(|f| !f.is_deleted())
+            .map(|&file| score_file(file))
+            .collect(),
     };
 
     sort_and_paginate(results, context)
