@@ -399,6 +399,39 @@ impl FilePicker {
         self.sync_data.overflow_files()
     }
 
+    /// Extracts all unique ancestor directories from the indexed file list.
+    pub fn extract_watch_dirs(&self) -> Vec<PathBuf> {
+        let files = self.sync_data.files();
+        let base = self.base_path.as_path();
+        let mut dirs = Vec::with_capacity(files.len() / 4);
+        let mut current = self.base_path.clone();
+
+        for file in files {
+            let Some(parent) = file.as_path().parent() else {
+                continue;
+            };
+            if parent == current.as_path() {
+                continue;
+            }
+
+            // Pop up to the common ancestor of current and parent.
+            while current.as_path() != base && !parent.starts_with(&current) {
+                current.pop();
+            }
+
+            // Push down to parent, emitting each new directory level.
+            let Ok(remainder) = parent.strip_prefix(&current) else {
+                continue;
+            };
+            for component in remainder.components() {
+                current.push(component);
+                dirs.push(current.clone());
+            }
+        }
+
+        dirs
+    }
+
     /// Create a new FilePicker from options.
     /// Always prefer new_with_shared_state for the consumer application, use this only if you know
     /// what you are doing. This won't spawn the backgraound watcher and won't walk the file tree.
@@ -537,12 +570,14 @@ impl FilePicker {
         shared_frecency: &SharedFrecency,
     ) -> Result<(), Error> {
         let git_workdir = self.sync_data.git_workdir.clone();
+        let watch_dirs = self.extract_watch_dirs();
         let watcher = BackgroundWatcher::new(
             self.base_path.clone(),
             git_workdir,
             shared_picker.clone(),
             shared_frecency.clone(),
             self.mode,
+            watch_dirs,
         )?;
         self.background_watcher = Some(watcher);
         self.watcher_ready.store(true, Ordering::Release);
@@ -1070,12 +1105,19 @@ fn spawn_scan_and_watcher(
         }
 
         if watch && !cancelled.load(Ordering::Acquire) {
+            let watch_dirs = shared_picker
+                .read()
+                .ok()
+                .and_then(|guard| guard.as_ref().map(|picker| picker.extract_watch_dirs()))
+                .unwrap_or_default();
+
             match BackgroundWatcher::new(
                 base_path,
                 git_workdir,
                 shared_picker.clone(),
                 shared_frecency.clone(),
                 mode,
+                watch_dirs,
             ) {
                 Ok(watcher) => {
                     info!("Background file watcher initialized successfully");
