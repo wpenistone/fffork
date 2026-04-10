@@ -117,8 +117,20 @@ impl SharedPicker {
 }
 
 /// Thread-safe shared handle to the [`FrecencyTracker`] instance.
-#[derive(Clone, Default)]
-pub struct SharedFrecency(pub(crate) Arc<RwLock<Option<FrecencyTracker>>>);
+#[derive(Clone)]
+pub struct SharedFrecency {
+    inner: Arc<RwLock<Option<FrecencyTracker>>>,
+    enabled: bool,
+}
+
+impl Default for SharedFrecency {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(None)),
+            enabled: true,
+        }
+    }
+}
 
 impl std::fmt::Debug for SharedFrecency {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -127,16 +139,27 @@ impl std::fmt::Debug for SharedFrecency {
 }
 
 impl SharedFrecency {
+    /// Creates a disabled instance that silently ignores all writes.
+    pub fn noop() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(None)),
+            enabled: false,
+        }
+    }
+
     pub fn read(&self) -> Result<RwLockReadGuard<'_, Option<FrecencyTracker>>, Error> {
-        self.0.read().map_err(|_| Error::AcquireFrecencyLock)
+        self.inner.read().map_err(|_| Error::AcquireFrecencyLock)
     }
 
     pub fn write(&self) -> Result<RwLockWriteGuard<'_, Option<FrecencyTracker>>, Error> {
-        self.0.write().map_err(|_| Error::AcquireFrecencyLock)
+        self.inner.write().map_err(|_| Error::AcquireFrecencyLock)
     }
 
-    /// Initialize the frecency tracker, replacing any existing one.
+    /// Initialize the frecency tracker. No-op if this is a disabled instance.
     pub fn init(&self, tracker: FrecencyTracker) -> Result<(), Error> {
+        if !self.enabled {
+            return Ok(());
+        }
         let mut guard = self.write()?;
         *guard = Some(tracker);
         Ok(())
@@ -153,8 +176,20 @@ impl SharedFrecency {
 }
 
 /// Thread-safe shared handle to the [`QueryTracker`] instance.
-#[derive(Clone, Default)]
-pub struct SharedQueryTracker(pub(crate) Arc<RwLock<Option<QueryTracker>>>);
+#[derive(Clone)]
+pub struct SharedQueryTracker {
+    inner: Arc<RwLock<Option<QueryTracker>>>,
+    enabled: bool,
+}
+
+impl Default for SharedQueryTracker {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(None)),
+            enabled: true,
+        }
+    }
+}
 
 impl std::fmt::Debug for SharedQueryTracker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -163,16 +198,27 @@ impl std::fmt::Debug for SharedQueryTracker {
 }
 
 impl SharedQueryTracker {
+    /// Creates a disabled instance that silently ignores all writes.
+    pub fn noop() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(None)),
+            enabled: false,
+        }
+    }
+
     pub fn read(&self) -> Result<RwLockReadGuard<'_, Option<QueryTracker>>, Error> {
-        self.0.read().map_err(|_| Error::AcquireFrecencyLock)
+        self.inner.read().map_err(|_| Error::AcquireFrecencyLock)
     }
 
     pub fn write(&self) -> Result<RwLockWriteGuard<'_, Option<QueryTracker>>, Error> {
-        self.0.write().map_err(|_| Error::AcquireFrecencyLock)
+        self.inner.write().map_err(|_| Error::AcquireFrecencyLock)
     }
 
-    /// Initialize the query tracker, replacing any existing one.
+    /// Initialize the query tracker. No-op if this is a disabled instance.
     pub fn init(&self, tracker: QueryTracker) -> Result<(), Error> {
+        if !self.enabled {
+            return Ok(());
+        }
         let mut guard = self.write()?;
         *guard = Some(tracker);
         Ok(())

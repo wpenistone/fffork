@@ -276,7 +276,10 @@ pub fn match_and_score_files<'a>(
                 0
             };
 
-            let current_file_penalty = calculate_current_file_penalty(file, base_score, context);
+            // Light penalty for the current file — just enough to demote it slightly,
+            // not enough to bury it when the query is a good match.
+            let current_file_penalty =
+                calculate_current_file_penalty(file, base_score / 4, context);
             let combo_match_boost = {
                 let last_same_query_match = context
                     .last_same_query_match
@@ -428,10 +431,7 @@ fn calculate_current_file_penalty(
     if let Some(current) = context.current_file
         && file.relative_path() == current
     {
-        penalty -= match file.git_status {
-            Some(status) if is_modified_status(status) => base_score / 2,
-            _ => base_score,
-        };
+        penalty -= base_score;
     }
 
     penalty

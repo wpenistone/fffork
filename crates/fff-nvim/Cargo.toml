@@ -39,6 +39,18 @@ path = "src/bin/grep_vs_rg.rs"
 name = "bench_grep_query"
 path = "src/bin/bench_grep_query.rs"
 
+[[bin]]
+name = "fuzzy_grep_test"
+path = "src/bin/fuzzy_grep_test.rs"
+
+[[bin]]
+name = "test_memory_leak"
+path = "src/bin/test_memory_leak.rs"
+
+[[bin]]
+name = "bench_ci_memmem"
+path = "src/bin/bench_ci_memmem.rs"
+
 [dependencies]
 # Workspace dependencies
 ahash = { workspace = true }

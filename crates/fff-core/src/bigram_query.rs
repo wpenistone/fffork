@@ -163,6 +163,98 @@ impl HirInfo {
     }
 }
 
+/// Prefilter fuzzy query. The algorithm is the following:
+/// we allow max_typs = min(len/3,2) every typo destroys at most 2 consecutive bigrams
+/// So out of N bigrams at least N - 2 * max_typos have to present in the matching fil
+pub(crate) fn fuzzy_to_bigram_query(query: &str, num_probes: usize) -> BigramQuery {
+    let lower: Vec<u8> = query.bytes().map(|b| b.to_ascii_lowercase()).collect();
+
+    if lower.len() < 2 {
+        return BigramQuery::Any;
+    }
+
+    let max_typos = (lower.len() / 3).min(2);
+
+    // Extract all consecutive bigram keys.
+    let bigram_keys: Vec<u16> = lower
+        .windows(2)
+        .filter_map(|w| consec_key(w[0], w[1]))
+        .collect();
+
+    if bigram_keys.is_empty() {
+        return BigramQuery::Any;
+    }
+
+    // For very short queries (0 typos), AND all bigrams — exact subsequence.
+    if max_typos == 0 {
+        return simplify_and(
+            bigram_keys
+                .iter()
+                .map(|&k| BigramQuery::Consec(k))
+                .collect(),
+        );
+    }
+
+    // Pick evenly-spaced probe bigrams.
+    let n = num_probes.min(bigram_keys.len());
+    if n <= max_typos {
+        // Too few probes to require anything useful.
+        return simplify_or(
+            bigram_keys
+                .iter()
+                .map(|&k| BigramQuery::Consec(k))
+                .collect(),
+        );
+    }
+
+    let probes: Vec<u16> = if n == bigram_keys.len() {
+        bigram_keys
+    } else {
+        (0..n)
+            .map(|i| {
+                let idx = i * (bigram_keys.len() - 1) / (n - 1);
+                bigram_keys[idx]
+            })
+            .collect()
+    };
+
+    let required = n - max_typos;
+
+    // If required == n, just AND all probes.
+    if required >= n {
+        return simplify_and(probes.iter().map(|&k| BigramQuery::Consec(k)).collect());
+    }
+
+    // Generate all C(n, required) subsets → OR(AND(subset), ...)
+    let mut branches = Vec::new();
+    let mut combo = vec![0u16; required];
+    combine(&probes, required, 0, 0, &mut combo, &mut branches);
+
+    simplify_or(branches)
+}
+
+/// Build C(n, k) combination branches in-place on a fixed-size slice.
+fn combine(
+    items: &[u16],
+    k: usize,
+    start: usize,
+    depth: usize,
+    combo: &mut [u16],
+    branches: &mut Vec<BigramQuery>,
+) {
+    if depth == k {
+        branches.push(simplify_and(
+            combo.iter().map(|&key| BigramQuery::Consec(key)).collect(),
+        ));
+        return;
+    }
+    let remaining = k - depth;
+    for i in start..=items.len() - remaining {
+        combo[depth] = items[i];
+        combine(items, k, i + 1, depth + 1, combo, branches);
+    }
+}
+
 pub(crate) fn regex_to_bigram_query(pattern: &str) -> BigramQuery {
     let mut parser = regex_syntax::ParserBuilder::new()
         .unicode(false)

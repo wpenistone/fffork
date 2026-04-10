@@ -7,7 +7,7 @@
 
 use crate::{
     BigramFilter, BigramOverlay,
-    bigram_query::regex_to_bigram_query,
+    bigram_query::{fuzzy_to_bigram_query, regex_to_bigram_query},
     constraints::apply_constraints,
     extract_bigrams,
     sort_buffer::sort_with_buffer,
@@ -1496,6 +1496,9 @@ fn fuzzy_grep_search<'a>(
     //   1-2 chars → 0 typos (exact subsequence only)
     //   3-5 chars → 1 typo
     //   6+  chars → 2 typos
+    // Cap at 2: higher values (3+) let the SIMD prefilter pass lines
+    // missing key characters entirely (e.g. query "flvencodeX" matching
+    // lines without 'l' or 'v'). Quality comes from the post-match filters.
     let max_typos = (grep_text.len() / 3).min(2);
     let scoring = neo_frizbee::Scoring {
         // Use default gap penalties. Higher values (e.g. 20) cause
@@ -1526,15 +1529,16 @@ fn fuzzy_grep_search<'a>(
     let perfect_score = (grep_text.len() as u16) * 16;
     let min_score = (perfect_score * 50) / 100;
 
-    // We allow up to needle_len * 2 to accommodate fuzzy subsequence
-    // matches in longer identifiers (e.g. "SortedMap" → "SortedArrayMap"
-    // has span 13 for needle 9). Quality is enforced by the density and
-    // gap checks below, not just span alone.
-    let max_match_span = grep_text.len() * 2;
+    // Target identifiers are often longer than the query due to delimiters
+    // (e.g. query "flvencodepicture" → "ff_flv_encode_picture_header").
+    // Allow 3x needle length to accommodate underscore/dot-separated names.
+    let max_match_span = grep_text.len() * 3;
     let needle_len = grep_text.len();
 
-    // We scale by needle_len: longer needles tolerate more gaps.
-    let max_gaps = (needle_len / 4).max(1);
+    // Each delimiter (_, .) in the target creates a gap. A typical C/Rust
+    // identifier like "ff_flv_encode_picture_header" has 4-5 underscores.
+    // Scale generously so delimiter gaps don't reject valid matches.
+    let max_gaps = (needle_len / 3).max(2);
 
     // File-level prefilter: collect unique needle chars (both cases) for
     // a fast memchr scan.  If a file doesn't contain enough distinct
@@ -1696,11 +1700,10 @@ fn fuzzy_grep_search<'a>(
                     // upstream returns indices in reverse order, sort ascending
                     match_indices.indices.sort_unstable();
 
-                    // Minimum matched chars: at least (needle_len - 1) characters
-                    // must appear in the match indices. This allows one missing
-                    // char (a single typo/transposition) but rejects matches that
-                    // only hit a partial substring (e.g. "HashMap" for "shcema").
-                    let min_matched = needle_len.saturating_sub(1).max(1);
+                    // Minimum matched chars: at least (needle_len - max_typos)
+                    // characters must appear. This is consistent with the typo
+                    // budget: each typo can drop one needle char from the alignment.
+                    let min_matched = needle_len.saturating_sub(max_typos).max(1);
                     if match_indices.indices.len() < min_matched {
                         continue;
                     }
@@ -1716,12 +1719,14 @@ fn fuzzy_grep_search<'a>(
 
                         // Density check: matched chars / span must be dense enough.
                         // Relaxed for perfect subsequence matches (all needle chars
-                        // present), stricter when typos are involved.
+                        // present), slightly relaxed for typo matches to handle
+                        // delimiter-heavy targets (e.g. "ff_flv_encode_picture_header"
+                        // has span inflated by underscores → density ~68%).
                         let density = (indices.len() * 100) / span;
                         let min_density = if indices.len() >= needle_len {
-                            50 // Perfect subsequence — relaxed
+                            45 // Perfect subsequence — relaxed (delimiters inflate span)
                         } else {
-                            70 // Has typos — stricter
+                            65 // Has typos — moderately strict
                         };
                         if density < min_density {
                             continue;
@@ -1843,7 +1848,6 @@ pub fn grep_search<'a>(
     let regex = match options.mode {
         GrepMode::PlainText => None,
         GrepMode::Fuzzy => {
-            // Fuzzy mode doesn't use bigram — prepare and return early.
             let (mut files_to_search, mut filtered_file_count) =
                 prepare_files_to_search(files, constraints_from_query, options);
             if files_to_search.is_empty()
@@ -1861,6 +1865,39 @@ pub fn grep_search<'a>(
                     ..Default::default()
                 };
             }
+
+            // Bigram prefilter: pick 5 evenly-spaced probe bigrams, require
+            // (5 - max_typos) of them to appear. Widely-spaced probes are
+            // far more selective than sliding windows of adjacent bigrams.
+            if let Some(idx) = bigram_index
+                && idx.is_ready()
+            {
+                let bq = fuzzy_to_bigram_query(&grep_text, 7);
+                if !bq.is_any()
+                    && let Some(mut candidates) = bq.evaluate(idx)
+                {
+                    if let Some(overlay) = bigram_overlay {
+                        for (r, t) in candidates.iter_mut().zip(overlay.tombstones().iter()) {
+                            *r &= !t;
+                        }
+                        // Fuzzy: conservatively add all modified files
+                        for file_idx in overlay.modified_indices() {
+                            let word = file_idx / 64;
+                            if word < candidates.len() {
+                                candidates[word] |= 1u64 << (file_idx % 64);
+                            }
+                        }
+                    }
+
+                    let base_ptr = files.as_ptr();
+                    files_to_search.retain(|f| {
+                        let file_idx =
+                            unsafe { (*f as *const FileItem).offset_from(base_ptr) as usize };
+                        BigramFilter::is_candidate(&candidates, file_idx)
+                    });
+                }
+            }
+
             return fuzzy_grep_search(
                 &grep_text,
                 &files_to_search,
