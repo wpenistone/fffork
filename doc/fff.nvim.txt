@@ -1,4 +1,5 @@
-*fff.nvim.txt*         For Neovim >= 0.10.0         Last change: 2026 April 10
+*fff.nvim.txt*
+                            For Neovim >= 0.10.0    Last change: 2026 April 13
 
 ==============================================================================
 Table of Contents                                 *fff.nvim-table-of-contents*
@@ -6,7 +7,7 @@ Table of Contents                                 *fff.nvim-table-of-contents*
   - MCP                                                         |fff.nvim-mcp|
   - Neovim guide                                       |fff.nvim-neovim-guide|
 1. Links                                                      |fff.nvim-links|
-FFFAI agents (MCP)   |   Neovim usersA fast file search for your AI and neovim, with memory built-in
+FFFAI agents (MCP)   |   Neovim usersA fast file search for your AI and neovim, with memory built-in
 
 
 
