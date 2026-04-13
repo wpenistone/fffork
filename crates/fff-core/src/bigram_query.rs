@@ -164,7 +164,7 @@ impl HirInfo {
 }
 
 /// Prefilter fuzzy query. The algorithm is the following:
-/// we allow max_typs = min(len/3,2) every typo destroys at most 2 consecutive bigrams
+/// we allow max_typos = min(len/3,2) every typo destroys at most 2 consecutive bigrams
 /// So out of N bigrams at least N - 2 * max_typos have to present in the matching fil
 pub(crate) fn fuzzy_to_bigram_query(query: &str, num_probes: usize) -> BigramQuery {
     let lower: Vec<u8> = query.bytes().map(|b| b.to_ascii_lowercase()).collect();
