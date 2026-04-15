@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -93,32 +94,6 @@ impl Clone for FileItem {
             flags: self.flags,
             // Don't clone the content — the clone lazily re-creates it on demand
             content: OnceLock::new(),
-        }
-    }
-}
-
-/// File content that is either borrowed from the persistent cache or owned
-/// from a temporary mmap. Dereferences to `&[u8]` so callers can use it
-/// transparently.
-///
-/// On Unix the uncached variant holds a temporary `memmap2::Mmap` that is
-/// backed by the kernel page cache — same zero-copy benefit as the cached
-/// path, but the mapping is released (munmap) as soon as this value is
-/// dropped instead of being retained for the lifetime of the `FileItem`.
-pub enum FileContentRef<'a> {
-    /// Content is stored in the `FileItem`'s `OnceLock` cache (fast path).
-    Cached(&'a [u8]),
-    /// Temporary mmap (Unix) / heap buffer (Windows) created because the
-    /// persistent cache budget was exceeded. Unmapped on drop.
-    Temp(FileContent),
-}
-
-impl std::ops::Deref for FileContentRef<'_> {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        match self {
-            FileContentRef::Cached(s) => s,
-            FileContentRef::Temp(c) => c,
         }
     }
 }
@@ -287,28 +262,31 @@ impl FileItem {
 
     /// Get file content for searching — **always returns content** for eligible
     /// files, even when the persistent cache budget is exhausted.
-    ///
-    /// Tries the `OnceLock` cache first (fast path). If the cache is full,
-    /// falls back to a temporary mmap that is unmapped when the returned
-    /// [`FileContentRef`] is dropped — no persistent kernel resources retained.
     #[inline]
     pub fn get_content_for_search<'a>(
         &'a self,
+        buf: &'a mut Vec<u8>,
         budget: &ContentCacheBudget,
-    ) -> Option<FileContentRef<'a>> {
+    ) -> Option<&'a [u8]> {
+        // Fast path: persistent cache hit (zero-copy).
         if let Some(cached) = self.get_content(budget) {
-            return Some(FileContentRef::Cached(cached));
+            return Some(cached);
         }
 
-        // get_content returned None — either ineligible or over budget.
         let max_file_size = budget.max_file_size;
         if self.is_binary() || self.size == 0 || self.size > max_file_size {
             return None;
         }
 
-        // Over budget: create a temporary mmap that is unmapped on drop.
-        let content = load_file_content(self.as_path(), self.size)?;
-        Some(FileContentRef::Temp(content))
+        // Slow path: read into the reusable buffer — open() + read_exact() + close().
+        // No mmap()/munmap() syscalls, no page table setup/teardown.
+        // We know the exact size so we use read_exact (1 read syscall) instead of
+        // read_to_end (2 read syscalls — one for data, one for EOF confirmation).
+        let len = self.size as usize;
+        buf.resize(len, 0);
+        let mut file = std::fs::File::open(self.as_path()).ok()?;
+        file.read_exact(buf).ok()?;
+        Some(buf.as_slice())
     }
 }
 

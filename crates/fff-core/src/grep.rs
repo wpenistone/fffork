@@ -1214,46 +1214,51 @@ where
         let chunk_results: Vec<(usize, &'a FileItem, Vec<GrepMatch>)> = chunk
             .par_iter()
             .enumerate()
-            .filter_map(|(local_idx, file)| {
-                if let Some(flag) = ctx.is_cancelled
-                    && flag.load(Ordering::Relaxed)
-                {
-                    budget_exceeded.store(true, Ordering::Relaxed);
-                    return None;
-                }
-
-                if let Some(budget) = time_budget
-                    && all_matches.len() > 1
-                    && search_start.elapsed() > budget
-                {
-                    budget_exceeded.store(true, Ordering::Relaxed);
-                    return None;
-                }
-
-                let content = file.get_content_for_search(ctx.budget)?;
-
-                // Fast whole-file memmem check before entering the
-                // grep-searcher machinery. Skips Vec alloc, Searcher
-                // setup, and line-splitting for files that can't match.
-                if let Some(pf) = ctx.prefilter {
-                    let found = if ctx.prefilter_case_insensitive {
-                        case_insensitive_memmem::search_packed_pair(&content, pf.needle())
-                    } else {
-                        pf.find(&content).is_some()
-                    };
-                    if !found {
+            .map_init(
+                // allocatge a single reusable buffer per thread
+                || Vec::with_capacity(64 * 1024),
+                |buf, (local_idx, file)| {
+                    if let Some(flag) = ctx.is_cancelled
+                        && flag.load(Ordering::Relaxed)
+                    {
+                        budget_exceeded.store(true, Ordering::Relaxed);
                         return None;
                     }
-                }
 
-                let file_matches = search_file(&content, options.max_matches_per_file);
+                    if let Some(budget) = time_budget
+                        && all_matches.len() > 1
+                        && search_start.elapsed() > budget
+                    {
+                        budget_exceeded.store(true, Ordering::Relaxed);
+                        return None;
+                    }
 
-                if file_matches.is_empty() {
-                    return None;
-                }
+                    let content = file.get_content_for_search(buf, ctx.budget)?;
 
-                Some((chunk_offset + local_idx, *file, file_matches))
-            })
+                    // Fast whole-file memmem check before entering the
+                    // grep-searcher machinery. Skips Vec alloc, Searcher
+                    // setup, and line-splitting for files that can't match.
+                    if let Some(pf) = ctx.prefilter {
+                        let found = if ctx.prefilter_case_insensitive {
+                            case_insensitive_memmem::search_packed_pair(content, pf.needle())
+                        } else {
+                            pf.find(content).is_some()
+                        };
+                        if !found {
+                            return None;
+                        }
+                    }
+
+                    let file_matches = search_file(content, options.max_matches_per_file);
+
+                    if file_matches.is_empty() {
+                        return None;
+                    }
+
+                    Some((chunk_offset + local_idx, *file, file_matches))
+                },
+            )
+            .flatten()
             .collect();
 
         // Every file in the chunk was visited by rayon (matched or not).
@@ -1577,14 +1582,14 @@ fn fuzzy_grep_search<'a>(
     let max_matches_per_file = options.max_matches_per_file;
 
     // Parallel phase with `map_init`: each rayon worker thread clones the
-    // matcher once and reuses it across all files that thread processes.
-    // This avoids per-file clone overhead (CPUID detection + matrix alloc).
+    // matcher once and gets a reusable read buffer. The buffer avoids
+    // mmap/munmap syscalls for non-cached files.
     let per_file_results: Vec<(usize, &'a FileItem, Vec<GrepMatch>)> = files_to_search
         .par_iter()
         .enumerate()
         .map_init(
-            || matcher.clone(),
-            |matcher, (idx, file)| {
+            || (matcher.clone(), Vec::with_capacity(64 * 1024)),
+            |(matcher, buf), (idx, file)| {
                 if let Some(flag) = is_cancelled
                     && flag.load(Ordering::Relaxed)
                 {
@@ -1599,8 +1604,7 @@ fn fuzzy_grep_search<'a>(
                     return None;
                 }
 
-                let file_content = file.get_content_for_search(budget)?;
-                let file_bytes: &[u8] = &file_content;
+                let file_bytes = file.get_content_for_search(buf, budget)?;
 
                 // File-level prefilter: check if enough distinct needle chars
                 // exist anywhere in the file bytes.  Uses memchr for speed.

@@ -940,6 +940,106 @@ impl FilePicker {
         }
     }
 
+    /// Spawn a background thread to rebuild the bigram index after rescan.
+    pub(crate) fn spawn_post_rescan_rebuild(&self, shared_picker: SharedPicker) -> bool {
+        if !self.warmup_mmap_cache || self.cancelled.load(Ordering::Relaxed) {
+            return false;
+        }
+
+        let post_scan_busy = Arc::clone(&self.post_scan_busy);
+        let cancelled = Arc::clone(&self.cancelled);
+        let auto_budget = !self.has_explicit_cache_budget;
+
+        post_scan_busy.store(true, Ordering::Release);
+
+        std::thread::spawn(move || {
+            let phase_start = std::time::Instant::now();
+
+            // Scale cache budget if not explicitly configured.
+            if auto_budget
+                && !cancelled.load(Ordering::Acquire)
+                && let Ok(mut guard) = shared_picker.write()
+                && let Some(ref mut picker) = *guard
+                && !picker.has_explicit_cache_budget
+            {
+                let file_count = picker.sync_data.files().len();
+                picker.cache_budget = Arc::new(ContentCacheBudget::new_for_repo(file_count));
+            }
+
+            // Take a snapshot of files + budget while holding a brief read lock.
+            // SAFETY: post_scan_busy blocks trigger_rescan from replacing
+            // sync_data, so the Vec backing this slice stays alive.
+            let files_snapshot = if !cancelled.load(Ordering::Acquire) {
+                shared_picker.read().ok().and_then(|guard| {
+                    guard.as_ref().map(|picker| {
+                        let files = picker.sync_data.files();
+                        let ptr = files.as_ptr();
+                        let len = files.len();
+                        let budget = Arc::clone(&picker.cache_budget);
+                        let static_files: &[FileItem] =
+                            unsafe { std::slice::from_raw_parts(ptr, len) };
+                        (static_files, budget)
+                    })
+                })
+            } else {
+                None
+            };
+
+            if let Some((files, budget)) = files_snapshot {
+                // Warmup mmap caches.
+                if !cancelled.load(Ordering::Acquire) {
+                    let t = std::time::Instant::now();
+                    warmup_mmaps(files, &budget);
+                    info!(
+                        "Rescan warmup completed in {:.2}s (cached {} files, {} bytes)",
+                        t.elapsed().as_secs_f64(),
+                        budget.cached_count.load(Ordering::Relaxed),
+                        budget.cached_bytes.load(Ordering::Relaxed),
+                    );
+                }
+
+                // Build bigram index (lock-free).
+                if !cancelled.load(Ordering::Acquire) {
+                    let t = std::time::Instant::now();
+                    info!(
+                        "Rescan: starting bigram index build for {} files...",
+                        files.len()
+                    );
+                    let (index, content_binary) = build_bigram_index(files, &budget);
+                    info!(
+                        "Rescan: bigram index ready in {:.2}s",
+                        t.elapsed().as_secs_f64()
+                    );
+
+                    // Brief write lock to store the index.
+                    if let Ok(mut guard) = shared_picker.write()
+                        && let Some(ref mut picker) = *guard
+                    {
+                        for &idx in &content_binary {
+                            if let Some(file) = picker.sync_data.get_file_mut(idx) {
+                                file.set_binary(true);
+                            }
+                        }
+
+                        let base_count = picker.sync_data.base_count;
+                        picker.sync_data.bigram_index = Some(Arc::new(index));
+                        picker.sync_data.bigram_overlay = Some(Arc::new(parking_lot::RwLock::new(
+                            BigramOverlay::new(base_count),
+                        )));
+                    }
+                }
+            }
+
+            post_scan_busy.store(false, Ordering::Release);
+            info!(
+                "Rescan post-scan warmup + bigram total: {:.2}s",
+                phase_start.elapsed().as_secs_f64(),
+            );
+        });
+
+        true
+    }
+
     pub fn trigger_rescan(&mut self, shared_frecency: &SharedFrecency) -> Result<(), Error> {
         if self.is_scanning.load(Ordering::Relaxed) {
             debug!("Scan already in progress, skipping trigger_rescan");
@@ -989,13 +1089,9 @@ impl FilePicker {
                     });
                 }
 
-                if self.warmup_mmap_cache {
-                    let files = self.sync_data.files().to_vec();
-                    let budget = Arc::clone(&self.cache_budget);
-                    std::thread::spawn(move || {
-                        warmup_mmaps(&files, &budget);
-                    });
-                }
+                // Warmup is deferred to the post-rescan bigram rebuild thread
+                // (spawned by trigger_full_rescan) which does warmup + bigram
+                // in one pass, matching the initial scan's post-scan phase.
             }
             Err(error) => error!(?error, "Failed to scan file system"),
         }

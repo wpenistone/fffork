@@ -552,7 +552,8 @@ fn main() {
     let mmap_count = files
         .iter()
         .filter(|f| {
-            f.get_content_for_search(&fff::ContentCacheBudget::unlimited())
+            let mut buf = Vec::new();
+            f.get_content_for_search(&mut buf, &fff::ContentCacheBudget::unlimited())
                 .is_some()
         })
         .count();

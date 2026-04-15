@@ -5,7 +5,7 @@ use crate::shared::{SharedFrecency, SharedPicker};
 use crate::sort_buffer::sort_with_buffer;
 use git2::Repository;
 use notify::event::{AccessKind, AccessMode};
-use notify::{Config, EventKind, RecursiveMode};
+use notify::{Config, EventKind, EventKindMask, RecursiveMode};
 use notify_debouncer_full::{DebounceEventResult, DebouncedEvent, NoCache, new_debouncer_opt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -128,10 +128,14 @@ impl BackgroundWatcher {
         watch_dirs: Vec<PathBuf>,
         watch_tx: mpsc::Sender<PathBuf>,
     ) -> Result<Debouncer, Error> {
-        // do not follow symlinks as then notifiers spawns a bunch of events for symlinked
-        // files that could be git ignored, we have to property differentiate those and if
-        // the file was edited through a
-        let config = Config::default().with_follow_symlinks(false);
+        let config = Config::default()
+            // do not follow symlinks as then notifiers spawns a bunch of events for symlinked
+            // files that could be git ignored, we have to property differentiate those and if
+            // the file was edited through a
+            .with_follow_symlinks(false)
+            // only the actual modification events, ignore the open syscals that we can generate by
+            // our own grep calls and preview window rendering
+            .with_event_kinds(EventKindMask::CORE);
 
         let git_workdir_for_handler = git_workdir.clone();
         let mut debouncer = new_debouncer_opt(
@@ -516,9 +520,14 @@ fn trigger_full_rescan(shared_picker: &SharedPicker, shared_frecency: &SharedFre
     };
     if let Err(e) = picker.trigger_rescan(shared_frecency) {
         error!("Failed to trigger full rescan: {:?}", e);
-    } else {
-        info!("Full filesystem rescan completed successfully");
+        return;
     }
+    info!("Full filesystem rescan completed successfully");
+
+    // Spawn background warmup + bigram rebuild (mirrors the initial scan's
+    // post-scan phase). The write lock is still held here but the spawned
+    // thread re-acquires it later — safe because the guard drops at function end.
+    picker.spawn_post_rescan_rebuild(shared_picker.clone());
 }
 
 fn should_include_file(path: &Path, repo: &Option<Repository>) -> bool {
