@@ -844,6 +844,7 @@ function M.setup_keymaps()
 
   if M.state.config.prompt_vim_mode then
     set_keymap('n', keymaps.close, M.close, input_opts)
+    set_keymap('i', '<C-c>', M.close, input_opts)
   else
     set_keymap({ 'i', 'n' }, keymaps.close, M.close, input_opts)
   end
