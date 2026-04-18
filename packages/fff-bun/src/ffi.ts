@@ -11,10 +11,14 @@
 import { CString, dlopen, FFIType, type Pointer, ptr, read } from "bun:ffi";
 import { findBinary } from "./download";
 import type {
+  DirItem,
+  DirSearchResult,
   FileItem,
   GrepMatch,
   GrepResult,
   Location,
+  MixedItem,
+  MixedSearchResult,
   Result,
   ScanProgress,
   Score,
@@ -58,6 +62,34 @@ const ffiDefinition = {
 
   // Search
   fff_search: {
+    args: [
+      FFIType.ptr, // handle
+      FFIType.cstring, // query
+      FFIType.cstring, // current_file
+      FFIType.u32, // max_threads
+      FFIType.u32, // page_index
+      FFIType.u32, // page_size
+      FFIType.i32, // combo_boost_multiplier
+      FFIType.u32, // min_combo_count
+    ],
+    returns: FFIType.ptr,
+  },
+
+  // Directory search
+  fff_search_directories: {
+    args: [
+      FFIType.ptr, // handle
+      FFIType.cstring, // query
+      FFIType.cstring, // current_file
+      FFIType.u32, // max_threads
+      FFIType.u32, // page_index
+      FFIType.u32, // page_size
+    ],
+    returns: FFIType.ptr,
+  },
+
+  // Mixed search (files + directories)
+  fff_search_mixed: {
     args: [
       FFIType.ptr, // handle
       FFIType.cstring, // query
@@ -171,6 +203,34 @@ const ffiDefinition = {
     returns: FFIType.ptr,
   },
   fff_search_result_get_score: {
+    args: [FFIType.ptr, FFIType.u32],
+    returns: FFIType.ptr,
+  },
+
+  // Dir search result accessors / free
+  fff_free_dir_search_result: {
+    args: [FFIType.ptr],
+    returns: FFIType.void,
+  },
+  fff_dir_search_result_get_item: {
+    args: [FFIType.ptr, FFIType.u32],
+    returns: FFIType.ptr,
+  },
+  fff_dir_search_result_get_score: {
+    args: [FFIType.ptr, FFIType.u32],
+    returns: FFIType.ptr,
+  },
+
+  // Mixed search result accessors / free
+  fff_free_mixed_search_result: {
+    args: [FFIType.ptr],
+    returns: FFIType.void,
+  },
+  fff_mixed_search_result_get_item: {
+    args: [FFIType.ptr, FFIType.u32],
+    returns: FFIType.ptr,
+  },
+  fff_mixed_search_result_get_score: {
     args: [FFIType.ptr, FFIType.u32],
     returns: FFIType.ptr,
   },
@@ -551,6 +611,214 @@ function parseSearchResult(resultPtr: Pointer | null): Result<SearchResult> {
 }
 
 // ---------------------------------------------------------------------------
+// FffDirSearchResult byte offsets (must match #[repr(C)] layout on 64-bit)
+// { items: *mut, scores: *mut, count: u32, total_matched: u32, total_dirs: u32 }
+// ---------------------------------------------------------------------------
+const DSR_ITEMS = 0; // *mut FffDirItem  (8)
+const DSR_SCORES = 8; // *mut FffScore    (8)
+const DSR_COUNT = 16; // u32              (4)
+const DSR_MATCHED = 20; // u32              (4)
+const DSR_TOTAL_DIRS = 24; // u32              (4)
+
+// FffDirItem (24 bytes: 8 + 8 + 4 + 4pad)
+const DI_RELPATH = 0; // *mut c_char (8)
+const DI_DIRNAME = 8; // *mut c_char (8)
+const DI_MAX_FRECENCY = 16; // i32         (4)
+
+/**
+ * Read an FffDirItem struct at the given raw address.
+ */
+function readDirItemStruct(p: number): DirItem {
+  const pp = asPtr(p);
+  return {
+    relativePath: readCString(read.ptr(pp, DI_RELPATH)) ?? "",
+    dirName: readCString(read.ptr(pp, DI_DIRNAME)) ?? "",
+    maxAccessFrecency: read.i32(pp, DI_MAX_FRECENCY),
+  };
+}
+
+/**
+ * Parse an FffDirSearchResult from a raw FffResult pointer, then free native memory.
+ */
+function parseDirSearchResult(resultPtr: Pointer | null): Result<DirSearchResult> {
+  if (resultPtr === null) {
+    return err("FFI returned null pointer");
+  }
+
+  const envelope = readResultEnvelope(resultPtr);
+  if (!("success" in envelope)) return envelope;
+
+  if (envelope.handlePtr === 0) {
+    return err("fff_search_directories returned null search result");
+  }
+
+  const hp = asPtr(envelope.handlePtr);
+  const count = read.u32(hp, DSR_COUNT);
+  const totalMatched = read.u32(hp, DSR_MATCHED);
+  const totalDirs = read.u32(hp, DSR_TOTAL_DIRS);
+
+  const library = loadLibrary();
+
+  const items: DirItem[] = [];
+  const scores: Score[] = [];
+
+  for (let i = 0; i < count; i++) {
+    const itemPtr = library.symbols.fff_dir_search_result_get_item(hp, i);
+    if (itemPtr !== null && (itemPtr as unknown as number) !== 0) {
+      items.push(readDirItemStruct(itemPtr as unknown as number));
+    }
+    const scorePtr = library.symbols.fff_dir_search_result_get_score(hp, i);
+    if (scorePtr !== null && (scorePtr as unknown as number) !== 0) {
+      scores.push(readScoreStruct(scorePtr as unknown as number));
+    }
+  }
+
+  // Free native dir search result
+  library.symbols.fff_free_dir_search_result(hp);
+
+  return { ok: true, value: { items, scores, totalMatched, totalDirs } };
+}
+
+// ---------------------------------------------------------------------------
+// FffMixedSearchResult byte offsets (must match #[repr(C)] layout on 64-bit)
+// { items: *mut, scores: *mut, count: u32, total_matched: u32, total_files: u32, total_dirs: u32, location: FffLocation }
+// ---------------------------------------------------------------------------
+const MSR_ITEMS = 0; // *mut FffMixedItem (8)
+const MSR_SCORES = 8; // *mut FffScore     (8)
+const MSR_COUNT = 16; // u32               (4)
+const MSR_MATCHED = 20; // u32               (4)
+const MSR_TOTAL_FILES = 24; // u32               (4)
+const MSR_TOTAL_DIRS = 28; // u32               (4)
+// FffLocation is inlined at offset 32
+const MSR_LOC_TAG = 32; // u8                (1 + 3 padding)
+const MSR_LOC_LINE = 36; // i32               (4)
+const MSR_LOC_COL = 40; // i32               (4)
+const MSR_LOC_END_LINE = 44; // i32               (4)
+const MSR_LOC_END_COL = 48; // i32               (4)
+
+// FffMixedItem (80 bytes)
+const MI_TYPE = 0; // u8          (1 + 7 pad)
+const MI_RELPATH = 8; // *mut c_char (8)
+const MI_DISPLAY = 16; // *mut c_char (8)
+const MI_GIT = 24; // *mut c_char (8)
+const MI_SIZE = 32; // u64         (8)
+const MI_MODIFIED = 40; // u64         (8)
+const MI_ACCESS = 48; // i64         (8)
+const MI_MODFR = 56; // i64         (8)
+const MI_TOTAL_FR = 64; // i64         (8)
+const MI_BINARY = 72; // bool        (1 + 7 pad)
+
+/**
+ * Read an FffMixedItem struct at the given raw address and return a MixedItem.
+ */
+function readMixedItemStruct(p: number): MixedItem {
+  const pp = asPtr(p);
+  const itemType = read.u8(pp, MI_TYPE);
+
+  if (itemType === 1) {
+    // Directory
+    return {
+      type: "directory",
+      item: {
+        relativePath: readCString(read.ptr(pp, MI_RELPATH)) ?? "",
+        dirName: readCString(read.ptr(pp, MI_DISPLAY)) ?? "",
+        maxAccessFrecency: Number(read.i64(pp, MI_ACCESS)),
+      },
+    };
+  }
+
+  // File (itemType === 0)
+  return {
+    type: "file",
+    item: {
+      relativePath: readCString(read.ptr(pp, MI_RELPATH)) ?? "",
+      fileName: readCString(read.ptr(pp, MI_DISPLAY)) ?? "",
+      gitStatus: readCString(read.ptr(pp, MI_GIT)) ?? "",
+      size: Number(read.u64(pp, MI_SIZE)),
+      modified: Number(read.u64(pp, MI_MODIFIED)),
+      accessFrecencyScore: Number(read.i64(pp, MI_ACCESS)),
+      modificationFrecencyScore: Number(read.i64(pp, MI_MODFR)),
+      totalFrecencyScore: Number(read.i64(pp, MI_TOTAL_FR)),
+    },
+  };
+}
+
+/**
+ * Parse an FffMixedSearchResult from a raw FffResult pointer, then free native memory.
+ */
+function parseMixedSearchResult(resultPtr: Pointer | null): Result<MixedSearchResult> {
+  if (resultPtr === null) {
+    return err("FFI returned null pointer");
+  }
+
+  const envelope = readResultEnvelope(resultPtr);
+  if (!("success" in envelope)) return envelope;
+
+  if (envelope.handlePtr === 0) {
+    return err("fff_search_mixed returned null search result");
+  }
+
+  const hp = asPtr(envelope.handlePtr);
+  const count = read.u32(hp, MSR_COUNT);
+  const totalMatched = read.u32(hp, MSR_MATCHED);
+  const totalFiles = read.u32(hp, MSR_TOTAL_FILES);
+  const totalDirs = read.u32(hp, MSR_TOTAL_DIRS);
+
+  // Read location
+  const locTag = read.u8(hp, MSR_LOC_TAG);
+  let location: Location | undefined;
+  if (locTag === 1) {
+    location = { type: "line", line: read.i32(hp, MSR_LOC_LINE) };
+  } else if (locTag === 2) {
+    location = {
+      type: "position",
+      line: read.i32(hp, MSR_LOC_LINE),
+      col: read.i32(hp, MSR_LOC_COL),
+    };
+  } else if (locTag === 3) {
+    location = {
+      type: "range",
+      start: { line: read.i32(hp, MSR_LOC_LINE), col: read.i32(hp, MSR_LOC_COL) },
+      end: {
+        line: read.i32(hp, MSR_LOC_END_LINE),
+        col: read.i32(hp, MSR_LOC_END_COL),
+      },
+    };
+  }
+
+  const library = loadLibrary();
+
+  const items: MixedItem[] = [];
+  const scores: Score[] = [];
+
+  for (let i = 0; i < count; i++) {
+    const itemPtr = library.symbols.fff_mixed_search_result_get_item(hp, i);
+    if (itemPtr !== null && (itemPtr as unknown as number) !== 0) {
+      items.push(readMixedItemStruct(itemPtr as unknown as number));
+    }
+    const scorePtr = library.symbols.fff_mixed_search_result_get_score(hp, i);
+    if (scorePtr !== null && (scorePtr as unknown as number) !== 0) {
+      scores.push(readScoreStruct(scorePtr as unknown as number));
+    }
+  }
+
+  // Free native mixed search result
+  library.symbols.fff_free_mixed_search_result(hp);
+
+  const result: MixedSearchResult = {
+    items,
+    scores,
+    totalMatched,
+    totalFiles,
+    totalDirs,
+  };
+  if (location) {
+    result.location = location;
+  }
+  return { ok: true, value: result };
+}
+
+// ---------------------------------------------------------------------------
 // FffGrepMatch byte offsets (must match #[repr(C)] layout on 64-bit)
 // ---------------------------------------------------------------------------
 
@@ -733,6 +1001,56 @@ export function ffiSearch(
     minComboCount,
   );
   return parseSearchResult(resultPtr);
+}
+
+/**
+ * Perform fuzzy directory search.
+ */
+export function ffiSearchDirectories(
+  handle: NativeHandle,
+  query: string,
+  currentFile: string | null,
+  maxThreads: number,
+  pageIndex: number,
+  pageSize: number,
+): Result<DirSearchResult> {
+  const library = loadLibrary();
+  const resultPtr = library.symbols.fff_search_directories(
+    handle,
+    ptr(encodeString(query)),
+    ptr(encodeString(currentFile ?? "")),
+    maxThreads,
+    pageIndex,
+    pageSize,
+  );
+  return parseDirSearchResult(resultPtr);
+}
+
+/**
+ * Perform mixed (files + directories) fuzzy search.
+ */
+export function ffiSearchMixed(
+  handle: NativeHandle,
+  query: string,
+  currentFile: string,
+  maxThreads: number,
+  pageIndex: number,
+  pageSize: number,
+  comboBoostMultiplier: number,
+  minComboCount: number,
+): Result<MixedSearchResult> {
+  const library = loadLibrary();
+  const resultPtr = library.symbols.fff_search_mixed(
+    handle,
+    ptr(encodeString(query)),
+    ptr(encodeString(currentFile)),
+    maxThreads,
+    pageIndex,
+    pageSize,
+    comboBoostMultiplier,
+    minComboCount,
+  );
+  return parseMixedSearchResult(resultPtr);
 }
 
 /**

@@ -43,7 +43,8 @@ use crate::score::fuzzy_match_and_score_files;
 use crate::shared::{SharedFrecency, SharedPicker};
 use crate::simd_path::ArenaPtr;
 use crate::types::{
-    ContentCacheBudget, DirItem, FileItem, PaginationArgs, ScoringContext, SearchResult,
+    ContentCacheBudget, DirItem, DirSearchResult, FileItem, MixedItemRef, MixedSearchResult,
+    PaginationArgs, Score, ScoringContext, SearchResult,
 };
 use fff_query_parser::FFFQuery;
 use git2::{Repository, Status, StatusOptions};
@@ -862,6 +863,193 @@ impl FilePicker {
         }
     }
 
+    /// Perform fuzzy search on indexed directories.
+    ///
+    /// Returns directories ranked by fuzzy match quality + frecency.
+    pub fn fuzzy_search_directories<'q>(
+        &self,
+        query: &'q FFFQuery<'q>,
+        options: FuzzySearchOptions<'q>,
+    ) -> DirSearchResult<'_> {
+        let dirs = self.get_dirs();
+        let max_threads = if options.max_threads == 0 {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        } else {
+            options.max_threads
+        };
+
+        let total_dirs = dirs.len();
+
+        let effective_query = match &query.fuzzy_query {
+            fff_query_parser::FuzzyQuery::Text(t) => *t,
+            fff_query_parser::FuzzyQuery::Parts(parts) if !parts.is_empty() => parts[0],
+            _ => query.raw_query.trim(),
+        };
+
+        let max_typos = (effective_query.len() as u16 / 4).clamp(2, 6);
+
+        let context = ScoringContext {
+            query,
+            max_typos,
+            max_threads,
+            project_path: options.project_path,
+            current_file: options.current_file,
+            last_same_query_match: None,
+            combo_boost_score_multiplier: 0,
+            min_combo_count: 0,
+            pagination: options.pagination,
+        };
+
+        let arena = self.sync_data.arena_base_ptr();
+        let time = std::time::Instant::now();
+
+        let (items, scores, total_matched) =
+            crate::score::fuzzy_match_and_score_dirs(dirs, &context, arena);
+
+        info!(
+            ?query,
+            completed_in = ?time.elapsed(),
+            total_matched,
+            returned_count = items.len(),
+            "Directory search completed",
+        );
+
+        DirSearchResult {
+            items,
+            scores,
+            total_matched,
+            total_dirs,
+        }
+    }
+
+    /// Perform a mixed fuzzy search across both files and directories.
+    ///
+    /// Returns a single flat list where files and directories are interleaved
+    /// by total score in descending order.
+    ///
+    /// If the raw query ends with a path separator (`/`), only directories
+    /// are searched — files are skipped entirely. The caller should parse the
+    /// query with `DirSearchConfig` so that trailing `/` is kept as fuzzy
+    /// text instead of becoming a `PathSegment` constraint.
+    pub fn fuzzy_search_mixed<'q>(
+        &self,
+        query: &'q FFFQuery<'q>,
+        query_tracker: Option<&QueryTracker>,
+        options: FuzzySearchOptions<'q>,
+    ) -> MixedSearchResult<'_> {
+        let location = query.location;
+        let page_offset = options.pagination.offset;
+        let page_limit = if options.pagination.limit > 0 {
+            options.pagination.limit
+        } else {
+            100
+        };
+
+        let dirs_only =
+            query.raw_query.ends_with(std::path::MAIN_SEPARATOR) || query.raw_query.ends_with('/');
+
+        // Run file search and dir search with no pagination (we merge then paginate).
+        let internal_limit = page_offset.saturating_add(page_limit).saturating_mul(2);
+
+        let dir_options = FuzzySearchOptions {
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: internal_limit,
+            },
+            ..options
+        };
+        let dir_results = self.fuzzy_search_directories(query, dir_options);
+
+        if dirs_only {
+            let total_matched = dir_results.total_matched;
+            let total_dirs = dir_results.total_dirs;
+
+            let mut merged: Vec<(MixedItemRef<'_>, Score)> =
+                Vec::with_capacity(dir_results.items.len());
+            for (dir, score) in dir_results.items.into_iter().zip(dir_results.scores) {
+                merged.push((MixedItemRef::Dir(dir), score));
+            }
+
+            if page_offset >= merged.len() {
+                return MixedSearchResult {
+                    items: vec![],
+                    scores: vec![],
+                    total_matched,
+                    total_files: self.sync_data.files().len(),
+                    total_dirs,
+                    location,
+                };
+            }
+
+            let end = (page_offset + page_limit).min(merged.len());
+            let page = merged.drain(page_offset..end);
+            let (items, scores): (Vec<_>, Vec<_>) = page.unzip();
+
+            return MixedSearchResult {
+                items,
+                scores,
+                total_matched,
+                total_files: self.sync_data.files().len(),
+                total_dirs,
+                location,
+            };
+        }
+
+        let file_options = FuzzySearchOptions {
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: internal_limit,
+            },
+            ..options
+        };
+        let file_results = self.fuzzy_search(query, query_tracker, file_options);
+
+        // Merge by score descending.
+        let total_matched = file_results.total_matched + dir_results.total_matched;
+        let total_files = file_results.total_files;
+        let total_dirs = dir_results.total_dirs;
+
+        let mut merged: Vec<(MixedItemRef<'_>, Score)> =
+            Vec::with_capacity(file_results.items.len() + dir_results.items.len());
+
+        for (file, score) in file_results.items.into_iter().zip(file_results.scores) {
+            merged.push((MixedItemRef::File(file), score));
+        }
+        for (dir, score) in dir_results.items.into_iter().zip(dir_results.scores) {
+            merged.push((MixedItemRef::Dir(dir), score));
+        }
+
+        // Sort merged results by total score descending.
+        merged.sort_unstable_by_key(|b| std::cmp::Reverse(b.1.total));
+
+        // Paginate.
+        if page_offset >= merged.len() {
+            return MixedSearchResult {
+                items: vec![],
+                scores: vec![],
+                total_matched,
+                total_files,
+                total_dirs,
+                location,
+            };
+        }
+
+        let end = (page_offset + page_limit).min(merged.len());
+        let page = merged.drain(page_offset..end);
+        let (items, scores): (Vec<_>, Vec<_>) = page.unzip();
+
+        MixedSearchResult {
+            items,
+            scores,
+            total_matched,
+            total_files,
+            total_dirs,
+            location,
+        }
+    }
+
     /// Perform a live grep search across indexed files.
     ///
     /// If `options.abort_signal` is set it overrides the picker's internal
@@ -972,6 +1160,12 @@ impl FilePicker {
                     if let Some(ref f) = *frecency {
                         file.update_frecency_scores(f, arena, &bp, mode)?;
                     }
+                    // Update parent dir frecency inline.
+                    let score = file.access_frecency_score as i32;
+                    let dir_idx = file.parent_dir_index() as usize;
+                    if let Some(dir) = self.sync_data.dirs.get_mut(dir_idx) {
+                        dir.update_frecency_if_larger(score);
+                    }
                 } else {
                     error!(?path, "Couldn't update the git status for path");
                 }
@@ -998,6 +1192,13 @@ impl FilePicker {
             && let Some(file) = self.sync_data.get_file_mut(index)
         {
             file.update_frecency_scores(frecency_tracker, arena, &self.base_path, self.mode)?;
+
+            // Update parent dir frecency inline (only if larger).
+            let score = file.access_frecency_score as i32;
+            let dir_idx = file.parent_dir_index() as usize;
+            if let Some(dir) = self.sync_data.dirs.get_mut(dir_idx) {
+                dir.update_frecency_if_larger(score);
+            }
         }
 
         Ok(())
@@ -1343,12 +1544,27 @@ impl FilePicker {
                     let mode = self.mode;
                     let bp = &self.base_path;
                     let arena = self.arena_base_ptr();
+
+                    // Reset dir frecency before recomputation.
+                    for dir in self.sync_data.dirs.iter() {
+                        dir.reset_frecency();
+                    }
+
+                    let files = &mut self.sync_data.files;
+                    let dirs = &self.sync_data.dirs;
                     BACKGROUND_THREAD_POOL.install(|| {
-                        self.sync_data.files.par_iter_mut().for_each(|file| {
+                        files.par_iter_mut().for_each(|file| {
                             file.git_status =
                                 git_cache.lookup_status(&file.absolute_path(arena, bp));
                             if let Some(frecency) = frecency_ref {
                                 let _ = file.update_frecency_scores(frecency, arena, bp, mode);
+                            }
+                            let score = file.access_frecency_score as i32;
+                            if score > 0 {
+                                let dir_idx = file.parent_dir_index() as usize;
+                                if let Some(dir) = dirs.get(dir_idx) {
+                                    dir.update_frecency_if_larger(score);
+                                }
                             }
                         });
                     });
@@ -1449,9 +1665,13 @@ fn spawn_scan_and_watcher(
                 scan_signal.store(false, Ordering::Relaxed);
                 info!("Files indexed and searchable");
 
-                // Apply git status (may still be running — this waits for it).
                 if !cancelled.load(Ordering::Acquire) {
-                    apply_git_status(&shared_picker, &shared_frecency, git_handle, mode);
+                    apply_git_status_and_frecency(
+                        &shared_picker,
+                        &shared_frecency,
+                        git_handle,
+                        mode,
+                    );
                 }
             }
             Err(e) => {
@@ -1896,7 +2116,14 @@ fn walk_filesystem(
 
         if prev_dir.as_deref() != Some(dir_part) {
             let dir_cs = builder.add_dir_immediate(dir_part);
-            dirs.push(DirItem::new(dir_cs));
+            // Compute last-segment offset: for "src/components/" -> 4 (points to "components/")
+            let last_seg = if dir_part.is_empty() {
+                0
+            } else {
+                let trimmed = dir_part.trim_end_matches('/');
+                trimmed.rfind('/').map(|i| i + 1).unwrap_or(0) as u16
+            };
+            dirs.push(DirItem::new(dir_cs, last_seg));
             current_dir_idx = (dirs.len() - 1) as u32;
             prev_dir = Some(dir_part.to_string());
         }
@@ -1910,13 +2137,22 @@ fn walk_filesystem(
     let arena = chunked_paths.as_arena_ptr();
 
     // Apply frecency scores (access-based only — git status not yet available).
+    // DirItem.max_access_frecency is AtomicI32, so parallel threads write directly.
     let frecency = shared_frecency
         .read()
         .map_err(|_| Error::AcquireFrecencyLock)?;
     if let Some(frecency) = frecency.as_ref() {
+        let dirs_ref = &dirs;
         BACKGROUND_THREAD_POOL.install(|| {
             files.par_iter_mut().for_each(|file| {
                 let _ = file.update_frecency_scores(frecency, arena, base_path, mode);
+                let score = file.access_frecency_score as i32;
+                if score > 0 {
+                    let dir_idx = file.parent_dir_index() as usize;
+                    if let Some(dir) = dirs_ref.get(dir_idx) {
+                        dir.update_frecency_if_larger(score);
+                    }
+                }
             });
         });
     }
@@ -1972,7 +2208,7 @@ fn walk_filesystem(
     })
 }
 
-fn apply_git_status(
+fn apply_git_status_and_frecency(
     shared_picker: &SharedPicker,
     shared_frecency: &SharedFrecency,
     git_handle: std::thread::JoinHandle<Option<GitStatusCache>>,
@@ -1996,16 +2232,34 @@ fn apply_git_status(
         let frecency = shared_frecency.read().ok();
         let frecency_ref = frecency.as_ref().and_then(|f| f.as_ref());
 
-        BACKGROUND_THREAD_POOL.install(|| {
-            let bp = &picker.base_path;
-            let arena = picker.arena_base_ptr();
-            picker.sync_data.files.par_iter_mut().for_each(|file| {
-                let mut abs_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-                let abs = file.write_absolute_path(arena, bp, &mut abs_buf);
+        // Destructure to split borrows: files (mut) and dirs (shared) are independent.
+        let bp = &picker.base_path;
+        let arena = picker.arena_base_ptr();
 
-                file.git_status = git_cache.lookup_status(abs);
+        // Reset dir frecency before recomputation.
+        for dir in picker.sync_data.dirs.iter() {
+            dir.reset_frecency();
+        }
+
+        let files = &mut picker.sync_data.files;
+        let dirs = &picker.sync_data.dirs;
+
+        BACKGROUND_THREAD_POOL.install(|| {
+            files.par_iter_mut().for_each(|file| {
+                let mut buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+                let absolute_path = file.write_absolute_path(arena, bp, &mut buf);
+
+                file.git_status = git_cache.lookup_status(absolute_path);
                 if let Some(frecency) = frecency_ref {
                     let _ = file.update_frecency_scores(frecency, arena, bp, mode);
+                }
+
+                let score = file.access_frecency_score as i32;
+                if score > 0 {
+                    let dir_idx = file.parent_dir_index() as usize;
+                    if let Some(dir) = dirs.get(dir_idx) {
+                        dir.update_frecency_if_larger(score);
+                    }
                 }
             });
         });

@@ -23,6 +23,8 @@ import {
   ffiRestartIndex,
   ffiScanFiles,
   ffiSearch,
+  ffiSearchDirectories,
+  ffiSearchMixed,
   ffiTrackQuery,
   ffiWaitForScan,
   ffiWaitForWatcher,
@@ -31,10 +33,13 @@ import {
 } from "./ffi";
 
 import type {
+  DirSearchOptions,
+  DirSearchResult,
   GrepOptions,
   GrepResult,
   HealthCheck,
   InitOptions,
+  MixedSearchResult,
   MultiGrepOptions,
   Result,
   ScanProgress,
@@ -179,6 +184,77 @@ export class FileFinder {
     if (!guard.ok) return guard;
 
     return ffiSearch(
+      guard.value,
+      query,
+      options?.currentFile ?? "",
+      options?.maxThreads ?? 0,
+      options?.pageIndex ?? 0,
+      options?.pageSize ?? 0,
+      options?.comboBoostMultiplier ?? 0,
+      options?.minComboCount ?? 0,
+    );
+  }
+
+  /**
+   * Search for directories matching the query.
+   *
+   * @param query - Search query string
+   * @param options - Directory search options
+   * @returns Search results with matched directories and scores
+   *
+   * @example
+   * ```typescript
+   * const result = finder.directorySearch("components", { pageSize: 10 });
+   * if (result.ok) {
+   *   console.log(`Found ${result.value.totalMatched} directories`);
+   *   for (const item of result.value.items) {
+   *     console.log(item.relativePath);
+   *   }
+   * }
+   * ```
+   */
+  directorySearch(query: string, options?: DirSearchOptions): Result<DirSearchResult> {
+    const guard = this.ensureAlive();
+    if (!guard.ok) return guard;
+
+    return ffiSearchDirectories(
+      guard.value,
+      query,
+      options?.currentFile ?? null,
+      options?.maxThreads ?? 0,
+      options?.pageIndex ?? 0,
+      options?.pageSize ?? 0,
+    );
+  }
+
+  /**
+   * Search for files and directories together (mixed search).
+   *
+   * Results are interleaved by total score in descending order.
+   *
+   * @param query - Search query string
+   * @param options - Search options
+   * @returns Mixed search results with files and directories interleaved by score
+   *
+   * @example
+   * ```typescript
+   * const result = finder.mixedSearch("main", { pageSize: 20 });
+   * if (result.ok) {
+   *   for (const entry of result.value.items) {
+   *     if (entry.type === "file") {
+   *       console.log(`File: ${entry.item.relativePath}`);
+   *     } else {
+   *       console.log(`Dir: ${entry.item.relativePath}`);
+   *     }
+   *   }
+   * }
+   * ```
+   */
+  mixedSearch(query: string, options?: SearchOptions): Result<MixedSearchResult> {
+    const guard = this.ensureAlive();
+    if (!guard.ok) return guard;
+
+    return ffiSearchMixed(
       guard.value,
       query,
       options?.currentFile ?? "",

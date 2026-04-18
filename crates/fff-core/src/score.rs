@@ -4,7 +4,7 @@ use crate::{
     path_utils::calculate_distance_penalty,
     simd_path::ArenaPtr,
     sort_buffer::{sort_by_key_with_buffer, sort_with_buffer},
-    types::{FileItem, Score, ScoringContext},
+    types::{DirItem, FileItem, Score, ScoringContext},
 };
 use fff_query_parser::FuzzyQuery;
 use neo_frizbee::Scoring;
@@ -64,6 +64,12 @@ fn match_fuzzy_parts(
         resolve_file_chunks(file, arena, buf)
     };
 
+    // because we reassemble the vec of reference we have to use a different type
+    // to narrow down the [&FileItem] which would be resolved by frizbee as &&
+    let resolve_ref = |file: &&FileItem, buf: &mut [*const u8; 32]| -> Option<(usize, u16)> {
+        resolve_file_chunks(file, arena, buf)
+    };
+
     let first_part_matches = match working_files {
         FileItems::All(files) => neo_frizbee::match_list_parallel_resolved(
             valid_parts[0],
@@ -75,9 +81,7 @@ fn match_fuzzy_parts(
         FileItems::Filtered(files) => neo_frizbee::match_list_parallel_resolved(
             valid_parts[0],
             files.as_slice(),
-            &|file_ref: &&FileItem, buf: &mut [*const u8; 32]| {
-                resolve_file_chunks(file_ref, arena, buf)
-            },
+            &resolve_ref,
             options,
             max_threads,
         ),
@@ -87,29 +91,46 @@ fn match_fuzzy_parts(
         return first_part_matches;
     }
 
-    let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+    let total_parts = valid_parts.len() as u32;
     let mut matches = first_part_matches;
     for part in valid_parts[1..].iter() {
         let mut part_options = *options;
         part_options.max_typos = options.max_typos.map(|t| t.min(part.len() as u16));
 
-        matches = matches
-            .into_iter()
-            .filter_map(|mut m| {
-                let file = working_files.index(m.index as usize);
-                let path_str = file.path.read_to_buf(arena, &mut path_buf);
-                let part_matches = neo_frizbee::match_list(part, &[path_str], &part_options);
-                let part_match = part_matches.first()?;
-
-                let total = (m.score as u32).saturating_add(part_match.score as u32);
-                m.score = total.min(u16::MAX as u32) as u16;
-                Some(m)
-            })
+        // Collect the subset of files that survived the previous round.
+        let subset: Vec<&FileItem> = matches
+            .iter()
+            .map(|m| working_files.index(m.index as usize))
             .collect();
 
-        if matches.is_empty() {
-            break;
+        let sub_matches = neo_frizbee::match_list_parallel_resolved(
+            part,
+            subset.as_slice(),
+            &resolve_ref,
+            &part_options,
+            max_threads,
+        );
+
+        if sub_matches.is_empty() {
+            return vec![]; // break early! 
         }
+
+        // Map sub_matches back to original indices, average scores across all parts.
+        matches = sub_matches
+            .into_iter()
+            .map(|sm| {
+                let prev = &matches[sm.index as usize];
+                let sum = (prev.score as u32).saturating_add(sm.score as u32);
+                let avg = sum / total_parts;
+
+                neo_frizbee::Match {
+                    index: prev.index,
+                    score: avg.min(u16::MAX as u32) as u16,
+                    end_col: prev.end_col, // keep first part's position for filename bonus
+                    exact: prev.exact && sm.exact,
+                }
+            })
+            .collect();
     }
 
     matches
@@ -145,6 +166,300 @@ pub(crate) fn fuzzy_match_and_score_files<'a>(
     };
 
     sort_and_paginate(results, context)
+}
+
+/// Resolve a DirItem's chunked path into frizbee's pointer buffer.
+#[inline]
+fn resolve_dir_chunks(
+    dir: &DirItem,
+    arena: ArenaPtr,
+    buf: &mut [*const u8; 32],
+) -> Option<(usize, u16)> {
+    let ptrs = dir.path.resolve_ptrs(arena, buf);
+    Some((ptrs.len(), dir.path.byte_len))
+}
+
+/// Run SIMD fuzzy match across directory items, narrowing the candidate set
+/// through each query part — same pipeline as file matching.
+fn match_fuzzy_parts_dirs(
+    fuzzy_parts: &[&str],
+    working_dirs: &[&DirItem],
+    options: &neo_frizbee::Config,
+    max_threads: usize,
+    arena: ArenaPtr,
+) -> Vec<neo_frizbee::Match> {
+    let valid_parts: Vec<&str> = fuzzy_parts
+        .iter()
+        .copied()
+        .filter(|p| p.len() >= 2)
+        .collect();
+
+    if valid_parts.is_empty() {
+        return vec![];
+    }
+
+    let resolve_chunks_for_frizbee =
+        |dir: &&DirItem, buf: &mut [*const u8; 32]| -> Option<(usize, u16)> {
+            resolve_dir_chunks(dir, arena, buf)
+        };
+
+    let first_part_matches = neo_frizbee::match_list_parallel_resolved(
+        valid_parts[0],
+        working_dirs,
+        &resolve_chunks_for_frizbee,
+        options,
+        max_threads,
+    );
+
+    if valid_parts.len() == 1 {
+        return first_part_matches;
+    }
+
+    let mut matches = first_part_matches;
+    let total_parts = valid_parts.len() as u32;
+    for part in valid_parts[1..].iter() {
+        let mut part_options = *options;
+        part_options.max_typos = options.max_typos.map(|t| t.min(part.len() as u16));
+
+        // Collect the subset of dirs that survived the previous round.
+        let subset: Vec<&DirItem> = matches
+            .iter()
+            .map(|m| working_dirs[m.index as usize])
+            .collect();
+
+        let sub_matches = neo_frizbee::match_list_parallel_resolved(
+            part,
+            subset.as_slice(),
+            &resolve_chunks_for_frizbee,
+            &part_options,
+            max_threads,
+        );
+
+        if sub_matches.is_empty() {
+            return vec![];
+        }
+
+        // Map sub_matches back to original indices, average scores across all parts.
+        matches = sub_matches
+            .into_iter()
+            .map(|sm| {
+                let prev = &matches[sm.index as usize];
+                let sum = (prev.score as u32).saturating_add(sm.score as u32);
+                let avg = sum / total_parts;
+
+                neo_frizbee::Match {
+                    index: prev.index,
+                    score: avg.min(u16::MAX as u32) as u16,
+                    end_col: prev.end_col, // keep first part's position for dirname bonus
+                    exact: prev.exact && sm.exact,
+                }
+            })
+            .collect();
+    }
+
+    matches
+}
+
+/// Match + score directories against a fuzzy query.
+/// Scoring: base_score, frecency_boost, distance_penalty, dirname_bonus.
+#[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
+pub(crate) fn fuzzy_match_and_score_dirs<'a>(
+    dirs: &'a [DirItem],
+    context: &ScoringContext,
+    arena: ArenaPtr,
+) -> (Vec<&'a DirItem>, Vec<Score>, usize) {
+    if dirs.is_empty() {
+        return (vec![], vec![], 0);
+    }
+
+    let parsed_query = context.query;
+    let working_dirs: Vec<&DirItem> = if parsed_query.constraints.is_empty() {
+        dirs.iter().collect()
+    } else {
+        match apply_constraints(dirs, &parsed_query.constraints, arena) {
+            Some(filtered) if !filtered.is_empty() => filtered,
+            Some(_) => return (vec![], vec![], 0),
+            None => dirs.iter().collect(),
+        }
+    };
+
+    let fuzzy_parts: &[&str] = match &parsed_query.fuzzy_query {
+        FuzzyQuery::Text(t) if t.len() >= 2 => std::slice::from_ref(t),
+        FuzzyQuery::Parts(parts) if !parts.is_empty() => parts.as_slice(),
+        _ => {
+            return score_dirs_by_frecency(&working_dirs, context, arena);
+        }
+    };
+
+    let valid_parts: Vec<&str> = fuzzy_parts
+        .iter()
+        .copied()
+        .filter(|p| p.len() >= 2)
+        .collect();
+    if valid_parts.is_empty() {
+        return score_dirs_by_frecency(&working_dirs, context, arena);
+    }
+
+    let has_uppercase = valid_parts
+        .iter()
+        .any(|p| p.chars().any(|c| c.is_uppercase()));
+
+    let options = neo_frizbee::Config {
+        max_typos: Some(context.max_typos),
+        sort: false,
+        scoring: Scoring {
+            capitalization_bonus: if has_uppercase { 8 } else { 0 },
+            matching_case_bonus: if has_uppercase { 4 } else { 0 },
+            ..Default::default()
+        },
+    };
+
+    let path_matches = match_fuzzy_parts_dirs(
+        fuzzy_parts,
+        &working_dirs,
+        &options,
+        context.max_threads,
+        arena,
+    );
+
+    let main_needle = valid_parts[0].as_bytes();
+    let main_needle_len = main_needle.len() as u16;
+
+    let mut dir_buf = String::with_capacity(64);
+    let mut dirname_buf = String::with_capacity(32);
+
+    let results: Vec<(&DirItem, Score)> = path_matches
+        .into_iter()
+        .map(|path_match| {
+            let dir = working_dirs[path_match.index as usize];
+            let base_score = path_match.score as i32;
+            let frecency_boost = base_score.saturating_mul(dir.max_access_frecency()) / 100;
+
+            // Distance penalty from current file's directory.
+            let distance_penalty = if context.current_file.is_some() {
+                dir.path.write_to_string(arena, &mut dir_buf);
+                calculate_distance_penalty(context.current_file, &dir_buf)
+            } else {
+                0
+            };
+
+            // Dirname bonus: if the match is in the last path segment.
+            let last_seg_offset = dir.last_segment_offset();
+            let match_start_approx = path_match.end_col.saturating_sub(main_needle_len - 1);
+            let is_dirname_match = match_start_approx >= last_seg_offset;
+
+            dir.write_dir_name(arena, &mut dirname_buf);
+            let dirname_len = dirname_buf.len();
+            let is_exact_dirname = is_dirname_match
+                && main_needle_len as usize == dirname_len
+                && main_needle.eq_ignore_ascii_case(dirname_buf.as_bytes());
+
+            let filename_bonus = if is_exact_dirname {
+                base_score / 5 * 2 // 40% bonus for exact dirname match
+            } else if is_dirname_match {
+                base_score / 6 // ~16% bonus for fuzzy dirname match
+            } else {
+                0
+            };
+
+            let total = base_score
+                .saturating_add(frecency_boost)
+                .saturating_add(distance_penalty)
+                .saturating_add(filename_bonus);
+
+            let score = Score {
+                total,
+                base_score,
+                filename_bonus,
+                special_filename_bonus: 0,
+                frecency_boost,
+                git_status_boost: 0,
+                distance_penalty,
+                current_file_penalty: 0,
+                combo_match_boost: 0,
+                path_alignment_bonus: 0,
+                exact_match: is_exact_dirname || path_match.exact,
+                match_type: if is_exact_dirname {
+                    "exact_dirname"
+                } else if is_dirname_match {
+                    "fuzzy_dirname"
+                } else if path_match.exact {
+                    "exact_path"
+                } else {
+                    "fuzzy_path"
+                },
+            };
+
+            (dir, score)
+        })
+        .collect();
+
+    sort_and_paginate_dirs(results, context)
+}
+
+/// Return dirs ranked by frecency only (no fuzzy query).
+fn score_dirs_by_frecency<'a>(
+    dirs: &[&'a DirItem],
+    context: &ScoringContext,
+    _arena: ArenaPtr,
+) -> (Vec<&'a DirItem>, Vec<Score>, usize) {
+    let results: Vec<(&DirItem, Score)> = dirs
+        .iter()
+        .filter(|d| d.max_access_frecency() > 0)
+        .map(|&dir| {
+            let score = Score {
+                total: dir.max_access_frecency(),
+                frecency_boost: dir.max_access_frecency(),
+                match_type: "frecency",
+                ..Default::default()
+            };
+            (dir, score)
+        })
+        .collect();
+
+    sort_and_paginate_dirs(results, context)
+}
+
+/// Sort dir results by total score (descending) and apply pagination.
+fn sort_and_paginate_dirs<'a>(
+    mut results: Vec<(&'a DirItem, Score)>,
+    context: &ScoringContext,
+) -> (Vec<&'a DirItem>, Vec<Score>, usize) {
+    let total_matched = results.len();
+    if total_matched == 0 {
+        return (vec![], vec![], 0);
+    }
+
+    let offset = context.pagination.offset;
+    let limit = if context.pagination.limit > 0 {
+        context.pagination.limit
+    } else {
+        total_matched
+    };
+
+    if offset >= total_matched {
+        return (vec![], vec![], total_matched);
+    }
+
+    let items_needed = offset.saturating_add(limit).min(total_matched);
+    let use_partial_sort = items_needed < total_matched / 2 && total_matched > 100;
+
+    if use_partial_sort {
+        results.select_nth_unstable_by(items_needed - 1, |a, b| b.1.total.cmp(&a.1.total));
+        results.truncate(items_needed);
+    }
+
+    sort_with_buffer(&mut results, |a, b| b.1.total.cmp(&a.1.total));
+
+    if results.len() > limit {
+        let page_end = std::cmp::min(offset + limit, results.len());
+        let page_size = page_end - offset;
+        results.drain(0..offset);
+        results.truncate(page_size);
+    }
+
+    let (items, scores): (Vec<&DirItem>, Vec<Score>) = results.into_iter().unzip();
+    (items, scores, total_matched)
 }
 
 fn match_and_score_in_arena<'a>(

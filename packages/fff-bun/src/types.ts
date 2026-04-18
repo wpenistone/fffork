@@ -135,6 +135,72 @@ export interface SearchResult {
 }
 
 /**
+ * A directory item in search results
+ */
+export interface DirItem {
+  /** Path relative to the indexed directory (e.g., "src/components/") */
+  relativePath: string;
+  /** Last path segment (e.g., "components/" for "src/components/") */
+  dirName: string;
+  /** Maximum access frecency score among direct child files */
+  maxAccessFrecency: number;
+}
+
+/**
+ * Search options for directory search (subset of SearchOptions)
+ */
+export interface DirSearchOptions {
+  /** Maximum threads for parallel search (0 = auto) */
+  maxThreads?: number;
+  /** Current file path (for distance scoring) */
+  currentFile?: string;
+  /** Page index for pagination (default: 0) */
+  pageIndex?: number;
+  /** Page size for pagination (default: 100) */
+  pageSize?: number;
+}
+
+/**
+ * Search result from fuzzy directory search
+ */
+export interface DirSearchResult {
+  /** Matched directory items */
+  items: DirItem[];
+  /** Corresponding scores for each item */
+  scores: Score[];
+  /** Total number of directories that matched */
+  totalMatched: number;
+  /** Total number of indexed directories */
+  totalDirs: number;
+}
+
+/**
+ * A single item in a mixed (files + directories) search result
+ */
+export type MixedItem =
+  | { type: "file"; item: FileItem }
+  | { type: "directory"; item: DirItem };
+
+/**
+ * Search result from mixed (files + directories) fuzzy search.
+ * Items are interleaved by total score in descending order.
+ */
+export interface MixedSearchResult {
+  /** Matched items (files and directories interleaved by score) */
+  items: MixedItem[];
+  /** Corresponding scores for each item */
+  scores: Score[];
+  /** Total number of items (files + dirs) that matched */
+  totalMatched: number;
+  /** Total number of indexed files */
+  totalFiles: number;
+  /** Total number of indexed directories */
+  totalDirs: number;
+  /** Location parsed from query */
+  location?: Location;
+}
+
+/**
  * Scan progress information
  */
 export interface ScanProgress {

@@ -1,7 +1,7 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::constraints::Constrainable;
 use crate::query_tracker::QueryMatchEntry;
@@ -84,10 +84,27 @@ impl DirFlags {
 }
 
 /// A directory in the file index. Shares chunk arena with file paths.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DirItem {
     flags: u8,
     pub(crate) path: crate::simd_path::ChunkedString,
+    /// Byte offset where the last path segment begins (e.g. for `src/components/`
+    /// this is 4, pointing to `components/`). Used for dirname-bonus scoring.
+    last_segment_offset: u16,
+    /// Maximum `access_frecency_score` among direct child files.
+    /// Atomic so parallel frecency updates can write directly without juggling.
+    max_access_frecency: AtomicI32,
+}
+
+impl Clone for DirItem {
+    fn clone(&self) -> Self {
+        Self {
+            flags: self.flags,
+            path: self.path.clone(),
+            last_segment_offset: self.last_segment_offset,
+            max_access_frecency: AtomicI32::new(self.max_access_frecency()),
+        }
+    }
 }
 
 impl DirItem {
@@ -96,8 +113,38 @@ impl DirItem {
         self.flags & DirFlags::OVERFLOW == 0
     }
 
-    pub(crate) fn new(path: crate::simd_path::ChunkedString) -> Self {
-        Self { path, flags: 0 }
+    pub(crate) fn new(path: crate::simd_path::ChunkedString, last_segment_offset: u16) -> Self {
+        Self {
+            path,
+            flags: 0,
+            last_segment_offset,
+            max_access_frecency: AtomicI32::new(0),
+        }
+    }
+
+    /// Byte offset of the last path segment within the directory path.
+    #[inline]
+    pub fn last_segment_offset(&self) -> u16 {
+        self.last_segment_offset
+    }
+
+    /// Current max access frecency score.
+    #[inline]
+    pub fn max_access_frecency(&self) -> i32 {
+        self.max_access_frecency.load(Ordering::Relaxed)
+    }
+
+    /// Atomically update the directory's frecency score if the given score is larger.
+    /// Safe to call from parallel threads.
+    #[inline]
+    pub fn update_frecency_if_larger(&self, score: i32) {
+        self.max_access_frecency.fetch_max(score, Ordering::Relaxed);
+    }
+
+    /// Reset frecency to zero (used before full recomputation).
+    #[inline]
+    pub fn reset_frecency(&self) {
+        self.max_access_frecency.store(0, Ordering::Relaxed);
     }
 
     pub(crate) fn read_relative_path<'a>(&self, arena: ArenaPtr, buf: &'a mut [u8]) -> &'a str {
@@ -117,6 +164,32 @@ impl DirItem {
         out
     }
 
+    /// Write the last segment (dirname) of this directory path to `out`.
+    pub fn write_dir_name(&self, arena: ArenaPtr, out: &mut String) {
+        out.clear();
+        let total = self.path.byte_len as usize;
+        let offset = self.last_segment_offset as usize;
+        if offset >= total {
+            return;
+        }
+        // Read the full path, then slice from last_segment_offset
+        let mut buf = [0u8; PATH_BUF_SIZE];
+        let full = self.path.read_to_buf(arena, &mut buf);
+        out.push_str(&full[offset..]);
+    }
+
+    /// The dirname (last segment) as an owned String. Cold path.
+    pub fn dir_name(&self, arena: impl FFFStringStorage) -> String {
+        let mut out = String::new();
+        let ptr = if self.is_overflow() {
+            arena.overflow_arena()
+        } else {
+            arena.base_arena()
+        };
+        self.write_dir_name(ptr, &mut out);
+        out
+    }
+
     /// A path = base_path + "/" + relative. Cold path, allocates.
     pub fn absolute_path(&self, arena: impl FFFStringStorage, base_path: &Path) -> PathBuf {
         let rel = self.relative_path(arena);
@@ -125,6 +198,24 @@ impl DirItem {
         } else {
             base_path.join(&rel)
         }
+    }
+}
+
+impl Constrainable for DirItem {
+    #[inline]
+    fn write_file_name(&self, arena: ArenaPtr, out: &mut String) {
+        // For dirs, the "file name" equivalent is the last path segment
+        self.write_dir_name(arena, out);
+    }
+
+    #[inline]
+    fn write_relative_path(&self, arena: ArenaPtr, out: &mut String) {
+        self.path.write_to_string(arena, out);
+    }
+
+    #[inline]
+    fn git_status(&self) -> Option<git2::Status> {
+        None
     }
 }
 
@@ -534,6 +625,41 @@ pub struct SearchResult<'a> {
     pub total_matched: usize,
     pub total_files: usize,
     pub location: Option<Location>,
+}
+
+/// Search result for directory-only fuzzy search.
+#[derive(Debug, Clone, Default)]
+pub struct DirSearchResult<'a> {
+    pub items: Vec<&'a DirItem>,
+    pub scores: Vec<Score>,
+    pub total_matched: usize,
+    pub total_dirs: usize,
+}
+
+/// A single item in a mixed (files + directories) search result.
+#[derive(Debug, Clone)]
+pub enum MixedItemRef<'a> {
+    File(&'a FileItem),
+    Dir(&'a DirItem),
+}
+
+/// Search result for mixed (files + directories) fuzzy search.
+/// Items are interleaved by total score in descending order.
+#[derive(Debug, Clone, Default)]
+pub struct MixedSearchResult<'a> {
+    pub items: Vec<MixedItemRef<'a>>,
+    pub scores: Vec<Score>,
+    pub total_matched: usize,
+    pub total_files: usize,
+    pub total_dirs: usize,
+    pub location: Option<Location>,
+}
+
+impl Default for MixedItemRef<'_> {
+    fn default() -> Self {
+        // Should never be used, exists only for Default derive on MixedSearchResult
+        unreachable!("MixedItemRef::default should not be called")
+    }
 }
 
 const MAX_MMAP_FILE_SIZE: u64 = 10 * 1024 * 1024;

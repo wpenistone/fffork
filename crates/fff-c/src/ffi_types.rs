@@ -9,7 +9,10 @@ use std::ptr;
 
 use fff::file_picker::FilePicker;
 use fff::git::format_git_status;
-use fff::{FileItem, GrepMatch, GrepResult, Location, Score, SearchResult};
+use fff::{
+    DirItem, DirSearchResult, FileItem, GrepMatch, GrepResult, Location, MixedItemRef,
+    MixedSearchResult, Score, SearchResult,
+};
 
 /// Allocate a heap CString from a `&str`, returning a raw pointer.
 fn cstring_new(s: &str) -> *mut c_char {
@@ -504,6 +507,200 @@ impl FffResult {
             error: CString::new(error).unwrap_or_default().into_raw(),
             handle: ptr::null_mut(),
             int_value: 0,
+        }))
+    }
+}
+
+/// A directory item returned by `fff_search_directories`.
+///
+/// All string fields are heap-allocated and owned by the parent `FffDirSearchResult`.
+/// Free the entire result with `fff_free_dir_search_result`.
+#[repr(C)]
+pub struct FffDirItem {
+    pub relative_path: *mut c_char,
+    pub dir_name: *mut c_char,
+    pub max_access_frecency: i32,
+}
+
+impl FffDirItem {
+    pub fn from_item(item: &DirItem, picker: &FilePicker) -> Self {
+        FffDirItem {
+            relative_path: cstring_new(&item.relative_path(picker)),
+            dir_name: cstring_new(&item.dir_name(picker)),
+            max_access_frecency: item.max_access_frecency(),
+        }
+    }
+
+    /// ## Safety
+    /// All string pointers must have been allocated by the rust side
+    pub unsafe fn free_strings(&mut self) {
+        unsafe {
+            if !self.relative_path.is_null() {
+                drop(CString::from_raw(self.relative_path));
+            }
+            if !self.dir_name.is_null() {
+                drop(CString::from_raw(self.dir_name));
+            }
+        }
+    }
+}
+
+/// Directory search result returned by `fff_search_directories`.
+///
+/// The caller must free this with `fff_free_dir_search_result`.
+#[repr(C)]
+pub struct FffDirSearchResult {
+    /// Pointer to a heap-allocated array of `FffDirItem` (length = `count`).
+    pub items: *mut FffDirItem,
+    /// Pointer to a heap-allocated array of `FffScore` (length = `count`).
+    pub scores: *mut FffScore,
+    /// Number of items/scores in the arrays.
+    pub count: u32,
+    /// Total number of directories that matched the query.
+    pub total_matched: u32,
+    /// Total number of indexed directories.
+    pub total_dirs: u32,
+}
+
+impl FffDirSearchResult {
+    /// Convert a core `DirSearchResult` into a heap-allocated `FffDirSearchResult`.
+    pub fn from_core(result: &DirSearchResult, picker: &FilePicker) -> *mut Self {
+        let items: Vec<FffDirItem> = result
+            .items
+            .iter()
+            .map(|i| FffDirItem::from_item(i, picker))
+            .collect();
+        let scores: Vec<FffScore> = result.scores.iter().map(FffScore::from).collect();
+        let count = items.len() as u32;
+
+        let (items_ptr, _) = vec_to_raw(items);
+        let (scores_ptr, _) = vec_to_raw(scores);
+
+        Box::into_raw(Box::new(FffDirSearchResult {
+            items: items_ptr,
+            scores: scores_ptr,
+            count,
+            total_matched: result.total_matched as u32,
+            total_dirs: result.total_dirs as u32,
+        }))
+    }
+}
+
+/// A single item in a mixed (files + directories) search result.
+///
+/// `item_type`: 0 = file, 1 = directory.
+/// All string fields are heap-allocated and owned by the parent `FffMixedSearchResult`.
+#[repr(C)]
+pub struct FffMixedItem {
+    /// 0 = file, 1 = directory.
+    pub item_type: u8,
+    pub relative_path: *mut c_char,
+    /// Filename for files, last directory segment for directories.
+    pub display_name: *mut c_char,
+    pub git_status: *mut c_char,
+    pub size: u64,
+    pub modified: u64,
+    /// The access frecency score for files, or max access frecency among all the immediate
+    /// children for directories.
+    pub access_frecency_score: i64,
+    /// Always 0 for directories
+    pub modification_frecency_score: i64,
+    /// Always 0 for directories
+    pub total_frecency_score: i64,
+    /// Always 0 for directories
+    pub is_binary: bool,
+}
+
+impl FffMixedItem {
+    pub fn from_mixed_ref(item: &MixedItemRef<'_>, picker: &FilePicker) -> Self {
+        match item {
+            MixedItemRef::File(file) => FffMixedItem {
+                item_type: 0,
+                relative_path: cstring_new(&file.relative_path(picker)),
+                display_name: cstring_new(&file.file_name(picker)),
+                git_status: cstring_new(format_git_status(file.git_status)),
+                size: file.size,
+                modified: file.modified,
+                access_frecency_score: file.access_frecency_score as i64,
+                modification_frecency_score: file.modification_frecency_score as i64,
+                total_frecency_score: file.total_frecency_score() as i64,
+                is_binary: file.is_binary(),
+            },
+            MixedItemRef::Dir(dir) => FffMixedItem {
+                item_type: 1,
+                relative_path: cstring_new(&dir.relative_path(picker)),
+                display_name: cstring_new(&dir.dir_name(picker)),
+                git_status: cstring_new(""),
+                size: 0,
+                modified: 0,
+                access_frecency_score: dir.max_access_frecency() as i64,
+                modification_frecency_score: 0,
+                total_frecency_score: dir.max_access_frecency() as i64,
+                is_binary: false,
+            },
+        }
+    }
+
+    /// ## Safety
+    /// All string pointers must have been allocated by rust side
+    pub unsafe fn free_strings(&mut self) {
+        unsafe {
+            if !self.relative_path.is_null() {
+                drop(CString::from_raw(self.relative_path));
+            }
+            if !self.display_name.is_null() {
+                drop(CString::from_raw(self.display_name));
+            }
+            if !self.git_status.is_null() {
+                drop(CString::from_raw(self.git_status));
+            }
+        }
+    }
+}
+
+/// Mixed search result returned by `fff_search_mixed`.
+///
+/// The caller must free this with `fff_free_mixed_search_result`.
+#[repr(C)]
+pub struct FffMixedSearchResult {
+    /// Pointer to a heap-allocated array of `FffMixedItem` (length = `count`).
+    pub items: *mut FffMixedItem,
+    /// Pointer to a heap-allocated array of `FffScore` (length = `count`).
+    pub scores: *mut FffScore,
+    /// Number of items/scores in the arrays.
+    pub count: u32,
+    /// Total number of items (files + dirs) that matched the query.
+    pub total_matched: u32,
+    /// Total number of indexed files.
+    pub total_files: u32,
+    /// Total number of indexed directories.
+    pub total_dirs: u32,
+    /// Location parsed from the query string.
+    pub location: FffLocation,
+}
+
+impl FffMixedSearchResult {
+    /// Convert a core `MixedSearchResult` into a heap-allocated `FffMixedSearchResult`.
+    pub fn from_core(result: &MixedSearchResult, picker: &FilePicker) -> *mut Self {
+        let items: Vec<FffMixedItem> = result
+            .items
+            .iter()
+            .map(|i| FffMixedItem::from_mixed_ref(i, picker))
+            .collect();
+        let scores: Vec<FffScore> = result.scores.iter().map(FffScore::from).collect();
+        let count = items.len() as u32;
+
+        let (items_ptr, _) = vec_to_raw(items);
+        let (scores_ptr, _) = vec_to_raw(scores);
+
+        Box::into_raw(Box::new(FffMixedSearchResult {
+            items: items_ptr,
+            scores: scores_ptr,
+            count,
+            total_matched: result.total_matched as u32,
+            total_files: result.total_files as u32,
+            total_dirs: result.total_dirs as u32,
+            location: FffLocation::from(result.location.as_ref()),
         }))
     }
 }
