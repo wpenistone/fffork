@@ -94,5 +94,9 @@ name = "indexing_and_search"
 harness = false
 
 [[bench]]
+name = "grep_bench"
+harness = false
+
+[[bench]]
 name = "query_tracker_bench"
 harness = false
