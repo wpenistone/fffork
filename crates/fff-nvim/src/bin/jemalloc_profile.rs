@@ -187,7 +187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         shared_frecency.clone(),
         fff::FilePickerOptions {
             base_path: base_path.clone(),
-            warmup_mmap_cache: false,
+            enable_mmap_cache: false,
             mode: FFFMode::Neovim,
             ..Default::default()
         },

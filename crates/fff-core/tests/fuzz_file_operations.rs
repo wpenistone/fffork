@@ -316,7 +316,8 @@ fn fuzz_file_operations_stress() {
         FilePickerOptions {
             watch: false, // we do not need the backgrodun monitor
             base_path: base.to_string_lossy().to_string(),
-            warmup_mmap_cache: true,
+            enable_mmap_cache: true,
+            enable_content_indexing: true,
             mode: FFFMode::Neovim,
             ..Default::default()
         },

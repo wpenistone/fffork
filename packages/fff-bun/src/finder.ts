@@ -38,7 +38,7 @@ import type {
   GrepOptions,
   GrepResult,
   HealthCheck,
-  InitOptions,
+  InitOptions as FFFInitOptions,
   MixedSearchResult,
   MultiGrepOptions,
   Result,
@@ -107,13 +107,15 @@ export class FileFinder {
    * });
    * ```
    */
-  static create(options: InitOptions): Result<FileFinder> {
+  static create(options: FFFInitOptions): Result<FileFinder> {
     const result = ffiCreate(
       options.basePath,
       options.frecencyDbPath ?? "",
       options.historyDbPath ?? "",
       options.useUnsafeNoLock ?? false,
-      options.warmupMmapCache ?? false,
+      !(options.disableMmapCache ?? false),
+      !(options.disableContentIndexing ?? options.disableMmapCache ?? false),
+      !(options.disableWatch ?? false),
       options.aiMode ?? false,
     );
 

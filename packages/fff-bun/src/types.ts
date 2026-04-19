@@ -30,12 +30,24 @@ export interface InitOptions {
   /** Use unsafe no-lock mode for databases (optional, defaults to false) */
   useUnsafeNoLock?: boolean;
   /**
-   * Pre-populate mmap caches for all files after the initial scan completes.
-   * When enabled, the first grep search will be as fast as subsequent ones
-   * at the cost of a longer scan time and higher initial memory usage.
+   * Disable mmap cache warmup after the initial scan. When mmap cache is
+   * enabled (the default), the first grep search is as fast as subsequent
+   * ones at the cost of background resources spent on awarming up the cache
+   */
+  disableMmapCache?: boolean;
+  /**
+   * Disable the content index built after the initial scan.
+   * Content indexing enables faster content-aware filtering during grep.
+   * When omitted, follows `disableMmapCache` for backward compatibility.
+   * (default: follows `disableMmapCache`)
+   */
+  disableContentIndexing?: boolean;
+  /**
+   * Disable the background file-system watcher. When the watcher is
+   * disabled, files are scanned once but not monitored for changes.
    * (default: false)
    */
-  warmupMmapCache?: boolean;
+  disableWatch?: boolean;
   /** enables optimizations for AI agent assistants. Provide as true if running via mcp/agent */
   aiMode?: boolean;
 }

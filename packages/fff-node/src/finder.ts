@@ -112,7 +112,9 @@ export class FileFinder {
       options.frecencyDbPath ?? "",
       options.historyDbPath ?? "",
       options.useUnsafeNoLock ?? false,
-      options.warmupMmapCache ?? false,
+      !(options.disableMmapCache ?? false),
+      !(options.disableContentIndexing ?? options.disableMmapCache ?? false),
+      !(options.disableWatch ?? false),
       options.aiMode ?? false,
     );
 

@@ -33,7 +33,7 @@ fn init_file_picker_internal(
         shared_frecency.clone(),
         FilePickerOptions {
             base_path: path.to_string(),
-            warmup_mmap_cache: false,
+            enable_mmap_cache: false,
             mode: FFFMode::Neovim,
             ..Default::default()
         },

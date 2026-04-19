@@ -33,7 +33,8 @@ fn modified_file_findable_via_overlay() {
         shared_frecency.clone(),
         FilePickerOptions {
             base_path: base.to_string_lossy().to_string(),
-            warmup_mmap_cache: true,
+            enable_mmap_cache: true,
+            enable_content_indexing: true,
             mode: FFFMode::Neovim,
             ..Default::default()
         },
@@ -182,7 +183,8 @@ fn deleted_file_excluded_via_overlay() {
         shared_frecency.clone(),
         FilePickerOptions {
             base_path: base.to_string_lossy().to_string(),
-            warmup_mmap_cache: true,
+            enable_mmap_cache: true,
+            enable_content_indexing: true,
             mode: FFFMode::Neovim,
             ..Default::default()
         },
@@ -250,7 +252,8 @@ fn new_file_findable_after_add() {
         shared_frecency.clone(),
         FilePickerOptions {
             base_path: base.to_string_lossy().to_string(),
-            warmup_mmap_cache: true,
+            enable_mmap_cache: true,
+            enable_content_indexing: true,
             mode: FFFMode::Neovim,
             ..Default::default()
         },
@@ -319,7 +322,8 @@ fn modified_file_findable_via_regex_overlay() {
         shared_frecency.clone(),
         FilePickerOptions {
             base_path: base.to_string_lossy().to_string(),
-            warmup_mmap_cache: true,
+            enable_mmap_cache: true,
+            enable_content_indexing: true,
             mode: FFFMode::Neovim,
             ..Default::default()
         },

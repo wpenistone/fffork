@@ -63,7 +63,7 @@ fn make_watched_picker(base: &Path) -> (SharedPicker, SharedFrecency) {
         shared_frecency.clone(),
         FilePickerOptions {
             base_path: base.to_string_lossy().to_string(),
-            warmup_mmap_cache: false,
+            enable_mmap_cache: false,
             mode: FFFMode::Neovim,
             watch: true,
             ..Default::default()

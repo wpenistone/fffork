@@ -340,12 +340,14 @@ typedef struct FffMixedSearchResult {
  *
  * # Parameters
  *
- * * `base_path`          – directory to index (required)
- * * `frecency_db_path`   – path to frecency LMDB database (NULL/empty to skip)
- * * `history_db_path`    – path to query history LMDB database (NULL/empty to skip)
- * * `use_unsafe_no_lock` – use MDB_NOLOCK for LMDB (useful in single-process setups)
- * * `warmup_mmap_cache`  – pre-populate mmap caches after the initial scan
- * * `ai_mode`            – enable AI-agent optimizations (auto-track frecency on modifications)
+ * * `base_path`                – directory to index (required)
+ * * `frecency_db_path`         – path to frecency LMDB database (NULL/empty to skip)
+ * * `history_db_path`          – path to query history LMDB database (NULL/empty to skip)
+ * * `use_unsafe_no_lock`       – use MDB_NOLOCK for LMDB (useful in single-process setups)
+ * * `enable_mmap_cache`        – pre-populate mmap caches after the initial scan
+ * * `enable_content_indexing`  – build content index after the initial scan
+ * * `watch`                    – start a background file-system watcher for live updates
+ * * `ai_mode`                  – enable AI-agent optimizations (auto-track frecency on modifications)
  *
  * ## Safety
  * String parameters must be valid null-terminated UTF-8 or NULL.
@@ -354,7 +356,9 @@ struct FffResult *fff_create_instance(const char *base_path,
                                       const char *frecency_db_path,
                                       const char *history_db_path,
                                       bool use_unsafe_no_lock,
-                                      bool warmup_mmap_cache,
+                                      bool enable_mmap_cache,
+                                      bool enable_content_indexing,
+                                      bool watch,
                                       bool ai_mode);
 
 /**

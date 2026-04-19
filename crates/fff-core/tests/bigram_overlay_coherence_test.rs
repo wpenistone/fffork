@@ -1435,7 +1435,8 @@ fn make_picker(base: &Path) -> (SharedPicker, SharedFrecency) {
         shared_frecency.clone(),
         FilePickerOptions {
             base_path: base.to_string_lossy().to_string(),
-            warmup_mmap_cache: true,
+            enable_mmap_cache: true,
+            enable_content_indexing: true,
             mode: FFFMode::Neovim,
             watch: false, // we drive events manually
             ..Default::default()

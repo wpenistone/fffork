@@ -6,7 +6,7 @@ use std::time::Instant;
 fn load_picker(path: &std::path::Path) -> FilePicker {
     let mut picker = FilePicker::new(fff::FilePickerOptions {
         base_path: path.to_string_lossy().to_string(),
-        warmup_mmap_cache: false,
+        enable_mmap_cache: false,
         mode: fff::FFFMode::Neovim,
         ..Default::default()
     })

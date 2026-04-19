@@ -80,7 +80,8 @@ pub fn init_file_picker(_: &Lua, base_path: String) -> LuaResult<bool> {
         FRECENCY.clone(),
         fff::FilePickerOptions {
             base_path,
-            warmup_mmap_cache: true,
+            enable_mmap_cache: true,
+            enable_content_indexing: true,
             mode: FFFMode::Neovim,
             ..Default::default()
         },
@@ -112,7 +113,8 @@ fn reinit_file_picker_internal(path: &Path) -> Result<(), Error> {
         FRECENCY.clone(),
         fff::FilePickerOptions {
             base_path: path.to_string_lossy().to_string(),
-            warmup_mmap_cache: true,
+            enable_mmap_cache: true,
+            enable_content_indexing: true,
             mode: FFFMode::Neovim,
             ..Default::default()
         },

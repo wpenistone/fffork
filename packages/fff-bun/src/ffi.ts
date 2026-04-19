@@ -50,7 +50,9 @@ const ffiDefinition = {
       FFIType.cstring, // frecency_db_path
       FFIType.cstring, // history_db_path
       FFIType.bool, // use_unsafe_no_lock
-      FFIType.bool, // warmup_mmap_cache
+      FFIType.bool, // enable_mmap_cache
+      FFIType.bool, // enable_content_indexing
+      FFIType.bool, // watch
       FFIType.bool, // ai_mode
     ],
     returns: FFIType.ptr,
@@ -419,7 +421,9 @@ export function ffiCreate(
   frecencyDbPath: string,
   historyDbPath: string,
   useUnsafeNoLock: boolean,
-  warmupMmapCache: boolean,
+  enableMmapCache: boolean,
+  enableContentIndexing: boolean,
+  watch: boolean,
   aiMode: boolean,
 ): Result<NativeHandle> {
   const library = loadLibrary();
@@ -428,7 +432,9 @@ export function ffiCreate(
     ptr(encodeString(frecencyDbPath)),
     ptr(encodeString(historyDbPath)),
     useUnsafeNoLock,
-    warmupMmapCache,
+    enableMmapCache,
+    enableContentIndexing,
+    watch,
     aiMode,
   );
 

@@ -17,7 +17,7 @@ fn create_picker(base: &Path, specs: &[(&str, &str)]) -> FilePicker {
     }
     let mut picker = FilePicker::new(FilePickerOptions {
         base_path: base.to_string_lossy().to_string(),
-        warmup_mmap_cache: false,
+        enable_mmap_cache: false,
         watch: false,
         ..Default::default()
     })

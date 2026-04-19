@@ -560,7 +560,9 @@ fn trigger_full_rescan(shared_picker: &SharedPicker, shared_frecency: &SharedFre
     // Spawn background warmup + bigram rebuild (mirrors the initial scan's
     // post-scan phase). The write lock is still held here but the spawned
     // thread re-acquires it later — safe because the guard drops at function end.
-    picker.spawn_post_rescan_rebuild(shared_picker.clone());
+    if shared_picker.need_complex_rebuild() {
+        picker.spawn_post_rescan_rebuild(shared_picker.clone());
+    }
 }
 
 /// After registering a watch on a newly created directory, list its

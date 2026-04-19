@@ -114,7 +114,7 @@ fn main() {
     let t = Instant::now();
     let mut picker = FilePicker::new(fff::FilePickerOptions {
         base_path: canonical.to_string_lossy().to_string(),
-        warmup_mmap_cache: false,
+        enable_mmap_cache: false,
         mode: fff::FFFMode::Neovim,
         ..Default::default()
     })

@@ -389,13 +389,16 @@ impl FileItem {
 /// Options for creating a [`FilePicker`].
 pub struct FilePickerOptions {
     pub base_path: String,
-    pub warmup_mmap_cache: bool,
+    /// Pre-populate mmap caches for top-frecency files after the initial scan.
+    pub enable_mmap_cache: bool,
+    /// Build content index after the initial scan for faster content-aware filtering.
+    pub enable_content_indexing: bool,
+    /// Mode of the picker impact the way file watcher events are handled and the scoring logic
     pub mode: FFFMode,
     /// Explicit cache budget. When `None`, the budget is auto-computed from
     /// the repo size after the initial scan completes.
     pub cache_budget: Option<ContentCacheBudget>,
     /// When `false`, `new_with_shared_state` skips the background file watcher.
-    /// Files are still scanned, warmed up, and bigram-indexed.
     pub watch: bool,
 }
 
@@ -403,7 +406,8 @@ impl Default for FilePickerOptions {
     fn default() -> Self {
         Self {
             base_path: ".".into(),
-            warmup_mmap_cache: false,
+            enable_mmap_cache: false,
+            enable_content_indexing: false,
             mode: FFFMode::default(),
             cache_budget: None,
             watch: true,
@@ -421,7 +425,8 @@ pub struct FilePicker {
     watcher_ready: Arc<AtomicBool>,
     scanned_files_count: Arc<AtomicUsize>,
     background_watcher: Option<BackgroundWatcher>,
-    warmup_mmap_cache: bool,
+    enable_mmap_cache: bool,
+    enable_content_indexing: bool,
     watch: bool,
     cancelled: Arc<AtomicBool>,
     // This is a soft lock that we use to prevent rescan be triggered while the
@@ -479,8 +484,16 @@ impl FilePicker {
             .and_then(|p| p.to_str())
     }
 
-    pub fn need_warmup_mmap_cache(&self) -> bool {
-        self.warmup_mmap_cache
+    pub fn need_enable_mmap_cache(&self) -> bool {
+        self.enable_mmap_cache
+    }
+
+    pub fn need_enable_content_indexing(&self) -> bool {
+        self.enable_content_indexing
+    }
+
+    pub fn need_watch(&self) -> bool {
+        self.watch
     }
 
     pub fn mode(&self) -> FFFMode {
@@ -632,7 +645,8 @@ impl FilePicker {
             post_scan_busy: Arc::new(AtomicBool::new(false)),
             scanned_files_count: Arc::new(AtomicUsize::new(0)),
             sync_data: FileSync::new(),
-            warmup_mmap_cache: options.warmup_mmap_cache,
+            enable_mmap_cache: options.enable_mmap_cache,
+            enable_content_indexing: options.enable_content_indexing,
             watch: options.watch,
             watcher_ready: Arc::new(AtomicBool::new(false)),
         })
@@ -648,13 +662,15 @@ impl FilePicker {
         let picker = Self::new(options)?;
 
         info!(
-            "Spawning background threads: base_path={}, warmup={}, mode={:?}",
+            "Spawning background threads: base_path={}, warmup={}, content_indexing={}, mode={:?}",
             picker.base_path.display(),
-            picker.warmup_mmap_cache,
+            picker.enable_mmap_cache,
+            picker.enable_content_indexing,
             picker.mode,
         );
 
-        let warmup = picker.warmup_mmap_cache;
+        let warmup = picker.enable_mmap_cache;
+        let content_indexing = picker.enable_content_indexing;
         let watch = picker.watch;
         let mode = picker.mode;
 
@@ -678,6 +694,7 @@ impl FilePicker {
             watcher_ready,
             synced_files_count,
             warmup,
+            content_indexing,
             watch,
             mode,
             shared_picker,
@@ -1400,13 +1417,15 @@ impl FilePicker {
 
     /// Spawn a background thread to rebuild the bigram index after rescan.
     pub(crate) fn spawn_post_rescan_rebuild(&self, shared_picker: SharedPicker) -> bool {
-        if !self.warmup_mmap_cache || self.cancelled.load(Ordering::Relaxed) {
+        if self.cancelled.load(Ordering::Relaxed) {
             return false;
         }
 
         let post_scan_busy = Arc::clone(&self.post_scan_busy);
         let cancelled = Arc::clone(&self.cancelled);
         let auto_budget = !self.has_explicit_cache_budget;
+        let do_warmup = self.enable_mmap_cache;
+        let do_content_indexing = self.enable_content_indexing;
 
         post_scan_busy.store(true, Ordering::Release);
 
@@ -1450,7 +1469,7 @@ impl FilePicker {
 
             if let Some((files, budget, bp, arena)) = files_snapshot {
                 // Warmup mmap caches.
-                if !cancelled.load(Ordering::Acquire) {
+                if do_warmup && !cancelled.load(Ordering::Acquire) {
                     let t = std::time::Instant::now();
                     warmup_mmaps(files, &budget, &bp, arena);
                     info!(
@@ -1462,7 +1481,7 @@ impl FilePicker {
                 }
 
                 // Build bigram index (lock-free).
-                if !cancelled.load(Ordering::Acquire) {
+                if do_content_indexing && !cancelled.load(Ordering::Acquire) {
                     let t = std::time::Instant::now();
                     info!(
                         "Rescan: starting bigram index build for {} files...",
@@ -1495,8 +1514,10 @@ impl FilePicker {
 
             post_scan_busy.store(false, Ordering::Release);
             info!(
-                "Rescan post-scan warmup + bigram total: {:.2}s",
+                "Rescan post-scan phase total: {:.2}s (warmup={}, content_indexing={})",
                 phase_start.elapsed().as_secs_f64(),
+                do_warmup,
+                do_content_indexing,
             );
         });
 
@@ -1617,7 +1638,8 @@ fn spawn_scan_and_watcher(
     scan_signal: Arc<AtomicBool>,
     watcher_ready: Arc<AtomicBool>,
     synced_files_count: Arc<AtomicUsize>,
-    warmup_mmap_cache: bool,
+    enable_mmap_cache: bool,
+    enable_content_indexing: bool,
     watch: bool,
     mode: FFFMode,
     shared_picker: SharedPicker,
@@ -1725,7 +1747,10 @@ fn spawn_scan_and_watcher(
 
         watcher_ready.store(true, Ordering::Release);
 
-        if warmup_mmap_cache && !cancelled.load(Ordering::Acquire) {
+        let need_post_scan =
+            (enable_mmap_cache || enable_content_indexing) && !cancelled.load(Ordering::Acquire);
+
+        if need_post_scan {
             post_scan_busy.store(true, Ordering::Release);
             let phase_start = std::time::Instant::now();
 
@@ -1768,9 +1793,11 @@ fn spawn_scan_and_watcher(
                     None
                 };
 
+            // both of this is using a custom soft lock not guaranteed by compiler
+            // this is required to keep the picker functioning if someone opened a really crazy
+            // e.g  10m files directory but potentially unsafe
             if let Some((files, budget, arena)) = files_snapshot {
-                // Warmup: populate mmap caches for top-frecency files.
-                if !cancelled.load(Ordering::Acquire) {
+                if enable_mmap_cache && !cancelled.load(Ordering::Acquire) {
                     let warmup_start = std::time::Instant::now();
                     warmup_mmaps(files, &budget, &base_path, arena);
                     info!(
@@ -1781,16 +1808,9 @@ fn spawn_scan_and_watcher(
                     );
                 }
 
-                // Build bigram index — entirely lock-free.
-                if !cancelled.load(Ordering::Acquire) {
-                    let bigram_start = std::time::Instant::now();
-                    info!("Starting bigram index build for {} files...", files.len());
+                if enable_content_indexing && !cancelled.load(Ordering::Acquire) {
                     let (index, content_binary) =
                         build_bigram_index(files, &budget, &base_path, arena);
-                    info!(
-                        "Bigram index ready in {:.2}s",
-                        bigram_start.elapsed().as_secs_f64(),
-                    );
 
                     if let Ok(mut guard) = shared_picker.write()
                         && let Some(ref mut picker) = *guard
@@ -1813,8 +1833,10 @@ fn spawn_scan_and_watcher(
             post_scan_busy.store(false, Ordering::Release);
 
             info!(
-                "Post-scan warmup + bigram total: {:.2}s",
+                "Post-scan phase total: {:.2}s (warmup={}, content_indexing={})",
                 phase_start.elapsed().as_secs_f64(),
+                enable_mmap_cache,
+                enable_content_indexing,
             );
         }
 
@@ -1897,6 +1919,7 @@ pub(crate) fn warmup_mmaps(
 /// so reading further adds no new information to the index.
 pub const BIGRAM_CONTENT_CAP: usize = 64 * 1024;
 
+#[tracing::instrument(skip_all, name = "Building Bigram Index", level = Level::DEBUG)]
 pub(crate) fn build_bigram_index(
     files: &[FileItem],
     budget: &ContentCacheBudget,

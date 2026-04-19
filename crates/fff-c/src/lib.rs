@@ -110,12 +110,14 @@ fn default_i32(val: i32, default: i32) -> i32 {
 ///
 /// # Parameters
 ///
-/// * `base_path`          – directory to index (required)
-/// * `frecency_db_path`   – path to frecency LMDB database (NULL/empty to skip)
-/// * `history_db_path`    – path to query history LMDB database (NULL/empty to skip)
-/// * `use_unsafe_no_lock` – use MDB_NOLOCK for LMDB (useful in single-process setups)
-/// * `warmup_mmap_cache`  – pre-populate mmap caches after the initial scan
-/// * `ai_mode`            – enable AI-agent optimizations (auto-track frecency on modifications)
+/// * `base_path`                – directory to index (required)
+/// * `frecency_db_path`         – path to frecency LMDB database (NULL/empty to skip)
+/// * `history_db_path`          – path to query history LMDB database (NULL/empty to skip)
+/// * `use_unsafe_no_lock`       – use MDB_NOLOCK for LMDB (useful in single-process setups)
+/// * `enable_mmap_cache`        – pre-populate mmap caches after the initial scan
+/// * `enable_content_indexing`  – build content index after the initial scan
+/// * `watch`                    – start a background file-system watcher for live updates
+/// * `ai_mode`                  – enable AI-agent optimizations (auto-track frecency on modifications)
 ///
 /// ## Safety
 /// String parameters must be valid null-terminated UTF-8 or NULL.
@@ -125,7 +127,9 @@ pub unsafe extern "C" fn fff_create_instance(
     frecency_db_path: *const c_char,
     history_db_path: *const c_char,
     use_unsafe_no_lock: bool,
-    warmup_mmap_cache: bool,
+    enable_mmap_cache: bool,
+    enable_content_indexing: bool,
+    watch: bool,
     ai_mode: bool,
 ) -> *mut FffResult {
     let base_path_str = match unsafe { cstr_to_str(base_path) } {
@@ -186,10 +190,11 @@ pub unsafe extern "C" fn fff_create_instance(
         shared_frecency.clone(),
         fff::FilePickerOptions {
             base_path: base_path_str,
-            warmup_mmap_cache,
+            enable_mmap_cache,
+            enable_content_indexing,
+            watch,
             mode,
             cache_budget: None,
-            ..Default::default()
         },
     ) {
         return FffResult::err(&format!("Failed to init file picker: {}", e));
@@ -829,13 +834,15 @@ pub unsafe extern "C" fn fff_restart_index(
         Err(e) => return FffResult::err(&format!("Failed to acquire file picker lock: {}", e)),
     };
 
-    let (warmup_caches, mode) = if let Some(mut picker) = guard.take() {
-        let warmup = picker.need_warmup_mmap_cache();
+    let (warmup_caches, content_indexing, watch, mode) = if let Some(mut picker) = guard.take() {
+        let warmup = picker.need_enable_mmap_cache();
+        let ci = picker.need_enable_content_indexing();
+        let w = picker.need_watch();
         let mode = picker.mode();
         picker.stop_background_monitor();
-        (warmup, mode)
+        (warmup, ci, w, mode)
     } else {
-        (false, FFFMode::default())
+        (false, false, true, FFFMode::default())
     };
 
     drop(guard);
@@ -845,10 +852,11 @@ pub unsafe extern "C" fn fff_restart_index(
         inst.frecency.clone(),
         fff::FilePickerOptions {
             base_path: canonical_path.to_string_lossy().to_string(),
-            warmup_mmap_cache: warmup_caches,
+            enable_mmap_cache: warmup_caches,
+            enable_content_indexing: content_indexing,
+            watch,
             mode,
             cache_budget: None,
-            ..Default::default()
         },
     ) {
         Ok(()) => FffResult::ok_empty(),

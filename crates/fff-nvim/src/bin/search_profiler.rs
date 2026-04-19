@@ -42,7 +42,7 @@ fn main() {
         shared_frecency.clone(),
         fff::FilePickerOptions {
             base_path: canonical_path.to_string_lossy().to_string(),
-            warmup_mmap_cache: false,
+            enable_mmap_cache: false,
             mode: FFFMode::Neovim,
             ..Default::default()
         },

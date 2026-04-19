@@ -330,7 +330,9 @@ export function ffiCreate(
   frecencyDbPath: string,
   historyDbPath: string,
   useUnsafeNoLock: boolean,
-  warmupMmapCache: boolean,
+  enableMmapCache: boolean,
+  enableContentIndexing: boolean,
+  watch: boolean,
   aiMode: boolean,
 ): Result<NativeHandle> {
   loadLibrary();
@@ -342,10 +344,21 @@ export function ffiCreate(
       DataType.String, // frecency_db_path
       DataType.String, // history_db_path
       DataType.Boolean, // use_unsafe_no_lock
-      DataType.Boolean, // warmup_mmap_cache
+      DataType.Boolean, // enable_mmap_cache
+      DataType.Boolean, // enable_content_indexing
+      DataType.Boolean, // watch
       DataType.Boolean, // ai_mode
     ],
-    [basePath, frecencyDbPath, historyDbPath, useUnsafeNoLock, warmupMmapCache, aiMode],
+    [
+      basePath,
+      frecencyDbPath,
+      historyDbPath,
+      useUnsafeNoLock,
+      enableMmapCache,
+      enableContentIndexing,
+      watch,
+      aiMode,
+    ],
   );
 
   const success = structData.success !== 0;
