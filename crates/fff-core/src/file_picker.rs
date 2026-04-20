@@ -210,7 +210,10 @@ impl FileSync {
         };
 
         // Split into directory (with trailing '/') and filename.
-        let parent_end = rel_path.rfind('/').map(|i| i + 1).unwrap_or(0);
+        let parent_end = rel_path
+            .rfind(std::path::is_separator)
+            .map(|i| i + 1)
+            .unwrap_or(0);
         let dir_rel = &rel_path[..parent_end];
         let filename = &rel_path[parent_end..];
 
@@ -308,10 +311,8 @@ impl FileItem {
         git_status: Option<Status>,
         metadata: Option<&std::fs::Metadata>,
     ) -> (Self, String) {
-        let relative_path = pathdiff::diff_paths(&path, base_path)
-            .unwrap_or_else(|| path.clone())
-            .to_string_lossy()
-            .into_owned();
+        let path_buf = pathdiff::diff_paths(&path, base_path).unwrap_or_else(|| path.clone());
+        let relative_path = path_buf.to_string_lossy().into_owned();
 
         let (size, modified) = match metadata {
             Some(metadata) => {
@@ -329,7 +330,10 @@ impl FileItem {
 
         let is_binary = is_known_binary_extension(&path);
 
-        let filename_start = relative_path.rfind('/').map(|i| i + 1).unwrap_or(0) as u16;
+        let filename_start = relative_path
+            .rfind(std::path::is_separator)
+            .map(|i| i + 1)
+            .unwrap_or(0) as u16;
 
         let item = Self::new_raw(filename_start, size, modified, git_status, is_binary);
         (item, relative_path)
@@ -363,7 +367,10 @@ impl FileItem {
 
         let rel = pathdiff::diff_paths(path, base_path).unwrap_or_else(|| path.to_path_buf());
         let rel_str = rel.to_string_lossy().into_owned();
-        let fname_offset = rel_str.rfind('/').map(|i| i + 1).unwrap_or(0) as u16;
+        let fname_offset = rel_str
+            .rfind(std::path::is_separator)
+            .map(|i| i + 1)
+            .unwrap_or(0) as u16;
 
         let item = Self::new_raw(fname_offset, size, modified, git_status, is_binary);
         (item, rel_str)
@@ -2143,8 +2150,11 @@ fn walk_filesystem(
             let last_seg = if dir_part.is_empty() {
                 0
             } else {
-                let trimmed = dir_part.trim_end_matches('/');
-                trimmed.rfind('/').map(|i| i + 1).unwrap_or(0) as u16
+                let trimmed = dir_part.trim_end_matches(std::path::is_separator);
+                trimmed
+                    .rfind(std::path::is_separator)
+                    .map(|i| i + 1)
+                    .unwrap_or(0) as u16
             };
             dirs.push(DirItem::new(dir_cs, last_seg));
             current_dir_idx = (dirs.len() - 1) as u32;
