@@ -1,5 +1,5 @@
 *fff.nvim.txt*
-                            For Neovim >= 0.10.0    Last change: 2026 April 19
+                            For Neovim >= 0.10.0    Last change: 2026 April 21
 
 ==============================================================================
 Table of Contents                                 *fff.nvim-table-of-contents*
@@ -182,6 +182,7 @@ all available options:
           -- 'middle': always uses dots (a/./b, a/../b, a/.../b)
           -- 'end': truncates from the end (home/user/projects)
           path_shorten_strategy = 'middle_number',
+          anchor = 'center', -- picker placement: 'center', 'top_left', 'top', 'top_right', 'left', 'right', 'bottom_left', 'bottom', 'bottom_right'
         },
         preview = {
           enabled = true,
