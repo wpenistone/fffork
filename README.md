@@ -1,10 +1,4 @@
-<p>
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./assets/logo-orange.png">
-    <source media="(prefers-color-scheme: light)" srcset="./assets/logo-light.png">
-    <img alt="FFF" src="./assets/logo-light.png" width="300">
-  </picture>
-</p>
+<img alt="FFF" src="./assets/logo-orange.png" width="300">
 
 <p>
   <i>A file search toolkit for humans and AI agents. Really fast.</i>
@@ -12,7 +6,7 @@
 
 Typo-resistant path and content search, frecency-ranked file access, a background watcher, and a lightweight in-memory content index. Way faster than CLIs like ripgrep and fzf in any long-running process that searches more than once.
 
-It started life as a [Neovim plugin](#neovim-plugin) people loved, but it turned out that plenty of AI harnesses and code editors need the same thing: accurate, fast file search as a library. That is what fff is.
+Originally started as [Neovim plugin](#neovim-plugin) people loved, but it turned out that plenty of AI harnesses and code editors need the same thing: accurate, fast file search as a library. That is what fff is.
 
 ---
 
@@ -462,7 +456,7 @@ int main(void) {
 
 ### Notes
 
-- Every function returning `FffResult*` allocates with Rust's `Box`. Free with `fff_free_result` — not `libc::free`.
+- Every function returning `FffResult*` allocates with Rust's `Box`. Free with `fff_free_result`, do not use malloc's free
 - Payloads (search results, grep results, scan progress) have their own dedicated free functions listed in the header.
 - C strings returned in the `handle` field (e.g. from `fff_get_base_path`) are freed with `fff_free_string`.
 
@@ -515,7 +509,7 @@ Algorithm for fuzzy matching is much more comprehensive than fzf's algorithm it 
 Yes, fff fundamentally requires more memory than calling a single child process. That is the primary source of the speedup. In practice, alongside one of the most popular file search pickers for Neovim, [fff ends up using less RAM than a burst of ripgrep invocations](https://x.com/neogoose_btw/status/2041606853155811442).
 
 
-FFF also keeps a content index, around 360 bytes per indexed file, so roughly 36 MB for a 100k-file repo. Not every file is indexed — binaries, oversized files, and anything not eligible for grep are skipped. If even that footprint is too much, the index can be backed by a memory-mapped file instead of anonymous RAM.
+FFF also keeps a content index, around 360 bytes per indexed file, so roughly 36 MB for a 100k-file repo. Not every file is indexed - binaries, oversized files, and anything not eligible for grep are skipped. If even that footprint is too much, the index can be backed by a memory-mapped file instead of anonymous RAM.
 
 ### What this means in practice
 
