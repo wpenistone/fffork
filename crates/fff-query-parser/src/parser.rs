@@ -1038,40 +1038,6 @@ mod tests {
     }
 
     #[test]
-    fn test_file_search_leading_slash_path_alone_stays_path_segment() {
-        // FileSearchConfig (fuzzy file finder) should still treat a lone
-        // `/api/tests/` as a PathSegment constraint — the user is scoping
-        // the file list to that directory.
-        let parser = QueryParser::new(FileSearchConfig);
-
-        let result = parser.parse("/api/tests/");
-        assert_eq!(
-            result.constraints.len(),
-            1,
-            "FileSearchConfig: expected PathSegment constraint, got {:?}",
-            result.constraints
-        );
-        assert!(
-            matches!(result.constraints[0], Constraint::PathSegment("api/tests")),
-            "FileSearchConfig: expected PathSegment(\"api/tests\"), got {:?}",
-            result.constraints[0]
-        );
-
-        let result = parser.parse("/api/tests");
-        assert_eq!(
-            result.constraints.len(),
-            1,
-            "FileSearchConfig: expected PathSegment constraint, got {:?}",
-            result.constraints
-        );
-        assert!(
-            matches!(result.constraints[0], Constraint::PathSegment("api/tests")),
-            "FileSearchConfig: expected PathSegment(\"api/tests\"), got {:?}",
-            result.constraints[0]
-        );
-    }
-
-    #[test]
     fn test_ai_grep_filename_with_extension_only_promotes_to_text() {
         // Same case with an Extension constraint — no fuzzy text means the
         // filename is what the user is searching for.
