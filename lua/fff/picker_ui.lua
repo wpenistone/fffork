@@ -933,6 +933,7 @@ function M.setup_keymaps()
   set_keymap('i', keymaps.move_up, M.move_up, input_opts)
   set_keymap('i', keymaps.move_down, M.move_down, input_opts)
   set_keymap('i', keymaps.cycle_previous_query, M.recall_query_from_history, input_opts)
+  set_keymap('i', keymaps.cycle_forward_query, M.cycle_forward_query, input_opts)
   set_keymap('n', 'j', M.move_down, input_opts)
   set_keymap('n', 'k', M.move_up, input_opts)
   set_keymap('n', keymaps.focus_list, M.focus_list_win, input_opts)
@@ -2213,6 +2214,47 @@ function M.recall_query_from_history()
       M.state.history_offset = nil
       return
     end
+  end
+
+  if M.state.mode ~= 'grep' then M.state.next_search_force_combo_boost = true end
+
+  -- this is going to trigger the on_input_change handler with the normal search and render flow
+  vim.api.nvim_buf_set_lines(M.state.input_buf, 0, -1, false, { M.state.config.prompt .. query })
+
+  -- Position cursor at end
+  vim.schedule(function()
+    if M.state.active and M.state.input_win and vim.api.nvim_win_is_valid(M.state.input_win) then
+      vim.api.nvim_win_set_cursor(M.state.input_win, { 1, #M.state.config.prompt + #query })
+    end
+  end)
+end
+
+--- Cycle forward through query history (toward more recent queries).
+--- Complements recall_query_from_history which cycles backward.
+--- Allows bidirectional navigation without losing your place.
+function M.cycle_forward_query()
+  if not M.state.active then return end
+
+  -- Initialize offset on first press (start from most recent, same as backward)
+  if M.state.history_offset == nil then
+    M.state.history_offset = 0
+  elseif M.state.history_offset > 0 then
+    -- Decrement offset to move forward toward more recent queries
+    M.state.history_offset = M.state.history_offset - 1
+  else
+    -- At the most recent entry (offset 0), can't go further forward
+    return
+  end
+
+  -- Fetch query at current offset from Rust (grep and file picker have separate histories)
+  local fuzzy = require('fff.core').ensure_initialized()
+  local history_fn = M.state.mode == 'grep' and fuzzy.get_historical_grep_query or fuzzy.get_historical_query
+  local ok, query = pcall(history_fn, M.state.history_offset)
+
+  if not ok or not query then
+    -- Shouldn't happen since we validated the offset, but handle gracefully
+    M.state.history_offset = nil
+    return
   end
 
   if M.state.mode ~= 'grep' then M.state.next_search_force_combo_boost = true end
