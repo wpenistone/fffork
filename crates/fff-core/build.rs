@@ -1,4 +1,12 @@
 fn main() {
+    // Opt-in cfg for the long-running randomized stress tests
+    // used by tests/fuzz_git_watcher_stress.rs
+    println!("cargo::rustc-check-cfg=cfg(stress)");
+
+    // When the `zlob` feature is enabled (Zig-compiled C library):
+    // On Windows MSVC, explicitly link the C runtime libraries.
+    // Zig-compiled static libraries don't emit /DEFAULTLIB directives for the
+    // MSVC CRT, so symbols like strcmp, memcpy etc. would be unresolved.
     if std::env::var("CARGO_FEATURE_ZLOB").is_ok() {
         if !zig_available() {
             panic!(
