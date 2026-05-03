@@ -51,6 +51,10 @@ path = "src/bin/test_memory_leak.rs"
 name = "bench_ci_memmem"
 path = "src/bin/bench_ci_memmem.rs"
 
+[[bin]]
+name = "bench_lmdb_parallel"
+path = "src/bin/bench_lmdb_parallel.rs"
+
 [dependencies]
 # Workspace dependencies
 ahash = { workspace = true }
