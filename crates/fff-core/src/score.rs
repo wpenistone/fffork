@@ -1462,3 +1462,108 @@ mod typo_resistance_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod constraint_only_query_tests {
+    use super::*;
+    use crate::types::PaginationArgs;
+    use fff_query_parser::QueryParser;
+
+    #[test]
+    fn constraint_only_git_status_query_returns_filtered_files() {
+        let paths = ["modified.rs", "clean.rs"];
+        let path_strings: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+        let items: Vec<FileItem> = paths
+            .iter()
+            .map(|p| {
+                let fname = p.rfind(std::path::is_separator).map(|i| i + 1).unwrap_or(0) as u16;
+                FileItem::new_raw(fname, 0, 0, None, false)
+            })
+            .collect();
+        let (store, strings) =
+            crate::simd_path::build_chunked_path_store_from_strings(&path_strings, &items);
+        let arena = store.as_arena_ptr();
+        let mut files: Vec<FileItem> = items;
+        for (i, file) in files.iter_mut().enumerate() {
+            file.set_path(strings[i].clone());
+        }
+        files[0].git_status = Some(git2::Status::WT_MODIFIED);
+        files[1].git_status = Some(git2::Status::CURRENT);
+        std::mem::forget(store);
+
+        let parser = QueryParser::default();
+        let parsed = parser.parse("git:modified");
+
+        let ctx = ScoringContext {
+            query: &parsed,
+            max_threads: 1,
+            max_typos: 2,
+            current_file: None,
+            last_same_query_match: None,
+            project_path: None,
+            combo_boost_score_multiplier: 100,
+            min_combo_count: 3,
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 50,
+            },
+        };
+
+        let (items, _scores, total_matched) =
+            fuzzy_match_and_score_files(&files, &ctx, files.len(), arena, arena);
+
+        assert_eq!(
+            total_matched, 1,
+            "git:modified constraint-only query should match exactly 1 modified file"
+        );
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].relative_path(arena), "modified.rs");
+    }
+
+    #[test]
+    fn constraint_only_status_modified_alias_returns_filtered_files() {
+        let paths = ["a.rs", "b.rs"];
+        let path_strings: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+        let items: Vec<FileItem> = paths
+            .iter()
+            .map(|p| {
+                let fname = p.rfind(std::path::is_separator).map(|i| i + 1).unwrap_or(0) as u16;
+                FileItem::new_raw(fname, 0, 0, None, false)
+            })
+            .collect();
+        let (store, strings) =
+            crate::simd_path::build_chunked_path_store_from_strings(&path_strings, &items);
+        let arena = store.as_arena_ptr();
+        let mut files: Vec<FileItem> = items;
+        for (i, file) in files.iter_mut().enumerate() {
+            file.set_path(strings[i].clone());
+        }
+        files[0].git_status = Some(git2::Status::WT_MODIFIED);
+        files[1].git_status = Some(git2::Status::CURRENT);
+        std::mem::forget(store);
+
+        let parser = QueryParser::default();
+        let parsed = parser.parse("status:modified");
+
+        let ctx = ScoringContext {
+            query: &parsed,
+            max_threads: 1,
+            max_typos: 2,
+            current_file: None,
+            last_same_query_match: None,
+            project_path: None,
+            combo_boost_score_multiplier: 100,
+            min_combo_count: 3,
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 50,
+            },
+        };
+
+        let (items, _scores, total_matched) =
+            fuzzy_match_and_score_files(&files, &ctx, files.len(), arena, arena);
+
+        assert_eq!(total_matched, 1);
+        assert_eq!(items[0].relative_path(arena), "a.rs");
+    }
+}
