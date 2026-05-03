@@ -85,6 +85,9 @@ fn make_grep_options(
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct FindFilesParams {
     /// Fuzzy search query. Supports path prefixes and glob constraints.
+    // `pattern` alias for consistency with grep's alias and the common
+    // file-search parameter name (#311).
+    #[serde(alias = "pattern")]
     pub query: String,
     /// Max results (default 20).
     #[serde(rename = "maxResults")]
@@ -98,6 +101,10 @@ pub struct FindFilesParams {
 pub struct GrepParams {
     /// Search text or regex query with optional constraint prefixes.
     /// Matches within single lines only — use ONE specific term, not multiple words.
+    // `pattern` alias: LLMs that have seen multi_grep (which uses `patterns`)
+    // routinely call grep with `pattern`; accept it instead of erroring out
+    // with an unhelpful "missing field `query`" (#311).
+    #[serde(alias = "pattern")]
     pub query: String,
     /// Max matching lines (default 20).
     #[serde(rename = "maxResults")]
@@ -708,5 +715,28 @@ mod tests {
         assert_eq!(normalize_max_results(Some(0.4), 20), 1);
         assert_eq!(normalize_max_results(Some(10.0), 20), 10);
         assert_eq!(normalize_max_results(Some(10.7), 20), 11);
+    }
+
+    #[test]
+    fn grep_params_accepts_pattern_alias() {
+        // Issue #311: LLMs flip between `query` and `pattern`; accept both.
+        let via_query: GrepParams =
+            serde_json::from_str(r#"{"query":"foo"}"#).expect("query field");
+        assert_eq!(via_query.query, "foo");
+
+        let via_pattern: GrepParams =
+            serde_json::from_str(r#"{"pattern":"foo"}"#).expect("pattern alias");
+        assert_eq!(via_pattern.query, "foo");
+    }
+
+    #[test]
+    fn find_files_params_accepts_pattern_alias() {
+        let via_query: FindFilesParams =
+            serde_json::from_str(r#"{"query":"foo"}"#).expect("query field");
+        assert_eq!(via_query.query, "foo");
+
+        let via_pattern: FindFilesParams =
+            serde_json::from_str(r#"{"pattern":"foo"}"#).expect("pattern alias");
+        assert_eq!(via_pattern.query, "foo");
     }
 }
