@@ -172,6 +172,11 @@ local function compute_layout(config)
   --   row: -1 for top/bottom (internal +1 on rows; bottom also accounts for chrome via bottom_edge)
   local center_col = math.floor((terminal_width - width) / 2)
   local center_row = top_edge + math.floor((usable_height - height) / 2)
+
+  -- At fullscreen the centering formula yields 0/top_edge, but calculate_layout_dimensions
+  -- adds +1 internally to position content. Compensate like edge-flush anchors do.
+  if width >= terminal_width then center_col = -1 end
+  if height >= usable_height then center_row = top_edge - 1 end
   local anchor_positions = {
     center = {
       col = center_col,
@@ -251,9 +256,14 @@ local function compute_layout(config)
     'layout.preview_size'
   )
 
+  local is_fullscreen = width >= terminal_width and height >= usable_height
+
   local layout_config = {
     total_width = width,
-    total_height = height,
+    -- Top/bottom preview with prompt-top has a 2-row chrome over-subtraction in
+    -- calculate_layout_dimensions (BORDER_SIZE is subtracted twice). Compensate at fullscreen.
+    total_height = (is_fullscreen and prompt_position == 'top'
+      and (preview_position == 'top' or preview_position == 'bottom')) and height + 2 or height,
     start_col = col,
     start_row = row,
     preview_position = preview_position,
@@ -300,6 +310,7 @@ local function build_window_configs(layout, config)
     row = layout.list_row,
     border = list_border,
     style = 'minimal',
+    zindex = 52,
   }
   if prompt_position == 'bottom' then
     list_cfg.title = title
@@ -328,6 +339,7 @@ local function build_window_configs(layout, config)
     row = layout.input_row,
     border = input_border,
     style = 'minimal',
+    zindex = 53,
   }
   if prompt_position == 'top' then
     input_cfg.title = title
@@ -346,6 +358,7 @@ local function build_window_configs(layout, config)
       border = border_chars,
       title = ' Preview ',
       title_pos = 'left',
+      zindex = 51,
     }
   end
 
@@ -398,7 +411,7 @@ function M.calculate_layout_dimensions(cfg)
     local list_width = math.max(0, total_width - cfg.preview_width - separator_width)
     local list_height = total_height
 
-    layout.list_col = cfg.start_col + cfg.preview_width + 3 -- +3 for borders and separator
+    layout.list_col = cfg.start_col + cfg.preview_width + 2 -- +2 for borders (shared separator column)
     layout.list_width = list_width
     layout.list_height = list_height
     layout.input_col = layout.list_col
@@ -425,7 +438,7 @@ function M.calculate_layout_dimensions(cfg)
 
     if preview_enabled then
       layout.preview = {
-        col = cfg.start_col + list_width + 3, -- +3 for borders and separator (matches original)
+        col = cfg.start_col + list_width + 2, -- +2 for borders (shared separator column)
         row = cfg.start_row + 1,
         width = cfg.preview_width,
         height = list_height,
