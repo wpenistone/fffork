@@ -134,6 +134,36 @@ impl SharedFilePicker {
         true
     }
 
+    /// Block until both the filesystem walk and post-scan indexing are
+    /// idle. When both `scanning` and `post_scan_indexing_active` are
+    /// false, no snapshot holds Arc clones of the backing buffers, so
+    /// the picker can be safely torn down.
+    pub fn wait_for_indexing_complete(&self, timeout: Duration) -> bool {
+        let (scanning, post_scan_active) = {
+            let guard = self.0.picker.read();
+            match &*guard {
+                Some(picker) => (
+                    Arc::clone(&picker.signals.scanning),
+                    Arc::clone(&picker.signals.post_scan_indexing_active),
+                ),
+                None => return true,
+            }
+        };
+
+        let start = std::time::Instant::now();
+        loop {
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            let s = scanning.load(std::sync::atomic::Ordering::Acquire);
+            let p = post_scan_active.load(std::sync::atomic::Ordering::Acquire);
+            if !s && !p {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Block until the background file watcher is ready.
     /// Returns `true` if watcher ready, `false` on timeout.
     pub fn wait_for_watcher(&self, timeout: Duration) -> bool {

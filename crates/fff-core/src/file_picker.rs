@@ -137,22 +137,22 @@ pub(crate) struct FileSync {
     files: StableVec<FileItem>,
     indexable_count: usize,
     base_count: usize,
-    /// Sorted directory table. Each entry is a unique parent directory of at
-    /// least one file in `files`. Sorted by absolute path for O(log n) lookup.
-    dirs: Vec<DirItem>,
+    /// Number of active present files that exists in the file system
+    live_count: usize,
+    /// Sorted directory table. `StableVec` so post-scan snapshots can keep
+    /// the allocation alive across a picker drop without copying, and so
+    /// concurrent readers observe a consistent view via the same shared
+    /// allocation. Dir frecency is updated through the per-entry atomic
+    /// (`DirItem::max_access_frecency`) without `&mut` aliasing.
+    dirs: StableVec<DirItem>,
     /// Shared builder for overflow file paths. Each overflow file's ChunkedString
     /// uses `arena_override` pointing into this builder's arena.
     overflow_builder: Option<crate::simd_path::ChunkedPathStoreBuilder>,
-    /// Compressed bigram inverted index built during the post-scan phase.
-    /// Lives here so that replacing `FileSync` on rescan automatically drops
-    /// the stale index (bigram file indices are positions in `files`).
     bigram_index: Option<Arc<BigramFilter>>,
-    /// Overlay tracking file mutations since the bigram index was built.
     bigram_overlay: Option<Arc<parking_lot::RwLock<BigramOverlay>>>,
-    /// Chunk-level deduped path store for zero-copy SIMD matching.
-    /// Each file's relative path is pre-chunked into 16-byte aligned blocks
-    /// with content-based deduplication across files.
-    chunked_paths: Option<crate::simd_path::ChunkedPathStore>,
+    /// Chunk-level deduped path store. Arc so post-scan snapshots can hold
+    /// the arena alive while iterating file paths.
+    chunked_paths: Option<Arc<crate::simd_path::ChunkedPathStore>>,
 }
 
 impl FileSync {
@@ -161,7 +161,8 @@ impl FileSync {
             files: StableVec::from_vec_with_reserve(Vec::new(), MAX_OVERFLOW_FILES),
             indexable_count: 0,
             base_count: 0,
-            dirs: Vec::new(),
+            live_count: 0,
+            dirs: StableVec::from_vec_with_reserve(Vec::new(), 0),
             overflow_builder: None,
             git_workdir: None,
             bigram_index: None,
@@ -298,41 +299,37 @@ impl FileSync {
             .map(|pos| self.base_count + pos)
     }
 
-    fn retain_files_with_arena<F>(&mut self, mut predicate: F) -> usize
+    /// Tombstone every file that matches `predicate`. No shift: the
+    /// `StableVec` is non-shifting by design, so indices and addresses
+    /// remain valid for every `Arc` clone (base+overflow). `indexable_count`
+    /// and `base_count` are deliberately NOT adjusted — they are the
+    /// partition boundaries of the physical buffer, not live counts.
+    /// Returns the number of newly-tombstoned files.
+    fn tombstone_files_with_arena<F>(&mut self, mut predicate: F) -> usize
     where
         F: FnMut(&FileItem, ArenaPtr) -> bool,
     {
         let base_arena = self.arena_base_ptr();
         let overflow_arena = self.overflow_arena_ptr();
-
-        let indexable_count = self.indexable_count;
         let base_count = self.base_count;
-        let initial_len = self.files.len();
 
-        let indexable_retained = self.files[..indexable_count]
-            .iter()
-            .filter(|f| predicate(f, base_arena))
-            .count();
-        let base_retained = self.files[indexable_count..base_count]
-            .iter()
-            .filter(|f| predicate(f, base_arena))
-            .count()
-            + indexable_retained;
-
-        self.files.retain(|f| {
-            predicate(
-                f,
-                if f.is_overflow() {
-                    overflow_arena
-                } else {
-                    base_arena
-                },
-            )
-        });
-
-        self.indexable_count = indexable_retained;
-        self.base_count = base_retained;
-        initial_len - self.files.len()
+        let mut tombstoned = 0usize;
+        for (idx, file) in self.files.iter_mut().enumerate() {
+            if file.is_deleted() {
+                continue;
+            }
+            let arena = if idx < base_count {
+                base_arena
+            } else {
+                overflow_arena
+            };
+            if predicate(file, arena) {
+                file.set_deleted(true);
+                tombstoned += 1;
+            }
+        }
+        self.live_count -= tombstoned;
+        tombstoned
     }
 }
 
@@ -340,6 +337,11 @@ impl FileItem {
     pub fn new(path: PathBuf, base_path: &Path, git_status: Option<Status>) -> (Self, String) {
         let metadata = std::fs::metadata(&path).ok();
         Self::new_with_metadata(path, base_path, git_status, metadata.as_ref())
+    }
+
+    pub fn delete(&mut self) {
+        self.set_deleted(true);
+        self.git_status = Some(Status::INDEX_DELETED); // this is not needed but cool
     }
 
     /// Create a FileItem using pre-fetched metadata to avoid a redundant stat syscall.
@@ -568,6 +570,12 @@ impl FilePicker {
         self.sync_data.files()
     }
 
+    /// Count of live (non-tombstoned) files. O(1).
+    #[inline]
+    pub fn live_file_count(&self) -> usize {
+        self.sync_data.live_count
+    }
+
     pub fn get_overflow_files(&self) -> &[FileItem] {
         self.sync_data.overflow_files()
     }
@@ -600,7 +608,7 @@ impl FilePicker {
             let mut prev_relative_path = String::new();
 
             let mut scratch_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-            for dir_item in dir_table {
+            for dir_item in dir_table.iter() {
                 let full_relative_path = dir_item.read_relative_path(arena, &mut scratch_buf);
                 let relative_path = full_relative_path.trim_end_matches(std::path::is_separator);
 
@@ -873,7 +881,7 @@ impl FilePicker {
             "Fuzzy search",
         );
 
-        let total_files = files.len();
+        let total_files = self.live_file_count();
         let location = query.location;
 
         // Get effective query for max_typos calculation (without location suffix)
@@ -1062,7 +1070,7 @@ impl FilePicker {
                     items: vec![],
                     scores: vec![],
                     total_matched,
-                    total_files: self.sync_data.files().len(),
+                    total_files: self.live_file_count(),
                     total_dirs,
                     location,
                 };
@@ -1076,7 +1084,7 @@ impl FilePicker {
                 items,
                 scores,
                 total_matched,
-                total_files: self.sync_data.files().len(),
+                total_files: self.live_file_count(),
                 total_dirs,
                 location,
             };
@@ -1277,17 +1285,15 @@ impl FilePicker {
             .post_scan_indexing_active
             .store(true, Ordering::Release);
 
-        let files = &self.sync_data.files;
-        let dirs = &self.sync_data.dirs;
         Some(PostScanUnsafeSnapshot {
-            files: files.as_ptr() as *mut FileItem,
+            files: self.sync_data.files.clone(),
+            dirs: self.sync_data.dirs.clone(),
+            arena: self.sync_data.chunked_paths.as_ref().map(Arc::clone),
             base_count: self.sync_data.base_count,
             indexable_count: self.sync_data.indexable_count,
-            dirs: dirs.as_ptr(),
-            dirs_len: dirs.len(),
-            arena: self.sync_data.arena_base_ptr(),
-            budget: &*self.cache_budget as *const _,
             base_path: self.base_path.clone(),
+            budget: Arc::clone(&self.cache_budget),
+            // to clear automatically
             post_scan_flag: Arc::clone(&self.signals.post_scan_indexing_active),
         })
     }
@@ -1325,10 +1331,12 @@ impl FilePicker {
                     if let Some(ref f) = *frecency {
                         file.update_frecency_scores(f, arena, &bp, mode)?;
                     }
-                    // Update parent dir frecency inline.
+                    // Update parent dir frecency inline. `DirItem` has an
+                    // interior-mutable atomic score, so `&self` access is
+                    // enough — no write aliasing against Arc clones.
                     let score = file.access_frecency_score as i32;
                     let dir_idx = file.parent_dir_index() as usize;
-                    if let Some(dir) = self.sync_data.dirs.get_mut(dir_idx) {
+                    if let Some(dir) = self.sync_data.dirs.get(dir_idx) {
                         dir.update_frecency_if_larger(score);
                     }
                 } else {
@@ -1362,10 +1370,10 @@ impl FilePicker {
         {
             file.update_frecency_scores(frecency_tracker, arena, &self.base_path, self.mode)?;
 
-            // Update parent dir frecency inline (only if larger).
+            // Update parent dir frecency inline (atomic, &self access).
             let score = file.access_frecency_score as i32;
             let dir_idx = file.parent_dir_index() as usize;
-            if let Some(dir) = self.sync_data.dirs.get_mut(dir_idx) {
+            if let Some(dir) = self.sync_data.dirs.get(dir_idx) {
                 dir.update_frecency_if_larger(score);
             }
         }
@@ -1424,7 +1432,7 @@ impl FilePicker {
                     "File market for modification doesn't exists or not accessible"
                 )
             })
-            .ok()?; // if we can't read metadata this file either doesn't exists or not accessible
+            .ok()?;
 
         let size = metadata.len();
         let modified_time = metadata
@@ -1433,7 +1441,8 @@ impl FilePicker {
             .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
             .map(|d| d.as_secs());
 
-        if file.is_deleted() {
+        let was_deleted = file.is_deleted();
+        if was_deleted {
             file.set_deleted(false);
         }
 
@@ -1453,7 +1462,13 @@ impl FilePicker {
             }
         }
 
-        Some(&*self.sync_data.get_file_mut(pos)?)
+        // Increment after dropping the mutable file reference so the
+        // reborrow for the return doesn't conflict.
+        if was_deleted {
+            self.sync_data.live_count += 1;
+        }
+
+        self.sync_data.files().get(pos)
     }
 
     /// Adds a new file to picker, if the file can not be added returns `None`
@@ -1497,6 +1512,7 @@ impl FilePicker {
             return None;
         }
 
+        self.sync_data.live_count += 1;
         self.sync_data.files.last()
     }
 
@@ -1507,28 +1523,23 @@ impl FilePicker {
             Ok(index) => {
                 let file = &mut self.sync_data.files[index];
                 file.set_deleted(true);
-                // Clear any cached git status — the tombstone no longer
-                // corresponds to a real worktree file, so any previously
-                // cached status (e.g. `WT_MODIFIED` from before the
-                // delete) is actively misleading. All user-facing search
-                // paths filter `is_deleted()` so this is invisible today,
-                // but keeping the invariant "tombstone ⇒ git_status=None"
-                // means a new reader that forgets the filter can't leak
-                // stale data.
                 file.git_status = None;
                 file.invalidate_mmap(&self.cache_budget);
                 if let Some(ref overlay) = self.sync_data.bigram_overlay {
                     overlay.write().delete_file(index);
                 }
+                self.sync_data.live_count -= 1;
                 true
             }
             Err(_) => {
-                // Check overflow for added files — these can be removed directly
-                // since they aren't in the base bigram index.
                 let rel = self.to_relative_path(path);
                 let rel_ref: &str = rel.as_deref().unwrap_or("");
                 if let Some(abs_pos) = self.sync_data.find_overflow_index(rel_ref) {
-                    self.sync_data.files.remove(abs_pos);
+                    let file = &mut self.sync_data.files[abs_pos];
+                    file.set_deleted(true);
+                    file.git_status = None;
+                    file.invalidate_mmap(&self.cache_budget);
+                    self.sync_data.live_count -= 1;
                     true
                 } else {
                     false
@@ -1551,8 +1562,8 @@ impl FilePicker {
             format!("{}{}", relative_dir, std::path::MAIN_SEPARATOR)
         };
 
-        self.sync_data.retain_files_with_arena(|file, arena| {
-            !file.relative_path_starts_with(arena, &dir_prefix)
+        self.sync_data.tombstone_files_with_arena(|file, arena| {
+            file.relative_path_starts_with(arena, &dir_prefix)
         })
     }
 
@@ -1641,22 +1652,25 @@ impl FileSlot {
     }
 }
 
-/// Raw pointers captured from the picker for off-lock parallel work.
-/// Created by [`FilePicker::post_scan_snapshot`]. See its safety docs.
+/// Snapshot of FilePicker state for off-lock post-scan work.
 ///
-/// Clears `post_scan_indexing_active` on drop — the flag is set by
-/// `post_scan_snapshot` and MUST only be cleared by dropping this struct.
+/// Each data field is an Arc-shared clone of the picker's backing
+/// allocation, so dropping the `FilePicker` (e.g. via
+/// `SharedFilePicker::write().take()`) cannot free memory this
+/// snapshot is still reading — UAF is impossible by construction.
+///
+/// Implements `Drop` to clear `post_scan_indexing_active`. Since only
+/// one snapshot can exist at a time (enforced by the flag check in
+/// `post_scan_snapshot`) and it is always created/dropped within
+/// `ScanJob::run`, `scan_job_running == false` implies no live snapshot.
 pub(crate) struct PostScanUnsafeSnapshot {
-    pub files: *mut FileItem,
+    pub files: StableVec<FileItem>,
+    pub dirs: StableVec<crate::types::DirItem>,
+    pub arena: Option<Arc<crate::simd_path::ChunkedPathStore>>,
+    pub budget: Arc<crate::types::ContentCacheBudget>,
     pub base_count: usize,
     pub indexable_count: usize,
-    pub dirs: *const crate::types::DirItem,
-    pub dirs_len: usize,
-    pub arena: ArenaPtr,
-    pub budget: *const crate::types::ContentCacheBudget,
     pub base_path: PathBuf,
-    /// Holds the flag reference so it is automatically flips
-    /// when the pointsr
     post_scan_flag: Arc<AtomicBool>,
 }
 
@@ -1666,8 +1680,9 @@ impl Drop for PostScanUnsafeSnapshot {
     }
 }
 
-// SAFETY: the pointers are derived from Vec/Arc storage that outlives
-// any use of this struct (guaranteed by reserve + post_scan_indexing_active).
+// SAFETY: every data field is Arc-shared and outlives the snapshot
+// via its own refcount. The mutable cast in `apply_git_status_and_frecency`
+// is consumed on the scan thread under the single-writer discipline.
 unsafe impl Send for PostScanUnsafeSnapshot {}
 unsafe impl Sync for PostScanUnsafeSnapshot {}
 
@@ -1956,12 +1971,13 @@ impl FileSync {
             files: StableVec::from_vec_with_reserve(files, MAX_OVERFLOW_FILES),
             indexable_count,
             base_count,
-            dirs,
+            live_count: base_count,
+            dirs: StableVec::from_vec_with_reserve(dirs, 0),
             overflow_builder: None,
             git_workdir,
             bigram_index: None,
             bigram_overlay: None,
-            chunked_paths: Some(chunked_paths),
+            chunked_paths: Some(Arc::new(chunked_paths)),
         })
     }
 }

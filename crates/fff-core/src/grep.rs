@@ -11,7 +11,7 @@ use crate::{
     constraints::apply_constraints,
     extract_bigrams,
     sort_buffer::sort_with_buffer,
-    types::{ContentCacheBudget, FileItem},
+    types::{ContentCacheBudget, FileItem, FileSliceExt},
 };
 use aho_corasick::AhoCorasick;
 pub use fff_grep::{
@@ -960,7 +960,7 @@ pub(crate) fn multi_grep_search<'a>(
     arena: crate::simd_path::ArenaPtr,
     overflow_arena: crate::simd_path::ArenaPtr,
 ) -> GrepResult<'a> {
-    let total_files = files.len();
+    let total_files = files.live_count();
 
     if patterns.is_empty() || patterns.iter().all(|p| p.is_empty()) {
         return GrepResult {
@@ -1859,7 +1859,7 @@ pub(crate) fn grep_search<'a>(
     arena: crate::simd_path::ArenaPtr,
     overflow_arena: crate::simd_path::ArenaPtr,
 ) -> GrepResult<'a> {
-    let total_files = files.len();
+    let total_files = files.live_count();
 
     // Extract the grep text and file constraints from the parsed query.
     // For grep, the search pattern is the original query with constraint tokens

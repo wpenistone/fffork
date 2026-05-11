@@ -105,3 +105,7 @@ harness = false
 [[bench]]
 name = "query_tracker_bench"
 harness = false
+
+[[bench]]
+name = "post_scan_bench"
+harness = false

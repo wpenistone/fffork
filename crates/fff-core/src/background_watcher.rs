@@ -587,11 +587,12 @@ fn handle_debounced_events(
         }
 
         overflow_count = picker.get_overflow_files().len();
-        info!(
-            files_updated = files_to_update_git_status.len(),
-            overflow_count, "File index changes applied",
-        );
     }
+
+    info!(
+        files_updated = files_to_update_git_status.len(),
+        overflow_count, "File index changes applied",
+    );
 
     if need_full_rescan || overflow_count > MAX_OVERFLOW_FILES {
         info!("Watcher faced limit of index overflow. Triggering rescan");

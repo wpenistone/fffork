@@ -689,14 +689,19 @@ fn bigram_overlay_coherence_overflow_file_edit_and_delete() {
         }
     }
 
-    // Verify 5 overflow remain.
+    // Verify 5 overflow remain live (tombstones still occupy slots by design —
+    // StableVec never shifts, so get_overflow_files().len() stays at 10).
     {
         let guard = shared_picker.read().unwrap();
         let picker = guard.as_ref().unwrap();
+        let live = picker
+            .get_overflow_files()
+            .iter()
+            .filter(|f| !f.is_deleted())
+            .count();
         assert_eq!(
-            picker.get_overflow_files().len(),
-            5,
-            "should have 5 overflow files after deleting 5"
+            live, 5,
+            "should have 5 live overflow files after deleting 5"
         );
     }
 

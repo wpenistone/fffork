@@ -36,6 +36,7 @@ use crate::error::Error;
 use crate::file_picker::{BACKGROUND_THREAD_POOL, FFFMode, warmup_mmaps};
 use crate::git::GitStatusCache;
 use crate::shared::{SharedFilePicker, SharedFrecency};
+use crate::simd_path::ArenaPtr;
 use crate::types::ContentCacheBudget;
 use rayon::prelude::*;
 
@@ -177,7 +178,7 @@ impl ScanJob {
         let status_handle = git_workdir.clone().map(FileSync::spawn_git_status);
         let sync = match FileSync::walk_filesystem(
             &base_path,
-            git_workdir,
+            git_workdir.clone(),
             &scanned_files_counter,
             &shared_frecency,
             mode,
@@ -189,17 +190,15 @@ impl ScanJob {
             }
         };
 
-        if signals.cancelled.load(Ordering::Acquire) {
-            info!("walk completed but picker was replaced, discarding results");
-            return;
-        }
-
-        let git_workdir = sync.git_workdir.clone();
-
         // 2. Brief write to install the freshly-walked file list.
         if let Ok(mut guard) = shared_picker.write()
             && let Some(picker) = guard.as_mut()
         {
+            if signals.cancelled.load(Ordering::Acquire) {
+                info!("scan cancelled between walk and commit, discarding");
+                return;
+            }
+
             picker.commit_new_sync(sync);
         } else {
             error!("failed to install scan results into picker");
@@ -217,7 +216,7 @@ impl ScanJob {
             rescubscribe_watcher_post_scan(&shared_picker);
         }
 
-        // 3. Apply git status + frecency off-lock.
+        // 3. Apply git status from the parallel index. This is very fast and doesn't lock
         if !signals.cancelled.load(Ordering::Acquire)
             && let Some(status_handle) = status_handle
         {
@@ -255,13 +254,7 @@ impl ScanJob {
         }
 
         // 6. Drain any rescan that arrived while we were busy.
-        //
-        // `trigger_full_rescan_async` sets `rescan_pending` whenever a
-        // caller asks for a rescan while `ScanJob::new` would have
-        // returned `Ok(None)` (scan active *or* post-scan busy). We
-        // consume the flag with `swap` so concurrent requests that land
-        // between the check and the follow-up spawn are still captured
-        // by the next invocation.
+        // if user initiated a new rescan we had no way to cancel current post scan, so do it again
         if !signals.cancelled.load(Ordering::Acquire)
             && signals.rescan_pending.swap(false, Ordering::AcqRel)
         {
@@ -271,11 +264,10 @@ impl ScanJob {
                     follow_up.spawn();
                 }
                 Ok(None) => {
-                    // Another scan slipped in between our post-scan exit
-                    // and the `new()` call above. That scan will drain
-                    // the flag we just cleared — but we re-arm it so it
-                    // does.
-                    signals.rescan_pending.store(true, Ordering::Release);
+                    // this should be practically impossible because we do not have any
+                    // queue, but if somehow a new rescan was triggered JUST IN THIS MOMENT
+                    // just ignore it because the ongoing one is fresh enough
+                    tracing::warn!("Post scan was re-triggered, ignoring");
                 }
                 Err(e) => {
                     error!(?e, "Failed to reschedule deferred rescan");
@@ -307,28 +299,22 @@ impl ScanJob {
             return;
         };
 
-        let files: &[crate::types::FileItem] = unsafe {
-            std::slice::from_raw_parts(unsafe_snapshot.files, unsafe_snapshot.base_count)
-        };
-        let budget: &ContentCacheBudget = unsafe { &*unsafe_snapshot.budget };
+        let arena = unsafe_snapshot
+            .arena
+            .as_ref()
+            .map(|s| s.as_arena_ptr())
+            .unwrap_or(ArenaPtr::null());
+        let budget: &ContentCacheBudget = &unsafe_snapshot.budget;
+        let files: &[crate::types::FileItem] = &unsafe_snapshot.files[..unsafe_snapshot.base_count];
 
         if config.warmup && !signals.cancelled.load(Ordering::Acquire) {
-            warmup_mmaps(
-                files,
-                budget,
-                &unsafe_snapshot.base_path,
-                unsafe_snapshot.arena,
-            );
+            warmup_mmaps(files, budget, &unsafe_snapshot.base_path, arena);
         }
 
         if config.content_indexing && !signals.cancelled.load(Ordering::Acquire) {
             let indexable_files = &files[..unsafe_snapshot.indexable_count.min(files.len())];
-            let (index, content_binary) = build_bigram_index(
-                indexable_files,
-                budget,
-                &unsafe_snapshot.base_path,
-                unsafe_snapshot.arena,
-            );
+            let (index, content_binary) =
+                build_bigram_index(indexable_files, budget, &unsafe_snapshot.base_path, arena);
 
             if let Ok(mut guard) = shared_picker.write()
                 && let Some(picker) = guard.as_mut()
@@ -338,28 +324,6 @@ impl ScanJob {
                         file.set_binary(true);
                     }
                 }
-                picker.set_bigram_index(index, BigramOverlay::new(unsafe_snapshot.indexable_count));
-            }
-        }
-
-        if config.content_indexing && !signals.cancelled.load(Ordering::Acquire) {
-            let indexable_files = &files[..unsafe_snapshot.indexable_count.min(files.len())];
-            let (index, content_binary) = build_bigram_index(
-                indexable_files,
-                budget,
-                &unsafe_snapshot.base_path,
-                unsafe_snapshot.arena,
-            );
-
-            if let Ok(mut guard) = shared_picker.write()
-                && let Some(picker) = guard.as_mut()
-            {
-                for &idx in &content_binary {
-                    if let Some(file) = picker.get_file_mut(idx) {
-                        file.set_binary(true);
-                    }
-                }
-
                 picker.set_bigram_index(index, BigramOverlay::new(unsafe_snapshot.indexable_count));
             }
         }
@@ -429,7 +393,10 @@ fn apply_git_status_and_frecency(
         }
     };
 
-    let Some(unsafe_snapshot) = shared_picker.read().ok().and_then(|guard| {
+    // Safety:
+    // apply_git_status_and_frecency is not causing any reallocas, does only sparse
+    // disjoint updates which is absolutely safe
+    let Some(mut unsafe_snapshot) = shared_picker.read().ok().and_then(|guard| {
         guard
             .as_ref()
             .and_then(|picker| unsafe { picker.post_scan_snapshot() })
@@ -440,11 +407,16 @@ fn apply_git_status_and_frecency(
     let frecency = shared_frecency.read().ok();
     let frecency_ref = frecency.as_ref().and_then(|f| f.as_ref());
 
-    let files: &mut [crate::types::FileItem] = unsafe {
-        std::slice::from_raw_parts_mut(unsafe_snapshot.files, unsafe_snapshot.base_count)
-    };
-    let dirs: &[crate::types::DirItem] =
-        unsafe { std::slice::from_raw_parts(unsafe_snapshot.dirs, unsafe_snapshot.dirs_len) };
+    let base_count = unsafe_snapshot.base_count;
+    let files: &mut [crate::types::FileItem] = &mut unsafe_snapshot.files[..base_count];
+    // Dir frecency goes through per-entry `AtomicI32`; a shared slice is
+    // enough and avoids any `&mut` aliasing against the Arc-shared buffer.
+    let dirs: &[crate::types::DirItem] = &unsafe_snapshot.dirs;
+    let arena = unsafe_snapshot
+        .arena
+        .as_ref()
+        .map(|s| s.as_arena_ptr())
+        .unwrap_or(ArenaPtr::null());
 
     // Reset dir frecency before recomputation.
     for dir in dirs.iter() {
@@ -454,20 +426,13 @@ fn apply_git_status_and_frecency(
     BACKGROUND_THREAD_POOL.install(|| {
         files.par_iter_mut().for_each(|file| {
             let mut buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-            let absolute_path = file.write_absolute_path(
-                unsafe_snapshot.arena,
-                &unsafe_snapshot.base_path,
-                &mut buf,
-            );
+            let absolute_path =
+                file.write_absolute_path(arena, &unsafe_snapshot.base_path, &mut buf);
 
             file.git_status = git_cache.lookup_status(absolute_path);
             if let Some(frecency) = frecency_ref {
-                let _ = file.update_frecency_scores(
-                    frecency,
-                    unsafe_snapshot.arena,
-                    &unsafe_snapshot.base_path,
-                    mode,
-                );
+                let _ =
+                    file.update_frecency_scores(frecency, arena, &unsafe_snapshot.base_path, mode);
             }
 
             let score = file.access_frecency_score as i32;
