@@ -226,7 +226,6 @@ pub unsafe extern "C" fn fff_create_instance2(
                 if let Err(e) = shared_frecency.init(tracker) {
                     return FffResult::err(&format!("Failed to acquire frecency lock: {}", e));
                 }
-                let _ = shared_frecency.spawn_gc(frecency_path.clone());
             }
             Err(e) => return FffResult::err(&format!("Failed to init frecency db: {}", e)),
         }

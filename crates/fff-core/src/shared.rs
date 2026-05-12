@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::time::{Duration, Instant};
 
+use crate::dbs::lmdb::spawn_lmdb_gc;
 use crate::error::Error;
 use crate::file_picker::FilePicker;
 use crate::frecency::FrecencyTracker;
@@ -292,19 +293,20 @@ impl SharedFrecency {
         self.inner.write().map_err(|_| Error::AcquireFrecencyLock)
     }
 
-    /// Initialize the frecency tracker. No-op if this is a disabled instance.
     pub fn init(&self, tracker: FrecencyTracker) -> Result<(), Error> {
         if !self.enabled {
             return Ok(());
         }
-        let mut guard = self.write()?;
-        *guard = Some(tracker);
-        Ok(())
-    }
 
-    /// Spawn a background GC thread for this frecency tracker.
-    pub fn spawn_gc(&self, db_path: String) -> crate::Result<std::thread::JoinHandle<()>> {
-        FrecencyTracker::spawn_gc(self.clone(), db_path)
+        {
+            let mut guard = self.write()?;
+            *guard = Some(tracker);
+        }
+
+        // GC holds a read guard on this lock, so destroy / re-init wait
+        // for it naturally — no join handle, no race against file removal.
+        spawn_lmdb_gc(self.inner.clone());
+        Ok(())
     }
 
     /// Drop the in-memory tracker and delete the on-disk database directory.
@@ -371,17 +373,22 @@ impl SharedQueryTracker {
         self.inner.write().map_err(|_| Error::AcquireFrecencyLock)
     }
 
-    /// Initialize the query tracker. No-op if this is a disabled instance.
+    /// Initialize the query tracker + spawn GC in the background.
+    /// No-op if this is a disabled instance.
     pub fn init(&self, tracker: QueryTracker) -> Result<(), Error> {
         if !self.enabled {
             return Ok(());
         }
-        let mut guard = self.write()?;
-        *guard = Some(tracker);
+        {
+            let mut guard = self.write()?;
+            *guard = Some(tracker);
+        }
+
+        spawn_lmdb_gc(self.inner.clone());
         Ok(())
     }
 
-    /// Drop the in-memory tracker and delete the on-disk database directory.
+    ///Drop the in-memory tracker and delete the on-disk database directory.
     ///
     /// Acquires the write lock, ensuring all readers (including any active mmap
     /// access) are finished before the LMDB environment is closed and the files
