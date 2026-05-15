@@ -361,6 +361,8 @@ export interface GrepOptions {
   beforeContext?: number;
   /** Number of context lines to include after each match (default: 0) */
   afterContext?: number;
+  /** Maximum matches to return in this page across all files (default: 50) */
+  pageSize?: number;
 }
 
 /**
@@ -457,4 +459,6 @@ export interface MultiGrepOptions {
   beforeContext?: number;
   /** Number of context lines to include after each match (default: 0) */
   afterContext?: number;
+  /** Maximum matches to return in this page across all files (default: 50) */
+  pageSize?: number;
 }

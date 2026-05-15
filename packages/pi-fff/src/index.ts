@@ -455,8 +455,7 @@ export default function fffExtension(pi: ExtensionAPI) {
     if (!shouldEnableMentions()) return;
 
     ctx.ui.setEditorComponent(
-      (tui: any, theme: any, keybindings: any) =>
-        new FffEditor(tui, theme, keybindings),
+      (tui: any, theme: any, keybindings: any) => new FffEditor(tui, theme, keybindings),
     );
   }
 

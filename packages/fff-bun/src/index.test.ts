@@ -199,6 +199,28 @@ describe("FileFinder - Full Lifecycle", () => {
     }
   });
 
+  test("grep respects pageSize option", () => {
+    // Cap to one match per file so pageSize bounds the total deterministically.
+    const unbounded = finder.grep("import", {
+      mode: "plain",
+      maxMatchesPerFile: 1,
+    });
+    expect(unbounded.ok).toBe(true);
+    if (!unbounded.ok) return;
+    expect(unbounded.value.items.length).toBeGreaterThan(2);
+
+    const limited = finder.grep("import", {
+      mode: "plain",
+      maxMatchesPerFile: 1,
+      pageSize: 2,
+    });
+    expect(limited.ok).toBe(true);
+    if (!limited.ok) return;
+    expect(limited.value.items.length).toBeLessThanOrEqual(2);
+    expect(limited.value.items.length).toBeLessThan(unbounded.value.items.length);
+    expect(limited.value.nextCursor).not.toBeNull();
+  });
+
   test("grep fuzzy mode returns results with scores", () => {
     // Intentional typo: "depdnency" instead of "dependency" to exercise fuzzy matching
     const result = finder.grep("depdnency", {

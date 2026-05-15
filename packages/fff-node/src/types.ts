@@ -364,6 +364,8 @@ export interface GrepOptions {
    * without a TS-side regex port. (default: false)
    */
   classifyDefinitions?: boolean;
+  /** Maximum matches to return in this page across all files (default: 50) */
+  pageSize?: number;
 }
 
 /**
@@ -467,4 +469,6 @@ export interface MultiGrepOptions {
    * and expose it via `GrepMatch.isDefinition`. (default: false)
    */
   classifyDefinitions?: boolean;
+  /** Maximum matches to return in this page across all files (default: 50) */
+  pageSize?: number;
 }

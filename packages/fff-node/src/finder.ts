@@ -321,7 +321,7 @@ export class FileFinder {
       options?.maxMatchesPerFile ?? 0,
       options?.smartCase ?? true,
       options?.cursor?._offset ?? 0,
-      0, // page_limit (0 = default 50)
+      options?.pageSize ?? 0,
       options?.timeBudgetMs ?? 0,
       options?.beforeContext ?? 0,
       options?.afterContext ?? 0,
@@ -370,7 +370,7 @@ export class FileFinder {
       options.maxMatchesPerFile ?? 0,
       options.smartCase ?? true,
       options.cursor?._offset ?? 0,
-      0, // page_limit (0 = default 50)
+      options.pageSize ?? 0,
       options.timeBudgetMs ?? 0,
       options.beforeContext ?? 0,
       options.afterContext ?? 0,

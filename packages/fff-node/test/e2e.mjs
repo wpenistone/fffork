@@ -170,6 +170,29 @@ describe("fff-node", { concurrency: 1 }, () => {
       }
     });
 
+    it("respects pageSize", () => {
+      // Cap to one match per file so pageSize bounds the total deterministically.
+      const unbounded = finder.grep("fn", { mode: "plain", maxMatchesPerFile: 1 });
+      assert.ok(unbounded.ok, `grep failed: ${!unbounded.ok ? unbounded.error : ""}`);
+      assert.ok(unbounded.value.items.length > 2);
+
+      const limited = finder.grep("fn", {
+        mode: "plain",
+        maxMatchesPerFile: 1,
+        pageSize: 2,
+      });
+      assert.ok(limited.ok, `grep failed: ${!limited.ok ? limited.error : ""}`);
+      assert.ok(
+        limited.value.items.length <= 2,
+        `expected <=2 items, got ${limited.value.items.length}`,
+      );
+      assert.ok(
+        limited.value.items.length < unbounded.value.items.length,
+        "limited page should yield fewer matches than the default",
+      );
+      assert.ok(limited.value.nextCursor !== null, "nextCursor should be set");
+    });
+
     it("regex mode matches pub fn declarations", () => {
       const r = finder.grep("pub fn \\w+", { mode: "regex" });
       assert.ok(r.ok, `regex grep failed: ${!r.ok ? r.error : ""}`);
