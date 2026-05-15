@@ -913,8 +913,18 @@ local function move_list_cursor(direction)
   local items = M.state.filtered_items
   if #items == 0 then return end
 
+  local wrap_around = M.state.config and M.state.config.wrap_around or false
   local new_cursor = M.state.cursor + direction
-  new_cursor = math.max(1, math.min(new_cursor, #items))
+
+  if wrap_around then
+    if new_cursor < 1 then
+      new_cursor = #items
+    elseif new_cursor > #items then
+      new_cursor = 1
+    end
+  else
+    new_cursor = math.max(1, math.min(new_cursor, #items))
+  end
 
   if new_cursor ~= M.state.cursor then
     M.state.cursor = new_cursor
@@ -2048,12 +2058,60 @@ function M.update_status(progress)
   })
 end
 
+--- Wrap cursor to the first page, first item (best result)
+function M.wrap_to_first()
+  if M.state.pagination.page_index == 0 then
+    -- Already on first page, just move cursor
+    M.state.cursor = 1
+    return true
+  end
+
+  -- For non-grep mode, jump directly to page 0
+  if M.state.mode ~= 'grep' then
+    return M.load_page_at_index(0, function() M.state.cursor = 1 end)
+  end
+
+  -- For grep mode, we can only go back if page 0 offset is recorded
+  if M.state.pagination.grep_file_offsets[1] ~= nil then
+    return M.load_page_at_index(0, function() M.state.cursor = 1 end)
+  end
+
+  M.state.cursor = 1
+  return true
+end
+
+--- Wrap cursor to the last page, last item (worst result)
+function M.wrap_to_last()
+  local page_size = M.state.pagination.page_size
+  if page_size == 0 then return false end
+
+  if M.state.mode ~= 'grep' then
+    local total = M.state.pagination.total_matched
+    if total == 0 then return false end
+    local max_page_index = math.max(0, math.ceil(total / page_size) - 1)
+
+    if M.state.pagination.page_index == max_page_index then
+      -- Already on last page, just move cursor to last item
+      M.state.cursor = #M.state.filtered_items
+      return true
+    end
+
+    return M.load_page_at_index(max_page_index, function(result_count) M.state.cursor = result_count end)
+  end
+
+  -- For grep mode, we can't jump to last page (sequential offsets required)
+  -- Just wrap within current page
+  M.state.cursor = #M.state.filtered_items
+  return true
+end
+
 function M.move_up()
   if not M.state.active then return end
   if #M.state.filtered_items == 0 then return end
 
   local prompt_position = get_prompt_position()
   local items_count = #M.state.filtered_items
+  local wrap_around = M.state.config and M.state.config.wrap_around or false
 
   -- Pagination logic depends on prompt position
   if prompt_position == 'bottom' then
@@ -2064,32 +2122,41 @@ function M.move_up()
 
     if near_bottom and at_last_item then
       local page_size = M.state.pagination.page_size
+      local has_more = false
       if page_size > 0 then
-        local has_more
         if M.state.mode == 'grep' then
           has_more = M.state.pagination.grep_next_file_offset > 0
         else
           local max_page = math.max(0, math.ceil(M.state.pagination.total_matched / page_size) - 1)
           has_more = M.state.pagination.page_index < max_page
         end
-        if has_more then
-          M.load_next_page()
-          return
-        end
       end
-    end
 
-    M.state.cursor = math.min(M.state.cursor + 1, items_count)
+      if has_more then
+        -- More pages available: paginate normally
+        M.load_next_page()
+        return
+      elseif wrap_around then
+        -- At global end (last item on last page): wrap to first
+        M.wrap_to_first()
+      end
+    else
+      M.state.cursor = math.min(M.state.cursor + 1, items_count)
+    end
   else
     -- Top prompt: scrolling UP means going to BETTER results (previous page)
     if M.state.cursor <= M.state.pagination.prefetch_margin + 1 and M.state.cursor <= 1 then
       if M.state.pagination.page_index > 0 then
+        -- More pages available: paginate normally
         vim.schedule(M.load_previous_page)
         return
+      elseif wrap_around then
+        -- At global start (first item on first page): wrap to last
+        M.wrap_to_last()
       end
+    else
+      M.state.cursor = math.max(M.state.cursor - 1, 1)
     end
-
-    M.state.cursor = math.max(M.state.cursor - 1, 1)
   end
 
   M.render_list()
@@ -2119,6 +2186,7 @@ function M.move_down()
 
   local prompt_position = get_prompt_position()
   local items_count = #M.state.filtered_items
+  local wrap_around = M.state.config and M.state.config.wrap_around or false
 
   -- Pagination logic depends on prompt position
   if prompt_position == 'bottom' then
@@ -2126,12 +2194,16 @@ function M.move_down()
     -- because lower index items (better) are rendered at higher line numbers
     if M.state.cursor <= M.state.pagination.prefetch_margin + 1 and M.state.cursor <= 1 then
       if M.state.pagination.page_index > 0 then
+        -- More pages available: paginate normally
         vim.schedule(M.load_previous_page)
         return
+      elseif wrap_around then
+        -- At global start (first item on first page): wrap to last
+        M.wrap_to_last()
       end
+    else
+      M.state.cursor = math.max(M.state.cursor - 1, 1)
     end
-
-    M.state.cursor = math.max(M.state.cursor - 1, 1)
   else
     -- Top prompt: scrolling DOWN means going to WORSE results (next page)
     local near_bottom = M.state.cursor >= (items_count - M.state.pagination.prefetch_margin)
@@ -2139,22 +2211,27 @@ function M.move_down()
 
     if near_bottom and at_last_item then
       local page_size = M.state.pagination.page_size
+      local has_more = false
       if page_size > 0 then
-        local has_more
         if M.state.mode == 'grep' then
           has_more = M.state.pagination.grep_next_file_offset > 0
         else
           local max_page = math.max(0, math.ceil(M.state.pagination.total_matched / page_size) - 1)
           has_more = M.state.pagination.page_index < max_page
         end
-        if has_more then
-          M.load_next_page()
-          return
-        end
       end
-    end
 
-    M.state.cursor = math.min(M.state.cursor + 1, items_count)
+      if has_more then
+        -- More pages available: paginate normally
+        M.load_next_page()
+        return
+      elseif wrap_around then
+        -- At global end (last item on last page): wrap to first
+        M.wrap_to_first()
+      end
+    else
+      M.state.cursor = math.min(M.state.cursor + 1, items_count)
+    end
   end
 
   M.render_list()
