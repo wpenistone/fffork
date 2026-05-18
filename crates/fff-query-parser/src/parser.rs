@@ -1169,6 +1169,42 @@ mod tests {
     }
 
     #[test]
+    fn test_grep_reversed_braces_does_not_panic() {
+        // BUG PINING https://github.com/dmtrKovalenko/fff/issues/479
+        // we should support any combination of different brackets without crashes
+        for query in [
+            "}{",
+            "}{ foo",
+            "foo }{",
+            "a}{b",
+            "}}{{",
+            "} something {{{ {}}}d{ {}}}}{{{    }}}}}d{d    something {{}}}}}}",
+        ] {
+            let result = QueryParser::new(GrepConfig).parse(query);
+            // A reversed-brace token must not be promoted to a Glob — there
+            // is no comma+letters between `{` and `}`, so it's just text.
+            assert!(
+                !result
+                    .constraints
+                    .iter()
+                    .any(|c| matches!(c, Constraint::Glob(_))),
+                "GrepConfig: {query:?} produced a Glob constraint, got {:?}",
+                result.constraints
+            );
+
+            let result = QueryParser::new(crate::AiGrepConfig).parse(query);
+            assert!(
+                !result
+                    .constraints
+                    .iter()
+                    .any(|c| matches!(c, Constraint::Glob(_))),
+                "AiGrepConfig: {query:?} produced a Glob constraint, got {:?}",
+                result.constraints
+            );
+        }
+    }
+
+    #[test]
     fn test_grep_braces_without_comma_is_text() {
         let parser = QueryParser::new(GrepConfig);
         // Code patterns like format!("{}") should NOT be treated as brace expansion
@@ -1179,6 +1215,49 @@ mod tests {
             result.constraints
         );
         assert_eq!(result.grep_text(), r#"format!("{}\\AppData", home)"#);
+    }
+
+    #[test]
+    fn test_grep_valid_brace_expansion_amid_junk_braces() {
+        // A query mixing junk-brace tokens (`}{`, `{{}}`, `}}{{`, `{}`) with
+        // a real brace-expansion glob (`{src,lib}`) must NOT panic and MUST
+        // still surface the valid glob as a Glob constraint. Regression for
+        // the `}{` slice-out-of-bounds panic at config.rs:175.
+        let parser = QueryParser::new(GrepConfig);
+        let result = parser.parse("}{ {{}} }}{{ {} {src,lib} pattern");
+
+        let glob_constraints: Vec<&str> = result
+            .constraints
+            .iter()
+            .filter_map(|c| match c {
+                Constraint::Glob(p) => Some(*p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            glob_constraints,
+            vec!["{src,lib}"],
+            "Expected exactly one Glob({{src,lib}}), got {:?}",
+            result.constraints
+        );
+
+        // Same scenario for AiGrepConfig (delegates to GrepConfig::is_glob_pattern).
+        let parser = QueryParser::new(crate::AiGrepConfig);
+        let result = parser.parse("}{ {{}} }}{{ {} {src,lib} pattern");
+        let glob_constraints: Vec<&str> = result
+            .constraints
+            .iter()
+            .filter_map(|c| match c {
+                Constraint::Glob(p) => Some(*p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            glob_constraints,
+            vec!["{src,lib}"],
+            "AiGrepConfig: expected Glob({{src,lib}}), got {:?}",
+            result.constraints
+        );
     }
 
     #[test]
