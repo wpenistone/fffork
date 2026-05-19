@@ -102,7 +102,7 @@ The Pi extension swaps pi's native tools for FFF implementations and feeds the i
 
 <details id="neovim-plugin">
 <summary>
-<h2>Neovim plugin</h2>
+<h2>fff.nvim</h2>
 </summary>
 
 Demo on the Linux kernel repo (100k files, 8GB):

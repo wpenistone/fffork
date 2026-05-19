@@ -362,8 +362,7 @@ jobs:
     name: Release
     needs: [build-nvim, build-c, build-mcp]
     runs-on: ubuntu-latest
-    # do not create releases on the forks (no permissions)
-    if: github.event_name != 'pull_request' || github.event.pull_request.user.login == 'dmtrKovalenko'
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/download-version' || startsWith(github.ref, 'refs/tags/v'))
     permissions:
       contents: write
     steps:
@@ -470,9 +469,7 @@ jobs:
     name: Publish Rust crates
     needs: [build-nvim, build-c, build-mcp]
     runs-on: ubuntu-latest
-    if: >-
-      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/download-version' || startsWith(github.ref, 'refs/tags/v')))
-      || (github.event_name == 'pull_request' && github.head_ref == 'main')
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/download-version' || startsWith(github.ref, 'refs/tags/v'))
 
     steps:
       - uses: actions/checkout@v5
@@ -499,9 +496,7 @@ jobs:
     name: Publish npm packages
     needs: [build-c]
     runs-on: ubuntu-latest
-    if: >-
-      (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/download-version' || startsWith(github.ref, 'refs/tags/v')))
-      || (github.event_name == 'pull_request' && github.head_ref == 'main')
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/download-version' || startsWith(github.ref, 'refs/tags/v'))
     permissions:
       contents: read
     steps:
