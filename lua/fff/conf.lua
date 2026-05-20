@@ -213,11 +213,12 @@ local function init()
       },
       show_scrollbar = true, -- Show scrollbar for pagination
       -- How to shorten long directory paths in the file list:
-      -- 'middle_number' (default): uses dots for 1-3 hidden (a/./b, a/../b, a/.../b)
-      --                            and numbers for 4+ (a/.4./b, a/.5./b)
-      -- 'middle': always uses dots (a/./b, a/../b, a/.../b)
-      -- 'end': truncates from the end (home/user/projects)
-      path_shorten_strategy = 'middle_number',
+      -- 'middle' (default): always uses dots (a/./b, a/../b, a/.../b)
+      -- 'middle_number' uses dots for 1-3 hidden (a/./b, a/../b, a/.../b)
+      --                 and numbers for 4+ (a/.4./b, a/.5./b)
+      -- 'end': truncates from the end, keeps the start (home/user/projects)
+      -- 'start': truncates from the start, keeps the end (.../parts/ai_extracted)
+      path_shorten_strategy = 'middle',
     },
     preview = {
       enabled = true,
