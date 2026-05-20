@@ -14,20 +14,15 @@ local M = {}
 --- @field access_frecency_score number Access-based frecency score
 --- @field modification_frecency_score number Modification-based frecency score
 --- @field git_status string|nil Git status string (e.g. 'modified', 'untracked') if file is in git repo
---- internal:
---- @field _has_group_header boolean Internal flag for render_line to indicate if this item has a combo header line (not from Rust)
 
 --- Render a file item line
 --- @param item FileItem File item from Rust
 --- @param ctx ListRenderContext Render context with all state
---- @param item_idx number Item index (1-based)
---- @return string[] Array of line strings (1 or 2 lines if combo)
-function M.render_line(item, ctx, item_idx)
+--- @param _item_idx number Item index (1-based)
+--- @return string[] Array of line strings (always exactly 1)
+function M.render_line(item, ctx, _item_idx)
   local icons = require('fff.file_picker.icons')
   local lines = {}
-
-  local has_combo = item_idx == 1 and ctx.has_combo and ctx.combo_header_line
-  if has_combo then table.insert(lines, ctx.combo_header_line) end
 
   local icon, _ = icons.get_icon(item.name, item.extension, false)
 

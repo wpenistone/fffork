@@ -6,6 +6,7 @@ local preview = require('fff.file_picker.preview')
 local utils = require('fff.utils')
 local location_utils = require('fff.location_utils')
 local combo_renderer = require('fff.combo_renderer')
+local list_separator = require('fff.list_separator')
 local list_renderer = require('fff.list_renderer')
 local scrollbar = require('fff.scrollbar')
 local rust = require('fff.rust')
@@ -40,24 +41,52 @@ local BORDER_PRESETS = {
 }
 
 local T_JUNCTION_PRESETS = {
-  single = { '├', '┤' },
-  double = { '╠', '╣' },
-  rounded = { '├', '┤' }, -- Rounded only affects corners
-  solid = { '▌', '▐' },
-  shadow = { '', '' },
-  none = { '', '' },
+  single = { '├', '┤', '┬', '┴', '┼' },
+  double = { '╠', '╣', '╦', '╩', '╬' },
+  rounded = { '├', '┤', '┬', '┴', '┼' },
+  solid = { '▌', '▐', '▀', '▄', '█' },
+  shadow = { '', '', '', '', '' },
+  none = { '', '', '', '', '' },
 }
 
 --- Get border characters from vim.o.winborder for custom connected borders
 --- @return table Array of 8 border characters
---- @return table Array of 2 T-junction characters (left, right)
+--- @return table Array of 5 T-junction characters (left, right, top, bottom, cross)
 local function get_border_chars()
   local winborder = vim.o.winborder or 'single'
 
   if BORDER_PRESETS[winborder] then return BORDER_PRESETS[winborder], T_JUNCTION_PRESETS[winborder] end
-
-  -- Fallback to single for unknown border styles
   return BORDER_PRESETS.single, T_JUNCTION_PRESETS.single
+end
+
+--- Resolve a corner glyph based on adjacency flags. Each neighbour flag means
+--- another float shares the edge meeting at that corner, so the corner needs
+--- to extend a stem in that direction instead of being a plain corner.
+--- @param corner string Default corner glyph (e.g. '┌')
+--- @param chars table Border preset
+--- @param j table T-junction preset { left, right, top, bottom, cross }
+--- @param which 'tl'|'tr'|'bl'|'br' Which corner we're computing
+--- @param n table { up=bool, down=bool, left=bool, right=bool } adjacency
+--- @return string
+local function resolve_corner(corner, chars, j, which, n)
+  -- Stems present at this corner from the float's own borders.
+  local stems = {
+    tl = { down = chars[8] ~= '', right = chars[2] ~= '' },
+    tr = { down = chars[4] ~= '', left = chars[2] ~= '' },
+    bl = { up = chars[8] ~= '', right = chars[6] ~= '' },
+    br = { up = chars[4] ~= '', left = chars[6] ~= '' },
+  }
+  local s = stems[which]
+  -- Compose final stems from own + neighbours
+  local up = s.up or n.up
+  local down = s.down or n.down
+  local left = s.left or n.left
+  local right = s.right or n.right
+  local count = (up and 1 or 0) + (down and 1 or 0) + (left and 1 or 0) + (right and 1 or 0)
+  if count >= 4 then return j[5] end
+  if up and down and (left or right) then return left and j[2] or j[1] end
+  if left and right and (up or down) then return up and j[4] or j[3] end
+  return corner
 end
 
 local function get_prompt_position()
@@ -98,7 +127,7 @@ local function get_preview_position()
 
     local flex = config.layout.flex
     if flex then
-      local size = flex.size or 130
+      local size = flex.size or 80
       local wrap = flex.wrap or 'top'
       if terminal_width < size then return wrap end
     end
@@ -291,19 +320,65 @@ end
 local function build_window_configs(layout, config)
   local border_chars, t_junctions = get_border_chars()
   local prompt_position = get_prompt_position()
+  local preview_position = get_preview_position()
+  local has_preview = layout.preview ~= nil
   local title = ' ' .. (config.title or 'FFFiles') .. ' '
 
-  -- List border: when prompt at bottom, list has top+sides (no bottom); when top, T-junctions at top
+  -- Adjacency flags. Used to decide which corners need T-junctions because a
+  -- neighbouring float shares that edge.
+  local list_neighbour_input_top = prompt_position == 'top'
+  local list_neighbour_input_bottom = prompt_position == 'bottom'
+  local list_neighbour_preview_top = has_preview and preview_position == 'top'
+  local list_neighbour_preview_bottom = has_preview and preview_position == 'bottom'
+  local list_neighbour_preview_left = has_preview and preview_position == 'left'
+  local list_neighbour_preview_right = has_preview and preview_position == 'right'
+
+  -- A side preview shares a *column* (vertical) with the list. Express that
+  -- as up+down neighbour stems on the corners next to that column. The
+  -- horizontal-side stem (`left`/`right`) is only added when the corner row
+  -- is also the preview's top/bottom edge row — i.e. the picker's outer
+  -- top/bottom edge AND no input/preview is stacked above/below the list at
+  -- that side.
+  local list_top_at_picker_top = (not list_neighbour_preview_top) and not list_neighbour_input_top
+  local list_bottom_at_picker_bottom = (not list_neighbour_preview_bottom) and not list_neighbour_input_bottom
+
+  -- Top corners only get an `up` stem if something is genuinely above this
+  -- row (input or preview stacked above). A side preview shares the column
+  -- but starts at the same top row, so it contributes a `down` stem only.
+  local corners = {
+    tl = resolve_corner(border_chars[1], border_chars, t_junctions, 'tl', {
+      up = list_neighbour_preview_top or list_neighbour_input_top,
+      down = list_neighbour_preview_left,
+      left = list_neighbour_preview_left and list_top_at_picker_top,
+    }),
+    tr = resolve_corner(border_chars[3], border_chars, t_junctions, 'tr', {
+      up = list_neighbour_preview_top or list_neighbour_input_top,
+      down = list_neighbour_preview_right,
+      right = list_neighbour_preview_right and list_top_at_picker_top,
+    }),
+    br = resolve_corner(border_chars[5], border_chars, t_junctions, 'br', {
+      down = list_neighbour_preview_bottom or list_neighbour_input_bottom,
+      up = list_neighbour_preview_right,
+      right = list_neighbour_preview_right and list_bottom_at_picker_bottom,
+    }),
+    bl = resolve_corner(border_chars[7], border_chars, t_junctions, 'bl', {
+      down = list_neighbour_preview_bottom or list_neighbour_input_bottom,
+      up = list_neighbour_preview_left,
+      left = list_neighbour_preview_left and list_bottom_at_picker_bottom,
+    }),
+  }
+
+  -- Drop the bottom row on bottom-prompt (input owns it); top row on top-prompt.
   local list_border = prompt_position == 'bottom'
-      and { border_chars[1], border_chars[2], border_chars[3], border_chars[4], '', '', '', border_chars[8] }
+      and { corners.tl, border_chars[2], corners.tr, border_chars[4], '', '', '', border_chars[8] }
     or {
-      t_junctions[1],
+      corners.tl,
       border_chars[2],
-      t_junctions[2],
+      corners.tr,
       border_chars[4],
-      border_chars[5],
+      corners.br,
       border_chars[6],
-      border_chars[7],
+      corners.bl,
       border_chars[8],
     }
 
@@ -322,19 +397,71 @@ local function build_window_configs(layout, config)
     list_cfg.title_pos = 'left'
   end
 
-  -- Input border: inverse of list border
+  -- Input is glued to the list along one row, and (when preview is on
+  -- top/bottom) it can also touch the preview on the other row. Side-by-side
+  -- previews share the input's left/right column too.
+  local input_neighbour_preview_left = has_preview and preview_position == 'left'
+  local input_neighbour_preview_right = has_preview and preview_position == 'right'
+  local input_neighbour_preview_top = has_preview and preview_position == 'top' and prompt_position == 'top'
+  local input_neighbour_preview_bottom = has_preview and preview_position == 'bottom' and prompt_position == 'bottom'
+
+  -- Side-by-side preview shares a *column* (vertical) with the input. The
+  -- preview vertical extends past the input corner on both sides, so we add
+  -- `up`/`down` neighbour stems. When the input ALSO sits at the top edge
+  -- of the picker (prompt=top) the preview top horizontal extends from the
+  -- shared corner toward the preview, so we need a horizontal stem too.
+  local input_top_at_picker_top = prompt_position == 'top'
+  local input_bottom_at_picker_bottom = prompt_position == 'bottom'
+
+  -- For each top corner figure out whether a vertical extends UP past it
+  -- (true only if the input is glued to a list/preview *above*) and whether
+  -- a horizontal extends OUT (true only if a side preview *also* shares the
+  -- same top-edge row, i.e. prompt=top with side preview).
+  local function tl_extends_up()
+    if prompt_position == 'bottom' then return true end -- list above
+    if input_neighbour_preview_top then return true end -- preview stack above
+    return false
+  end
+  local function tr_extends_up() return tl_extends_up() end
+  local function bl_extends_down()
+    if prompt_position == 'top' then return true end -- list below
+    if input_neighbour_preview_bottom then return true end -- preview stack below
+    return false
+  end
+  local function br_extends_down() return bl_extends_down() end
+
+  local function input_corners()
+    return {
+      tl = resolve_corner(border_chars[1], border_chars, t_junctions, 'tl', {
+        up = tl_extends_up(),
+        -- side preview shares the column → preview vertical extends from this
+        -- corner downward when input is at the top edge, upward when at the
+        -- bottom edge. Horizontal stem (`left`/`right`) only when the corner
+        -- row is also the preview top/bottom row (true at picker outer edge).
+        down = input_neighbour_preview_left and input_top_at_picker_top,
+        left = input_neighbour_preview_left and input_top_at_picker_top,
+      }),
+      tr = resolve_corner(border_chars[3], border_chars, t_junctions, 'tr', {
+        up = tr_extends_up(),
+        down = input_neighbour_preview_right and input_top_at_picker_top,
+        right = input_neighbour_preview_right and input_top_at_picker_top,
+      }),
+      br = resolve_corner(border_chars[5], border_chars, t_junctions, 'br', {
+        down = br_extends_down(),
+        up = input_neighbour_preview_right and input_bottom_at_picker_bottom,
+        right = input_neighbour_preview_right and input_bottom_at_picker_bottom,
+      }),
+      bl = resolve_corner(border_chars[7], border_chars, t_junctions, 'bl', {
+        down = bl_extends_down(),
+        up = input_neighbour_preview_left and input_bottom_at_picker_bottom,
+        left = input_neighbour_preview_left and input_bottom_at_picker_bottom,
+      }),
+    }
+  end
+  local ic = input_corners()
   local input_border = prompt_position == 'bottom'
-      and {
-        t_junctions[1],
-        border_chars[2],
-        t_junctions[2],
-        border_chars[4],
-        border_chars[5],
-        border_chars[6],
-        border_chars[7],
-        border_chars[8],
-      }
-    or { border_chars[1], border_chars[2], border_chars[3], border_chars[4], '', '', '', border_chars[8] }
+      and { ic.tl, border_chars[2], ic.tr, border_chars[4], ic.br, border_chars[6], ic.bl, border_chars[8] }
+    or { ic.tl, border_chars[2], ic.tr, border_chars[4], '', '', '', border_chars[8] }
 
   local input_cfg = {
     relative = 'editor',
@@ -353,6 +480,47 @@ local function build_window_configs(layout, config)
 
   local preview_cfg = nil
   if layout.preview then
+    -- Preview corners that touch the list/input column share verticals with
+    -- those floats; the other side stays a plain corner. When the debug
+    -- file_info panel is rendered above the preview, the preview's top edge
+    -- additionally meets the file_info's bottom edge.
+    local has_file_info_above = layout.file_info ~= nil
+    local preview_corners = {
+      tl = resolve_corner(border_chars[1], border_chars, t_junctions, 'tl', {
+        right = preview_position == 'left',
+        up = has_file_info_above,
+      }),
+      tr = resolve_corner(border_chars[3], border_chars, t_junctions, 'tr', {
+        left = preview_position == 'right',
+        up = has_file_info_above,
+      }),
+      br = resolve_corner(border_chars[5], border_chars, t_junctions, 'br', {
+        left = preview_position == 'right',
+      }),
+      bl = resolve_corner(border_chars[7], border_chars, t_junctions, 'bl', {
+        right = preview_position == 'left',
+      }),
+    }
+    -- For top/bottom preview position we additionally have a shared row with
+    -- the list; the matching horizontal edge gets T-junctions.
+    if preview_position == 'top' then
+      preview_corners.bl = resolve_corner(border_chars[7], border_chars, t_junctions, 'bl', { down = true })
+      preview_corners.br = resolve_corner(border_chars[5], border_chars, t_junctions, 'br', { down = true })
+    elseif preview_position == 'bottom' then
+      preview_corners.tl = resolve_corner(border_chars[1], border_chars, t_junctions, 'tl', { up = true })
+      preview_corners.tr = resolve_corner(border_chars[3], border_chars, t_junctions, 'tr', { up = true })
+    end
+    local pc = preview_corners
+    local preview_border = {
+      pc.tl,
+      border_chars[2],
+      pc.tr,
+      border_chars[4],
+      pc.br,
+      border_chars[6],
+      pc.bl,
+      border_chars[8],
+    }
     preview_cfg = {
       relative = 'editor',
       width = layout.preview.width,
@@ -360,8 +528,11 @@ local function build_window_configs(layout, config)
       col = layout.preview.col,
       row = layout.preview.row,
       style = 'minimal',
-      border = border_chars,
-      title = ' Preview ',
+      border = preview_border,
+      -- Title hidden when file_info is rendered above — its footer already
+      -- says "Preview". Otherwise show the preview title with the active
+      -- file's relative path (set in update_preview_title).
+      title = layout.file_info and '' or ' Preview ',
       title_pos = 'left',
       zindex = 51,
     }
@@ -369,6 +540,44 @@ local function build_window_configs(layout, config)
 
   local file_info_cfg = nil
   if layout.file_info then
+    -- file_info sits on top of the preview. The corner shared with the list's
+    -- right vertical (preview=right) gets a horizontal stem pointing *into*
+    -- the list at the top, so the corner reads as a `┬` instead of `┌`.
+    -- Symmetric for preview=left.
+    local list_meets_fi_left = preview_position == 'right'
+    local list_meets_fi_right = preview_position == 'left'
+    local fi_corners = {
+      tl = resolve_corner(border_chars[1], border_chars, t_junctions, 'tl', {
+        -- preview=right -> list lives to the left of file_info's tl, list
+        -- top horizontal stem points right *into* the corner.
+        left = list_meets_fi_left,
+      }),
+      tr = resolve_corner(border_chars[3], border_chars, t_junctions, 'tr', {
+        right = list_meets_fi_right,
+      }),
+      -- bl/br share a row with the preview top. The file_info bottom row IS
+      -- the preview top row, so the corner doubles as preview's top corner:
+      -- only add a `down` stem (preview vertical extends below). The list's
+      -- adjacent column has *vertical* there, not horizontal, so we don't
+      -- add a left/right stem here — the list verticals stay continuous and
+      -- the corner reads as `├` / `┤`.
+      bl = resolve_corner(border_chars[7], border_chars, t_junctions, 'bl', {
+        down = true,
+      }),
+      br = resolve_corner(border_chars[5], border_chars, t_junctions, 'br', {
+        down = true,
+      }),
+    }
+    local fi_border = {
+      fi_corners.tl,
+      border_chars[2],
+      fi_corners.tr,
+      border_chars[4],
+      fi_corners.br,
+      border_chars[6],
+      fi_corners.bl,
+      border_chars[8],
+    }
     file_info_cfg = {
       relative = 'editor',
       width = layout.file_info.width,
@@ -376,9 +585,13 @@ local function build_window_configs(layout, config)
       col = layout.file_info.col,
       row = layout.file_info.row,
       style = 'minimal',
-      border = border_chars,
+      border = fi_border,
       title = ' File Info ',
       title_pos = 'left',
+      -- Above the list zindex so the file_info borders win over the list's
+      -- shared-column verticals at junction cells, and above the preview so
+      -- the shared bottom-border row reads as file_info's `├──┤`.
+      zindex = 53,
     }
   end
 
@@ -528,26 +741,23 @@ function M.calculate_layout_dimensions(cfg)
   end
 
   -- Section 4: Position debug panel (if enabled)
-  if cfg.debug_enabled and preview_enabled and layout.preview then
-    if cfg.preview_position == 'left' or cfg.preview_position == 'right' then
-      layout.file_info = {
-        width = layout.preview.width,
-        height = cfg.file_info_height,
-        col = layout.preview.col,
-        row = layout.preview.row,
-      }
-      layout.preview.row = layout.preview.row + cfg.file_info_height + SEPARATOR_HEIGHT + 1
-      layout.preview.height = math.max(3, layout.preview.height - cfg.file_info_height - SEPARATOR_HEIGHT - 1)
-    else
-      layout.file_info = {
-        width = layout.preview.width,
-        height = cfg.file_info_height,
-        col = layout.preview.col,
-        row = layout.preview.row,
-      }
-      layout.preview.row = layout.preview.row + cfg.file_info_height + SEPARATOR_HEIGHT + 1
-      layout.preview.height = math.max(3, layout.preview.height - cfg.file_info_height - SEPARATOR_HEIGHT - 1)
-    end
+  -- Only shown in side-by-side preview layouts. When the layout has wrapped
+  -- to a stacked top/bottom preview (compact view), the preview is already
+  -- short — squeezing in a debug panel makes both unreadable.
+  local is_side_by_side = cfg.preview_position == 'left' or cfg.preview_position == 'right'
+  if cfg.debug_enabled and preview_enabled and layout.preview and is_side_by_side then
+    layout.file_info = {
+      width = layout.preview.width,
+      height = cfg.file_info_height,
+      col = layout.preview.col,
+      row = layout.preview.row,
+    }
+    -- Stack preview directly below file_info so they share a border row;
+    -- the shared row resolves to ├──...──┤ T-junctions instead of two
+    -- adjacent corners.
+    local consumed = cfg.file_info_height + 1 -- file_info content + its bottom border row
+    layout.preview.row = layout.preview.row + consumed
+    layout.preview.height = math.max(3, layout.preview.height - consumed)
   end
 
   return layout
@@ -658,7 +868,7 @@ function M.create_ui()
 
   if not M.state.ns_id then
     M.state.ns_id = vim.api.nvim_create_namespace('fff_picker_status')
-    combo_renderer.init(M.state.ns_id)
+    list_separator.init(M.state.ns_id)
   end
 
   local layout, debug_enabled_in_preview = compute_layout(config)
@@ -1547,6 +1757,8 @@ end
 --- Render the grep empty state: tips + bordered section of recent files.
 --- Called when grep mode has an empty query and no items.
 local function render_grep_empty_state(ctx)
+  list_separator.hide()
+
   local config = ctx.config
   local win_width = ctx.win_width
   local win_height = ctx.win_height
@@ -1650,31 +1862,50 @@ local function build_render_context()
 
   -- Combo detection (only in file picker mode with real results, not grep or suggestions)
   local combo_boost_score_multiplier = config.history and config.history.combo_boost_score_multiplier or 100
-  local has_combo, combo_header_line, combo_header_text_len, combo_item_index
-  if M.state.mode == 'grep' or M.state.suggestion_source then
-    has_combo = false
-    combo_header_line = nil
-    combo_header_text_len = nil
-    combo_item_index = nil
-  else
-    has_combo, combo_header_line, combo_header_text_len, combo_item_index = combo_renderer.detect_and_prepare(
+  local separator = nil
+  local combo_info = nil
+  if M.state.mode ~= 'grep' and not M.state.suggestion_source then
+    combo_info = combo_renderer.detect(
       items,
       file_picker,
-      win_width,
       combo_boost_score_multiplier,
       M.state.next_search_force_combo_boost or config.history.min_combo_count == 0
     )
   end
   M.state.next_search_force_combo_boost = false
 
-  if has_combo and not M.state.combo_visible then
-    has_combo = false
-    combo_item_index = nil
+  if combo_info and M.state.combo_visible then
+    -- Text is finalised in finalize_render once we know whether the
+    -- separator landed visually above or below the match (depends on iter
+    -- direction + which end of the iter the anchor sits on).
+    separator = {
+      idx = combo_info.idx,
+      text = combo_info.text,
+      text_hl = config.hl.combo_header,
+      border_hl = config.hl.border,
+    }
+    -- Track the actual anchor so the navigation hide-rule measures distance
+    -- from the real separator, not an assumed item-1 anchor.
+    M.state.combo_initial_cursor = combo_info.idx
   end
 
   -- Determine iteration order
   local display_start = 1
   local display_end = #items
+
+  -- Reserve one row for the separator gap when present. Without this, items
+  -- fill the list to the brim, the gap overflows the window, and the
+  -- separator float (positioned by buffer line) gets clipped or drawn on
+  -- top of the input border. Drop the item at the far end of the items
+  -- list, opposite the anchor — that's the row farthest from the prompt.
+  if separator and (display_end - display_start + 1) >= win_height then
+    if separator.idx == display_start then
+      display_end = display_end - 1
+    else
+      display_start = display_start + 1
+    end
+  end
+
   local iter_start, iter_end, iter_step
   if prompt_position == 'bottom' then
     iter_start, iter_end, iter_step = display_end, display_start, -1
@@ -1691,10 +1922,8 @@ local function build_render_context()
     max_path_width = text_width, -- Actual text area width (excluding signcolumn)
     debug_enabled = config and config.debug and config.debug.show_scores,
     prompt_position = prompt_position,
-    has_combo = has_combo,
-    combo_header_line = combo_header_line,
-    combo_header_text_len = combo_header_text_len,
-    combo_item_index = combo_item_index,
+    separator = separator,
+    combo_info = combo_info,
     display_start = display_start,
     display_end = display_end,
     iter_start = iter_start,
@@ -1710,27 +1939,28 @@ local function build_render_context()
   }
 end
 
-local function finalize_render(item_to_lines, ctx)
-  local combo_text_len = nil
-  if ctx.combo_item_index and item_to_lines[ctx.combo_item_index] then
-    combo_text_len = item_to_lines[ctx.combo_item_index].combo_header_text_len
+local function finalize_render(separator_line, _item_to_lines, ctx)
+  if ctx.separator and separator_line then
+    -- Arrow points toward the prompt: matches sit between the separator and
+    -- the prompt, so the arrow visually leads the eye from "rest of list"
+    -- through the separator toward the match + prompt.
+    local arrow = ctx.prompt_position == 'bottom' and '↓' or '↑'
+
+    local list_cfg = vim.api.nvim_win_get_config(M.state.list_win)
+    -- list_cfg.row is on the top border; content starts at list_cfg.row + 1.
+    -- separator_line is 1-based -> add directly.
+    local screen_row = list_cfg.row + separator_line
+
+    list_separator.update({
+      list_win = M.state.list_win,
+      row = screen_row,
+      text = arrow .. ' ' .. ctx.separator.text,
+      text_hl = ctx.separator.text_hl,
+      border_hl = ctx.separator.border_hl,
+    })
+  else
+    list_separator.hide()
   end
-
-  local combo_was_hidden = combo_renderer.render_highlights_and_overlays(
-    ctx.combo_item_index,
-    combo_text_len or ctx.combo_header_text_len,
-    M.state.list_buf,
-    M.state.list_win,
-    M.state.ns_id,
-    ctx.config.hl.border,
-    item_to_lines,
-    ctx.prompt_position,
-    #ctx.items
-  )
-
-  -- it's important part of functionality when user scrolls to the middle of the page we hide
-  -- the combo overlay which leaves the gap of the internal neovim buffer, so scroll to show last item
-  if combo_was_hidden and ctx.prompt_position == 'bottom' then scroll_to_bottom() end
 
   -- Scrollbar is only meaningful for file picker mode where total_matched is exact.
   -- Grep uses early termination so total_matched is approximate — scrollbar would be misleading.
@@ -1749,17 +1979,12 @@ function M.render_list()
     return
   end
 
-  -- Delegate line generation, padding, buffer write, cursor, and highlights
-  -- to the list_renderer module. It returns the item_to_lines mapping needed
-  -- by finalize_render for combo overlays and scrollbar.
-  local item_to_lines = list_renderer.render(ctx, M.state.list_buf, M.state.list_win, M.state.ns_id)
-
+  local separator_line, item_to_lines = list_renderer.render(ctx, M.state.list_buf, M.state.list_win, M.state.ns_id)
   -- For bottom prompt, always ensure content is anchored at the bottom after rendering
   -- This prevents results from appearing in the middle when there are few items
   if ctx.prompt_position == 'bottom' then scroll_to_bottom() end
 
-  -- Finalize with combo overlays and scrollbar
-  finalize_render(item_to_lines, ctx)
+  finalize_render(separator_line, item_to_lines, ctx)
 end
 
 --- Build and set the preview window title for a given item and location.
@@ -1915,7 +2140,13 @@ function M.update_preview()
 
   M.update_preview_title(item, effective_location)
 
-  if M.state.file_info_buf then preview.update_file_info_buffer(item, M.state.file_info_buf, M.state.cursor) end
+  if M.state.file_info_buf then
+    preview.update_file_info_buffer(item, M.state.file_info_buf, M.state.cursor)
+    if M.state.file_info_win and vim.api.nvim_win_is_valid(M.state.file_info_win) then
+      local rel = item.relative_path or item.path or ''
+      pcall(vim.api.nvim_win_set_config, M.state.file_info_win, { title = ' ' .. rel .. ' ', title_pos = 'left' })
+    end
+  end
 
   preview.set_preview_window(M.state.preview_win)
   preview.preview(resolve_item_path(item), M.state.preview_buf, effective_location, item.is_binary)
@@ -2007,13 +2238,11 @@ function M.update_status(progress)
     local win_width = vim.api.nvim_win_get_width(M.state.input_win)
     local available_width = win_width - 2
 
-    local virt_text
     if fallback_label then
       local total_len = #fallback_label
       local col_position = available_width - total_len
-      virt_text = { { fallback_label, 'DiagnosticWarn' } }
       vim.api.nvim_buf_set_extmark(M.state.input_buf, M.state.ns_id, 0, 0, {
-        virt_text = virt_text,
+        virt_text = { { fallback_label, 'DiagnosticWarn' } },
         virt_text_win_col = col_position,
       })
     else
@@ -2105,6 +2334,27 @@ function M.wrap_to_last()
   return true
 end
 
+--- After cursor moves, decide whether the combo separator should hide.
+--- Hide rule: cursor has moved more than 50% of a page *past* the separator
+--- anchor (in the direction away from it). Direction-agnostic w.r.t. prompt
+--- position because we measure against the item index of the anchor, not its
+--- visual row.
+local function maybe_hide_combo_separator()
+  if not (M.state.combo_initial_cursor and M.state.combo_visible) then return end
+  local distance_past = M.state.cursor - M.state.combo_initial_cursor
+  -- Anchor at index 1 → "past" means cursor index grew. Anchor at #items
+  -- → "past" means cursor index shrank. Use absolute distance + a sign that
+  -- matches which side of the anchor the user crossed to.
+  if distance_past == 0 then return end
+  local half_page = math.floor(M.state.pagination.page_size * 0.5)
+  if math.abs(distance_past) <= half_page then return end
+
+  M.state.combo_visible = false
+  list_separator.hide()
+  M.render_list()
+  if get_prompt_position() == 'bottom' then scroll_to_bottom() end
+end
+
 function M.move_up()
   if not M.state.active then return end
   if #M.state.filtered_items == 0 then return end
@@ -2167,17 +2417,7 @@ function M.move_up()
   end
   M.update_status()
 
-  if M.state.combo_initial_cursor and M.state.combo_visible then
-    local cursor_distance = math.abs(M.state.cursor - M.state.combo_initial_cursor)
-    local half_page = math.floor(M.state.pagination.page_size / 2)
-    if cursor_distance > half_page then
-      M.state.combo_visible = false
-      combo_renderer.cleanup()
-      M.render_list() -- Re-render once without combo
-      -- Scroll to bottom for bottom prompt to eliminate gap
-      if get_prompt_position() == 'bottom' then scroll_to_bottom() end
-    end
-  end
+  maybe_hide_combo_separator()
 end
 
 function M.move_down()
@@ -2242,17 +2482,7 @@ function M.move_down()
   end
   M.update_status()
 
-  if M.state.combo_initial_cursor and M.state.combo_visible then
-    local cursor_distance = math.abs(M.state.cursor - M.state.combo_initial_cursor)
-    local half_page = math.floor(M.state.pagination.page_size / 2)
-    if cursor_distance > half_page then
-      M.state.combo_visible = false
-      combo_renderer.cleanup()
-      M.render_list() -- Re-render once without combo
-      -- Scroll to bottom for bottom prompt to eliminate gap
-      if get_prompt_position() == 'bottom' then scroll_to_bottom() end
-    end
-  end
+  maybe_hide_combo_separator()
 end
 
 --- Scroll preview up by half window height
@@ -2702,7 +2932,7 @@ function M.close()
 
   restore_paste(M.state.restore_paste)
 
-  combo_renderer.cleanup()
+  list_separator.cleanup()
   scrollbar.cleanup()
 
   -- Clean up treesitter scratch buffers used for grep syntax highlighting

@@ -1,4 +1,5 @@
 PLENARY_DIR ?= ../plenary.nvim
+MINI_DIR ?= ../mini.nvim
 
 PREFIX ?= /usr/local
 LIBDIR ?= $(PREFIX)/lib
@@ -8,7 +9,7 @@ INCLUDEDIR ?= $(PREFIX)/include
 STRESS_RUSTFLAGS := --cfg stress
 FFF_STRESS_DEFAULT_SEED ?= 0xDEADBEEFCAFEBABE
 
-.PHONY: build build-c-lib install uninstall test test-rust test-lua test-version test-bun test-node prepare-bun prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-repos
+.PHONY: build build-c-lib install uninstall test test-rust test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-repos
 
 all: format test lint
 
@@ -54,6 +55,10 @@ test-setup:
 		echo "Cloning plenary.nvim..."; \
 		git clone --depth 1 https://github.com/nvim-lua/plenary.nvim $(PLENARY_DIR); \
 	fi
+	@if [ ! -d "$(MINI_DIR)" ]; then \
+		echo "Cloning mini.nvim..."; \
+		git clone --depth 1 https://github.com/echasnovski/mini.nvim $(MINI_DIR); \
+	fi
 
 test-rust:
 	cargo test --workspace --features zlob --exclude fff-nvim
@@ -67,6 +72,19 @@ test-lua: test-setup build
 	if echo "$$output" | grep -qE "SIG(SEGV|ABRT|BUS|FPE|ILL)"; then \
 		echo ""; \
 		echo "FAIL: native crash detected during lua tests"; \
+		exit 1; \
+	fi
+
+# mini.test reference_screenshot snapshots. Separate runner because mini.test
+# spawns child processes and uses its own collector (incompatible with
+# PlenaryBustedDirectory).
+test-lua-snap: test-setup build
+	@output=$$(nvim --headless -u tests/minimal_init.lua \
+		-c "lua require('mini.test').run_file('tests/picker_ui_snap.lua')" 2>&1); \
+	echo "$$output"; \
+	if echo "$$output" | grep -qE "SIG(SEGV|ABRT|BUS|FPE|ILL)"; then \
+		echo ""; \
+		echo "FAIL: native crash detected during snapshot tests"; \
 		exit 1; \
 	fi
 
@@ -95,8 +113,7 @@ test-bun: prepare-bun
 test-node: prepare-node
 	cd packages/fff-node && npm run build && node test/e2e.mjs
 
-test: test-rust test-lua test-version test-bun test-node
-
+test: test-rust test-lua test-lua-snap test-version test-bun test-node
 
 test-stress-seeded:
 	FFF_STRESS_SEED="$${FFF_STRESS_SEED:-$(FFF_STRESS_DEFAULT_SEED)}" \
