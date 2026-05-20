@@ -444,6 +444,8 @@ pub struct FilePickerOptions {
     pub cache_budget: Option<ContentCacheBudget>,
     /// When `false`, `new_with_shared_state` skips the background file watcher.
     pub watch: bool,
+    /// Follow symbolic links during file indexing.
+    pub follow_symlinks: bool,
 }
 
 impl Default for FilePickerOptions {
@@ -455,6 +457,7 @@ impl Default for FilePickerOptions {
             mode: FFFMode::default(),
             cache_budget: None,
             watch: true,
+            follow_symlinks: false,
         }
     }
 }
@@ -471,6 +474,7 @@ pub struct FilePicker {
     enable_mmap_cache: bool,
     enable_content_indexing: bool,
     watch: bool,
+    follow_symlinks: bool,
 }
 
 impl std::fmt::Debug for FilePicker {
@@ -522,6 +526,10 @@ impl FilePicker {
 
     pub fn has_watcher(&self) -> bool {
         self.watch
+    }
+
+    pub fn follows_symlinks(&self) -> bool {
+        self.follow_symlinks
     }
 
     pub fn mode(&self) -> FFFMode {
@@ -717,6 +725,7 @@ impl FilePicker {
             enable_mmap_cache: options.enable_mmap_cache,
             enable_content_indexing: options.enable_content_indexing,
             watch: options.watch,
+            follow_symlinks: options.follow_symlinks,
         })
     }
 
@@ -741,6 +750,7 @@ impl FilePicker {
         let content_indexing = picker.enable_content_indexing;
         let watch = picker.watch;
         let mode = picker.mode;
+        let follow_symlinks = picker.follow_symlinks;
 
         let signals = picker.scan_signals();
         let scanned_files_counter = picker.scanned_files_counter();
@@ -767,6 +777,7 @@ impl FilePicker {
                 watch,
                 auto_cache_budget: true,
                 install_watcher: true,
+                follow_symlinks,
             },
         )
         .spawn();
@@ -796,6 +807,7 @@ impl FilePicker {
             &self.scanned_files_count,
             &empty_frecency,
             self.mode,
+            self.follow_symlinks,
         )?;
 
         self.sync_data = sync;
@@ -1711,6 +1723,7 @@ impl FileSync {
         synced_files_count: &Arc<AtomicUsize>,
         shared_frecency: &SharedFrecency,
         mode: FFFMode,
+        follow_symlinks: bool,
     ) -> Result<FileSync, Error> {
         use ignore::WalkBuilder;
 
@@ -1729,7 +1742,7 @@ impl FileSync {
             .git_exclude(true)
             .git_global(true)
             .ignore(true)
-            .follow_links(false)
+            .follow_links(follow_symlinks)
             .threads(bg_threads);
 
         if !is_git_repo && let Some(overrides) = non_git_repo_overrides(base_path) {

@@ -39,6 +39,7 @@ pub(crate) struct ScanConfig {
     pub(crate) watch: bool,
     pub(crate) auto_cache_budget: bool,
     pub(crate) install_watcher: bool,
+    pub(crate) follow_symlinks: bool,
 }
 
 /// A fully-configured scan job ready to run on a background thread.
@@ -87,6 +88,7 @@ impl ScanJob {
             watch: picker.has_watcher(),
             auto_cache_budget: !picker.has_explicit_cache_budget(),
             install_watcher: false, // the watcher is independent of rescan, it is not restarting EVER
+            follow_symlinks: picker.follows_symlinks(),
         };
 
         drop(guard); // just a sanity check
@@ -157,6 +159,7 @@ impl ScanJob {
             &scanned_files_counter,
             &shared_frecency,
             mode,
+            config.follow_symlinks,
         ) {
             Ok(sync) => sync,
             Err(e) => {

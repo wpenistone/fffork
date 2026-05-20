@@ -57,7 +57,10 @@ pub fn destroy_query_db(_: &Lua, _: ()) -> LuaResult<bool> {
     Ok(QUERY_TRACKER.destroy().into_lua_result()?.is_some())
 }
 
-pub fn init_file_picker(_: &Lua, base_path: String) -> LuaResult<bool> {
+pub fn init_file_picker(
+    _: &Lua,
+    (base_path, follow_symlinks): (String, Option<bool>),
+) -> LuaResult<bool> {
     {
         let guard = FILE_PICKER.read().into_lua_result()?;
         if guard.is_some() {
@@ -73,6 +76,7 @@ pub fn init_file_picker(_: &Lua, base_path: String) -> LuaResult<bool> {
             enable_mmap_cache: true,
             enable_content_indexing: true,
             mode: FFFMode::Neovim,
+            follow_symlinks: follow_symlinks.unwrap_or(false),
             ..Default::default()
         },
     )
