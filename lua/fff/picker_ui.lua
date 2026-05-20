@@ -1939,7 +1939,7 @@ local function build_render_context()
   }
 end
 
-local function finalize_render(separator_line, _item_to_lines, ctx)
+local function finalize_render(separator_line, ctx)
   if ctx.separator and separator_line then
     -- Arrow points toward the prompt: matches sit between the separator and
     -- the prompt, so the arrow visually leads the eye from "rest of list"
@@ -1979,12 +1979,12 @@ function M.render_list()
     return
   end
 
-  local separator_line, item_to_lines = list_renderer.render(ctx, M.state.list_buf, M.state.list_win, M.state.ns_id)
+  local separator_line = list_renderer.render(ctx, M.state.list_buf, M.state.list_win, M.state.ns_id)
   -- For bottom prompt, always ensure content is anchored at the bottom after rendering
   -- This prevents results from appearing in the middle when there are few items
   if ctx.prompt_position == 'bottom' then scroll_to_bottom() end
 
-  finalize_render(separator_line, item_to_lines, ctx)
+  finalize_render(separator_line, ctx)
 end
 
 --- Build and set the preview window title for a given item and location.

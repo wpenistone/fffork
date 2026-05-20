@@ -14,10 +14,7 @@ local tresitter_highlight = require('fff.treesitter_hl')
 ---@param ctx table Render context
 ---@return string The header line string
 local function build_group_header(item, ctx)
-  ctx.has_combo = false
-  ---@diagnostic disable-next-line: param-type-mismatch
-  local lines = file_renderer.render_line(item, ctx, 0)
-  ctx.has_combo = false -- never has a combo in grep
+  local lines = file_renderer.render_line(item, ctx)
   return lines[1]
 end
 

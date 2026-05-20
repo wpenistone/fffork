@@ -11,9 +11,6 @@ local M = {}
 --- @field debug_enabled boolean Whether debug mode shows scores
 --- @field prompt_position string 'top' or 'bottom'
 --- @field has_combo boolean Whether combo boost is active
---- @field combo_header_line string|nil Formatted combo header line
---- @field combo_header_text_len number|nil Length of combo header text
---- @field combo_item_index number|nil Index of item with combo (usually 1)
 --- @field display_start number Start index for displayed items (1)
 --- @field display_end number End index for displayed items (#items)
 --- @field iter_start number Iteration start
@@ -101,7 +98,7 @@ local function generate_item_lines(ctx)
     local item = ctx.items[i]
     local item_start_line = #lines + 1
 
-    local item_lines = renderer.render_line(item, ctx, i)
+    local item_lines = renderer.render_line(item, ctx)
     vim.list_extend(lines, item_lines)
 
     local item_end_line = #lines
@@ -227,7 +224,6 @@ end
 --- @param list_win number List window handle
 --- @param ns_id number Highlight namespace
 --- @return number|nil separator_line 1-based buffer line of the separator (post-padding), nil if none
---- @return table<number, ItemLineMapping> item_to_lines
 function M.render(ctx, list_buf, list_win, ns_id)
   local lines, item_to_lines, separator_line = generate_item_lines(ctx)
 
@@ -255,49 +251,7 @@ function M.render(ctx, list_buf, list_win, ns_id)
     end
   end
 
-  return separator_line, item_to_lines
-end
-
---- Get the buffer line for an item's content (selectable) line.
---- Used by picker_ui for cursor positioning after navigation.
---- @param item_to_lines table<number, ItemLineMapping>
---- @param item_index number 1-based item index
---- @return number|nil line 1-based buffer line, or nil if item not mapped
-function M.get_content_line(item_to_lines, item_index)
-  local mapping = item_to_lines[item_index]
-  if not mapping then return nil end
-  return mapping.last
-end
-
---- Get the buffer line for an item's first line (may be a virtual header).
---- Used by combo_renderer for overlay positioning.
---- @param item_to_lines table<number, ItemLineMapping>
---- @param item_index number 1-based item index
---- @return number|nil line 1-based buffer line, or nil if item not mapped
-function M.get_first_line(item_to_lines, item_index)
-  local mapping = item_to_lines[item_index]
-  if not mapping then return nil end
-  return mapping.first
-end
-
---- Check if an item has virtual (header) rows.
---- @param item_to_lines table<number, ItemLineMapping>
---- @param item_index number 1-based item index
---- @return boolean
-function M.has_virtual_rows(item_to_lines, item_index)
-  local mapping = item_to_lines[item_index]
-  if not mapping then return false end
-  return mapping.virtual_count > 0
-end
-
---- Count total buffer lines an item occupies (content + virtual).
---- @param item_to_lines table<number, ItemLineMapping>
---- @param item_index number 1-based item index
---- @return number
-function M.get_line_count(item_to_lines, item_index)
-  local mapping = item_to_lines[item_index]
-  if not mapping then return 0 end
-  return mapping.last - mapping.first + 1
+  return separator_line
 end
 
 return M
