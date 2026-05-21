@@ -384,8 +384,8 @@ local function build_window_configs(layout, config)
 
   local list_cfg = {
     relative = 'editor',
-    width = layout.list_width,
-    height = layout.list_height,
+    width = math.max(1, layout.list_width),
+    height = math.max(1, layout.list_height),
     col = layout.list_col,
     row = layout.list_row,
     border = list_border,
@@ -465,7 +465,7 @@ local function build_window_configs(layout, config)
 
   local input_cfg = {
     relative = 'editor',
-    width = layout.input_width,
+    width = math.max(1, layout.input_width),
     height = 1,
     col = layout.input_col,
     row = layout.input_row,
@@ -523,8 +523,8 @@ local function build_window_configs(layout, config)
     }
     preview_cfg = {
       relative = 'editor',
-      width = layout.preview.width,
-      height = layout.preview.height,
+      width = math.max(1, layout.preview.width),
+      height = math.max(1, layout.preview.height),
       col = layout.preview.col,
       row = layout.preview.row,
       style = 'minimal',
@@ -580,8 +580,8 @@ local function build_window_configs(layout, config)
     }
     file_info_cfg = {
       relative = 'editor',
-      width = layout.file_info.width,
-      height = layout.file_info.height,
+      width = math.max(1, layout.file_info.width),
+      height = math.max(1, layout.file_info.height),
       col = layout.file_info.col,
       row = layout.file_info.row,
       style = 'minimal',
