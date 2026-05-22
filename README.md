@@ -386,6 +386,22 @@ Sign-column indicators are on by default. To color filename text by git status, 
 
 The picker maps its float content to `NormalFloat` (via `hl.normal`) and the border to `FloatBorder`. Default `FloatBorder` links to `NormalFloat`, so border and content share a background out of the box and the picker reads as a single popup. Override `hl.normal = 'Normal'` to make the picker blend with the editor instead.
 
+For finer control, set `hl.winhl` to override the per-window `winhighlight`. It accepts either a single string applied to every picker window, or a table with optional `prompt`, `list`, `preview`, and `file_info` keys. Missing keys fall back to the default built from `hl.normal`, `hl.border`, and `hl.title`.
+
+```lua
+-- Apply the same winhighlight to all picker windows
+hl = { winhl = 'Normal:NormalFloat,FloatBorder:FloatBorder,FloatTitle:Title' }
+
+-- Or override specific windows only
+hl = {
+  winhl = {
+    prompt  = 'Normal:Pmenu,FloatBorder:FloatBorder',
+    list    = 'Normal:NormalFloat,FloatBorder:FloatBorder',
+    preview = 'Normal:NormalFloat,FloatBorder:FloatBorder',
+  },
+}
+```
+
 ### File info panel
 
 Enable with `debug.enabled = true`. The panel sits above the preview and shows

@@ -324,6 +324,11 @@ local function init()
       file_info_match_type = 'FFFFileInfoMatchType', -- match_type label (bold)
       file_info_score_pos = 'FFFFileInfoScorePos', -- Positive score components
       file_info_score_neg = 'FFFFileInfoScoreNeg', -- Negative score components / penalties
+      -- Per-window 'winhighlight' overrides. When nil, falls back to a combination of `normal`, `border`, and `title` above.
+      -- Accepts either a string applied to every picker window, or a table with optional `prompt`, `list`, `preview`, `file_info` keys.
+      -- Example: `winhl = 'Normal:NormalFloat,FloatBorder:FloatBorder,FloatTitle:Title'`
+      -- Example: `winhl = { prompt = 'Normal:Pmenu,...', list = 'Normal:NormalFloat,...' }`
+      winhl = nil,
     },
     -- Store file open frecency
     frecency = {
