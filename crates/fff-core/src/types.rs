@@ -214,6 +214,7 @@ pub struct FileItem {
     pub(crate) path: crate::simd_path::ChunkedString,
     pub(crate) parent_dir_index: u32,
     flags: AtomicU8,
+    /// Lazy mmap cache. Only populated by the actual file read, controlled by the budget.
     #[cfg(not(target_os = "windows"))]
     content: OnceLock<memmap2::Mmap>,
 }
@@ -381,6 +382,7 @@ impl FileItem {
         self.access_frecency_score as i32 + self.modification_frecency_score as i32
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn is_likely_hot(&self) -> bool {
         self.access_frecency_score > 0 || self.git_status.is_some()
@@ -593,6 +595,15 @@ impl FileItem {
         None
     }
 
+    /// Returns a reference to a cached mmap of the file's contents.
+    ///
+    /// SAFETY-CRITICAL: callers must hold the picker read lock for as long as
+    /// the returned slice is in use. The watcher mutates `FileItem` (including
+    /// `invalidate_mmap`) under the picker write lock, so the read lock is
+    /// what prevents UAF (`OnceLock` reset → `munmap`) and SIGBUS (in-place
+    /// truncate → access past new EOF). Detached background tasks (e.g. the
+    /// bigram builder running on `BACKGROUND_THREAD_POOL`) MUST NOT call this
+    /// — use `read_trimmed_into_buf` instead.
     #[cfg(not(target_os = "windows"))]
     pub(crate) fn get_cached_content(
         &self,
@@ -648,7 +659,9 @@ impl FileItem {
         base_path: &Path,
         budget: &ContentCacheBudget,
     ) -> Option<&'a [u8]> {
-        // Fast path: persistent cache hit (zero-copy).
+        // Fast path: persistent cache hit (zero-copy). Safe here because grep
+        // callers hold the picker read lock for the lifetime of the returned
+        // slice — see [`Self::get_cached_content`] safety note.
         if let Some(cached) = self.get_cached_content(arena, base_path, budget) {
             return Some(cached);
         }

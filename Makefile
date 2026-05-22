@@ -14,7 +14,7 @@ SHELL := bash
 # string rather than the literal `-o` / `pipefail` tokens.
 .SHELLFLAGS := -o pipefail -ec
 
-.PHONY: build build-c-lib install uninstall test test-rust test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-repos
+.PHONY: build build-c-lib install uninstall test test-rust test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-repos test-node-stress
 
 all: format test lint
 
@@ -125,7 +125,14 @@ test-bun: prepare-bun
 test-node: prepare-node
 	cd packages/fff-node && npm run build && node test/e2e.mjs
 
-test: test-rust test-lua test-lua-snap test-version test-bun test-node
+# Bug pinning stress test script over fff-node for issue #515
+# Just keep it untouched because it's good enough + some stress for SDK
+FFF_STRESS_ITERS ?= 50
+test-node-stress: prepare-node
+	cd packages/fff-node && npm run build && \
+		FFF_STRESS_ITERS=$(FFF_STRESS_ITERS) node test/stress-515.mjs
+
+test: test-rust test-lua test-lua-snap test-version test-bun test-node test-node-stress
 
 test-stress-seeded:
 	FFF_STRESS_SEED="$${FFF_STRESS_SEED:-$(FFF_STRESS_DEFAULT_SEED)}" \

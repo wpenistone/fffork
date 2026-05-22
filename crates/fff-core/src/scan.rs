@@ -9,7 +9,7 @@ use crate::FileSync;
 use crate::background_watcher::BackgroundWatcher;
 use crate::bigram_filter::build_bigram_index;
 use crate::error::Error;
-use crate::file_picker::{BACKGROUND_THREAD_POOL, FFFMode, warmup_mmaps};
+use crate::file_picker::{BACKGROUND_THREAD_POOL, FFFMode};
 use crate::git::GitStatusCache;
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::simd_path::ArenaPtr;
@@ -277,6 +277,11 @@ impl ScanJob {
         }
     }
 
+    /// THIS IS VERY VERY IMPORTANT THAT ANYTHING INSIDE THIS FUNCTION TO NOT READ ANYTHING CLEARABLE OUTSIDE
+    /// this is a very silly off lock implementation that actually matters, and that's why it is crafted
+    /// to never read anything from the picker, it can only WRITE information using single instructions
+    ///
+    /// Things that are safe and immutable - file list, indexes of files, paths, and signals.
     #[tracing::instrument(skip_all, fields(warmup = ?config.warmup, indexing = ?config.content_indexing))]
     fn run_post_scan(
         shared_picker: &SharedFilePicker,
@@ -289,33 +294,28 @@ impl ScanJob {
             .as_ref()
             .map(|s| s.as_arena_ptr())
             .unwrap_or(ArenaPtr::null());
-        let budget: &ContentCacheBudget = &unsafe_snapshot.budget;
+        let _budget: &ContentCacheBudget = &unsafe_snapshot.budget;
         let files: &[crate::types::FileItem] = &unsafe_snapshot.files[..unsafe_snapshot.base_count];
 
         if signals.cancelled.load(Ordering::Acquire) {
             return;
         }
 
-        // unified bigram and warmup_mmaps in one go, it's important to reuse open files as much as possible
         if config.content_indexing {
             let indexable_files = &files[..unsafe_snapshot.indexable_count.min(files.len())];
-            let index = build_bigram_index(
-                indexable_files,
-                budget,
-                &unsafe_snapshot.base_path,
-                arena,
-                config.warmup, // can be optionally skipped
-            );
+            let index = build_bigram_index(indexable_files, &unsafe_snapshot.base_path, arena);
 
             if let Ok(mut guard) = shared_picker.write()
                 && let Some(picker) = guard.as_mut()
             {
                 picker.set_bigram_index(index);
             }
-        } else if config.warmup {
-            // Warmup-only: no bigram indexing, just fill the mmap cache.
-            warmup_mmaps(files, budget, &unsafe_snapshot.base_path, arena);
         }
+
+        // Skipped as potentially unsafe - figure this out later
+        // if config.warmup && !signals.cancelled.load(Ordering::Acquire) {
+        //     warmup_mmaps(files, budget, &unsafe_snapshot.base_path, arena);
+        // }
     }
 }
 

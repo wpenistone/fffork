@@ -610,31 +610,19 @@ thread_local! {
         std::cell::RefCell::new(vec![0u8; MAX_INDEXABLE_FILE_SIZE].into_boxed_slice());
 }
 
-/// reads a chunk for bigram either from new warmed up cache or from the file directly
+/// Reads bigram chunk, we *SHOULD NOT* use mmap cache here because bigram is built off-lock
+/// if the watcher thread tries to invalidate mmap during the borrow from it - UAB or segfaut
+///
+/// mmap should only be used by the locked version of grep which absolutely minimizes any riscs
 #[inline]
-#[allow(clippy::too_many_arguments)]
 fn read_bigram_chunk<'a>(
-    file: &'a crate::types::FileItem,
+    file: &crate::types::FileItem,
     base_fd: libc::c_int,
     base_path: &std::path::Path,
     arena: crate::simd_path::ArenaPtr,
-    budget: &crate::types::ContentCacheBudget,
-    warmup: bool,
     buf: &'a mut [u8],
     path_buf: &mut [u8; crate::simd_path::PATH_BUF_SIZE],
 ) -> Option<&'a [u8]> {
-    if warmup
-        && !file.is_likely_hot()
-        && let Some(cached) = file.get_cached_content(arena, base_path, budget)
-    {
-        if crate::file_picker::detect_binary_content(cached) {
-            file.set_binary(true);
-            return None;
-        }
-
-        return Some(&cached[..cached.len().min(MAX_INDEXABLE_FILE_SIZE)]);
-    }
-
     let want = (file.size as usize).min(MAX_INDEXABLE_FILE_SIZE);
     let filled = file.read_trimmed_into_buf(base_fd, base_path, arena, path_buf, &mut buf[..want]);
     if filled == 0 {
@@ -652,10 +640,8 @@ fn read_bigram_chunk<'a>(
 #[tracing::instrument(skip_all, name = "Building Bigram Index", level = tracing::Level::DEBUG)]
 pub(crate) fn build_bigram_index(
     files: &[crate::types::FileItem],
-    budget: &crate::types::ContentCacheBudget,
     base_path: &std::path::Path,
     arena: crate::simd_path::ArenaPtr,
-    warmup: bool,
 ) -> BigramFilter {
     let builder = BigramIndexBuilder::new(files.len());
     let skip_builder = BigramIndexBuilder::new(files.len());
@@ -665,12 +651,11 @@ pub(crate) fn build_bigram_index(
     #[cfg(not(unix))]
     let base_fd: i32 = -1;
 
-    // Single unified pass: every file is bigram-indexed, and (when `warmup`)
-    // the content cache is opportunistically filled. We SKIP caching files
-    // that are likely already hot in the OS page cache (recent frecency hits
-    // or dirty-per-git) so our limited cache budget goes to the cold tail
-    // that actually benefits from a pinned mmap. Natural traversal order,
-    // no pre-sort, no separate warmup pass.
+    // Always reads each file into the thread-local READ_BUF — never aliases the
+    // persistent mmap cache. See `read_bigram_chunk` for the rationale: this
+    // pass runs detached on the background pool without holding the picker
+    // read lock, so a watcher event mutating a `FileItem` would race any
+    // borrow we took from a cached `Mmap`.
     crate::file_picker::BACKGROUND_THREAD_POOL.install(|| {
         files
             .par_chunks(BIGRAM_CHUNK_FILES)
@@ -693,8 +678,6 @@ pub(crate) fn build_bigram_index(
                             base_fd,
                             base_path,
                             arena,
-                            budget,
-                            warmup,
                             &mut buf[..],
                             &mut path_buf,
                         ) {

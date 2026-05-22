@@ -1903,6 +1903,7 @@ impl FileSync {
 
 /// Pre-populate mmap caches for cold tail files so the first grep search
 /// doesn't pay the mmap creation + page fault cost.
+#[allow(dead_code)]
 #[tracing::instrument(skip(files), name = "warmup_mmaps", level = Level::DEBUG)]
 pub(crate) fn warmup_mmaps(
     files: &[FileItem],
