@@ -5,6 +5,8 @@ use std::cell::UnsafeCell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 
+use crate::FileItem;
+
 /// Maximum number of distinct bigrams tracked in the inverted index.
 /// 95 printable ASCII chars (32..=126) after lowercasing → ~70 distinct → 4900 possible.
 /// We cap at 5000 to cover all printable bigrams with margin.
@@ -107,14 +109,8 @@ impl BigramIndexBuilder {
         &slab[start..start + self.words]
     }
 
-    // `pub` (via `#[doc(hidden)]`) only so the criterion bench can drive
-    // `add_file_content` directly. External consumers should use
-    // `build_bigram_index` instead.
-    ///
-    /// SAFETY: concurrent callers must partition `file_idx` by
-    /// word-aligned ranges so that `file_idx / 64` never collides across
-    /// threads. The `file_picker::build_bigram_index` driver enforces
-    /// this via `par_chunks` with a word-aligned chunk size.
+    // `pub` (via `#[doc(hidden)]`) only for benchmarking
+    // External consumers should use `build_bigram_index` instead.
     #[doc(hidden)]
     pub fn add_file_content(&self, skip_builder: &Self, file_idx: usize, content: &[u8]) {
         if content.len() < 2 {
@@ -616,7 +612,7 @@ thread_local! {
 /// mmap should only be used by the locked version of grep which absolutely minimizes any riscs
 #[inline]
 fn read_bigram_chunk<'a>(
-    file: &crate::types::FileItem,
+    file: &FileItem,
     base_fd: libc::c_int,
     base_path: &std::path::Path,
     arena: crate::simd_path::ArenaPtr,
@@ -630,10 +626,7 @@ fn read_bigram_chunk<'a>(
     }
 
     let data = &buf[..filled];
-    if crate::file_picker::detect_binary_content(data) {
-        file.set_binary(true);
-        return None;
-    }
+
     Some(data)
 }
 
@@ -681,6 +674,14 @@ pub(crate) fn build_bigram_index(
                             &mut buf[..],
                             &mut path_buf,
                         ) {
+                            // we have to manually ensure that every byte is a valid text byte to
+                            // perform this we have to scan every file, first 512 bytes is not enough
+                            // so basically we rely on the fact that first 2MB will always contain
+                            // an invalid text sequence if this is not a binary file.
+                            //
+                            // Need to find a better way to do this.
+                            file.set_binary(crate::file_picker::detect_binary_content(content));
+
                             builder.add_file_content(&skip_builder, file_idx, content);
                         }
                     });

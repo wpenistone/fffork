@@ -1987,7 +1987,12 @@ pub fn is_known_binary_extension(path: &Path) -> bool {
         ext,
         // Images
         "png" | "jpg" | "jpeg" | "gif" | "bmp" | "ico" | "webp" | "tiff" | "tif" | "avif" |
-        "heic" | "psd" | "icns" | "cur" | "raw" | "cr2" | "nef" | "dng" | "tga" |
+        "heic" | "heif" | "jxl" | "jp2" | "j2k" | "psd" | "icns" | "cur" | "cr2" |
+        "nef" | "dng" | "tga" |
+        // GPU / VFX texture formats
+        "rgbe" | "hdr" | "exr" | "dds" | "ktx" | "ktx2" | "pvr" | "astc" |
+        // Adobe Illustrator (PDF wrapper) / Apple webarchive / MIME HTML archive
+        "ai" | "webarchive" | "mhtml" |
         // Video/Audio
         "mp4" | "avi" | "mov" | "wmv" | "mkv" | "mp3" | "wav" | "flac" | "ogg" | "m4a" |
         "aac" | "webm" | "flv" | "mpg" | "mpeg" | "wma" | "opus" | "pcm" | "reapeaks" |
@@ -2011,30 +2016,27 @@ pub fn is_known_binary_extension(path: &Path) -> bool {
         // Compiled/Runtime
         "class" | "pyc" | "pyo" | "wasm" | "dex" | "jar" | "war" |
         // OCaml / Swift / Objective-C build artefacts
-        "cmi" | "cmt" | "cmti" | "cmx" | "cof" | "cop" | "nib" |
+        "cmi" | "cmt" | "cmti" | "cmx" | "nib" |
         "swiftdeps" | "swiftdeps~" | "swiftdoc" | "swiftmodule" | "swiftsourceinfo" |
         // ML/Data Science
-        "npy" | "npz" | "pkl" | "pickle" | "h5" | "hdf5" | "pt" | "pth" | "onnx" |
-        "safetensors" | "tfrecord" |
+        "npy" | "npz" | "pkl" | "pickle" | "h5" | "hdf5" | "pt" | "onnx" |
+        "safetensors" | "tfrecord" | "tflite" | "gguf" | "ggml" | "joblib" |
         // 3D/Game assets
-        "glb" | "fbx" | "blend" | "blp" |
-        // Compressed-text formats (gzip/binary on disk)
-        "dia" | "tfx" | "flm" | "bcmap" | "journal" |
+        "glb" | "blend" | "blp" |
+        // Gzipped-XML / binary maps
+        "dia" | "bcmap" |
         // Protobuf wire format
         "pb" |
         // Data/serialized
         "parquet" | "arrow" |
         // IDE/OS metadata
-        "DS_Store" | "suo"
+        "suo"
     )
 }
 
-/// Detect binary content by checking for NUL bytes in the first 512 bytes.
-/// Called lazily when file content is first loaded, not during initial scan.
 #[inline]
 pub(crate) fn detect_binary_content(content: &[u8]) -> bool {
-    let check_len = content.len().min(512);
-    content[..check_len].contains(&0)
+    memchr::memchr(0, content).is_some()
 }
 
 /// Length of the longest shared directory prefix of two relative dir
