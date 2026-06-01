@@ -41,8 +41,15 @@ end
 ---@param item table Grep match item
 ---@param ctx table Render context
 ---@return string The match line string
+local function format_location(item, ctx)
+  local fmt = (ctx.config and ctx.config.grep and ctx.config.grep.location_format) or ':%d:%d'
+  local ok, str = pcall(string.format, fmt, item.line_number or 0, (item.col or 0) + 1)
+  if not ok then str = string.format(':%d:%d', item.line_number or 0, (item.col or 0) + 1) end
+  return str
+end
+
 local function render_match_line(item, ctx)
-  local location = string.format(':%d:%d', item.line_number or 0, (item.col or 0) + 1)
+  local location = format_location(item, ctx)
   local separator = '  '
   -- vim.json.decode may return Blobs for strings with NUL bytes; coerce to string.
   local raw_content = item.line_content
@@ -105,7 +112,7 @@ local function apply_match_highlights(item, ctx, item_idx, buf, ns_id, row, line
   end
 
   -- 2. Location (:line:col) dimmed — use extmark with priority so it layers with cursor
-  local location_str = string.format(':%d:%d', item.line_number or 0, (item.col or 0) + 1)
+  local location_str = format_location(item, ctx)
   local loc_start = indent
   local loc_end = loc_start + #location_str
   if loc_end <= #line_content then

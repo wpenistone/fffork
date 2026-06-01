@@ -321,6 +321,7 @@ require('fff').setup({
     time_budget_ms = 150,
     modes = { 'plain', 'regex', 'fuzzy' },
     trim_whitespace = false,
+    location_format = ':%d:%d', -- printf format for line:col prefix in grep results, e.g. ':%d' for line-only
   },
   debug = {
     enabled = false, -- show the file info panel next to the preview

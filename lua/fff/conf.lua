@@ -57,6 +57,7 @@ local M = {}
 --- @field time_budget_ms number
 --- @field modes string[]
 --- @field trim_whitespace boolean
+--- @field location_format string
 
 --- @class FffConfig
 --- @field base_path string
@@ -376,6 +377,10 @@ local function init()
       time_budget_ms = 150, -- Max search time in ms per call (prevents UI freeze, 0 = no limit)
       modes = { 'plain', 'regex', 'fuzzy' }, -- Available grep modes and their cycling order
       trim_whitespace = false, -- Strip leading whitespace from matched lines (useful for cleaner display)
+      -- Format string for the line/column location prefix in grep results.
+      -- Uses vim's printf-style format: %d placeholders for line and column (1-based).
+      -- Default ':%d:%d' renders as ':356:1'. Use ':%d' for line-only ':356'.
+      location_format = ':%d:%d',
     },
   }
 
