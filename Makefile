@@ -250,7 +250,7 @@ CRATES_TO_PUBLISH= fff-grep fff-query-parser fff-search
 
 publish-crates:
 	@test -n "$(V)" || (echo "V is required. Usage: make publish-crates V=0.2.0" && exit 1)
-	cargo install cargo-edit
+	cargo install cargo-edit --force --locked
 	cargo set-version $(V) || exit 1;
 	@for crate in $(CRATES_TO_PUBLISH); do \
 		cargo publish -p $$crate --allow-dirty $$(if [ -n "$$CI" ]; then echo "--no-verify"; fi) || exit 1; \

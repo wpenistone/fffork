@@ -61,7 +61,7 @@ ahash = { workspace = true }
 tracing = { workspace = true }
 
 # Local crates
-fff = { package = "fff-search", path = "../fff-core", version = "0.8.4", features = [
+fff = { package = "fff-search", path = "../fff-core", version = "0.9.0", features = [
 	"mimalloc-collect",
 ] }
 fff-query-parser = { path = "../fff-query-parser", version = "0.9.0" }
