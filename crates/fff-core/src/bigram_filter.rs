@@ -110,9 +110,7 @@ impl BigramIndexBuilder {
         &slab[start..start + self.words]
     }
 
-    // `pub` (via `#[doc(hidden)]`) only for benchmarking
-    // External consumers should use `build_bigram_index` instead.
-    #[doc(hidden)]
+    #[doc(hidden)] // `pub` (via `#[doc(hidden)]`) only for benchmarking
     pub fn add_file_content(&self, skip_builder: &Self, file_idx: usize, content: &[u8]) {
         if content.len() < 2 {
             return;
@@ -127,13 +125,6 @@ impl BigramIndexBuilder {
         let mut seen_consec = [0u64; 1024];
         let mut seen_skip = [0u64; 1024];
 
-        // Normalise each byte as we stream and carry a 2-byte history
-        // across iterations so each input byte is normalised exactly once
-        // even though it participates in up to three bigrams (as `cur`,
-        // then `prev`, then `skip_prev`). Benchmarked against a NEON
-        // pre-pass variant — the pre-pass needs a heap scratch per call,
-        // which kills throughput unless content is gigantic. Inline
-        // normalisation is the faster choice for realistic file sizes.
         let bytes = content;
         let len = bytes.len();
 

@@ -14,9 +14,37 @@ SHELL := bash
 # string rather than the literal `-o` / `pipefail` tokens.
 .SHELLFLAGS := -o pipefail -ec
 
-.PHONY: build build-c-lib install uninstall test test-rust test-c-smoke test-c-api test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-repos test-node-stress
+.PHONY: build build-c-lib install uninstall test test-rust test-c-smoke test-c-api test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-repos test-node-stress sync-js-api sync-js-api-check
 
 all: format test lint
+
+# Single source of truth for the shared FileFinder TS interface lives in
+# packages/shared/fff-api.ts. tsc cannot import across a package's
+# rootDir and the bun package publishes its raw src/, so the file is copied
+# into each package instead of symlinked.
+SYNC_API_SRC := packages/shared/fff-api.ts
+SYNC_API_TARGETS := packages/fff-node/src/fff-api.ts packages/fff-bun/src/fff-api.ts
+SYNC_API_BANNER := // ----------------------------------------------------------------------------\n// GENERATED FILE - DO NOT EDIT.\n// Source of truth: packages/shared/fff-api.ts\n// Run make sync-js-api from the repo root to regenerate.\n// ----------------------------------------------------------------------------\n\n
+
+sync-js-api:
+	@for target in $(SYNC_API_TARGETS); do \
+		printf '$(SYNC_API_BANNER)' > "$$target"; \
+		cat $(SYNC_API_SRC) >> "$$target"; \
+		echo "synced: $$target"; \
+	done
+
+sync-js-api-check:
+	@status=0; \
+	for target in $(SYNC_API_TARGETS); do \
+		tmp=$$(mktemp); \
+		printf '$(SYNC_API_BANNER)' > "$$tmp"; \
+		cat $(SYNC_API_SRC) >> "$$tmp"; \
+		if ! cmp -s "$$tmp" "$$target"; then \
+			echo "out of date: $$target (run make sync-js-api)"; status=1; \
+		fi; \
+		rm -f "$$tmp"; \
+	done; \
+	exit $$status
 
 build:
 	cargo build --release --features zlob
@@ -123,13 +151,13 @@ test-version: test-setup
 	nvim --headless -u tests/minimal_init.lua \
 		-c "PlenaryBustedFile tests/version_spec.lua" 2>&1
 
-prepare-bun: build
+prepare-bun: build sync-js-api
 	mkdir -p packages/fff-bun/bin
 	cp target/release/libfff_c.dylib packages/fff-bun/bin/ 2>/dev/null || true; \
 	cp target/release/libfff_c.so packages/fff-bun/bin/ 2>/dev/null || true; \
 	cp target/release/fff_c.dll packages/fff-bun/bin/ 2>/dev/null || true
 
-prepare-node: build
+prepare-node: build sync-js-api
 	mkdir -p packages/fff-node/bin
 	cp target/release/libfff_c.dylib packages/fff-node/bin/ 2>/dev/null || true; \
 	cp target/release/libfff_c.so packages/fff-node/bin/ 2>/dev/null || true; \
@@ -141,6 +169,8 @@ test-bun: prepare-bun
 
 test-node: prepare-node
 	cd packages/fff-node && npm run build && node test/e2e.mjs
+
+test-js: test-bun test-node
 
 # Bug pinning stress test script over fff-node for issue #515
 # Just keep it untouched because it's good enough + some stress for SDK

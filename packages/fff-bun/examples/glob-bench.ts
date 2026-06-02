@@ -94,7 +94,7 @@ const finder = fffInit.result;
 
 // Wait until initial scan done so the first .glob() doesn't see a partial
 // index. Returns true = completed, false = timed out.
-const scanReady = finder.waitForScan(30_000);
+const scanReady = finder.waitForScanBlocking(30_000);
 if (!scanReady.ok || !scanReady.value) {
   console.error("fff: initial scan did not finish in 30s — exiting");
   process.exit(1);

@@ -23,8 +23,8 @@ import type {
   ScanProgress,
   Score,
   SearchResult,
-} from "./types";
-import { createGrepCursor, err } from "./types";
+} from "./fff-api";
+import { createGrepCursor, err } from "./fff-api";
 
 /** Grep mode constants matching the C API (u8). */
 const GREP_MODE_PLAIN = 0;
@@ -186,10 +186,6 @@ const ffiDefinition = {
     args: [FFIType.ptr, FFIType.u64],
     returns: FFIType.ptr,
   },
-  fff_wait_for_watcher: {
-    args: [FFIType.ptr, FFIType.u64],
-    returns: FFIType.ptr,
-  },
   fff_restart_index: {
     args: [FFIType.ptr, FFIType.cstring],
     returns: FFIType.ptr,
@@ -286,7 +282,6 @@ const ffiDefinition = {
 
 type FFFLibrary = ReturnType<typeof dlopen<typeof ffiDefinition>>;
 
-// Library instance (lazy loaded)
 let lib: FFFLibrary | null = null;
 
 /**
@@ -938,6 +933,7 @@ const GM_FUZZY_SCORE = 128;
 // 1-byte
 const GM_HAS_FUZZY = 130;
 const GM_IS_BINARY = 131;
+const GM_IS_DEFINITION = 132;
 
 // struct size: pad to 8-byte alignment → 136
 const GM_SIZE_OF = 136;
@@ -1014,6 +1010,9 @@ function readGrepMatchStruct(p: number): GrepMatch {
   }
   if (ctxAfterCount > 0) {
     match.contextAfter = readCStringArray(read.ptr(pp, GM_CTX_AFTER), ctxAfterCount);
+  }
+  if (read.u8(pp, GM_IS_DEFINITION) !== 0) {
+    match.isDefinition = true;
   }
 
   return match;
@@ -1295,18 +1294,6 @@ export function ffiGetScanProgress(handle: NativeHandle): Result<ScanProgress> {
 export function ffiWaitForScan(handle: NativeHandle, timeoutMs: number): Result<boolean> {
   const library = loadLibrary();
   const resultPtr = library.symbols.fff_wait_for_scan(handle, BigInt(timeoutMs));
-  return parseBoolResult(resultPtr);
-}
-
-/**
- * Wait for the background file watcher to be ready.
- */
-export function ffiWaitForWatcher(
-  handle: NativeHandle,
-  timeoutMs: number,
-): Result<boolean> {
-  const library = loadLibrary();
-  const resultPtr = library.symbols.fff_wait_for_watcher(handle, BigInt(timeoutMs));
   return parseBoolResult(resultPtr);
 }
 

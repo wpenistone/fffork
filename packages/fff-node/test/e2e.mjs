@@ -1,22 +1,8 @@
-/**
- * End-to-end tests for the fff-node package.
- *
- * Indexes the fff.nvim repository itself so the test suite is fully
- * self-contained — no external projects required.
- *
- * Requires:
- *   - A built Rust library (cargo build --release -p fff-c)
- *   - A compiled TS dist  (cd packages/fff-node && npx tsc)
- *
- * Run:
- *   node --test test/e2e.mjs
- */
-
 import { after, before, describe, it } from "node:test";
 import { strict as assert } from "node:assert";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { FileFinder, closeLibrary } from "../dist/src/index.js";
+import { FileFinder } from "../dist/src/index.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "..", "..", "..");
@@ -40,10 +26,9 @@ describe("fff-node", { concurrency: 1 }, () => {
   });
 
   after(() => {
-    if (finder && !finder.isDestroyed) finder.destroy();
-    // Skip closeLibrary() — the OS handles cleanup on process exit.
-    // Calling ffi-rs close() during test teardown can cause native crashes
-    // on some platforms (e.g. Windows DLL unload, Linux dlclose).
+    if (finder && !finder.isDestroyed) {
+      finder.destroy();
+    }
   });
 
   it("isAvailable returns true when the native library is loadable", () => {
@@ -136,7 +121,10 @@ describe("fff-node", { concurrency: 1 }, () => {
       assert.ok(r.ok, `glob failed: ${!r.ok ? r.error : ""}`);
       assert.ok(r.value.items.length > 0, "expected at least one .rs file");
       for (const item of r.value.items) {
-        assert.ok(item.relativePath.endsWith(".rs"), `unexpected file: ${item.relativePath}`);
+        assert.ok(
+          item.relativePath.endsWith(".rs"),
+          `unexpected file: ${item.relativePath}`,
+        );
       }
     });
 
@@ -163,14 +151,32 @@ describe("fff-node", { concurrency: 1 }, () => {
       // Constrain to .rs files so the assertion doesn't depend on result ordering
       // or content-indexing timing for other file types.
       const rustResults = finder.grep("*.rs FffResult", { mode: "plain" });
-      assert.ok(rustResults.ok, `grep failed: ${!rustResults.ok ? rustResults.error : ""}`);
-      assert.ok(rustResults.value.items.length > 0, "expected at least one .rs match");
-      assert.ok(rustResults.value.items.some((m) => m.relativePath.endsWith(".rs")));
+      assert.ok(
+        rustResults.ok,
+        `grep failed: ${!rustResults.ok ? rustResults.error : ""}`,
+      );
+      assert.ok(
+        rustResults.value.items.length > 0,
+        "expected at least one .rs match",
+      );
+      assert.ok(
+        rustResults.value.items.some((m) => m.relativePath.endsWith(".rs")),
+      );
 
-      const cResults = finder.grep("!**/*.{js,ts,rs} FffResult", { mode: "plain" });
-      assert.ok(cResults.ok, `grep failed: ${!cResults.ok ? cResults.error : ""}`);
-      assert.ok(cResults.value.items.length > 0, "expected at least one non-js/ts/rs match");
-      assert.ok(cResults.value.items.some((m) => m.relativePath.endsWith(".h")));
+      const cResults = finder.grep("!**/*.{js,ts,rs} FffResult", {
+        mode: "plain",
+      });
+      assert.ok(
+        cResults.ok,
+        `grep failed: ${!cResults.ok ? cResults.error : ""}`,
+      );
+      assert.ok(
+        cResults.value.items.length > 0,
+        "expected at least one non-js/ts/rs match",
+      );
+      assert.ok(
+        cResults.value.items.some((m) => m.relativePath.endsWith(".h")),
+      );
     });
 
     it("match items contain all required fields", () => {
@@ -200,8 +206,14 @@ describe("fff-node", { concurrency: 1 }, () => {
 
     it("respects pageSize", () => {
       // Cap to one match per file so pageSize bounds the total deterministically.
-      const unbounded = finder.grep("fn", { mode: "plain", maxMatchesPerFile: 1 });
-      assert.ok(unbounded.ok, `grep failed: ${!unbounded.ok ? unbounded.error : ""}`);
+      const unbounded = finder.grep("fn", {
+        mode: "plain",
+        maxMatchesPerFile: 1,
+      });
+      assert.ok(
+        unbounded.ok,
+        `grep failed: ${!unbounded.ok ? unbounded.error : ""}`,
+      );
       assert.ok(unbounded.value.items.length > 2);
 
       const limited = finder.grep("fn", {
@@ -240,7 +252,8 @@ describe("fff-node", { concurrency: 1 }, () => {
       assert.ok(r.ok, `grep with context failed: ${!r.ok ? r.error : ""}`);
 
       const match = r.value.items.find(
-        (m) => normalizePath(m.relativePath) === "packages/fff-node/test/e2e.mjs",
+        (m) =>
+          normalizePath(m.relativePath) === "packages/fff-node/test/e2e.mjs",
       );
       assert.ok(
         match,
@@ -248,9 +261,7 @@ describe("fff-node", { concurrency: 1 }, () => {
           .map((m) => normalizePath(m.relativePath))
           .join(", ")}`,
       );
-      assert.deepEqual(match.contextBefore, [
-        "      const r = finder.grep(",
-      ]);
+      assert.deepEqual(match.contextBefore, ["      const r = finder.grep("]);
       assert.deepEqual(match.contextAfter, ["        {"]);
     });
   });

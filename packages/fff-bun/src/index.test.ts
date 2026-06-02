@@ -102,9 +102,9 @@ describe("FileFinder - Full Lifecycle", () => {
     }
   });
 
-  test("waitForScan completes", () => {
+  test("waitForScanBlocking completes", () => {
     // Small timeout - scan should be fast or already done
-    const result = finder.waitForScan(500);
+    const result = finder.waitForScanBlocking(500);
     expect(result.ok).toBe(true);
   });
 
@@ -204,7 +204,12 @@ describe("FileFinder - Full Lifecycle", () => {
     const page1 = finder.glob("**/*.ts", { pageSize: 5, pageIndex: 1 });
     expect(page0.ok).toBe(true);
     expect(page1.ok).toBe(true);
-    if (page0.ok && page1.ok && page0.value.items.length > 1 && page1.value.items.length > 0) {
+    if (
+      page0.ok &&
+      page1.ok &&
+      page0.value.items.length > 1 &&
+      page1.value.items.length > 0
+    ) {
       expect(page1.value.items[0]!.relativePath).toBe(page0.value.items[1]!.relativePath);
     }
   });
@@ -400,7 +405,7 @@ describe("FileFinder - Directory Search", () => {
     if (result.ok) {
       finder = result.value;
     }
-    finder.waitForScan(5000);
+    finder.waitForScanBlocking(5000);
   });
 
   afterAll(() => {
@@ -479,7 +484,7 @@ describe("FileFinder - Error Handling", () => {
 
 describe("Result Type Helpers", () => {
   test("ok helper creates success result", async () => {
-    const { ok } = await import("./types");
+    const { ok } = await import("./fff-api");
     const result = ok(42);
     expect(result.ok).toBe(true);
     if (result.ok) {
@@ -488,7 +493,7 @@ describe("Result Type Helpers", () => {
   });
 
   test("err helper creates error result", async () => {
-    const { err } = await import("./types");
+    const { err } = await import("./fff-api");
     const result = err<number>("something went wrong");
     expect(result.ok).toBe(false);
     if (!result.ok) {

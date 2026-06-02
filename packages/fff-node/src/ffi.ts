@@ -57,8 +57,8 @@ import type {
   Result,
   Score,
   SearchResult,
-} from "./types.js";
-import { createGrepCursor, err } from "./types.js";
+} from "./fff-api.js";
+import { createGrepCursor, err } from "./fff-api.js";
 
 const LIBRARY_KEY = "fff_c";
 
@@ -237,11 +237,7 @@ function readResultEnvelope(
   paramsValue: unknown[],
 ): { rawPtr: JsExternal; struct: FffResultRaw } | Result<never> {
   loadLibrary();
-  const { rawPtr, struct: structData } = callRaw(
-    funcName,
-    paramsType,
-    paramsValue,
-  );
+  const { rawPtr, struct: structData } = callRaw(funcName, paramsType, paramsValue);
 
   if (structData.success === 0) {
     const errorStr = readCString(structData.error);
@@ -319,8 +315,7 @@ function callJsonResult<T>(
   if (isNullPointer(handlePtr)) return { ok: true, value: undefined as T };
   const jsonStr = readCString(handlePtr);
   freeString(handlePtr);
-  if (jsonStr === null || jsonStr === "")
-    return { ok: true, value: undefined as T };
+  if (jsonStr === null || jsonStr === "") return { ok: true, value: undefined as T };
   try {
     return { ok: true, value: snakeToCamel(JSON.parse(jsonStr)) as T };
   } catch {
@@ -598,7 +593,6 @@ interface FffMixedSearchResultRaw {
   location_end_col: number;
 }
 
-// FffGrepMatch (144 bytes) — ordered by alignment: ptrs, u64s, u32s, u16, bools
 const FFF_GREP_MATCH_STRUCT = {
   relative_path: DataType.External,
   file_name: DataType.External,
@@ -618,7 +612,7 @@ const FFF_GREP_MATCH_STRUCT = {
   match_ranges_count: DataType.U32,
   context_before_count: DataType.U32,
   context_after_count: DataType.U32,
-  fuzzy_score: DataType.U32, // actually u16 in C, but ffi-rs doesn't have U16 — reads as u32 with padding
+  fuzzy_score: DataType.U32, // actually u16 in C, but ffi-rs doesn't so we read it as u32 with padding
   has_fuzzy_score: DataType.U8,
   is_binary: DataType.U8,
   is_definition: DataType.U8,
@@ -839,16 +833,10 @@ function readGrepMatchFromRaw(raw: FffGrepMatchRaw): GrepMatch {
     match.fuzzyScore = raw.fuzzy_score;
   }
   if (raw.context_before_count > 0) {
-    match.contextBefore = readCStringArray(
-      raw.context_before,
-      raw.context_before_count,
-    );
+    match.contextBefore = readCStringArray(raw.context_before, raw.context_before_count);
   }
   if (raw.context_after_count > 0) {
-    match.contextAfter = readCStringArray(
-      raw.context_after,
-      raw.context_after_count,
-    );
+    match.contextAfter = readCStringArray(raw.context_after, raw.context_after_count);
   }
   if (raw.is_definition !== 0) {
     match.isDefinition = true;
@@ -917,8 +905,7 @@ function parseGrepResult(rawPtr: JsExternal): Result<GrepResult> {
     totalFilesSearched: gr.total_files_searched,
     totalFiles: gr.total_files,
     filteredFileCount: gr.filtered_file_count,
-    nextCursor:
-      gr.next_file_offset > 0 ? createGrepCursor(gr.next_file_offset) : null,
+    nextCursor: gr.next_file_offset > 0 ? createGrepCursor(gr.next_file_offset) : null,
   };
   if (regexFallbackError) {
     grepResult.regexFallbackError = regexFallbackError;
@@ -1270,14 +1257,7 @@ export function ffiGlob(
       DataType.U32, // page_index
       DataType.U32, // page_size
     ],
-    paramsValue: [
-      handle,
-      pattern,
-      currentFile,
-      maxThreads,
-      pageIndex,
-      pageSize,
-    ],
+    paramsValue: [handle, pattern, currentFile, maxThreads, pageIndex, pageSize],
     freeResultMemory: false,
   }) as JsExternal;
 
@@ -1309,14 +1289,7 @@ export function ffiSearchDirectories(
       DataType.U32, // page_index
       DataType.U32, // page_size
     ],
-    paramsValue: [
-      handle,
-      query,
-      currentFile ?? "",
-      maxThreads,
-      pageIndex,
-      pageSize,
-    ],
+    paramsValue: [handle, query, currentFile ?? "", maxThreads, pageIndex, pageSize],
     freeResultMemory: false,
   }) as JsExternal;
 
@@ -1514,25 +1487,28 @@ export function ffiGetBasePath(handle: NativeHandle): Result<string | null> {
 const FFF_SCAN_PROGRESS_STRUCT = {
   scanned_files_count: DataType.U64,
   is_scanning: DataType.U8,
+  is_watcher_ready: DataType.U8,
+  is_warmup_complete: DataType.U8,
 };
 
 interface FffScanProgressRaw {
   scanned_files_count: number;
   is_scanning: number;
+  is_watcher_ready: number;
+  is_warmup_complete: number;
 }
 
 /**
  * Get scan progress.
  */
-export function ffiGetScanProgress(
-  handle: NativeHandle,
-): Result<{ scannedFilesCount: number; isScanning: boolean }> {
+export function ffiGetScanProgress(handle: NativeHandle): Result<{
+  scannedFilesCount: number;
+  isScanning: boolean;
+  isWatcherReady: boolean;
+  isWarmupComplete: boolean;
+}> {
   loadLibrary();
-  const res = readResultEnvelope(
-    "fff_get_scan_progress",
-    [DataType.External],
-    [handle],
-  );
+  const res = readResultEnvelope("fff_get_scan_progress", [DataType.External], [handle]);
   if ("ok" in res) return res;
 
   const handlePtr = res.struct.handle;
@@ -1548,6 +1524,8 @@ export function ffiGetScanProgress(
   const result = {
     scannedFilesCount: Number(sp.scanned_files_count),
     isScanning: sp.is_scanning !== 0,
+    isWatcherReady: sp.is_watcher_ready !== 0,
+    isWarmupComplete: sp.is_warmup_complete !== 0,
   };
 
   // Free native scan progress
@@ -1565,10 +1543,7 @@ export function ffiGetScanProgress(
 /**
  * Wait for a tree scan to complete.
  */
-export function ffiWaitForScan(
-  handle: NativeHandle,
-  timeoutMs: number,
-): Result<boolean> {
+export function ffiWaitForScan(handle: NativeHandle, timeoutMs: number): Result<boolean> {
   return callBoolResult(
     "fff_wait_for_scan",
     [DataType.External, DataType.U64],
@@ -1579,10 +1554,7 @@ export function ffiWaitForScan(
 /**
  * Restart index in new path.
  */
-export function ffiRestartIndex(
-  handle: NativeHandle,
-  newPath: string,
-): Result<void> {
+export function ffiRestartIndex(handle: NativeHandle, newPath: string): Result<void> {
   return callVoidResult(
     "fff_restart_index",
     [DataType.External, DataType.String],
