@@ -239,6 +239,11 @@ impl IntoLua for GrepResultLua<'_> {
             item.set("line_number", m.line_number)?;
             item.set("col", m.col)?;
             item.set("byte_offset", m.byte_offset)?;
+
+            // There is a little race window when fff can return matches inside of a non-binary
+            // classified entities, the window is minimal but it errors out neovim so guard it
+            let is_binary_content = m.line_content.as_bytes().contains(&0u8);
+            item.set("is_binary_content", is_binary_content)?;
             item.set("line_content", m.line_content.as_str())?;
 
             // Match byte ranges within line_content

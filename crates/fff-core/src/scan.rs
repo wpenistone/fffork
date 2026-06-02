@@ -7,7 +7,7 @@ use tracing::{error, info};
 
 use crate::FileSync;
 use crate::background_watcher::BackgroundWatcher;
-use crate::bigram_filter::build_bigram_index;
+use crate::bigram_filter::{build_bigram_index, sniff_binary_for_non_indexable};
 use crate::error::Error;
 use crate::file_picker::{BACKGROUND_THREAD_POOL, FFFMode};
 use crate::git::GitStatusCache;
@@ -211,8 +211,9 @@ impl ScanJob {
 
         // 3. Post-scan warmup + bigram build — runs in parallel with the
         // git-status thread to overlap the two expensive phases.
-        if (config.warmup || config.content_indexing)
-            && !signals.cancelled.load(Ordering::Acquire)
+        // Always runs (even with both flags off) so binary-content files
+        // with unknown extensions get reclassified before user search hits.
+        if !signals.cancelled.load(Ordering::Acquire)
             && let Some(snap) = snapshot.as_ref()
         {
             Self::run_post_scan(&shared_picker, &signals, &config, snap);
@@ -289,20 +290,23 @@ impl ScanJob {
         config: &ScanConfig,
         unsafe_snapshot: &crate::file_picker::PostScanUnsafeSnapshot,
     ) {
-        let arena = unsafe_snapshot
-            .arena
+        let Some(arena) = unsafe_snapshot
+            .arena // we are never touching overlays so this arena is always correct
             .as_ref()
             .map(|s| s.as_arena_ptr())
-            .unwrap_or(ArenaPtr::null());
-        let _budget: &ContentCacheBudget = &unsafe_snapshot.budget;
-        let files: &[crate::types::FileItem] = &unsafe_snapshot.files[..unsafe_snapshot.base_count];
+        else {
+            tracing::error!("Failed to run post scan: arena is invalid");
+            return;
+        };
 
+        let files: &[crate::types::FileItem] = &unsafe_snapshot.files[..unsafe_snapshot.base_count];
         if signals.cancelled.load(Ordering::Acquire) {
             return;
         }
 
         if config.content_indexing {
-            let indexable_files = &files[..unsafe_snapshot.indexable_count.min(files.len())];
+            let indexable_count = unsafe_snapshot.indexable_count.min(files.len());
+            let (indexable_files, non_indexable_files) = files.split_at(indexable_count);
             let index = build_bigram_index(indexable_files, &unsafe_snapshot.base_path, arena);
 
             if let Ok(mut guard) = shared_picker.write()
@@ -310,9 +314,23 @@ impl ScanJob {
             {
                 picker.set_bigram_index(index);
             }
+
+            // Bigram only sniffs files <= MAX_INDEXABLE_FILE_SIZE; large
+            // unknown-extension binaries slip past it and would otherwise be
+            // grep-able as text. Cheap header sniff catches those.
+            if !signals.cancelled.load(Ordering::Acquire) {
+                sniff_binary_for_non_indexable(
+                    non_indexable_files,
+                    &unsafe_snapshot.base_path,
+                    arena,
+                );
+            }
+        } else {
+            // this potentially a long running as we are not parallelizing it but it's okay
+            sniff_binary_for_non_indexable(files, &unsafe_snapshot.base_path, arena);
         }
 
-        // Skipped as potentially unsafe - figure this out later
+        // TODO Skipped as potentially unsafe - figure this out later
         // if config.warmup && !signals.cancelled.load(Ordering::Acquire) {
         //     warmup_mmaps(files, budget, &unsafe_snapshot.base_path, arena);
         // }

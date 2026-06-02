@@ -333,6 +333,8 @@ pub struct GrepResult<'a> {
     pub regex_fallback_error: Option<String>,
 }
 
+pub use crate::constants::MAX_FFFILE_SIZE;
+
 /// Options for grep search.
 #[derive(Debug, Clone)]
 pub struct GrepSearchOptions {
@@ -371,7 +373,7 @@ pub struct GrepSearchOptions {
 impl Default for GrepSearchOptions {
     fn default() -> Self {
         Self {
-            max_file_size: 10 * 1024 * 1024,
+            max_file_size: MAX_FFFILE_SIZE,
             max_matches_per_file: 200,
             smart_case: true,
             file_offset: 0,
@@ -1243,16 +1245,16 @@ where
     for chunk in files_to_search.chunks(chunk_size) {
         let chunk_offset = files_consumed;
 
-        // Parallel phase: search all files in this chunk concurrently.
-        // Within a chunk every file is visited (no gaps), so pagination
-        // offsets remain correct across chunk boundaries.
         let chunk_results: Vec<(usize, &'a FileItem, Vec<GrepMatch>)> = chunk
             .par_iter()
             .enumerate()
             .map_init(
                 // Per-thread scratch: a reusable read buffer for small files
                 // and an mmap slot for cache-miss large files (≥ FRESH_MMAP_THRESHOLD).
-                || (Vec::with_capacity(64 * 1024), MmapSlot::default()),
+                || {
+                    tracing::info!("LMAOTHREAD");
+                    (Vec::with_capacity(64 * 1024), MmapSlot::default())
+                },
                 |(buf, mmap_slot), (local_idx, file)| {
                     if ctx.abort_signal.load(Ordering::Relaxed) {
                         budget_exceeded.store(true, Ordering::Relaxed);
@@ -2433,7 +2435,7 @@ mod tests {
         let arena = picker.arena_base_ptr();
 
         let options = super::GrepSearchOptions {
-            max_file_size: 10 * 1024 * 1024,
+            max_file_size: MAX_FFFILE_SIZE,
             max_matches_per_file: 0,
             smart_case: true,
             file_offset: 0,
@@ -2617,7 +2619,7 @@ mod tests {
         // (a, b, c in base + f, g, h in overflow).
         let query = super::parse_grep_query("unicorn");
         let options = super::GrepSearchOptions {
-            max_file_size: 10 * 1024 * 1024,
+            max_file_size: MAX_FFFILE_SIZE,
             max_matches_per_file: 0,
             smart_case: true,
             file_offset: 0,

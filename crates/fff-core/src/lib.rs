@@ -98,6 +98,7 @@ mod scan;
 #[doc(hidden)]
 pub mod bigram_filter;
 pub mod bigram_query;
+pub mod constants;
 mod constraints;
 mod error;
 mod score;

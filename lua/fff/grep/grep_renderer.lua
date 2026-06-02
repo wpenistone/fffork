@@ -48,6 +48,8 @@ local function format_location(item, ctx)
   return str
 end
 
+local BINARY_PLACEHOLDER = '<binary content>'
+
 local function render_match_line(item, ctx)
   local location = format_location(item, ctx)
   local separator = '  '
@@ -55,6 +57,7 @@ local function render_match_line(item, ctx)
   local raw_content = item.line_content
   if type(raw_content) ~= 'string' then raw_content = raw_content and tostring(raw_content) or '' end
   local content = raw_content
+  if item.is_binary_content then content = BINARY_PLACEHOLDER end
 
   -- Indent + location + separator + content
   local indent = ' '
@@ -138,7 +141,17 @@ local function apply_match_highlights(item, ctx, item_idx, buf, ns_id, row, line
   -- Priority 120: above CursorLine (100) so syntax is visible on cursor line,
   -- below IncSearch match ranges (200) so search matches take precedence.
   local content_start = sep_end
-  if item._trimmed_content and item.name then
+
+  if item.is_binary_content then
+    local content_end = content_start + #BINARY_PLACEHOLDER
+    if content_end <= #line_content then
+      pcall(vim.api.nvim_buf_set_extmark, buf, ns_id, row, content_start, {
+        end_col = content_end,
+        hl_group = 'Comment',
+        priority = 150,
+      })
+    end
+  elseif item._trimmed_content and item.name then
     -- Resolve language once per file group (cache on the render context)
     ctx._ts_lang_cache = ctx._ts_lang_cache or {}
     local lang = ctx._ts_lang_cache[item.name]
@@ -166,7 +179,7 @@ local function apply_match_highlights(item, ctx, item_idx, buf, ns_id, row, line
   -- 5. Match ranges highlighted with IncSearch
   -- Use extmarks with priority > cursor line (100) so IncSearch renders
   -- properly on the selected line instead of being overridden by CursorLine.
-  if item.match_ranges then
+  if item.match_ranges and not item.is_binary_content then
     for _, range in ipairs(item.match_ranges) do
       local raw_start = range[1] or 0
       local raw_end = range[2] or 0

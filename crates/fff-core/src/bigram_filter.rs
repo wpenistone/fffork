@@ -1,3 +1,4 @@
+use crate::constants::MAX_INDEXABLE_FILE_SIZE;
 use ahash::AHashMap;
 use rayon::iter::{IndexedParallelIterator, ParallelIterator};
 use rayon::slice::ParallelSlice;
@@ -5,7 +6,7 @@ use std::cell::UnsafeCell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 
-use crate::FileItem;
+use crate::{FileItem, constants};
 
 /// Maximum number of distinct bigrams tracked in the inverted index.
 /// 95 printable ASCII chars (32..=126) after lowercasing → ~70 distinct → 4900 possible.
@@ -592,7 +593,6 @@ impl BigramOverlay {
     }
 }
 
-pub(crate) const MAX_INDEXABLE_FILE_SIZE: usize = 2 * 1024 * 1024;
 const BIGRAM_CHUNK_FILES: usize = 4 * 64;
 
 /// Sparse-column cutoff for the skip-1 sub-index. Rare skip columns add
@@ -680,7 +680,7 @@ pub(crate) fn build_bigram_index(
                             // an invalid text sequence if this is not a binary file.
                             //
                             // Need to find a better way to do this.
-                            file.set_binary(crate::file_picker::detect_binary_content(content));
+                            file.set_binary(crate::types::detect_binary_content(content));
 
                             builder.add_file_content(&skip_builder, file_idx, content);
                         }
@@ -704,6 +704,28 @@ pub(crate) fn build_bigram_index(
     crate::file_picker::hint_allocator_collect();
 
     index
+}
+
+#[tracing::instrument(skip_all, name = "Sniffing Large Files Binary", level = tracing::Level::DEBUG)]
+pub(crate) fn sniff_binary_for_non_indexable(
+    files: &[FileItem],
+    base_path: &std::path::Path,
+    arena: crate::simd_path::ArenaPtr,
+) {
+    // Non-indexable files are few in a typical repo, so a serial pass with a
+    // single reused chunk buffer beats spinning up the thread pool.
+    let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+    let mut chunk = vec![0u8; crate::types::BINARY_CLASSIFICATION_CHUNK_SIZE];
+
+    for file in files {
+        // check only the files that we are able to grep
+        if file.size == 0 || file.size > constants::MAX_FFFILE_SIZE {
+            continue;
+        }
+
+        let abs = file.write_absolute_path(arena, base_path, &mut path_buf);
+        file.detect_binary_per_byte(abs, &mut chunk);
+    }
 }
 
 /// Open the base directory for the `openat` fast path. Returns `-1` on

@@ -33,6 +33,7 @@
 use crate::FFFStringStorage;
 use crate::background_watcher::{BackgroundWatcher, is_git_file};
 use crate::bigram_filter::{BigramFilter, BigramOverlay};
+use crate::constants::{MAX_OVERFLOW_FILES, PATH_BUF_SIZE};
 use crate::error::Error;
 use crate::frecency::FrecencyTracker;
 use crate::git::GitStatusCache;
@@ -42,7 +43,7 @@ use crate::query_tracker::QueryTracker;
 use crate::scan::{ScanConfig, ScanJob, ScanSignals};
 use crate::score::fuzzy_match_and_score_files;
 use crate::shared::{SharedFilePicker, SharedFrecency};
-use crate::simd_path::{ArenaPtr, PATH_BUF_SIZE};
+use crate::simd_path::ArenaPtr;
 use crate::stable_vec::StableVec;
 use crate::types::{
     ContentCacheBudget, DirItem, DirSearchResult, FileItem, MixedItemRef, MixedSearchResult,
@@ -61,11 +62,6 @@ use std::sync::{
 use std::thread::JoinHandle;
 use std::time::SystemTime;
 use tracing::{Level, debug, error, info, warn};
-
-/// Max overflow files before the watcher triggers a full rescan.
-/// `walk_filesystem` reserves this much extra capacity so the Vec never
-/// reallocates while raw pointers are held during post-scan.
-pub(crate) const MAX_OVERFLOW_FILES: usize = 1024;
 
 /// Dedicated thread pool for background work (scan, warmup, bigram build).
 /// Uses fewer threads than the global rayon pool so Neovim's event loop
@@ -812,8 +808,6 @@ impl FilePicker {
 
         self.sync_data = sync;
 
-        // Recalculate cache budget based on actual file count (unless
-        // the caller provided an explicit budget via FilePickerOptions).
         if !self.has_explicit_cache_budget {
             let file_count = self.sync_data.files().len();
             self.cache_budget = Arc::new(ContentCacheBudget::new_for_repo(file_count));
@@ -821,14 +815,18 @@ impl FilePicker {
             self.cache_budget.reset();
         }
 
-        // Apply git status synchronously.
         if let Some(handle) = git_handle
             && let Ok(Some(git_cache)) = handle.join()
         {
+            let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+
             let arena = self.arena_base_ptr();
             for file in self.sync_data.files.iter_mut() {
-                file.git_status =
-                    git_cache.lookup_status(&file.absolute_path(arena, &self.base_path));
+                file.git_status = git_cache.lookup_status(file.write_absolute_path(
+                    arena,
+                    &self.base_path,
+                    &mut path_buf,
+                ));
             }
         }
 
@@ -864,6 +862,7 @@ impl FilePicker {
     /// The query should be parsed using [`FFFQuery`]::parse() before calling
     /// this function. If a [`QueryTracker`] is provided, the search will
     /// automatically look up the last selected file for this query and boost it
+    #[tracing::instrument(skip_all, name = "Fuzzy file search", fields(query = query.raw_query))]
     pub fn fuzzy_search<'q>(
         &self,
         query: &'q FFFQuery<'q>,
@@ -1273,9 +1272,9 @@ impl FilePicker {
             base_count: self.sync_data.base_count,
             indexable_count: self.sync_data.indexable_count,
             base_path: self.base_path.clone(),
-            budget: Arc::clone(&self.cache_budget),
             cancelled: Arc::clone(&self.signals.cancelled),
             post_scan_flag: Arc::clone(&self.signals.post_scan_indexing_active),
+            _budget: Arc::clone(&self.cache_budget),
         })
     }
 
@@ -1421,7 +1420,14 @@ impl FilePicker {
 
         file.update_metadata(&self.cache_budget, modified_time, Some(size));
 
-        // only base-region entries participate in the bigram overlay
+        // Re-classify binary status from current content (chunked, fixed
+        // buffer). Already-binary files are left alone.
+        if !file.is_binary() {
+            let mut chunk = [0u8; crate::types::BINARY_CLASSIFICATION_CHUNK_SIZE];
+            file.detect_binary_per_byte(path, &mut chunk);
+        }
+
+        // Indexable base-region files feed fresh content to the bigram overlay.
         if matches!(slot, FileSlot::Base(_))
             && let Some(ref overlay) = overlay
         {
@@ -1451,12 +1457,10 @@ impl FilePicker {
         } else if let Ok(c) = crate::path_utils::canonicalize(path) {
             Some(c)
         } else {
-            let parent = path.parent()?;
-            let file_name = path.file_name()?;
-            let mut p = crate::path_utils::canonicalize(parent).ok()?;
-            p.push(file_name);
-            Some(p)
+            tracing::error!(path = ?path.display(), "Failed to canonicalize file path to add");
+            return None;
         };
+
         #[cfg(windows)]
         let path_for_index: &Path = canonical_buf.as_deref().unwrap_or(path);
         #[cfg(not(windows))]
@@ -1465,13 +1469,20 @@ impl FilePicker {
         let (mut file_item, rel_path) =
             FileItem::new(path_for_index.to_path_buf(), &self.base_path, None);
 
+        // we have to perform manual classification for every new file this will be
+        // batched during the scan, this is the path when the file is ad-hoc added to the sync
+        file_item.detect_binary_per_byte(
+            path_for_index,
+            // inline chunk buf
+            &mut [0u8; crate::types::BINARY_CLASSIFICATION_CHUNK_SIZE],
+        );
+
         let builder = self.sync_data.overflow_builder.get_or_insert_with(|| {
             // we know that overflow would never create more files during the file
             crate::simd_path::ChunkedPathStoreBuilder::new(MAX_OVERFLOW_FILES)
         });
 
-        let chunked_path = builder.add_file_immediate(&rel_path, file_item.path.filename_offset);
-        file_item.set_path(chunked_path);
+        file_item.set_path(builder.add_file_immediate(&rel_path, file_item.path.filename_offset));
         file_item.set_overflow(true);
 
         if !self.sync_data.files.push(file_item) {
@@ -1658,7 +1669,8 @@ pub(crate) struct PostScanUnsafeSnapshot {
     pub files: StableVec<FileItem>,
     pub dirs: StableVec<crate::types::DirItem>,
     pub arena: Option<Arc<crate::simd_path::ChunkedPathStore>>,
-    pub budget: Arc<crate::types::ContentCacheBudget>,
+    // TODO figure this out
+    pub _budget: Arc<crate::types::ContentCacheBudget>,
     pub base_count: usize,
     pub indexable_count: usize,
     pub base_path: PathBuf,
@@ -1847,7 +1859,7 @@ impl FileSync {
         let is_indexable = |f: &FileItem| {
             !f.is_binary()
                 && f.size > 0
-                && f.size <= crate::bigram_filter::MAX_INDEXABLE_FILE_SIZE as u64
+                && f.size <= crate::constants::MAX_INDEXABLE_FILE_SIZE as u64
         };
 
         BACKGROUND_THREAD_POOL.install(|| {
@@ -2032,11 +2044,6 @@ pub fn is_known_binary_extension(path: &Path) -> bool {
         // IDE/OS metadata
         "suo"
     )
-}
-
-#[inline]
-pub(crate) fn detect_binary_content(content: &[u8]) -> bool {
-    memchr::memchr(0, content).is_some()
 }
 
 /// Length of the longest shared directory prefix of two relative dir

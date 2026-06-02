@@ -1,5 +1,6 @@
+use crate::constants::MAX_OVERFLOW_FILES;
 use crate::error::Error;
-use crate::file_picker::{FFFMode, MAX_OVERFLOW_FILES};
+use crate::file_picker::FFFMode;
 use crate::git::GitStatusCache;
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::sort_buffer::sort_with_buffer;
@@ -25,7 +26,6 @@ pub struct BackgroundWatcher {
 }
 
 const DEBOUNCE_TIMEOUT: Duration = Duration::from_millis(50);
-const MAX_PATHS_THRESHOLD: usize = 1024;
 /// On macOS, each `watch()` call creates a separate FSEventStream. When the
 /// number of directories exceeds this threshold we fall back to a single
 /// recursive watch to avoid exhausting the per-process stream limit.
@@ -497,10 +497,11 @@ fn handle_debounced_events(
         }
 
         affected_paths_count += debounced_event.event.paths.len();
-        if affected_paths_count > MAX_PATHS_THRESHOLD {
+        if affected_paths_count > MAX_OVERFLOW_FILES {
             warn!(
-                "Too many affected paths ({}) in a single batch, triggering full rescan",
-                affected_paths_count
+                ?affected_paths_count,
+                max = MAX_OVERFLOW_FILES,
+                "Too many affected paths in a single batch, triggering full rescan",
             );
 
             need_full_rescan = true;

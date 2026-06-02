@@ -60,7 +60,7 @@ impl std::fmt::Debug for SimdChunk {
     }
 }
 
-pub const PATH_BUF_SIZE: usize = 4096;
+pub use crate::constants::PATH_BUF_SIZE;
 
 /// Indices into a shared `SimdChunk` arena representing a file path.
 ///
