@@ -166,7 +166,6 @@ impl FileSync {
         }
     }
 
-    /// Arena for base files (from the last full scan).
     #[inline]
     fn arena_base_ptr(&self) -> ArenaPtr {
         self.chunked_paths
@@ -175,47 +174,45 @@ impl FileSync {
             .unwrap_or(ArenaPtr::null())
     }
 
-    /// Arena for overflow files (added after the last full scan).
     #[inline]
-    fn overflow_arena_ptr(&self) -> ArenaPtr {
+    fn arena_overflow_ptr(&self) -> ArenaPtr {
         self.overflow_builder
             .as_ref()
             .map(|b| b.as_arena_ptr())
-            .unwrap_or(self.arena_base_ptr())
+            .unwrap_or(ArenaPtr::null())
     }
 
-    /// Resolve the correct arena for a given file (base vs overflow).
     #[inline]
     fn arena_for_file(&self, file: &FileItem) -> ArenaPtr {
         if file.is_overflow() {
-            self.overflow_arena_ptr()
+            self.arena_overflow_ptr()
         } else {
             self.arena_base_ptr()
         }
     }
 
-    /// Get all files (base + overflow). The base portion `[..base_count]` is
-    /// sorted by path; the overflow tail is unsorted.
     #[inline]
     fn files(&self) -> &[FileItem] {
         &self.files
     }
 
-    /// Get the overflow portion (files added since last full reindex).
     #[inline]
     fn overflow_files(&self) -> &[FileItem] {
         &self.files[self.base_count..]
     }
 
-    /// Get mutable file at index (works for base files only).
     #[inline]
-    fn get_file_mut(&mut self, index: usize) -> Option<&mut FileItem> {
-        self.files.get_mut(index)
+    fn get_file_mut(&mut self, index: usize) -> Option<(ArenaPtr, &mut FileItem)> {
+        Some((
+            if index < self.base_count {
+                self.arena_base_ptr()
+            } else {
+                self.arena_overflow_ptr()
+            },
+            self.files.get_mut(index)?,
+        ))
     }
 
-    /// Find file index by path using binary search on the sorted base partitions,
-    /// falling back to a linear scan of the overflow region.
-    /// `path` must be an absolute path under `base_path`.
     #[inline]
     fn find_file_index(&self, path: &Path, base_path: &Path) -> Option<usize> {
         let arena = self.arena_base_ptr();
@@ -283,7 +280,7 @@ impl FileSync {
 
         // Overflow region: linear scan by full relative path.
         if self.base_count < self.files.len() {
-            let overflow_arena = self.overflow_arena_ptr();
+            let overflow_arena = self.arena_overflow_ptr();
             if let Some(pos) = self.files[self.base_count..]
                 .iter()
                 .position(|f| f.relative_path_eq(overflow_arena, rel_path))
@@ -295,18 +292,15 @@ impl FileSync {
         None
     }
 
-    /// Tombstone every file that matches `predicate`. No shift: the
-    /// `StableVec` is non-shifting by design, so indices and addresses
-    /// remain valid for every `Arc` clone (base+overflow). `indexable_count`
-    /// and `base_count` are deliberately NOT adjusted — they are the
-    /// partition boundaries of the physical buffer, not live counts.
-    /// Returns the number of newly-tombstoned files.
+    // TODO remove this function and make a better way to remove all files
+    // from the directory without looping over the whole sync data list
+    /// Tombstones every file in the arena that matches certain predicate
     fn tombstone_files_with_arena<F>(&mut self, mut predicate: F) -> usize
     where
         F: FnMut(&FileItem, ArenaPtr) -> bool,
     {
         let base_arena = self.arena_base_ptr();
-        let overflow_arena = self.overflow_arena_ptr();
+        let overflow_arena = self.arena_overflow_ptr();
         let base_count = self.base_count;
 
         let mut tombstoned = 0usize;
@@ -513,7 +507,7 @@ impl FFFStringStorage for &FilePicker {
 
     #[inline]
     fn overflow_arena(&self) -> crate::simd_path::ArenaPtr {
-        self.sync_data.overflow_arena_ptr()
+        self.sync_data.arena_overflow_ptr()
     }
 }
 
@@ -562,7 +556,7 @@ impl FilePicker {
         self.sync_data.bigram_overlay.as_deref()
     }
 
-    pub fn get_file_mut(&mut self, index: usize) -> Option<&mut FileItem> {
+    pub fn get_file_mut(&mut self, index: usize) -> Option<(ArenaPtr, &mut FileItem)> {
         self.sync_data.get_file_mut(index)
     }
 
@@ -960,12 +954,7 @@ impl FilePicker {
         let time = std::time::Instant::now();
 
         let base_arena = self.sync_data.arena_base_ptr();
-        let overflow_arena = self
-            .sync_data
-            .overflow_builder
-            .as_ref()
-            .map(|b| b.as_arena_ptr())
-            .unwrap_or(base_arena);
+        let overflow_arena = self.sync_data.arena_overflow_ptr();
 
         let (items, scores, total_matched) = fuzzy_match_and_score_files(
             files,
@@ -1213,7 +1202,7 @@ impl FilePicker {
     pub fn grep(&self, query: &FFFQuery<'_>, options: &GrepSearchOptions) -> GrepResult<'_> {
         let overlay_guard = self.sync_data.bigram_overlay.as_ref().map(|o| o.read());
         let arena = self.arena_base_ptr();
-        let overflow_arena = self.sync_data.overflow_arena_ptr();
+        let overflow_arena = self.sync_data.arena_overflow_ptr();
         let cancel = options
             .abort_signal
             .as_deref()
@@ -1242,7 +1231,7 @@ impl FilePicker {
     ) -> GrepResult<'_> {
         let overlay_guard = self.sync_data.bigram_overlay.as_ref().map(|o| o.read());
         let arena = self.arena_base_ptr();
-        let overflow_arena = self.sync_data.overflow_arena_ptr();
+        let overflow_arena = self.sync_data.arena_overflow_ptr();
         let cancel = options
             .abort_signal
             .as_deref()
@@ -1359,13 +1348,12 @@ impl FilePicker {
 
         let mode = self.mode;
         let bp = self.base_path.clone();
-        let arena = self.arena_base_ptr();
         let frecency = shared_frecency.read()?;
 
         status_cache
             .into_iter()
             .try_for_each(|(path, status)| -> Result<(), Error> {
-                if let Some(file) = self.get_mut_file_by_path(&path) {
+                if let Some((arena, file)) = self.get_mut_file_by_path(&path) {
                     file.git_status = Some(status);
                     if let Some(ref f) = *frecency {
                         file.update_frecency_scores(f, arena, &bp, mode)?;
@@ -1396,13 +1384,12 @@ impl FilePicker {
         frecency_tracker: &FrecencyTracker,
     ) -> Result<(), Error> {
         let path = file_path.as_ref();
-        let arena = self.arena_base_ptr();
 
-        let index = self.sync_data.find_file_index(path, &self.base_path);
+        let Some(index) = self.sync_data.find_file_index(path, &self.base_path) else {
+            return Ok(());
+        };
 
-        if let Some(index) = index
-            && let Some(file) = self.sync_data.get_file_mut(index)
-        {
+        if let Some((arena, file)) = self.sync_data.get_file_mut(index) {
             file.update_frecency_scores(frecency_tracker, arena, &self.base_path, self.mode)?;
 
             // Update parent dir frecency inline (atomic, &self access).
@@ -1422,7 +1409,10 @@ impl FilePicker {
             .and_then(|index| self.sync_data.files().get(index))
     }
 
-    pub fn get_mut_file_by_path(&mut self, path: impl AsRef<Path>) -> Option<&mut FileItem> {
+    pub fn get_mut_file_by_path(
+        &mut self,
+        path: impl AsRef<Path>,
+    ) -> Option<(ArenaPtr, &mut FileItem)> {
         let path = path.as_ref();
         let index = self.sync_data.find_file_index(path, &self.base_path);
         index.and_then(|i| self.sync_data.get_file_mut(i))
@@ -1467,7 +1457,7 @@ impl FilePicker {
             }
         };
 
-        let file = self.sync_data.get_file_mut(pos)?;
+        let (_arena, file) = self.sync_data.get_file_mut(pos)?;
 
         let size = metadata.len();
         let modified_time = metadata
