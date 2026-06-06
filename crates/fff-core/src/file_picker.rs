@@ -446,6 +446,8 @@ pub struct FilePicker {
     follow_symlinks: bool,
     enable_fs_root_scanning: bool,
     enable_home_dir_scanning: bool,
+    trace_span: tracing::Span,
+    trace_id: String,
 }
 
 impl std::fmt::Debug for FilePicker {
@@ -509,6 +511,14 @@ impl FilePicker {
 
     pub fn home_dir_scanning_enabled(&self) -> bool {
         self.enable_home_dir_scanning
+    }
+
+    pub fn trace_id(&self) -> &str {
+        &self.trace_id
+    }
+
+    pub fn trace_span(&self) -> tracing::Span {
+        self.trace_span.clone()
     }
 
     pub fn mode(&self) -> FFFMode {
@@ -698,6 +708,9 @@ impl FilePicker {
         let has_explicit_budget = options.cache_budget.is_some();
         let initial_budget = options.cache_budget.unwrap_or_default();
 
+        let trace_id = crate::log::generate_trace_id();
+        let trace_span = crate::log::trace_span(&trace_id, "picker");
+
         Ok(FilePicker {
             background_watcher: None,
             base_path: path,
@@ -713,11 +726,13 @@ impl FilePicker {
             follow_symlinks: options.follow_symlinks,
             enable_fs_root_scanning: options.enable_fs_root_scanning,
             enable_home_dir_scanning: options.enable_home_dir_scanning,
+            trace_span,
+            trace_id,
         })
     }
 
     /// Create a picker, place it into the shared handle, and spawn background
-    /// indexing + file-system watcher. This is the default entry point.
+    /// indexing + file-system watcgenerate_trace_id the default entry point.
     pub fn new_with_shared_state(
         shared_picker: SharedFilePicker,
         shared_frecency: SharedFrecency,
@@ -744,13 +759,12 @@ impl FilePicker {
         let signals = picker.scan_signals();
         let scanned_files_counter = picker.scanned_files_counter();
         let path = picker.base_path.clone();
+        let trace_span = picker.trace_span.clone();
 
         {
             let mut guard = shared_picker.write()?;
             *guard = Some(picker);
-            // by dropping the old picker if it exists we triggering
-            // it's internal `cancelled` flag flip which will automatically clean
-            // any thread that might be capturing the reference safely & unsfaely
+            // dropping old picker flips its `cancelled` flag → bg threads exit cleanly
         }
 
         ScanJob::new_initial(
@@ -760,6 +774,7 @@ impl FilePicker {
             mode,
             signals,
             scanned_files_counter,
+            trace_span,
             ScanConfig {
                 warmup,
                 content_indexing,
@@ -848,6 +863,7 @@ impl FilePicker {
             self.mode,
             self.enable_fs_root_scanning,
             self.enable_home_dir_scanning,
+            self.trace_span.clone(),
         )?;
         self.background_watcher = Some(watcher);
         self.signals.watcher_ready.store(true, Ordering::Release);

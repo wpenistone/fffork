@@ -35,6 +35,7 @@ const MAX_MACOS_NONRECURSIVE_WATCHES: usize = 4096;
 const AI_MODE_COOLDOWN_SECS: u64 = 5 * 60;
 
 impl BackgroundWatcher {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         base_path: PathBuf,
         git_workdir: Option<PathBuf>,
@@ -43,6 +44,7 @@ impl BackgroundWatcher {
         mode: FFFMode,
         enable_fs_root_scanning: bool,
         enable_home_dir_scanning: bool,
+        trace_span: tracing::Span,
     ) -> Result<Self, Error> {
         info!(
             "Initializing background watcher for path: {}, mode: {:?}",
@@ -103,9 +105,11 @@ impl BackgroundWatcher {
         #[cfg(target_os = "linux")]
         let owner_debouncer = Arc::clone(&debouncer);
 
+        let owner_span = trace_span.clone();
         let owner_thread = std::thread::Builder::new()
             .name("fff-watcher-own".into())
             .spawn(move || {
+                let _g = owner_span.enter();
                 while let Ok(dir) = watch_rx.recv() {
                     // if the picker is dropped we do need to exit the loop
                     let Some(strong_picker) = owner_weak_picker.upgrade() else {

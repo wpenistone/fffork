@@ -100,7 +100,10 @@ typedef struct FffCreateOptions {
    */
   bool ai_mode;
   /**
-   * Tracing log file path. NULL/empty to skip log init.
+   * Path-shape hint for the per-session log file. Each call writes a fresh
+   * sibling file `<stem>+<UTC-timestamp>+<pid>.<ext>` next to this path.
+   * The literal path is never written to, so concurrent processes get
+   * unique per-pid files. NULL/empty to skip log init.
    */
   const char *log_file_path;
   /**

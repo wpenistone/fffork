@@ -110,7 +110,12 @@ M.change_indexing_directory = function(new_path)
   end
 
   local fff_rust = M.ensure_initialized()
-  local ok, err = pcall(fff_rust.restart_index_in_path, expanded_path)
+  local config = require('fff.conf').get()
+  local ok, err = pcall(fff_rust.restart_index_in_path, expanded_path, {
+    follow_symlinks = config.follow_symlinks,
+    enable_fs_root_scanning = config.enable_fs_root_scanning,
+    enable_home_dir_scanning = config.enable_home_dir_scanning,
+  })
   if not ok then
     vim.notify('Failed to change directory: ' .. err, vim.log.levels.ERROR)
     return false
@@ -126,7 +131,8 @@ M.ensure_initialized = function()
 
   local config = require('fff.conf').get()
   if config.logging.enabled then
-    local log_success, log_error = pcall(fuzzy.init_tracing, config.logging.log_file, config.logging.log_level)
+    local log_success, log_error =
+      pcall(fuzzy.init_tracing, config.logging.log_file, config.logging.log_level, config.logging.retain_runs)
     if log_success then
       M.log_file_path = log_error
     else
@@ -140,7 +146,11 @@ M.ensure_initialized = function()
   local ok, result = pcall(fuzzy.init_db, frecency_db_path, history_db_path, true)
   if not ok then vim.notify('Failed to databases: ' .. tostring(result), vim.log.levels.WARN) end
 
-  ok, result = pcall(fuzzy.init_file_picker, config.base_path, config.follow_symlinks)
+  ok, result = pcall(fuzzy.init_file_picker, config.base_path, {
+    follow_symlinks = config.follow_symlinks,
+    enable_fs_root_scanning = config.enable_fs_root_scanning,
+    enable_home_dir_scanning = config.enable_home_dir_scanning,
+  })
   if not ok then
     vim.notify('Failed to initialize file picker: ' .. tostring(result), vim.log.levels.ERROR)
     return fuzzy

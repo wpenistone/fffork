@@ -228,7 +228,7 @@ pub unsafe extern "C" fn fff_create_instance_with(opts: *const FffCreateOptions)
 
     if let Some(log_path) = unsafe { optional_cstr(opts.log_file_path) } {
         let level = unsafe { optional_cstr(opts.log_level) };
-        if let Err(e) = fff::log::init_tracing(log_path, level) {
+        if let Err(e) = fff::log::init_tracing(log_path, level, None) {
             return FffResult::err(&format!("Failed to init tracing: {}", e));
         }
     }

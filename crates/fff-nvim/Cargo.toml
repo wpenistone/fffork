@@ -11,50 +11,6 @@ crate-type = ["cdylib", "rlib"]
 default = []
 zlob = ["fff/zlob"]
 
-[[bin]]
-name = "test_watcher"
-path = "src/bin/test_watcher.rs"
-
-[[bin]]
-name = "jemalloc_profile"
-path = "src/bin/jemalloc_profile.rs"
-
-[[bin]]
-name = "search_profiler"
-path = "src/bin/search_profiler.rs"
-
-[[bin]]
-name = "bench_search_only"
-path = "src/bin/bench_search_only.rs"
-
-[[bin]]
-name = "grep_profiler"
-path = "src/bin/grep_profiler.rs"
-
-[[bin]]
-name = "grep_vs_rg"
-path = "src/bin/grep_vs_rg.rs"
-
-[[bin]]
-name = "bench_grep_query"
-path = "src/bin/bench_grep_query.rs"
-
-[[bin]]
-name = "fuzzy_grep_test"
-path = "src/bin/fuzzy_grep_test.rs"
-
-[[bin]]
-name = "test_memory_leak"
-path = "src/bin/test_memory_leak.rs"
-
-[[bin]]
-name = "bench_ci_memmem"
-path = "src/bin/bench_ci_memmem.rs"
-
-[[bin]]
-name = "bench_lmdb_parallel"
-path = "src/bin/bench_lmdb_parallel.rs"
-
 [dependencies]
 # Workspace dependencies
 ahash = { workspace = true }

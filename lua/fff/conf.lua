@@ -68,6 +68,8 @@ local M = {}
 --- @field lazy_sync boolean
 --- @field prompt_vim_mode boolean
 --- @field follow_symlinks boolean
+--- @field enable_fs_root_scanning boolean
+--- @field enable_home_dir_scanning boolean
 --- @field layout FffLayoutConfig
 --- @field preview FffPreviewConfig
 --- @field keymaps FffKeymapsConfig
@@ -205,6 +207,10 @@ local function init()
     prompt_vim_mode = false, -- set to true to enable vim-mode in the prompt: <Esc> leaves insert for normal mode bindings (also allows <leader>p or <leader>l to jump around) the second <Esc> closes the picker
     wrap_around = false, -- set to true to wrap cursor to the opposite end when reaching the first/last item
     follow_symlinks = false, -- set to true to follow symbolic links during file indexing
+    -- Allow fff in the user's $HOME director.
+    enable_home_dir_scanning = true,
+    -- Allow fff in a filesystem root (e.g. `/`, `C:\`)
+    enable_fs_root_scanning = false,
     layout = {
       height = 0.8,
       width = 0.8,
@@ -362,8 +368,15 @@ local function init()
     },
     logging = {
       enabled = true,
+      -- Path-shape hint: each nvim startup writes a fresh sibling file
+      -- `<stem>+<UTC-timestamp>+<pid>.<ext>` next to this path. The literal
+      -- path itself is never written to — multiple concurrent nvim instances
+      -- get their own per-pid file with no locking.
       log_file = vim.fn.stdpath('log') .. '/fff.log',
       log_level = 'info',
+      -- How many session log files to retain. Newest are kept, older are
+      -- pruned on the next startup. Set to 0 to disable retention.
+      retain_runs = 20,
     },
     -- find_files settings
     file_picker = {

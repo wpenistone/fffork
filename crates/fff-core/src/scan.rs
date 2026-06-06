@@ -61,6 +61,7 @@ pub(crate) struct ScanJob {
     /// side. Reset to 0 at scan start, incremented per-file by the
     /// walker. Shared `Arc` so the UI polls the same atomic.
     scanned_files_counter: Arc<AtomicUsize>,
+    trace_span: tracing::Span,
 }
 
 impl ScanJob {
@@ -84,6 +85,7 @@ impl ScanJob {
         let signals = picker.scan_signals();
         let scanned_files_counter = picker.scanned_files_counter();
         let base_path = picker.base_path().to_path_buf();
+        let trace_span = picker.trace_span();
 
         let new_scan_config = ScanConfig {
             warmup: picker.has_mmap_cache(),
@@ -106,9 +108,11 @@ impl ScanJob {
             config: new_scan_config,
             shared_picker: shared_picker.clone(),
             shared_frecency: shared_frecency.clone(),
+            trace_span,
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_initial(
         shared_picker: SharedFilePicker,
         shared_frecency: SharedFrecency,
@@ -116,6 +120,7 @@ impl ScanJob {
         mode: FFFMode,
         signals: ScanSignals,
         scanned_files_counter: Arc<AtomicUsize>,
+        trace_span: tracing::Span,
         config: ScanConfig,
     ) -> Self {
         Self {
@@ -126,15 +131,20 @@ impl ScanJob {
             signals,
             scanned_files_counter,
             config,
+            trace_span,
         }
     }
 
     /// Spawn the job on a dedicated OS thread. Returns immediately.
     pub fn spawn(self) -> std::thread::JoinHandle<()> {
         self.signals.scanning.store(true, Ordering::Release);
+        let span = self.trace_span.clone();
         std::thread::Builder::new()
             .name("fff-scan".into())
-            .spawn(move || self.run())
+            .spawn(move || {
+                let _g = span.enter();
+                self.run();
+            })
             .expect("failed to spawn fff-scan thread")
     }
 
@@ -147,6 +157,7 @@ impl ScanJob {
             signals,
             scanned_files_counter,
             config,
+            trace_span: _,
         } = self;
 
         let _scanning = ScanningGuard::new(&signals, config.install_watcher);
@@ -250,6 +261,7 @@ impl ScanJob {
                 mode,
                 config.enable_fs_root_scanning,
                 config.enable_home_dir_scanning,
+                tracing::Span::current(),
             ) {
                 Ok(watcher) => {
                     if let Ok(mut guard) = shared_picker.write()

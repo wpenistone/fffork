@@ -256,6 +256,12 @@ require('fff').setup({
   max_threads = 4,
   lazy_sync = true,
   prompt_vim_mode = false,
+  follow_symlinks = false,
+  -- Allow indexing the user's $HOME directory. Enabled by default.
+  -- Disable if you strictly sure you don't want this, as it makes whole fff error hard
+  enable_home_dir_scanning = true,
+  -- Allow indexing a filesystem root (e.g. `/`, `C:\`). Disabled by default
+  enable_fs_root_scanning = false,
   layout = {
     height = 0.8,
     width = 0.8,
@@ -340,9 +346,11 @@ require('fff').setup({
     },
   },
   logging = {
-    enabled = true,
+    -- logs will be written in a parent directory of this file path in files like
+    -- `<stem>+<UTC-timestamp>+<pid>.<ext>`. Run :FFFOpenLog to open current one
     log_file = vim.fn.stdpath('log') .. '/fff.log',
     log_level = 'info',
+    retain_runs = 20,
   },
 })
 ```
@@ -442,7 +450,9 @@ Run `:FFFScan` to force a rescan.
 ### Troubleshooting
 
 - `:FFFHealth` verifies picker init, optional dependencies, and DB connectivity.
-- `:FFFOpenLog` opens the log file.
+- `:FFFOpenLog` opens the current session's log file.
+- Historical log files are stored near the main log file `<state>/log/fff+<UTC-timestamp>+<pid>.log` (up to 20 files)
+- For a crash backtrace, run `lldb -- nvim` or `gdb -- nvim` and reproduce 
 
 </details>
 

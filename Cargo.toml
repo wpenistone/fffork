@@ -30,6 +30,7 @@ heed = "0.22.0"
 ignore = "0.4.22"
 memmap2 = "0.9"
 mimalloc = "0.1.47"
+signal-hook-registry = "1.4"
 zlob = "1.4.1"
 
 mlua = { version = "0.11.1", features = ["module", "luajit"] }
@@ -50,7 +51,7 @@ tracing = "0.1"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-strip = true
+strip = "debuginfo"
 
 [profile.ci]
 inherits = "release"
