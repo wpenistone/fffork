@@ -49,8 +49,20 @@ jobs:
       - name: Cleanup intermediate file
         run: rm -f .panvimdoc-input.md
 
+      # panvimdoc stamps "Last change: <today>" every run, so a daily cron always
+      # produces a one-line diff. Skip the PR unless a non-date line changed.
+      - name: Detect real doc changes
+        id: docdiff
+        run: |
+          if git diff --quiet -I 'Last change:' -- doc/fff.nvim.txt; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create pull request
         id: cpr
+        if: steps.docdiff.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v7
         with:
           branch: bot/regenerate-vimdoc

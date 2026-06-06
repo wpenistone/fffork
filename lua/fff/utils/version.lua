@@ -38,7 +38,7 @@ function M.current_release_tag(repo_root)
   for tag in raw:gmatch('[^\n]+') do
     if tag:match('^v%d') then
       stable = tag
-    elseif tag:match('%-nightly%.') then
+    elseif tag == 'nightly' or tag:match('%-nightly%.') then
       nightly = tag
     elseif tag:match('%-dev%.') then
       dev = tag
@@ -135,9 +135,13 @@ function M.resolve(repo_root)
   end
 
   local version = string.format('%s-%s.%s', next_version, prerelease_label, short_sha)
+  -- Nightlies publish to a single rolling "nightly" release/tag updated in place,
+  -- so re-publishing never re-notifies watchers. `version` stays unique per-sha
+  -- because crates.io/npm reject duplicate versions.
+  local release_tag = (prerelease_label == 'nightly') and 'nightly' or version
   return {
     version = version,
-    release_tag = version,
+    release_tag = release_tag,
     is_release = false,
     npm_tag = npm_tag,
   }

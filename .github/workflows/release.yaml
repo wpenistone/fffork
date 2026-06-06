@@ -439,11 +439,18 @@ jobs:
         id: version
         run: lua scripts/determine-version.lua
 
+      # All nightly releases share the same tag and same release in github
+      - name: Move rolling nightly tag to current commit
+        if: steps.version.outputs.release_tag == 'nightly'
+        run: |
+          git tag -f nightly "${{ github.sha }}"
+          git push -f origin refs/tags/nightly
+
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v2
         with:
           name: "${{ steps.version.outputs.version }}"
-          tag_name: "${{ steps.version.outputs.is_release == 'true' && format('v{0}', steps.version.outputs.version) || steps.version.outputs.version }}"
+          tag_name: "${{ steps.version.outputs.release_tag }}"
           token: ${{ github.token }}
           files: ./binaries/*
           draft: false
