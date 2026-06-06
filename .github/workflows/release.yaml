@@ -439,9 +439,11 @@ jobs:
         id: version
         run: lua scripts/determine-version.lua
 
-      # All nightly releases share the same tag and same release in github
+      # Nightlies publish to a permanent per-sha tag (release_tag == version) so
+      # pinned/stale installs always fetch the binary built for their own commit.
+      # The rolling `nightly` tag is also moved to HEAD for "give me latest" tooling.
       - name: Move rolling nightly tag to current commit
-        if: steps.version.outputs.release_tag == 'nightly'
+        if: steps.version.outputs.is_release != 'true'
         run: |
           git tag -f nightly "${{ github.sha }}"
           git push -f origin refs/tags/nightly
@@ -459,6 +461,8 @@ jobs:
           body: |
             ${{ steps.version.outputs.is_release == 'true' && format('Release {0}', steps.version.outputs.version) || format('Nightly release from commit: {0}', github.sha) }}
 
+            npm packages and rust crates are available under this version ${{ steps.version.outputs.version }}
+
             ## Neovim Plugin
             - `{target}.so` / `.dylib` / `.dll` - Lua module for Neovim
 
@@ -468,7 +472,7 @@ jobs:
             ## MCP Server
             - `fff-mcp-{target}` - MCP server binary
 
-            Install with:
+            Update mcp via:
             ```sh
             curl -fsSL https://raw.githubusercontent.com/dmtrKovalenko/fff.nvim/main/install-mcp.sh | bash
             ```
