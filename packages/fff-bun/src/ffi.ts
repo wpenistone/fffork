@@ -10,6 +10,7 @@
 
 import { CString, dlopen, FFIType, type Pointer, ptr, read } from "bun:ffi";
 import { findBinary } from "./download";
+import { embeddedLibPath } from "./embedded";
 import type {
   DirItem,
   DirSearchResult,
@@ -290,15 +291,34 @@ let lib: FFFLibrary | null = null;
 function loadLibrary(): FFFLibrary {
   if (lib) return lib;
 
-  const binaryPath = findBinary();
+  const isEmbedded = embeddedLibPath?.includes("$bunfs") ?? false;
+  const binaryPath = isEmbedded
+    ? embeddedLibPath
+    : (findBinary() ?? embeddedLibPath);
   if (!binaryPath) {
-    throw new Error(
-      "fff native library not found. Build from source with `cargo build --release -p fff-c` or install the platform package.",
-    );
+    throw new Error(libNotFoundMessage());
   }
 
   lib = dlopen(binaryPath, ffiDefinition);
   return lib;
+}
+
+function libNotFoundMessage(): string {
+  if (import.meta.url.includes("$bunfs")) {
+    if (process.platform === "linux") {
+      return [
+        "You are running bun --compile with fff native library which CAN NOT resolve a binary",
+        "On Linux the libc must be supplied at compile time so the native lib is bundled.",
+        "Rebuild with:",
+        "  bun build --compile --define FFF_LIBC='\"gnu\"'  ...   # glibc",
+        "  bun build --compile --define FFF_LIBC='\"musl\"' ...   # musl / Alpine",
+      ].join("\n");
+    }
+
+    return "fff native library was not embedded into this executable. Rebuild with `bun build --compile` and ensure the @ff-labs/fff-bin-* package for this platform is installed.";
+  }
+
+  return "fff native library not found. Build from source with `cargo build --release -p fff-c` or install the platform package.";
 }
 
 /**
@@ -329,7 +349,9 @@ function snakeToCamel(obj: unknown): unknown {
 
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
-    const camelKey = key.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase());
+    const camelKey = key.replace(/_([a-z])/g, (_, letter) =>
+      letter.toUpperCase(),
+    );
     result[camelKey] = snakeToCamel(value);
   }
   return result;
@@ -424,7 +446,8 @@ function parseJsonResult<T>(resultPtr: Pointer | null): Result<T> {
   const jsonStr = readCString(envelope.handlePtr);
   library.symbols.fff_free_string(asPtr(envelope.handlePtr));
 
-  if (jsonStr === null || jsonStr === "") return { ok: true, value: undefined as T };
+  if (jsonStr === null || jsonStr === "")
+    return { ok: true, value: undefined as T };
 
   try {
     return { ok: true, value: snakeToCamel(JSON.parse(jsonStr)) as T };
@@ -725,7 +748,9 @@ function readDirItemStruct(p: number): DirItem {
 /**
  * Parse an FffDirSearchResult from a raw FffResult pointer, then free native memory.
  */
-function parseDirSearchResult(resultPtr: Pointer | null): Result<DirSearchResult> {
+function parseDirSearchResult(
+  resultPtr: Pointer | null,
+): Result<DirSearchResult> {
   if (resultPtr === null) {
     return err("FFI returned null pointer");
   }
@@ -828,7 +853,9 @@ function readMixedItemStruct(p: number): MixedItem {
 /**
  * Parse an FffMixedSearchResult from a raw FffResult pointer, then free native memory.
  */
-function parseMixedSearchResult(resultPtr: Pointer | null): Result<MixedSearchResult> {
+function parseMixedSearchResult(
+  resultPtr: Pointer | null,
+): Result<MixedSearchResult> {
   if (resultPtr === null) {
     return err("FFI returned null pointer");
   }
@@ -860,7 +887,10 @@ function parseMixedSearchResult(resultPtr: Pointer | null): Result<MixedSearchRe
   } else if (locTag === 3) {
     location = {
       type: "range",
-      start: { line: read.i32(hp, MSR_LOC_LINE), col: read.i32(hp, MSR_LOC_COL) },
+      start: {
+        line: read.i32(hp, MSR_LOC_LINE),
+        col: read.i32(hp, MSR_LOC_COL),
+      },
       end: {
         line: read.i32(hp, MSR_LOC_END_LINE),
         col: read.i32(hp, MSR_LOC_END_COL),
@@ -1006,10 +1036,16 @@ function readGrepMatchStruct(p: number): GrepMatch {
     match.fuzzyScore = read.u16(pp, GM_FUZZY_SCORE);
   }
   if (ctxBeforeCount > 0) {
-    match.contextBefore = readCStringArray(read.ptr(pp, GM_CTX_BEFORE), ctxBeforeCount);
+    match.contextBefore = readCStringArray(
+      read.ptr(pp, GM_CTX_BEFORE),
+      ctxBeforeCount,
+    );
   }
   if (ctxAfterCount > 0) {
-    match.contextAfter = readCStringArray(read.ptr(pp, GM_CTX_AFTER), ctxAfterCount);
+    match.contextAfter = readCStringArray(
+      read.ptr(pp, GM_CTX_AFTER),
+      ctxAfterCount,
+    );
   }
   if (read.u8(pp, GM_IS_DEFINITION) !== 0) {
     match.isDefinition = true;
@@ -1291,18 +1327,30 @@ export function ffiGetScanProgress(handle: NativeHandle): Result<ScanProgress> {
 /**
  * Wait for scan to complete.
  */
-export function ffiWaitForScan(handle: NativeHandle, timeoutMs: number): Result<boolean> {
+export function ffiWaitForScan(
+  handle: NativeHandle,
+  timeoutMs: number,
+): Result<boolean> {
   const library = loadLibrary();
-  const resultPtr = library.symbols.fff_wait_for_scan(handle, BigInt(timeoutMs));
+  const resultPtr = library.symbols.fff_wait_for_scan(
+    handle,
+    BigInt(timeoutMs),
+  );
   return parseBoolResult(resultPtr);
 }
 
 /**
  * Restart index in new path.
  */
-export function ffiRestartIndex(handle: NativeHandle, newPath: string): Result<void> {
+export function ffiRestartIndex(
+  handle: NativeHandle,
+  newPath: string,
+): Result<void> {
   const library = loadLibrary();
-  const resultPtr = library.symbols.fff_restart_index(handle, ptr(encodeString(newPath)));
+  const resultPtr = library.symbols.fff_restart_index(
+    handle,
+    ptr(encodeString(newPath)),
+  );
   return parseVoidResult(resultPtr);
 }
 
@@ -1340,7 +1388,10 @@ export function ffiGetHistoricalQuery(
   offset: number,
 ): Result<string | null> {
   const library = loadLibrary();
-  const resultPtr = library.symbols.fff_get_historical_query(handle, BigInt(offset));
+  const resultPtr = library.symbols.fff_get_historical_query(
+    handle,
+    BigInt(offset),
+  );
   return parseStringResult(resultPtr);
 }
 

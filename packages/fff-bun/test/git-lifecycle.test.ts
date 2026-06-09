@@ -10,8 +10,8 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { FileItem } from "./fff-api";
-import { FileFinder } from "./index";
+import type { FileItem } from "../src/fff-api";
+import { FileFinder } from "../src/index";
 
 /**
  * Integration test: full git lifecycle with a real repository.

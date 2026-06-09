@@ -29,6 +29,26 @@ The correct native binary for your platform is installed automatically via platf
 
 If the platform package isn't available, the postinstall script will attempt to download from GitHub releases as a fallback.
 
+### Standalone executables (`bun build --compile`)
+
+`@ff-labs/fff-bun` embeds the native library into single-file executables built
+with `bun build --compile`. macOS and Windows work with no extra flags:
+
+```bash
+bun build --compile ./app.ts --outfile myapp
+```
+
+On **Linux** the C library's libc (glibc vs musl) can't be detected at build
+time, so you must pass it as a build constant for the lib to embed:
+
+```bash
+bun build --compile --define FFF_LIBC='"gnu"'  ./app.ts --outfile myapp   # glibc
+bun build --compile --define FFF_LIBC='"musl"' ./app.ts --outfile myapp   # musl / Alpine
+```
+
+Without the define on Linux the library is resolved at runtime instead of being
+embedded, which works under `bun run` but not in a standalone binary.
+
 ## Quick Start
 
 Each `FileFinder` instance owns an independent native index. Create one, wait

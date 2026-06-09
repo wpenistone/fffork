@@ -14,7 +14,7 @@ SHELL := bash
 # string rather than the literal `-o` / `pipefail` tokens.
 .SHELLFLAGS := -o pipefail -ec
 
-.PHONY: build build-c-lib install uninstall test test-rust test-c-smoke test-c-api test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-repos test-node-stress sync-js-api sync-js-api-check bump-homebrew-formula bump-install-mcp-sh
+.PHONY: build build-c-lib install uninstall test test-rust test-c-smoke test-c-api test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-bun-packaged prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-repos test-node-stress sync-js-api sync-js-api-check bump-homebrew-formula bump-install-mcp-sh test-bun-compile 
 
 all: format test lint
 
@@ -164,8 +164,48 @@ prepare-node: build sync-js-api
 	cp target/release/fff_c.dll packages/fff-node/bin/ 2>/dev/null || true
 
 test-bun: prepare-bun
-	cd packages/fff-bun && bun test src/
+	cd packages/fff-bun && bun test test/
 	cd packages/pi-fff && bun test test/
+
+# Same as prepare-bun but puts the compiled binary into the actual npm package location
+prepare-bun-packaged: prepare-bun
+	@machine=$$(uname -m); \
+	case "$$machine" in \
+	  x86_64|amd64) arch=x64 ;; \
+	  aarch64|arm64) arch=arm64 ;; \
+	  *) echo "unsupported arch: $$machine" >&2; exit 1 ;; \
+	esac; \
+	case "$$(uname -s)" in \
+	  Darwin) lib=libfff_c.dylib; pkg=fff-bin-darwin-$$arch ;; \
+	  Linux) lib=libfff_c.so; \
+	    if ldd --version 2>&1 | grep -qi musl; then libc=musl; else libc=gnu; fi; \
+	    pkg=fff-bin-linux-$$arch-$$libc ;; \
+	  MINGW*|MSYS*|CYGWIN*|Windows_NT) lib=fff_c.dll; pkg=fff-bin-win32-$$arch ;; \
+	  *) echo "unsupported OS: $$(uname -s)" >&2; exit 1 ;; \
+	esac; \
+	src=target/release/$$lib; \
+	[ -f "$$src" ] || { echo "missing built library: $$src" >&2; exit 1; }; \
+	dest=packages/fff-bun/node_modules/@ff-labs/$$pkg; \
+	rm -rf "$$dest"; mkdir -p "$$dest"; \
+	cp "$$src" "$$dest/$$lib"; \
+	printf '{ "name": "@ff-labs/%s", "version": "0.0.0", "main": "%s" }\n' "$$pkg" "$$lib" > "$$dest/package.json"
+
+# Compile a bun example to a standalone executable and run it. Verifies the
+# native libfff_c is embedded + loaded from a `bun build --compile` binary.
+# The staged bin package is removed before running so success proves the lib
+# was embedded, not resolved from disk.
+test-bun-compile: prepare-bun-packaged
+	cd packages/fff-bun && \
+		if [ "$$(uname -s)" = "Linux" ]; then \
+		  if ldd --version 2>&1 | grep -qi musl; then DEFINE='--define FFF_LIBC="musl"'; \
+		  else DEFINE='--define FFF_LIBC="gnu"'; fi; \
+		else DEFINE=""; fi; \
+		bun build --compile $$DEFINE ./examples/glob-bench.ts --outfile ./glob-bench-bin && \
+		EXE=./glob-bench-bin; [ -f "$$EXE.exe" ] && EXE="$$EXE.exe"; \
+		rm -rf bin node_modules/@ff-labs; \
+		"$$EXE" . '**/*.ts' 1 | tee /tmp/fff-compile-e2e.log && \
+		grep -q 'fff.glob' /tmp/fff-compile-e2e.log
+	rm -f packages/fff-bun/glob-bench-bin packages/fff-bun/glob-bench-bin.exe
 
 test-node: prepare-node
 	cd packages/fff-node && npm run build && node test/e2e.mjs

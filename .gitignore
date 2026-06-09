@@ -16,6 +16,7 @@ result
 *.data
 node_modules/
 crates/fff-notify-debouncer-full/
+packages/fff-bun/glob-bench-bin
 
 dist/
 scripts/benchmark-results/

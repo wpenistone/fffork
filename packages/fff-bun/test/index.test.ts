@@ -1,9 +1,9 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import fs from "node:fs";
 import path from "node:path";
-import { findBinary } from "./download";
-import { FileFinder } from "./index";
-import { getLibExtension, getLibFilename, getTriple } from "./platform";
+import { findBinary } from "../src/download";
+import { FileFinder } from "../src/index";
+import { getLibExtension, getLibFilename, getTriple } from "../src/platform";
 
 // Cross-platform path normalization helpers
 const normalizePath = (path: string | null | undefined): string | null => {
@@ -484,7 +484,7 @@ describe("FileFinder - Error Handling", () => {
 
 describe("Result Type Helpers", () => {
   test("ok helper creates success result", async () => {
-    const { ok } = await import("./fff-api");
+    const { ok } = await import("../src/fff-api");
     const result = ok(42);
     expect(result.ok).toBe(true);
     if (result.ok) {
@@ -493,7 +493,7 @@ describe("Result Type Helpers", () => {
   });
 
   test("err helper creates error result", async () => {
-    const { err } = await import("./fff-api");
+    const { err } = await import("../src/fff-api");
     const result = err<number>("something went wrong");
     expect(result.ok).toBe(false);
     if (!result.ok) {

@@ -118,6 +118,10 @@ jobs:
           make test-bun
           make test-c-api
 
+      - name: Verify bun --compile 
+        shell: bash
+        run: make test-bun-compile
+
       - name: Install Node.js
         if: ${{ matrix.os != 'ubuntu-latest' }}
         uses: actions/setup-node@v6
