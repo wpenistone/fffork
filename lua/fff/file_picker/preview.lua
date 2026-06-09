@@ -28,6 +28,17 @@ local function append_buffer_lines(bufnr, lines)
   vim.api.nvim_set_option_value('modifiable', false, { buf = bufnr })
 end
 
+local function show_preview_unavailable(bufnr) set_buffer_lines(bufnr, { 'No preview available' }) end
+
+local function set_preview_filetype(bufnr, filetype)
+  -- FileType hooks can throw or mutate global v:errmsg during preview setup.
+  -- pcall lets us restore it; callers treat failures as preview-local.
+  local errmsg = vim.v.errmsg
+  local ok, err = pcall(vim.api.nvim_set_option_value, 'filetype', filetype, { buf = bufnr })
+  vim.v.errmsg = errmsg
+  return ok, err
+end
+
 local function find_existing_buffer(file_path)
   local abs_path = vim.fn.resolve(vim.fn.fnamemodify(file_path, ':p'))
 
@@ -87,25 +98,27 @@ local function init_dynamic_loading_async(file_path, callback)
   local generation = M.state.preview_generation
 
   vim.uv.fs_open(file_path, 'r', 438, function(err, fd)
-    -- Stale callback: preview moved on to a different file
-    if M.state.preview_generation ~= generation then
-      if fd then pcall(vim.uv.fs_close, fd) end
-      return
-    end
+    vim.schedule(function()
+      -- Stale callback: preview moved on to a different file
+      if M.state.preview_generation ~= generation then
+        if fd then pcall(vim.uv.fs_close, fd) end
+        return
+      end
 
-    if err or not fd then
-      callback(false, 'Failed to open file: ' .. (err or 'unknown error'))
-      return
-    end
+      if err or not fd then
+        callback(false, 'Failed to open file: ' .. (err or 'unknown error'))
+        return
+      end
 
-    M.state.file_operation = {
-      fd = fd,
-      file_path = file_path,
-      position = 0,
-      remainder = '',
-    }
+      M.state.file_operation = {
+        fd = fd,
+        file_path = file_path,
+        position = 0,
+        remainder = '',
+      }
 
-    callback(true)
+      callback(true)
+    end)
   end)
 end
 
@@ -278,7 +291,10 @@ local function link_buffer_content(source_bufnr, target_bufnr)
   set_buffer_lines(target_bufnr, lines)
 
   local source_ft = vim.api.nvim_get_option_value('filetype', { buf = source_bufnr })
-  if source_ft ~= '' then vim.api.nvim_set_option_value('filetype', source_ft, { buf = target_bufnr }) end
+  if source_ft ~= '' then
+    local ok = set_preview_filetype(target_bufnr, source_ft)
+    if not ok then return false end
+  end
 
   M.state.has_more_content = false
   M.state.total_file_lines = #lines
@@ -434,7 +450,11 @@ function M.preview_file(file_path, bufnr)
       set_buffer_lines(bufnr, content)
 
       local file_config = M.get_file_config(file_path)
-      vim.api.nvim_set_option_value('filetype', info.filetype, { buf = bufnr })
+      local ok = set_preview_filetype(bufnr, info.filetype)
+      if not ok then
+        show_preview_unavailable(bufnr)
+        return
+      end
       vim.api.nvim_set_option_value('modifiable', false, { buf = bufnr })
       vim.api.nvim_set_option_value('readonly', true, { buf = bufnr })
       vim.api.nvim_set_option_value('buftype', 'nofile', { buf = bufnr })
@@ -553,7 +573,11 @@ function M.preview_binary_file(file_path, bufnr)
   end
 
   set_buffer_lines(bufnr, lines)
-  vim.api.nvim_set_option_value('filetype', 'text', { buf = bufnr })
+  local ok = set_preview_filetype(bufnr, 'text')
+  if not ok then
+    show_preview_unavailable(bufnr)
+    return false
+  end
   vim.api.nvim_set_option_value('modifiable', false, { buf = bufnr })
   vim.api.nvim_set_option_value('readonly', true, { buf = bufnr })
 
@@ -839,7 +863,7 @@ function M.clear_buffer(bufnr)
   pcall(vim.treesitter.stop, bufnr)
 
   vim.api.nvim_set_option_value('modifiable', true, { buf = bufnr })
-  vim.api.nvim_set_option_value('filetype', '', { buf = bufnr })
+  set_preview_filetype(bufnr, '')
   vim.api.nvim_set_option_value('syntax', '', { buf = bufnr })
   vim.api.nvim_set_option_value('buftype', 'nofile', { buf = bufnr })
 
