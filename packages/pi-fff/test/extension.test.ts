@@ -154,6 +154,8 @@ describe("pi-fff autocomplete registration", () => {
         frecencyDbPath: undefined,
         historyDbPath: undefined,
         aiMode: true,
+        enableHomeDirScanning: true,
+        enableFsRootScanning: false,
       },
     ]);
   });
