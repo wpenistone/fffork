@@ -5,8 +5,8 @@ use fff::frecency::FrecencyTracker;
 use fff::path_utils::expand_tilde;
 use fff::query_tracker::QueryTracker;
 use fff::{
-    DbHealthChecker, DirSearchConfig, Error, FFFMode, FileSearchConfig, FuzzySearchOptions,
-    GrepConfig, MixedSearchConfig, PaginationArgs, QueryParser, Score, SearchResult,
+    DbHealthChecker, DirSearchConfig, Error, FFFMode, FFFQuery, FileSearchConfig,
+    FuzzySearchOptions, MixedSearchConfig, PaginationArgs, QueryParser, Score, SearchResult,
     SharedFilePicker, SharedFrecency, SharedQueryTracker,
 };
 use mimalloc::MiMalloc;
@@ -15,12 +15,14 @@ use once_cell::sync::Lazy;
 use path_shortening::PathShortenStrategy;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use user_config::{NvimGrepConfig, UserConfigOptions, set_global_user_config};
 
 mod error;
 mod hex_dump;
 mod log;
 mod lua_types;
 mod path_shortening;
+mod user_config;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -65,6 +67,7 @@ struct PickerInitOpts {
     follow_symlinks: bool,
     enable_fs_root_scanning: bool,
     enable_home_dir_scanning: bool,
+    enable_filename_constraint: bool,
 }
 
 impl PickerInitOpts {
@@ -85,6 +88,9 @@ impl PickerInitOpts {
                     .unwrap_or(false),
                 enable_home_dir_scanning: t
                     .get::<Option<bool>>("enable_home_dir_scanning")?
+                    .unwrap_or(false),
+                enable_filename_constraint: t
+                    .get::<Option<bool>>("enable_filename_constraint")?
                     .unwrap_or(false),
             }),
             other => Err(LuaError::RuntimeError(format!(
@@ -107,6 +113,9 @@ pub fn init_file_picker(
     }
 
     let opts = PickerInitOpts::from_lua_value(opts)?;
+    set_global_user_config(UserConfigOptions {
+        enable_filename_constraint: opts.enable_filename_constraint,
+    });
 
     FilePicker::new_with_shared_state(
         FILE_PICKER.clone(),
@@ -144,6 +153,9 @@ pub fn restart_index_in_path(
     })?;
 
     let opts = PickerInitOpts::from_lua_value(opts)?;
+    set_global_user_config(UserConfigOptions {
+        enable_filename_constraint: opts.enable_filename_constraint,
+    });
 
     // Spawn a background thread BEFORE touching the picker lock. The
     // same-dir short-circuit previously called `FILE_PICKER.read()` on
@@ -277,11 +289,9 @@ pub fn fuzzy_search_files(
         "Fuzzy search parameters"
     );
 
-    let parser = QueryParser::new(FileSearchConfig);
-    let parsed = parser.parse(&query);
-
+    let parsed_query = FFFQuery::parse(&query, FileSearchConfig);
     let results = picker.fuzzy_search(
-        &parsed,
+        &parsed_query,
         query_tracker_guard.as_ref(),
         FuzzySearchOptions {
             max_threads,
@@ -297,7 +307,7 @@ pub fn fuzzy_search_files(
     );
 
     if results.items.is_empty() && query.contains(std::path::MAIN_SEPARATOR) {
-        let pure_query = match &parsed.fuzzy_query {
+        let pure_query = match &parsed_query.fuzzy_query {
             fff_query_parser::FuzzyQuery::Text(t) => t.trim(),
             _ => query.trim(),
         };
@@ -314,7 +324,7 @@ pub fn fuzzy_search_files(
                     }],
                     total_matched: 1,
                     total_files: results.total_files,
-                    location: parsed.location,
+                    location: parsed_query.location,
                 };
 
                 return lua_types::SearchResultLua::new(found, picker).into_lua(lua);
@@ -443,7 +453,7 @@ pub fn live_grep(
         return Err(error::to_lua_error(Error::FilePickerMissing));
     };
 
-    let parsed = fff::grep::parse_grep_query(&query);
+    let parsed_query = FFFQuery::parse(&query, NvimGrepConfig);
     let mode = match grep_mode.as_deref() {
         Some("regex") => fff::GrepMode::Regex,
         Some("fuzzy") => fff::GrepMode::Fuzzy,
@@ -465,7 +475,7 @@ pub fn live_grep(
         abort_signal: None,
     };
 
-    let result = picker.grep(&parsed, &options);
+    let result = picker.grep(&parsed_query, &options);
     lua_types::GrepResultLua::new(result, picker).into_lua(lua)
 }
 
@@ -773,10 +783,10 @@ pub fn get_historical_grep_query(_: &Lua, offset: usize) -> LuaResult<Option<Str
 
 /// Parse a grep query string and return its text portion (with constraints stripped).
 ///
-/// Uses the Rust `GrepConfig` parser as the single source of truth, so Lua
-/// code never needs to re-implement constraint detection.
+/// Uses the Neovim grep parser config so filename-constraint detection follows
+/// the user's setting, keeping Lua from re-implementing constraint detection.
 pub fn parse_grep_query(lua: &Lua, query: String) -> LuaResult<LuaTable> {
-    let parser = QueryParser::new(GrepConfig);
+    let parser = QueryParser::new(NvimGrepConfig);
     let parsed = parser.parse(&query);
     let table = lua.create_table()?;
     table.set("grep_text", parsed.grep_text())?;

@@ -413,6 +413,11 @@ local function init()
       time_budget_ms = 150, -- Max search time in ms per call (prevents UI freeze, 0 = no limit)
       modes = { 'plain', 'regex', 'fuzzy' }, -- Available grep modes and their cycling order
       trim_whitespace = false, -- Strip leading whitespace from matched lines (useful for cleaner display)
+      -- Treat filename-like tokens (e.g. `score.rs`, `src/main.rs`) in a grep query as a
+      -- file-path filter, scoping the content search to matching files. When off, such
+      -- tokens are searched as literal text. A token is a filename if it has a valid-looking
+      -- extension and no wildcards.
+      enable_filename_constraint = false,
       -- Format string for the line/column location prefix in grep results.
       -- Uses vim's printf-style format: %d placeholders for line and column (1-based).
       -- Default ':%d:%d' renders as ':356:1'. Use ':%d' for line-only ':356'.

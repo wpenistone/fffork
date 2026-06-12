@@ -517,7 +517,7 @@ export class FileFinder implements FileFinderApi {
     if (!guard.ok) return guard;
 
     const deadline = Date.now() + timeoutMs;
-    while(true) {
+    while (true) {
       const progress = this.getScanProgress();
       if (!progress.ok) return progress;
       if (!progress.value.isScanning && progress.value.isWarmupComplete) {

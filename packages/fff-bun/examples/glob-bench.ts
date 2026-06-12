@@ -24,9 +24,8 @@ import { Glob as BunGlob } from "bun";
 import { FileFinder } from "../src/index";
 
 // npm glob — optional. Skip silently if not installed.
-let npmGlob:
-  | ((pattern: string, opts: { cwd: string }) => Promise<string[]>)
-  | null = null;
+let npmGlob: ((pattern: string, opts: { cwd: string }) => Promise<string[]>) | null =
+  null;
 try {
   const mod: {
     glob: (pattern: string, opts: { cwd: string }) => Promise<string[]>;
@@ -61,16 +60,13 @@ function summarize(label: string, samples: Sample[]): void {
   const median = sorted[Math.floor(sorted.length / 2)]!;
   const worst = sorted[sorted.length - 1]!;
   const counts = new Set(samples.map((s) => s.count));
-  const countStr =
-    counts.size === 1 ? `${best.count}` : `[${[...counts].join(", ")}]`;
+  const countStr = counts.size === 1 ? `${best.count}` : `[${[...counts].join(", ")}]`;
   console.log(
     `${label.padEnd(16)} best=${best.ms.toFixed(2)}ms  median=${median.ms.toFixed(2)}ms  worst=${worst.ms.toFixed(2)}ms  count=${countStr}`,
   );
 }
 
-async function bench<T>(
-  fn: () => Promise<T> | T,
-): Promise<{ ms: number; result: T }> {
+async function bench<T>(fn: () => Promise<T> | T): Promise<{ ms: number; result: T }> {
   const start = performance.now();
   const result = await fn();
   return { ms: performance.now() - start, result };
@@ -152,8 +148,6 @@ const counts = {
 console.log(
   `\nNote: fff respects gitignore + skips binaries; Bun.Glob and npm glob walk the raw filesystem. Count differences are expected.`,
 );
-console.log(
-  `raw counts: fff=${counts.fff} bun=${counts.bun} npm=${counts.npm}`,
-);
+console.log(`raw counts: fff=${counts.fff} bun=${counts.bun} npm=${counts.npm}`);
 
 finder.destroy();

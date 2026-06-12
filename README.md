@@ -342,6 +342,7 @@ require('fff').setup({
     time_budget_ms = 150,
     modes = { 'plain', 'regex', 'fuzzy' },
     trim_whitespace = false,
+    enable_filename_constraint = false, -- treat filename-like tokens (e.g. `score.rs`) in a grep query as a file-path filter scoping the search; off = searched as literal text
     location_format = ':%d:%d', -- printf format for line:col prefix in grep results, e.g. ':%d' for line-only
   },
   debug = {
