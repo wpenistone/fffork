@@ -20,6 +20,11 @@ const NO_COLUMN: u16 = u16::MAX;
 /// 1024 × u64 = 8 KB covers all 65536 possible bigram keys.
 const SEEN_WORDS: usize = 1024;
 
+/// Content size where the branchless two-pass `add_long_content` overtakes
+/// the single-pass `add_short_content`: ~-35% on 4 KB files, but its fixed
+/// flush scan dominates files under ~1 KB. See bigram_bench `bigram_build`.
+const LONG_CONTENT_MIN_LEN: usize = 1024;
+
 thread_local! {
     static NORM_BUF: std::cell::RefCell<Vec<u8>> =
         std::cell::RefCell::new(Vec::with_capacity(4096));
@@ -117,16 +122,6 @@ impl BigramIndexBuilder {
         let word_idx = file_idx / 64;
         let bit_mask = 1u64 << (file_idx % 64);
 
-        // Stack-local dedup bitsets: 1024 × u64 = 8 KB each, covers all 65536
-        // bigram keys with margin. Has to fit in L1 cache.
-        let mut seen_consec = [0u64; SEEN_WORDS];
-        let mut seen_skip = [0u64; SEEN_WORDS];
-
-        let consec_base = self.col_data_ptr();
-        let consec_words = self.words;
-        let skip_base = skip_builder.col_data_ptr();
-        let skip_words = skip_builder.words;
-
         NORM_BUF.with_borrow_mut(|buf| {
             let len = content.len();
             if buf.len() < len {
@@ -136,48 +131,12 @@ impl BigramIndexBuilder {
             normalize_bytes(content, &mut buf[..len]);
             let n = &buf[..len];
 
-            let mut n0 = n[0];
-            let mut n1 = n[1];
-
-            if n0 != 0 && n1 != 0 {
-                let key = (n0 as u16) << 8 | n1 as u16;
-                self.record_bigram(
-                    &mut seen_consec,
-                    key,
-                    word_idx,
-                    bit_mask,
-                    consec_base,
-                    consec_words,
-                );
-            }
-
-            for &cur in &n[2..] {
-                if cur != 0 {
-                    if n1 != 0 {
-                        let key = (n1 as u16) << 8 | cur as u16;
-                        self.record_bigram(
-                            &mut seen_consec,
-                            key,
-                            word_idx,
-                            bit_mask,
-                            consec_base,
-                            consec_words,
-                        );
-                    }
-                    if n0 != 0 {
-                        let key = (n0 as u16) << 8 | cur as u16;
-                        skip_builder.record_bigram(
-                            &mut seen_skip,
-                            key,
-                            word_idx,
-                            bit_mask,
-                            skip_base,
-                            skip_words,
-                        );
-                    }
-                }
-                n0 = n1;
-                n1 = cur;
+            // Both paths record the identical bigram set; the split exists
+            // purely for speed (see LONG_CONTENT_MIN_LEN).
+            if len >= LONG_CONTENT_MIN_LEN {
+                self.add_long_content(skip_builder, n, word_idx, bit_mask);
+            } else {
+                self.add_short_content(skip_builder, n, word_idx, bit_mask);
             }
         });
 
@@ -185,10 +144,94 @@ impl BigramIndexBuilder {
         skip_builder.populated.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Mark `key` as present for the file whose column-word is `word_idx`
-    /// and bit position is `bit_mask`, de-duplicating via the caller-owned
-    /// `seen` bitmap so we only touch the shared column slab at most once
-    /// per unique bigram per file.
+    // Branchless two-pass: set every pair in stack-local bitmaps, including
+    // pairs touching the 0 sentinel — flush_seen masks those out. ~-35% vs
+    // the single pass on 4 KB files.
+    #[inline(always)]
+    fn add_long_content(&self, skip_builder: &Self, n: &[u8], word_idx: usize, bit_mask: u64) {
+        // Stack-local dedup bitsets: 1024 × u64 = 8 KB each, covers all 65536
+        // bigram keys. Has to fit in L1 cache.
+        let mut seen_consec = [0u64; SEEN_WORDS];
+        let mut seen_skip = [0u64; SEEN_WORDS];
+
+        let mut n0 = n[0];
+        let mut n1 = n[1];
+
+        let key = (n0 as usize) << 8 | n1 as usize;
+        // SAFETY: key < 65536, so key >> 6 < 1024 = SEEN_WORDS.
+        unsafe { *seen_consec.get_unchecked_mut(key >> 6) |= 1u64 << (key & 63) };
+
+        for &cur in &n[2..] {
+            let ck = (n1 as usize) << 8 | cur as usize;
+            let sk = (n0 as usize) << 8 | cur as usize;
+            unsafe {
+                *seen_consec.get_unchecked_mut(ck >> 6) |= 1u64 << (ck & 63);
+                *seen_skip.get_unchecked_mut(sk >> 6) |= 1u64 << (sk & 63);
+            }
+
+            n0 = n1;
+            n1 = cur;
+        }
+
+        self.flush_seen(&seen_consec, word_idx, bit_mask);
+        skip_builder.flush_seen(&seen_skip, word_idx, bit_mask);
+    }
+
+    #[inline(always)]
+    fn add_short_content(&self, skip_builder: &Self, n: &[u8], word_idx: usize, bit_mask: u64) {
+        let mut seen_consec = [0u64; SEEN_WORDS];
+        let mut seen_skip = [0u64; SEEN_WORDS];
+
+        let consec_base = self.col_data_ptr();
+        let consec_words = self.words;
+        let skip_base = skip_builder.col_data_ptr();
+        let skip_words = skip_builder.words;
+
+        let mut n0 = n[0];
+        let mut n1 = n[1];
+
+        if n0 != 0 && n1 != 0 {
+            let key = (n0 as u16) << 8 | n1 as u16;
+            self.record_bigram(
+                &mut seen_consec,
+                key,
+                word_idx,
+                bit_mask,
+                consec_base,
+                consec_words,
+            );
+        }
+
+        for &cur in &n[2..] {
+            if cur != 0 {
+                if n1 != 0 {
+                    let key = (n1 as u16) << 8 | cur as u16;
+                    self.record_bigram(
+                        &mut seen_consec,
+                        key,
+                        word_idx,
+                        bit_mask,
+                        consec_base,
+                        consec_words,
+                    );
+                }
+                if n0 != 0 {
+                    let key = (n0 as u16) << 8 | cur as u16;
+                    skip_builder.record_bigram(
+                        &mut seen_skip,
+                        key,
+                        word_idx,
+                        bit_mask,
+                        skip_base,
+                        skip_words,
+                    );
+                }
+            }
+            n0 = n1;
+            n1 = cur;
+        }
+    }
+
     #[inline(always)]
     fn record_bigram(
         &self,
@@ -213,6 +256,36 @@ impl BigramIndexBuilder {
                 unsafe {
                     let p = col_base.add(col as usize * words + word_idx);
                     *p |= bit_mask;
+                }
+            }
+        }
+    }
+
+    fn flush_seen(&self, seen: &[u64; SEEN_WORDS], word_idx: usize, bit_mask: u64) {
+        let col_base = self.col_data_ptr();
+        let words = self.words;
+        for (blk, block) in seen.chunks_exact(8).enumerate() {
+            // OR-test whole blocks so the mostly-empty bitmap scans fast.
+            if block.iter().fold(0u64, |a, &w| a | w) == 0 {
+                continue;
+            }
+            for (j, &word_bits) in block.iter().enumerate() {
+                let w = blk * 8 + j;
+                let mut bits = match w & 3 {
+                    _ if w < 4 => 0,
+                    0 => word_bits & !1,
+                    _ => word_bits,
+                };
+                while bits != 0 {
+                    let key = (w << 6 | bits.trailing_zeros() as usize) as u16;
+                    bits &= bits - 1;
+                    let col = self.get_or_alloc_column(key);
+                    if col != NO_COLUMN {
+                        unsafe {
+                            let p = col_base.add(col as usize * words + word_idx);
+                            *p |= bit_mask;
+                        }
+                    }
                 }
             }
         }
@@ -1100,6 +1173,25 @@ mod tests {
         run_and_compare(&mixed[..127]); // scalar path
         run_and_compare(&mixed); // SIMD path (256 bytes)
         run_and_compare(&mixed[..192]); // SIMD path with scalar tail
+    }
+
+    #[test]
+    fn add_file_long_short_paths_agree() {
+        // Same mixed content checked just below, at, and above
+        // LONG_CONTENT_MIN_LEN so both add_short_content and add_long_content
+        // are validated against the reference implementation.
+        let mut mixed = Vec::with_capacity(LONG_CONTENT_MIN_LEN * 2);
+        for i in 0..LONG_CONTENT_MIN_LEN * 2 {
+            mixed.push(match i % 11 {
+                0 => 0,
+                1 => 0x7F,
+                2 => b'\n',
+                _ => 32 + ((i * 31) % 95) as u8,
+            });
+        }
+        run_and_compare(&mixed[..LONG_CONTENT_MIN_LEN - 1]);
+        run_and_compare(&mixed[..LONG_CONTENT_MIN_LEN]);
+        run_and_compare(&mixed);
     }
 
     #[test]
