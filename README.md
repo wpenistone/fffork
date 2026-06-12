@@ -331,6 +331,10 @@ require('fff').setup({
   git = {
     status_text_color = false, -- true to color filenames by git status
   },
+  select = {
+    -- Return winid to open the chosen file in, or nil to open in the original window
+    select_window = function(current_buf, action) --[[ default impl ]] end,
+  },
   grep = {
     max_file_size = 10 * 1024 * 1024,
     max_matches_per_file = 100,
@@ -392,6 +396,20 @@ Grep-only:
 - `src/main.rs`. Grep inside a single file.
 
 Mix freely: `git:modified src/**/*.rs !src/**/mod.rs user controller`.
+
+### Open in invoking window
+
+By default fff.nvim will try to open a file in the most suitable window, so any non-file buffers are not affected. You can customize or disable this by providing:
+
+```lua
+require('fff').setup({
+  select = {
+    select_window = function(_current_buf, _action) return nil end,
+  },
+})
+```
+
+Caveat: the chosen file replaces the buffer in the invoking window even if it's a non-modifiable / special buftype. `winfixbuf` windows still fall back to `:split` to avoid `E1513`.
 
 ### Multi-select and quickfix
 

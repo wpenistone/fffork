@@ -59,6 +59,11 @@ local M = {}
 --- @field trim_whitespace boolean
 --- @field location_format string
 
+--- @alias FffSelectAction 'edit' | 'split' | 'vsplit' | 'tab'
+
+--- @class FffSelectConfig
+--- @field select_window fun(current_buf: integer, action: FffSelectAction): integer|nil
+
 --- @class FffConfig
 --- @field base_path string
 --- @field prompt string
@@ -76,6 +81,7 @@ local M = {}
 --- @field hl table<string, string>
 --- @field frecency FffFrecencyConfig
 --- @field history FffHistoryConfig
+--- @field select FffSelectConfig
 --- @field git table
 --- @field debug table
 --- @field logging table
@@ -348,6 +354,23 @@ local function init()
       db_path = vim.fn.stdpath('data') .. '/fff_queries',
       min_combo_count = 3, -- Minimum selections before combo boost applies (3 = boost starts on 3rd selection)
       combo_boost_score_multiplier = 100, -- Score multiplier for combo matches (files repeatedly opened with same query)
+    },
+    select = {
+      --- Returns winid to open the file in. Return nil to open in the invoking
+      --- window. Default retargets when the invoking window can't host a file
+      --- buffer (special buftype, non-modifiable, or winfixbuf).
+      --- @param current_buf integer
+      --- @param action FffSelectAction
+      --- @return integer|nil
+      select_window = function(current_buf, action)
+        if action ~= 'edit' then return nil end
+        local current_win = vim.api.nvim_get_current_win()
+        local buftype = vim.api.nvim_get_option_value('buftype', { buf = current_buf })
+        local modifiable = vim.api.nvim_get_option_value('modifiable', { buf = current_buf })
+        local winfixbuf = require('fff.utils').window_has_winfixbuf(current_win)
+        if buftype == '' and modifiable and not winfixbuf then return nil end
+        return require('fff.utils').find_suitable_window()
+      end,
     },
     -- Git integration
     git = {
