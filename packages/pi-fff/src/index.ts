@@ -467,6 +467,30 @@ export default function fffExtension(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     try {
       activeCwd = ctx.cwd;
+
+      // Restore persisted mode from session entries. This handles session
+      // resume after process restart where env vars are lost, and ensures
+      // the env var is set for the next /reload in the same session.
+      const entries = ctx.sessionManager?.getEntries();
+      if (entries) {
+        const modeEntry = [...entries]
+          .reverse()
+          .find(
+            (e: { type: string; customType?: string }) =>
+              e.type === "custom" && e.customType === "fff-mode",
+          );
+        if (
+          modeEntry &&
+          typeof (modeEntry as any).data?.mode === "string" &&
+          VALID_MODES.includes((modeEntry as any).data.mode as FffMode)
+        ) {
+          const restored = (modeEntry as any).data.mode as FffMode;
+          if (restored !== currentMode) {
+            currentMode = restored;
+          }
+        }
+      }
+
       registerAutocompleteProvider(ctx);
       await ensureFinder(activeCwd);
     } catch (e: unknown) {
@@ -920,8 +944,10 @@ export default function fffExtension(pi: ExtensionAPI) {
       if (!arg) {
         const mode = getMode();
         const flag = pi.getFlag("fff-mode") ?? "unset";
-        const env = process.env.PI_FFF_MODE ?? "unset";
-        ctx.ui.notify(`Current mode: '${mode}'\nFlag: ${flag}, Env: ${env}`, "info");
+        ctx.ui.notify(
+          `Current mode: '${mode}' (flag: ${flag})`,
+          "info",
+        );
         return;
       }
 
@@ -935,9 +961,11 @@ export default function fffExtension(pi: ExtensionAPI) {
       const oldMode = getMode();
       setMode(newMode);
 
+      pi.appendEntry("fff-mode", { mode: newMode });
+
       const note =
         (oldMode === "override") !== (newMode === "override")
-          ? " (tool name change requires restart)"
+          ? " (tool name change requires /reload)"
           : "";
       ctx.ui.notify(`Mode changed: '${oldMode}' → '${newMode}'${note}`, "info");
     },
