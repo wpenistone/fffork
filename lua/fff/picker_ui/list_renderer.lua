@@ -98,7 +98,7 @@ local function generate_item_lines(ctx)
     local item = ctx.items[i]
     local item_start_line = #lines + 1
 
-    local item_lines = renderer.render_line(item, ctx)
+    local item_lines = renderer.render_line(item, ctx, i)
     vim.list_extend(lines, item_lines)
 
     local item_end_line = #lines
