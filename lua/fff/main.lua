@@ -8,7 +8,9 @@ function M.setup(config) vim.g.fff = config end
 
 --- Find files in current directory.
 --- When opts.resume is true, resumes the last find_files picker (or opens a new one if none saved).
---- @param opts? table Optional configuration {renderer = custom_renderer, resume = boolean}
+--- When opts.on_submit is set, it replaces the default `:edit` action on user selection.
+--- Signature: `fun(item: table, ctx: { action: string, path: string, relative_path: string, location: table|nil, query: string, mode: string|nil })`.
+--- @param opts? table Optional configuration {renderer = custom_renderer, resume = boolean, on_submit = function}
 function M.find_files(opts)
   local picker_ok, picker_ui = pcall(require, 'fff.picker_ui.picker_ui')
   if not picker_ok then

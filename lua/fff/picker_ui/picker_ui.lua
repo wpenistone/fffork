@@ -483,37 +483,51 @@ function M.select(action)
   vim.cmd('stopinsert')
   M.close()
 
+  local on_submit = config and config.on_submit
+
   -- Defer file open past picker float teardown. Without this, foldexpr is not
   -- recomputed on the new window (folds appear missing) on some platforms.
   vim.schedule(function()
-    if config and config.select and type(config.select.select_window) == 'function' then
-      local ok, win = pcall(config.select.select_window, vim.api.nvim_get_current_buf(), action)
-      if not ok then
-        vim.notify('FFF: select.select_window error: ' .. tostring(win), vim.log.levels.WARN)
-      elseif type(win) == 'number' and vim.api.nvim_win_is_valid(win) then
-        vim.api.nvim_set_current_win(win)
+    if type(on_submit) == 'function' then
+      local ok, err = pcall(on_submit, item, {
+        action = action,
+        path = abs_path,
+        relative_path = relative_path,
+        location = location,
+        query = query,
+        mode = mode,
+      })
+      if not ok then vim.notify('FFF: on_submit error: ' .. tostring(err), vim.log.levels.ERROR) end
+    else
+      if config and config.select and type(config.select.select_window) == 'function' then
+        local ok, win = pcall(config.select.select_window, vim.api.nvim_get_current_buf(), action)
+        if not ok then
+          vim.notify('FFF: select.select_window error: ' .. tostring(win), vim.log.levels.WARN)
+        elseif type(win) == 'number' and vim.api.nvim_win_is_valid(win) then
+          vim.api.nvim_set_current_win(win)
+        end
       end
-    end
 
-    if action == 'edit' then
-      -- Hard guard against E1513 ("Cannot switch buffer. 'winfixbuf' is enabled"):
-      -- if the (post-hook) current window is pinned, fall back to :split.
-      local opened_via_split = false
-      if window_has_winfixbuf(vim.api.nvim_get_current_win()) then
+      if action == 'edit' then
+        -- Hard guard against E1513 ("Cannot switch buffer. 'winfixbuf' is enabled"):
+        -- if the (post-hook) current window is pinned, fall back to :split.
+        local opened_via_split = false
+        if window_has_winfixbuf(vim.api.nvim_get_current_win()) then
+          vim.cmd('split ' .. vim.fn.fnameescape(relative_path))
+          opened_via_split = true
+        end
+
+        if not opened_via_split then vim.cmd('edit ' .. vim.fn.fnameescape(relative_path)) end
+      elseif action == 'split' then
         vim.cmd('split ' .. vim.fn.fnameescape(relative_path))
-        opened_via_split = true
+      elseif action == 'vsplit' then
+        vim.cmd('vsplit ' .. vim.fn.fnameescape(relative_path))
+      elseif action == 'tab' then
+        vim.cmd('tabedit ' .. vim.fn.fnameescape(relative_path))
       end
 
-      if not opened_via_split then vim.cmd('edit ' .. vim.fn.fnameescape(relative_path)) end
-    elseif action == 'split' then
-      vim.cmd('split ' .. vim.fn.fnameescape(relative_path))
-    elseif action == 'vsplit' then
-      vim.cmd('vsplit ' .. vim.fn.fnameescape(relative_path))
-    elseif action == 'tab' then
-      vim.cmd('tabedit ' .. vim.fn.fnameescape(relative_path))
+      if location then location_utils.jump_to_location(location) end
     end
-
-    if location then location_utils.jump_to_location(location) end
 
     if query and query ~= '' then
       local cfg = config or conf.get()
