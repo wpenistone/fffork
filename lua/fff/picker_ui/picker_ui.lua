@@ -76,6 +76,8 @@ M.move_up = navigation.move_up
 M.move_down = navigation.move_down
 M.scroll_preview_up = navigation.scroll_preview_up
 M.scroll_preview_down = navigation.scroll_preview_down
+M.grep_jump_to_next_file = navigation.grep_jump_to_next_file
+M.grep_jump_to_prev_file = navigation.grep_jump_to_prev_file
 
 -- Expose helpers used by navigation
 M.scroll_to_bottom = renderer.scroll_to_bottom

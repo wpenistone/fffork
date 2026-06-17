@@ -196,4 +196,94 @@ function M.scroll_preview_down()
   preview.scroll(scroll_lines)
 end
 
+-- Helper function to eliminate UI update redundancy
+local function update_ui_after_jump(old_cursor)
+  if not P.render_after_cursor_move(old_cursor) then return false end
+  P.update_status()
+  pcall(vim.cmd, 'redraw')
+  P.update_preview_debounced()
+  return true
+end
+
+function M.grep_jump_to_next_file()
+  if not P.state.active or S.mode ~= 'grep' then return end
+  local items = S.filtered_items
+  if not items or #items == 0 then return end
+
+  local old_cursor = S.cursor
+  local current_path = items[S.cursor] and items[S.cursor].relative_path
+
+  for i = S.cursor + 1, #items do
+    if items[i].relative_path ~= current_path then
+      S.cursor = i
+      update_ui_after_jump(old_cursor)
+      return
+    end
+  end
+
+  if P.load_next_page and P.load_next_page() then
+    local new_items = S.filtered_items
+    if new_items and #new_items > 0 then
+      local idx = 1
+      if new_items[1].relative_path == current_path then
+        for i = 2, #new_items do
+          if new_items[i].relative_path ~= current_path then
+            idx = i
+            break
+          end
+        end
+      end
+      S.cursor = idx
+      update_ui_after_jump(old_cursor)
+    end
+  end
+end
+
+function M.grep_jump_to_prev_file()
+  if not P.state.active or S.mode ~= 'grep' then return end
+  local items = S.filtered_items
+  if not items or #items == 0 then return end
+
+  local old_cursor = S.cursor
+  local current_path = items[S.cursor] and items[S.cursor].relative_path
+
+  for i = S.cursor - 1, 1, -1 do
+    if items[i].relative_path ~= current_path then
+      local target_idx = i
+      while target_idx > 1 and items[target_idx - 1].relative_path == items[i].relative_path do
+        target_idx = target_idx - 1
+      end
+      S.cursor = target_idx
+      update_ui_after_jump(old_cursor)
+      return
+    end
+  end
+
+  if P.load_previous_page and P.load_previous_page() then
+    local new_items = S.filtered_items
+    if not new_items or #new_items == 0 then return end
+
+    local target_path = nil
+    for i = #new_items, 1, -1 do
+      if new_items[i].relative_path ~= current_path then
+        target_path = new_items[i].relative_path
+        break
+      end
+    end
+
+    target_path = target_path or new_items[#new_items].relative_path
+
+    local first = 1
+    for i = 1, #new_items do
+      if new_items[i].relative_path == target_path then
+        first = i
+        break
+      end
+    end
+
+    S.cursor = first
+    update_ui_after_jump(old_cursor)
+  end
+end
+
 return M

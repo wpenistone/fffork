@@ -35,6 +35,8 @@ local M = {}
 --- @field cycle_grep_modes string
 --- @field cycle_previous_query string
 --- @field cycle_forward_query string
+--- @field grep_jump_to_next_file string|string[]
+--- @field grep_jump_to_prev_file string|string[]
 --- @field toggle_select string
 --- @field send_to_quickfix string
 --- @field focus_list string
@@ -269,6 +271,9 @@ local function init()
       toggle_debug = '<F2>',
       -- grep mode: cycle between plain text, regex, and fuzzy search
       cycle_grep_modes = '<S-Tab>',
+      -- grep mode only: jump cursor to first item of next/prev file group
+      grep_jump_to_next_file = { '<C-A-n>', '<A-Down>' },
+      grep_jump_to_prev_file = { '<C-A-p>', '<A-Up>' },
       -- goes to the previous query in history
       cycle_previous_query = '<C-Up>',
       -- goes to the next query in history (forward)

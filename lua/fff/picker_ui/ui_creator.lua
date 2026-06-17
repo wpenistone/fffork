@@ -347,6 +347,13 @@ function M.setup_keymaps()
   set_keymap('n', keymaps.focus_list, M.focus_list_win, input_opts)
   set_keymap('n', keymaps.focus_preview, M.focus_preview_win, input_opts)
 
+  if keymaps.grep_jump_to_next_file then
+    set_keymap({ 'i', 'n' }, keymaps.grep_jump_to_next_file, function() P.grep_jump_to_next_file() end, input_opts)
+  end
+  if keymaps.grep_jump_to_prev_file then
+    set_keymap({ 'i', 'n' }, keymaps.grep_jump_to_prev_file, function() P.grep_jump_to_prev_file() end, input_opts)
+  end
+
   if S.config.prompt_vim_mode then
     set_keymap('n', keymaps.close, P.close, input_opts)
     set_keymap('i', '<C-c>', P.close, input_opts)

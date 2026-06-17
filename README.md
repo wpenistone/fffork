@@ -312,6 +312,9 @@ require('fff').setup({
     preview_scroll_down = '<C-d>',
     toggle_debug = '<F2>',
     cycle_grep_modes = '<S-Tab>',
+    -- grep mode only: jump cursor to first match of next/prev file group
+    grep_jump_to_next_file = { '<C-A-n>', '<A-Down>' },
+    grep_jump_to_prev_file = { '<C-A-p>', '<A-Up>' },
     cycle_previous_query = '<C-Up>',
     toggle_select = '<Tab>',
     send_to_quickfix = '<C-q>',
@@ -451,20 +454,20 @@ disabled individually via `debug.show_file_info`.
 
 Customise the panel via `hl`:
 
-| key                          | default              | used for                            |
-| ---------------------------- | -------------------- | ----------------------------------- |
-| `file_info_section`          | `Title`              | section header label                |
-| `file_info_separator`        | `FloatBorder`        | dashes that act as section borders  |
-| `file_info_label`            | `Comment`            | row labels (Size, Type, Git, ...)   |
-| `file_info_value`            | `Normal` fg          | plain values                        |
-| `file_info_value_dim`        | `NonText`            | dim values, separators inside rows  |
-| `file_info_size`             | `Number`             | file size value                     |
-| `file_info_type`             | `Type`               | filetype value                      |
-| `file_info_path`             | `Directory`          | full path                           |
-| `file_info_total_score`      | bold + `Number`      | total score (bold)                  |
-| `file_info_match_type`       | bold + `Special`     | match type (bold)                   |
-| `file_info_score_pos`        | `DiagnosticOk`       | positive score components           |
-| `file_info_score_neg`        | `DiagnosticError`    | negative score components           |
+| key                     | default           | used for                           |
+| ----------------------- | ----------------- | ---------------------------------- |
+| `file_info_section`     | `Title`           | section header label               |
+| `file_info_separator`   | `FloatBorder`     | dashes that act as section borders |
+| `file_info_label`       | `Comment`         | row labels (Size, Type, Git, ...)  |
+| `file_info_value`       | `Normal` fg       | plain values                       |
+| `file_info_value_dim`   | `NonText`         | dim values, separators inside rows |
+| `file_info_size`        | `Number`          | file size value                    |
+| `file_info_type`        | `Type`            | filetype value                     |
+| `file_info_path`        | `Directory`       | full path                          |
+| `file_info_total_score` | bold + `Number`   | total score (bold)                 |
+| `file_info_match_type`  | bold + `Special`  | match type (bold)                  |
+| `file_info_score_pos`   | `DiagnosticOk`    | positive score components          |
+| `file_info_score_neg`   | `DiagnosticError` | negative score components          |
 
 ### File filtering
 
@@ -482,7 +485,7 @@ Run `:FFFScan` to force a rescan.
 - `:FFFHealth` verifies picker init, optional dependencies, and DB connectivity.
 - `:FFFOpenLog` opens the current session's log file.
 - Historical log files are stored near the main log file `<state>/log/fff+<UTC-timestamp>+<pid>.log` (up to 20 files)
-- For a crash backtrace, run `lldb -- nvim` or `gdb -- nvim` and reproduce 
+- For a crash backtrace, run `lldb -- nvim` or `gdb -- nvim` and reproduce
 
 </details>
 
@@ -634,7 +637,7 @@ FffResult *res = fff_create_instance_with(&(FffCreateOptions){
     .version = FFF_CREATE_OPTIONS_VERSION,
     .base_path = "/path/to/repo",
     .ai_mode = true,
-    .watch = true, 
+    .watch = true,
     .enable_fs_root_scanning = false,   // off by default
     .enable_home_dir_scanning = false,  // off by default
 });
@@ -741,7 +744,7 @@ FFF is a file search library, not a CLI. Ripgrep and fzf are great tools, but th
 
 FFF keeps the index and the file cache resident in one long-lived process and exposes the same Rust core through four thin layers: a native crate (`fff-search`), a C library (`libfff_c`), a Node/Bun SDK (`@ff-labs/fff-node`), and an MCP server. You call `FileFinder.create()` once, then every subsequent search hits warm memory. On a 500k-file Chromium checkout, that is the difference between 3-9 **SECONDS** per ripgrep spawn and sub-10 ms per FFF query.
 
-Algorithm for fuzzy matching is much more comprehensive than fzf's algorithm it is **typo-resistant** and we provide a query language with additional constraint parsing for prefiltering e.g. "*.rs !test/ shcema" is a perfectly valid query for fff, but fzf wouldn't find anything even for a single typo in "shcema".
+Algorithm for fuzzy matching is much more comprehensive than fzf's algorithm it is **typo-resistant** and we provide a query language with additional constraint parsing for prefiltering e.g. "\*.rs !test/ shcema" is a perfectly valid query for fff, but fzf wouldn't find anything even for a single typo in "shcema".
 
 ### Why a programmatic API matters
 
@@ -774,7 +777,6 @@ Algorithm for fuzzy matching is much more comprehensive than fzf's algorithm it 
 ### Memory allocation
 
 Yes, fff fundamentally requires more memory than calling a single child process. That is the primary source of the speedup. In practice, alongside one of the most popular file search pickers for Neovim, [fff ends up using less RAM than a burst of ripgrep invocations](https://x.com/neogoose_btw/status/2041606853155811442).
-
 
 FFF also keeps a content index, around 360 bytes per indexed file, so roughly 36 MB for a 100k-file repo. Not every file is indexed - binaries, oversized files, and anything not eligible for grep are skipped. If even that footprint is too much, the index can be backed by a memory-mapped file instead of anonymous RAM.
 
