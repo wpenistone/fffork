@@ -664,6 +664,75 @@ Source: [`crates/fff-c/`](./crates/fff-c/).
 
 Stable C ABI. Bind from C/C++, Zig, Go via cgo, Python via ctypes, or anything with C FFI.
 
+<details id="python-bindings">
+<summary>
+<h2>Python bindings</h2>
+</summary>
+
+### Install
+
+```bash
+pip install fff-search
+```
+
+Or build and install from source:
+
+```bash
+cd packages/fff-python
+uv sync --all-extras
+uv run maturin develop --release
+```
+
+### Basic usage
+
+```python
+from fff import FileFinder
+
+with FileFinder("/path/to/project", watch=False) as finder:
+    finder.wait_for_scan_blocking(timeout_ms=5000)
+
+    result = finder.search("main")
+    for item, score in zip(result.items, result.scores):
+        print(f"{item.relative_path}: {score.total}")
+
+    hits = finder.grep("class Profile", mode="plain", before_context=1, after_context=1)
+```
+
+### Async usage
+
+`wait_for_scan` is a coroutine that polls scan status and yields to the event
+loop, so it never blocks other tasks. Use `wait_for_scan_blocking` from
+synchronous code.
+
+```python
+import asyncio
+from fff import FileFinder
+
+async def main():
+    with FileFinder("/path/to/project", watch=False) as finder:
+        await finder.wait_for_scan(timeout_ms=5000)
+        result = finder.search("main")
+        print(result)
+
+asyncio.run(main())
+```
+
+### What you get
+
+- `search`, `glob`, `directory_search`, `mixed_search` — frecency-ranked fuzzy file/dir search
+- `grep` / `multi_grep` — plain, regex, or fuzzy content search with context lines and cursor pagination
+- `track_query` / `get_historical_query` — optional frecency and query-history databases
+- `reindex`, `refresh_git_status`, `scan_progress`, `health_check` — lifecycle and diagnostics
+
+Typed result objects (`FileItem`, `Score`, `GrepMatch`, …) with `py.typed`
+stubs included. Ships as an `abi3` wheel compatible with Python 3.10+.
+
+Source: [`packages/fff-python/`](./packages/fff-python/).
+
+</details>
+
+Native Python bindings built with PyO3. Use them for notebooks, agent scripts, or any Python tool that needs fast file search.
+
 ---
 
 ## What is FFF and why use it over ripgrep or fzf?

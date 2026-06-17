@@ -4,9 +4,11 @@ members = [
   "crates/fff-core",
   "crates/fff-mcp",
   "crates/fff-nvim",
+  "crates/fff-python",
   "crates/fff-query-parser",
   "crates/fff-grep",
 ]
+
 resolver = "2"
 
 [workspace.dependencies]
