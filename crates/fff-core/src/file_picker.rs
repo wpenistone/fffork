@@ -761,6 +761,16 @@ impl FilePicker {
         let path = picker.base_path.clone();
         let trace_span = picker.trace_span.clone();
 
+        // Pre-arm `scanning` BEFORE publishing the new picker. `ScanJob::spawn`
+        // also sets it, but that runs after this function returns; consumers
+        // (e.g. lua `wait_for_initial_scan` after `restart_index_in_path`)
+        // that grab the signal Arc between publish and spawn would otherwise
+        // observe scanning=false and skip the wait, racing the walker. The
+        // race is wide on Windows CI where notify is slow.
+        signals
+            .scanning
+            .store(true, std::sync::atomic::Ordering::Release);
+
         {
             let mut guard = shared_picker.write()?;
             *guard = Some(picker);
