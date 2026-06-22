@@ -612,7 +612,7 @@ jobs:
         with:
           # Workflow runs on detached HEAD at the v* tag — explicit target needed.
           branch: main
-          commit_message: "chore: bump fff-mcp release artifacts to v${{ steps.version.outputs.version }} [skip ci]"
+          commit_message: "chore: bump fff-mcp release artifacts to v${{ steps.version.outputs.version }}"
           file_pattern: "Formula/fff-mcp.rb install-mcp.sh"
           commit_user_name: github-actions[bot]
           commit_user_email: 41898282+github-actions[bot]@users.noreply.github.com
