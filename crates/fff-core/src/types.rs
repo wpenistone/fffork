@@ -372,7 +372,12 @@ impl FileItem {
 
         let base_end_idx = base_len + sep_len;
         let relative_portion_str = self.path.read_to_buf(arena, &mut buf[base_end_idx..]);
-        let total = base_end_idx + relative_portion_str.len();
+        let rel_len = relative_portion_str.len();
+        let total = base_end_idx + rel_len;
+        // Stored relative paths are '/'-canonical; rewrite to the OS-native
+        // separator so the result matches git-cache keys, the frecency DB, and
+        // Win32 file APIs. No-op off Windows.
+        crate::path_utils::nativize_slashes_in_place(&mut buf[base_end_idx..total]);
         Path::new(unsafe { std::str::from_utf8_unchecked(&buf[..total]) })
     }
 

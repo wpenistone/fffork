@@ -47,7 +47,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Run tests
-        run: cargo test --features zlob --workspace --exclude fff-nvim
+        run: cargo test --no-default-features --features zlob --workspace --exclude fff-nvim
 
   stress-test:
     name: Stress Test (Watcher + Git)
@@ -133,4 +133,4 @@ jobs:
           components: clippy
           
       - name: Run clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --no-default-features --features zlob -- -D warnings

@@ -91,6 +91,9 @@ pub enum Error {
 
     #[error("libgit2 error occurred: {0}")]
     Git(#[from] git2::Error),
+
+    #[error("Filesystem walk failed: {0}")]
+    WalkFailed(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

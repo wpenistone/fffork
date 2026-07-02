@@ -5,6 +5,9 @@
 //! by [frizbee](https://docs.rs/neo_frizbee), frecency scoring backed by LMDB,
 //! and multi-mode grep search.
 //!
+//! > [!Important performance information]  
+//! > For the most optimized fff build use `zlob` feature. It requires zig v0.16.0 to be installed on the machine.
+//!
 //! ## Architecture
 //!
 //! - [`file_picker::FilePicker`] — Main entry point. Indexes a directory tree in a
@@ -144,6 +147,7 @@ mod ignore;
 /// Thread-safe shared handles for [`FilePicker`], [`FrecencyTracker`],
 /// and [`QueryTracker`].
 pub mod shared;
+pub mod walk;
 
 pub use bigram_filter::*;
 pub use dbs::db_healthcheck::{DbHealth, DbHealthChecker};

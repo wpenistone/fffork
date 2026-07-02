@@ -8,8 +8,10 @@ path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = []
-zlob = ["fff/zlob"]
+# Pure-Rust walker by default; zlob is opt-in (needs Zig).
+default = ["ripgrep"]
+ripgrep = ["fff/ripgrep", "fff-query-parser/ripgrep", "dep:ignore"]
+zlob = ["fff/zlob", "fff-query-parser/zlob", "dep:zlob"]
 
 [dependencies]
 # Workspace dependencies
@@ -17,17 +19,18 @@ ahash = { workspace = true }
 tracing = { workspace = true }
 
 # Local crates
-fff = { package = "fff-search", path = "../fff-core", version = "0.9.6", features = [
+fff = { package = "fff-search", path = "../fff-core", version = "0.9.6", default-features = false, features = [
 	"mimalloc-collect",
 ] }
-fff-query-parser = { path = "../fff-query-parser", version = "0.9.6" }
+fff-query-parser = { path = "../fff-query-parser", version = "0.9.6", default-features = false }
 chrono = { version = "0.4", features = ["serde"] }
 ctrlc = "3.4.2"
 git2 = { workspace = true }
-ignore = "0.4.22"
+ignore = { version = "0.4.22", optional = true }
 mimalloc = { version = "0.1.47", features = ["local_dynamic_tls"] }
 mlua = { version = "0.11.1", features = ["module", "luajit"] }
 once_cell = "1.20.2"
+zlob = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

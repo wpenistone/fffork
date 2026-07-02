@@ -31,14 +31,13 @@
 //! the file index, so read-heavy search workloads rarely contend.
 
 use crate::FFFStringStorage;
-use crate::background_watcher::{BackgroundWatcher, is_git_file};
+use crate::background_watcher::BackgroundWatcher;
 use crate::bigram_filter::{BigramFilter, BigramOverlay};
 use crate::constants::{MAX_OVERFLOW_FILES, PATH_BUF_SIZE};
 use crate::error::Error;
 use crate::frecency::FrecencyTracker;
 use crate::git::GitStatusCache;
 use crate::grep::{GrepResult, GrepSearchOptions, grep_search, multi_grep_search};
-use crate::ignore::non_git_repo_overrides;
 use crate::query_tracker::QueryTracker;
 use crate::scan::{ScanConfig, ScanJob, ScanSignals};
 use crate::score::fuzzy_match_and_score_files;
@@ -119,6 +118,9 @@ pub(crate) struct FileSync {
     /// Chunk-level deduped path store. Arc so post-scan snapshots can hold
     /// the arena alive while iterating file paths.
     chunked_paths: Option<Arc<crate::simd_path::ChunkedPathStore>>,
+    /// Ignore rules the walker assembled (zlob backend only). Shared with the
+    /// background watcher so filesystem events can be filtered without libgit2.
+    pub(crate) ignore_rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
 }
 
 impl FileSync {
@@ -134,6 +136,7 @@ impl FileSync {
             bigram_index: None,
             bigram_overlay: None,
             chunked_paths: None,
+            ignore_rules: None,
         }
     }
 
@@ -205,6 +208,9 @@ impl FileSync {
                 }
             }
         };
+        // The dir table and stored file paths are '/'-canonical; fold the
+        // native relative path so the byte-wise comparisons below match.
+        let rel_path_owned = crate::path_utils::to_canonical_slashes(&rel_path_owned).into_owned();
         let rel_path: &str = &rel_path_owned;
 
         // Split into directory (with trailing '/') and filename.
@@ -310,7 +316,9 @@ impl FileItem {
         metadata: Option<&std::fs::Metadata>,
     ) -> (Self, String) {
         let path_buf = pathdiff::diff_paths(&path, base_path).unwrap_or_else(|| path.clone());
-        let relative_path = path_buf.to_string_lossy().into_owned();
+        // The index is '/'-canonical on every platform; fold native separators.
+        let relative_path =
+            crate::path_utils::to_canonical_slashes(&path_buf.to_string_lossy()).into_owned();
 
         let (size, modified) = match metadata {
             Some(metadata) => {
@@ -361,16 +369,55 @@ impl FileItem {
             None => (0, 0),
         };
 
+        Self::new_from_walk_parts(path, base_path, git_status, size, modified)
+    }
+
+    /// Like [`Self::new_from_walk`] but takes already-extracted size and
+    /// modification time (Unix seconds) instead of a `std::fs::Metadata`.
+    /// Used by the zlob walker backend, which fetches metadata in bulk.
+    pub fn new_from_walk_parts(
+        path: &Path,
+        base_path: &Path,
+        git_status: Option<Status>,
+        size: u64,
+        modified: u64,
+    ) -> (Self, String) {
         let is_binary = is_known_binary_extension(path);
 
         let rel = pathdiff::diff_paths(path, base_path).unwrap_or_else(|| path.to_path_buf());
-        let rel_str = rel.to_string_lossy().into_owned();
+        // The index is '/'-canonical on every platform; fold native separators.
+        let rel_str = crate::path_utils::to_canonical_slashes(&rel.to_string_lossy()).into_owned();
         let fname_offset = rel_str
             .rfind(std::path::is_separator)
             .map(|i| i + 1)
             .unwrap_or(0) as u16;
 
         let item = Self::new_raw(fname_offset, size, modified, git_status, is_binary);
+        (item, rel_str)
+    }
+
+    /// Zlob-walker fast path: skip the `pathdiff::diff_paths` PathBuf alloc by
+    /// taking the already-relative slice and the basename-offset that zlob's
+    /// scanner computed during traversal. ~80–120 ms saved on a chromium scan
+    /// (500k entries × one fewer alloc + no component walk).
+    ///
+    /// `relative_path` is root-relative bytes; `basename_offset` is the byte
+    /// offset where the basename begins (e.g. zlob's `entry.path_bytes().len()
+    /// - entry.file_name().as_os_str().as_encoded_bytes().len()` minus the
+    /// `relative_offset`).
+    pub fn new_from_walk_bytes(
+        path: &Path,
+        relative_path: &[u8],
+        basename_offset: u16,
+        git_status: Option<Status>,
+        size: u64,
+        modified: u64,
+    ) -> (Self, String) {
+        let is_binary = is_known_binary_extension(path);
+        // SAFETY-ish: paths on macOS/Linux are bytes; lossy conversion mirrors
+        // the existing `to_string_lossy()` behavior on non-UTF8 names.
+        let rel_str = String::from_utf8_lossy(relative_path).into_owned();
+        let item = Self::new_raw(basename_offset, size, modified, git_status, is_binary);
         (item, rel_str)
     }
 
@@ -487,6 +534,14 @@ impl FFFStringStorage for &FilePicker {
 impl FilePicker {
     pub fn base_path(&self) -> &Path {
         &self.base_path
+    }
+
+    /// Ignore rules the walker assembled during the last scan (zlob backend
+    /// only). The background watcher uses these to filter events without
+    /// libgit2. `None` when the backend doesn't surface rules or no ignore
+    /// files were present.
+    pub(crate) fn ignore_rules(&self) -> Option<Arc<crate::walk::WalkIgnoreRules>> {
+        self.sync_data.ignore_rules.clone()
     }
 
     pub fn has_mmap_cache(&self) -> bool {
@@ -1596,7 +1651,8 @@ impl FilePicker {
         let dir_prefix = if relative_dir.is_empty() {
             String::new()
         } else {
-            format!("{}{}", relative_dir, std::path::MAIN_SEPARATOR)
+            // Stored relative paths are '/'-canonical on every platform.
+            format!("{relative_dir}/")
         };
 
         self.sync_data.tombstone_files_with_arena(|file, arena| {
@@ -1644,7 +1700,8 @@ impl FilePicker {
         if let Ok(stripped) = path.strip_prefix(&self.base_path)
             && let Some(s) = stripped.to_str()
         {
-            return Some(std::borrow::Cow::Borrowed(s));
+            // Callers compare against '/'-canonical stored paths.
+            return Some(crate::path_utils::to_canonical_slashes(s));
         }
 
         #[cfg(windows)]
@@ -1667,7 +1724,7 @@ fn canonical_relative_path(path: &Path, base: &Path) -> Option<String> {
         && let Ok(stripped) = canonical.strip_prefix(base)
         && let Some(s) = stripped.to_str()
     {
-        return Some(s.to_owned());
+        return Some(crate::path_utils::to_canonical_slashes(s).into_owned());
     }
 
     // Deleted files can't be canonicalized — canonicalize the parent and
@@ -1678,7 +1735,8 @@ fn canonical_relative_path(path: &Path, base: &Path) -> Option<String> {
     let stripped_parent = canonical_parent.strip_prefix(base).ok()?;
     let mut rel = stripped_parent.to_path_buf();
     rel.push(file_name);
-    rel.to_str().map(str::to_owned)
+    rel.to_str()
+        .map(|s| crate::path_utils::to_canonical_slashes(s).into_owned())
 }
 
 impl Drop for FilePicker {
@@ -1787,8 +1845,6 @@ impl FileSync {
         mode: FFFMode,
         follow_symlinks: bool,
     ) -> Result<FileSync, Error> {
-        use ignore::WalkBuilder;
-
         let scan_start = std::time::Instant::now();
         info!("SCAN: Starting filesystem walk and git status (async)");
 
@@ -1796,71 +1852,15 @@ impl FileSync {
         let is_git_repo = git_workdir.is_some();
         let bg_threads = BACKGROUND_THREAD_POOL.current_num_threads();
 
-        let mut walk_builder = WalkBuilder::new(base_path);
-        walk_builder
-            // this is a very important guard for the user opening ~/ or other root non-git dir
-            .hidden(!is_git_repo)
-            .git_ignore(true)
-            .git_exclude(true)
-            .git_global(true)
-            .ignore(true)
-            .follow_links(follow_symlinks)
-            .threads(bg_threads);
-
-        if !is_git_repo && let Some(overrides) = non_git_repo_overrides(base_path) {
-            walk_builder.overrides(overrides);
-        }
-
-        let walker = walk_builder.build_parallel();
-        let walker_start = std::time::Instant::now();
-        debug!("SCAN: Starting file walker");
-
-        // Walk: collect (FileItem, rel_path) pairs. Keep the walk fast —
-        // no chunking, no HashMap, just Vec::push under the Mutex.
-        let pairs = parking_lot::Mutex::new(Vec::<(FileItem, String)>::new());
-
-        let walker_span = tracing::info_span!("walker_run").entered();
-        walker.run(|| {
-            let pairs = &pairs;
-            let counter = Arc::clone(synced_files_count);
-            let base_path = base_path.to_path_buf();
-
-            Box::new(move |result| {
-                let Ok(entry) = result else {
-                    return ignore::WalkState::Continue;
-                };
-
-                if entry.file_type().is_some_and(|ft| ft.is_file()) {
-                    let path = entry.path();
-
-                    // Ignore walkers sometimes surface files inside `.git/`
-                    // when the base is itself a git repo — skip them.
-                    if is_git_file(path) {
-                        return ignore::WalkState::Continue;
-                    }
-
-                    if !is_git_repo && is_known_binary_extension(path) {
-                        return ignore::WalkState::Continue;
-                    }
-
-                    let metadata = entry.metadata().ok();
-                    let (file_item, rel_path) =
-                        FileItem::new_from_walk(path, &base_path, None, metadata.as_ref());
-
-                    pairs.lock().push((file_item, rel_path));
-                    counter.fetch_add(1, Ordering::Relaxed);
-                }
-                ignore::WalkState::Continue
-            })
-        });
-        drop(walker_span);
-
-        let mut pairs = pairs.into_inner();
-        info!(
-            "SCAN: File walking completed in {:?} for {} files",
-            walker_start.elapsed(),
-            pairs.len(),
-        );
+        let mut walk_output = crate::walk::walk_collect_files(
+            base_path,
+            is_git_repo,
+            follow_symlinks,
+            bg_threads,
+            synced_files_count,
+        )?;
+        let ignore_rules = walk_output.ignore_rules.take().map(Arc::new);
+        let mut pairs = walk_output.pairs;
 
         // Sort by (dir_part, filename). This groups files by their directory
         // into contiguous runs so the linear dir-extraction pass below can
@@ -1959,6 +1959,7 @@ impl FileSync {
             bigram_index: None,
             bigram_overlay: None,
             chunked_paths: Some(Arc::new(chunked_paths)),
+            ignore_rules,
         })
     }
 }
@@ -2043,7 +2044,24 @@ pub fn is_known_binary_extension(path: &Path) -> bool {
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return false;
     };
+    is_binary_extension_str(ext)
+}
 
+/// Like [`is_known_binary_extension`] but takes a basename string directly,
+/// avoiding `Path::extension()` overhead. Mirrors `Path::extension()`
+/// semantics: dotfiles with no other dots → no extension. Used by the zlob
+/// walker, which already has the basename slice from traversal.
+#[cfg(feature = "zlob")]
+#[inline]
+pub(crate) fn is_known_binary_extension_basename(name: &str) -> bool {
+    match name.rfind('.') {
+        Some(pos) if pos > 0 && pos < name.len() - 1 => is_binary_extension_str(&name[pos + 1..]),
+        _ => false,
+    }
+}
+
+#[inline]
+fn is_binary_extension_str(ext: &str) -> bool {
     matches!(
         ext,
         // Images

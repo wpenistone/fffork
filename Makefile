@@ -47,10 +47,10 @@ sync-js-api-check:
 	exit $$status
 
 build:
-	cargo build --release --features zlob
+	cargo build --release --no-default-features --features zlob
 
 build-c-lib:
-	cargo build --release -p fff-c --features zlob
+	cargo build --release -p fff-c --no-default-features --features zlob
 
 header:
 	cbindgen --config crates/fff-c/cbindgen.toml --crate fff-c --output crates/fff-c/include/fff.h
@@ -94,7 +94,7 @@ test-setup:
 	fi
 
 test-rust:
-	cargo test --workspace --features zlob --exclude fff-nvim
+	cargo test --workspace --no-default-features --features zlob --exclude fff-nvim
 
 CC ?= cc
 CFLAGS ?= -O0 -g -Wall -Wextra -std=c99
@@ -227,7 +227,7 @@ test-stress-seeded:
 	cargo test --release \
 		-p fff-search \
 		--test fuzz_git_watcher_stress \
-		--features zlob \
+		--no-default-features --features zlob \
 		-- --nocapture stress_seeded
 
 test-stress-random:
@@ -235,7 +235,7 @@ test-stress-random:
 	cargo test --release \
 		-p fff-search \
 		--test fuzz_git_watcher_stress \
-		--features zlob \
+		--no-default-features --features zlob \
 		-- --nocapture stress_random
 
 test-stress-repos:
@@ -243,7 +243,7 @@ test-stress-repos:
 	cargo test --release \
 		-p fff-search \
 		--test fuzz_real_repos \
-		--features zlob \
+		--no-default-features --features zlob \
 		-- --nocapture
 
 test-stress: test-stress-seeded test-stress-random test-stress-repos
@@ -276,7 +276,7 @@ format-ts:
 format: format-rust format-lua format-ts
 
 lint-rust:
-	cargo clippy --workspace --features zlob -- -D warnings
+	cargo clippy --workspace --no-default-features --features zlob -- -D warnings
 lint-lua:
 	 ~/.luarocks/bin/luacheck .
 lint-ts:

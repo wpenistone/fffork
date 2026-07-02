@@ -97,9 +97,9 @@ export interface InitOptions {
   /** Override for the per-file byte cap in the content cache. */
   cacheBudgetMaxFileSize?: number;
   /**
-   * Allow indexing the filesystem root (`/`). Off by default, having fff instance at the large folder  
+   * Allow indexing the filesystem root (`/`). Off by default, having fff instance at the large folder
    * will generally require file watcher
-  * */
+   * */
 
   enableFsRootScanning?: boolean;
   /** Allow indexing the user's home directory. Same trade-off as `enableFsRootScanning`. */

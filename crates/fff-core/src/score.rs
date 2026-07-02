@@ -291,20 +291,6 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         }
     };
 
-    // See `score_files` — stored dir paths are platform-native on Windows.
-    #[cfg(windows)]
-    let fuzzy_parts_owned: Option<Vec<String>> = if fuzzy_parts.iter().any(|p| p.contains('/')) {
-        Some(fuzzy_parts.iter().map(|p| p.replace('/', "\\")).collect())
-    } else {
-        None
-    };
-    #[cfg(windows)]
-    let fuzzy_parts_refs: Option<Vec<&str>> = fuzzy_parts_owned
-        .as_ref()
-        .map(|v| v.iter().map(String::as_str).collect());
-    #[cfg(windows)]
-    let fuzzy_parts: &[&str] = fuzzy_parts_refs.as_deref().unwrap_or(fuzzy_parts);
-
     let valid_parts: Vec<&str> = fuzzy_parts
         .iter()
         .copied()
@@ -504,22 +490,6 @@ fn match_and_score_in_arena<'a>(
             return score_filtered_by_frecency(&working_files, context, arena);
         }
     };
-
-    // On Windows, stored relative paths use the native `\\` separator while
-    // users type `/`. Translate so frizbee sees the same bytes it would on
-    // a path stored by the walker.
-    #[cfg(windows)]
-    let fuzzy_parts_owned: Option<Vec<String>> = if fuzzy_parts.iter().any(|p| p.contains('/')) {
-        Some(fuzzy_parts.iter().map(|p| p.replace('/', "\\")).collect())
-    } else {
-        None
-    };
-    #[cfg(windows)]
-    let fuzzy_parts_refs: Option<Vec<&str>> = fuzzy_parts_owned
-        .as_ref()
-        .map(|v| v.iter().map(String::as_str).collect());
-    #[cfg(windows)]
-    let fuzzy_parts: &[&str] = fuzzy_parts_refs.as_deref().unwrap_or(fuzzy_parts);
 
     debug_assert!(!fuzzy_parts.is_empty());
     let has_uppercase = fuzzy_parts

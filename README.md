@@ -570,6 +570,11 @@ make build-c-lib
 cargo build --release -p fff-c --features zlob
 ```
 
+> The `zlob` feature (requires the [Zig](https://ziglang.org) toolchain) switches both
+> glob matching **and** filesystem traversal to [zlob](https://github.com/dmtrKovalenko/zlob)'s
+> native parallel walker. Without it, the default build uses the pure-Rust
+> [`ignore`](https://crates.io/crates/ignore) (ripgrep) walker and `globset`.
+
 The output is a `cdylib` (`libfff_c.so` / `libfff_c.dylib` / `fff_c.dll`). The header lives at [`crates/fff-c/include/fff.h`](./crates/fff-c/include/fff.h).
 
 Prebuilt binaries for every version, including every commit on main, are on the [releases page](https://github.com/dmtrKovalenko/fff.nvim/releases). The same binaries also ship inside the `@ff-labs/fff-bin-*` npm packages.

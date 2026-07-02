@@ -10,7 +10,9 @@ authors = ["Dmitriy Kovalenko <dmtr.kovalenko@outlok.com>"]
 path = "src/lib.rs"
 
 [features]
-default = []
+# `ripgrep` = pure-Rust glob detection (default). `zlob` overrides it when set.
+default = ["ripgrep"]
+ripgrep = []
 zlob = ["dep:zlob"]
 
 [dependencies]

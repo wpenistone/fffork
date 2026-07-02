@@ -42,6 +42,7 @@ fn detect_binary(path: &Path, size: u64) -> bool {
     buf[..n].contains(&0)
 }
 
+#[cfg(not(feature = "zlob"))]
 fn load_file_contents(base_path: &Path) -> Vec<Vec<u8>> {
     use ignore::WalkBuilder;
 
@@ -70,6 +71,36 @@ fn load_file_contents(base_path: &Path) -> Vec<Vec<u8>> {
         });
 
     contents
+}
+
+#[cfg(feature = "zlob")]
+fn load_file_contents(base_path: &Path) -> Vec<Vec<u8>> {
+    use std::cell::RefCell;
+    use zlob::walk::{WalkBuilder, WalkFlags, WalkMetadata, WalkState};
+
+    let contents = RefCell::new(Vec::new());
+    let max_size = 10 * 1024 * 1024u64;
+
+    let _ = WalkBuilder::new(base_path)
+        .expect("WalkBuilder::new")
+        .options(WalkFlags::GITIGNORE)
+        .metadata(WalkMetadata::SIZE)
+        .run_serial(|entry| {
+            if !entry.is_file() {
+                return WalkState::Continue;
+            }
+            let path = entry.path();
+            let size = entry.size().unwrap_or(0);
+            if size == 0 || size > max_size || detect_binary(path, size) {
+                return WalkState::Continue;
+            }
+            if let Ok(data) = std::fs::read(path) {
+                contents.borrow_mut().push(data);
+            }
+            WalkState::Continue
+        });
+
+    contents.into_inner()
 }
 
 fn bench_impl(

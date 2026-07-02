@@ -85,8 +85,8 @@ export interface InitOptions {
   /** Override for the per-file byte cap in the content cache. */
   cacheBudgetMaxFileSize?: number;
   /**
-   * Allow indexing the filesystem root (`/`). 
-   * Off by default, having fff instance at the large folder will generally require 
+   * Allow indexing the filesystem root (`/`).
+   * Off by default, having fff instance at the large folder will generally require
    * file watcher and indexing which will consume a lot of resources if performed uncontrolled
    **/
   enableFsRootScanning?: boolean;
@@ -539,16 +539,10 @@ export interface FileFinderApi {
   glob(pattern: string, options?: GlobOptions): Result<SearchResult>;
 
   /** Fuzzy directory search. */
-  directorySearch(
-    query: string,
-    options?: DirSearchOptions,
-  ): Result<DirSearchResult>;
+  directorySearch(query: string, options?: DirSearchOptions): Result<DirSearchResult>;
 
   /** Fuzzy search over files and directories interleaved by score. */
-  mixedSearch(
-    query: string,
-    options?: SearchOptions,
-  ): Result<MixedSearchResult>;
+  mixedSearch(query: string, options?: SearchOptions): Result<MixedSearchResult>;
 
   /** Content search (live grep). */
   grep(query: string, options?: GrepOptions): Result<GrepResult>;

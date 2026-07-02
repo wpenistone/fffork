@@ -224,6 +224,16 @@ impl FrecencyTracker {
     }
 
     fn path_to_hash_bytes(path: &Path) -> Result<[u8; 32]> {
+        // On Windows, resolve to the canonical form (short-name/case/symlink)
+        // so the same file always hashes to one key regardless of how the
+        // caller spelled it. Falls back to the raw path when the file no
+        // longer exists (e.g. watcher delete events), so the op is never
+        // dropped. No-op on other platforms.
+        #[cfg(windows)]
+        let canonical: Option<std::path::PathBuf> = crate::path_utils::canonicalize(path).ok();
+        #[cfg(windows)]
+        let path: &Path = canonical.as_deref().unwrap_or(path);
+
         let Some(key) = path.to_str() else {
             return Err(Error::InvalidPath(path.to_path_buf()));
         };
@@ -399,6 +409,15 @@ impl FrecencyTracker {
 mod tests {
     use super::*;
     use crate::file_picker::FFFMode;
+
+    // A path that doesn't exist on disk must still hash (canonicalize fails on
+    // Windows → falls back to the raw string), so watcher delete events and
+    // raced files never drop their frecency op.
+    #[test]
+    fn hashes_nonexistent_path_without_error() {
+        let missing = Path::new("/this/path/definitely/does/not/exist/frecency_test_xyz");
+        assert!(FrecencyTracker::path_to_hash_bytes(missing).is_ok());
+    }
 
     fn calculate_test_frecency_score(access_timestamps: &[u64], current_time: u64) -> i64 {
         let mut total_frecency = 0.0;

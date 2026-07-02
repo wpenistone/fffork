@@ -40,17 +40,11 @@ pub(crate) trait Constrainable {
     fn is_overflow(&self) -> bool;
 }
 
-/// Windows stores paths with `\\`; `/` comes from user queries.
+/// Stored/canonical paths use `/`; also accept `\` so a Windows user typing
+/// a native separator in a query still matches.
 #[inline]
 fn is_path_sep(b: u8) -> bool {
-    #[cfg(windows)]
-    {
-        b == b'/' || b == b'\\'
-    }
-    #[cfg(not(windows))]
-    {
-        b == b'/'
-    }
+    b == b'/' || b == b'\\'
 }
 
 #[inline]
@@ -511,12 +505,6 @@ impl PathBuffer {
             let start = bytes.len();
             item.write_relative_path(item_arena, &mut tmp);
             bytes.extend_from_slice(tmp.as_bytes());
-            #[cfg(windows)]
-            for b in &mut bytes[start..] {
-                if *b == b'\\' {
-                    *b = b'/';
-                }
-            }
             offsets.push((start, bytes.len() - start));
         }
         Self { bytes, offsets }

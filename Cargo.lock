@@ -698,6 +698,7 @@ dependencies = [
  "rand 0.8.5",
  "tracing",
  "tracing-subscriber",
+ "zlob",
 ]
 
 [[package]]
@@ -3257,9 +3258,9 @@ dependencies = [
 
 [[package]]
 name = "zlob"
-version = "1.4.1"
+version = "1.6.0-dev.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "466e82062db3527af78a7627a0e066f2420f8d2e573d530956fb9192956dc7b6"
+checksum = "7a001622f7432c8853a610dfe22a774e0fc8c8d9969cb73be71ab49bd506e180"
 dependencies = [
  "bindgen",
  "bitflags 2.11.0",

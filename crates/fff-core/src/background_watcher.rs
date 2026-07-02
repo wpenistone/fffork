@@ -193,6 +193,7 @@ impl BackgroundWatcher {
         // we just broke with `owner_picker`'s `downgrade()` above.
         // Capture a weak handle instead and upgrade per-batch.
         let git_workdir_for_handler = git_workdir.clone();
+        let base_path_for_handler = base_path.clone();
         let shared_picker_for_watching = shared_picker.clone();
         let event_picker = shared_picker.weaken();
         let mut debouncer = new_debouncer_opt(
@@ -211,6 +212,7 @@ impl BackgroundWatcher {
 
                         let new_dirs = handle_debounced_events(
                             events,
+                            &base_path_for_handler,
                             &git_workdir_for_handler,
                             &strong_picker,
                             &shared_frecency,
@@ -389,6 +391,7 @@ impl Drop for BackgroundWatcher {
 #[tracing::instrument(name = "fs_events", skip(events, shared_picker, shared_frecency), level = Level::DEBUG)]
 fn handle_debounced_events(
     events: Vec<DebouncedEvent>,
+    base_path: &Path,
     git_workdir: &Option<PathBuf>,
     shared_picker: &SharedFilePicker,
     shared_frecency: &SharedFrecency,
@@ -396,6 +399,13 @@ fn handle_debounced_events(
 ) -> Vec<PathBuf> {
     // this will be called very often, we have to minimiy the lock time for file picker
     let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
+    // Prefer the walker's own ignore rules (zlob); grab a cheap Arc clone once
+    // per batch so we don't hold the picker lock during filtering.
+    let walker_rules = shared_picker
+        .read()
+        .ok()
+        .and_then(|g| g.as_ref().and_then(|p| p.ignore_rules()));
+    let filter = IgnoreFilter::new(base_path, walker_rules, repo.as_ref());
     let mut need_full_rescan = false;
     let mut need_full_git_rescan = false;
     let mut paths_to_remove = Vec::new();
@@ -426,7 +436,7 @@ fn handle_debounced_events(
                     .paths
                     .iter()
                     // but we are smart enough and not falling into the paths
-                    .all(|p| should_include_file(p, repo.as_ref()))
+                    .all(|p| should_include_file(p, &filter))
             {
                 break;
             }
@@ -489,12 +499,12 @@ fn handle_debounced_events(
             } else if is_removal || !path.exists() {
                 paths_to_remove.push(path.as_path());
             } else if path.is_dir() {
-                if !is_path_ignored(path, &repo) {
+                if !is_path_ignored(path, &filter) {
                     new_dirs_to_watch.push(path.to_path_buf());
                 }
             } else {
                 // For additions/modifications, still filter gitignored files.
-                if should_include_file(path, repo.as_ref()) {
+                if should_include_file(path, &filter) {
                     paths_to_add_or_modify.push(path.as_path());
                 }
             }
@@ -715,12 +725,22 @@ fn track_files_from_new_directories(
     };
 
     let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
+    // Prefer the walker's ignore rules; read base_path + rules from the picker.
+    let (base_path, walker_rules) = match shared_picker.read().ok().and_then(|g| {
+        g.as_ref()
+            .map(|p| (p.base_path().to_path_buf(), p.ignore_rules()))
+    }) {
+        Some(pair) => pair,
+        None => return,
+    };
+
+    let filter = IgnoreFilter::new(&base_path, walker_rules, repo.as_ref());
     let mut files_to_add = Vec::new();
 
     for entry in entries.flatten() {
         if entry.file_type().is_ok_and(|ft| ft.is_file()) {
             let path = entry.path();
-            if should_include_file(&path, repo.as_ref()) {
+            if should_include_file(&path, &filter) {
                 files_to_add.push(path);
             }
         }
@@ -768,28 +788,57 @@ fn track_files_from_new_directories(
     );
 }
 
-fn should_include_file(path: &Path, repo: Option<&Repository>) -> bool {
+fn should_include_file(path: &Path, filter: &IgnoreFilter) -> bool {
     // Directories are not indexed — only regular files (and symlinks to files).
     if path.is_dir() {
         return false;
     }
-
-    match repo.as_ref() {
-        Some(repo) => repo.is_path_ignored(path) != Ok(true),
-        None => {
-            // When we have no git repo apply basic sanity filters to preve
-            // Hidden directories are skipped by the watcher setup (hidden(true)),
-            // but events can still arrive for files in known non-code directories.
-            !crate::ignore::is_non_code_directory(path)
-        }
-    }
+    !filter.is_ignored(path)
 }
 
 #[inline]
-fn is_path_ignored(path: &Path, repo: &Option<Repository>) -> bool {
-    match repo.as_ref() {
-        Some(repo) => repo.is_path_ignored(path) == Ok(true),
-        None => crate::ignore::is_non_code_directory(path),
+fn is_path_ignored(path: &Path, filter: &IgnoreFilter) -> bool {
+    filter.is_ignored(path)
+}
+
+struct IgnoreFilter<'a> {
+    base_path: &'a Path,
+    /// Reusable ignore rules from the last walk (zlob backend only).
+    rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
+    /// libgit2 repo, consulted only when `rules` is `None`. Borrowed from the
+    /// caller's repo (also used for git-status queries) to avoid re-opening.
+    repo: Option<&'a Repository>,
+}
+
+impl<'a> IgnoreFilter<'a> {
+    fn new(
+        base_path: &'a Path,
+        rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
+        repo: Option<&'a Repository>,
+    ) -> Self {
+        Self {
+            base_path,
+            rules,
+            repo,
+        }
+    }
+
+    /// Whether `path` (absolute) is ignored.
+    fn is_ignored(&self, path: &Path) -> bool {
+        if let Some(rules) = self.rules.as_ref() {
+            let Ok(rel) = path.strip_prefix(self.base_path) else {
+                return false;
+            };
+            // `IgnoreRules::is_ignored` enumerates every ancestor .gitignore
+            // layer internally, so a leaf under an ignored directory (rule
+            // `build/`, path `build/out.rs`) is caught in one call.
+            return rules.is_ignored(rel);
+        }
+        match self.repo {
+            Some(repo) => repo.is_path_ignored(path) == Ok(true),
+            // No repo and no rules: fall back to the non-code-dir heuristic.
+            None => crate::ignore::is_non_code_directory(path),
+        }
     }
 }
 

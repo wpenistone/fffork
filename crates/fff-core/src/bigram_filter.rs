@@ -906,13 +906,20 @@ pub(crate) fn sniff_binary_for_non_indexable(
     files: &[FileItem],
     base_path: &std::path::Path,
     arena: crate::simd_path::ArenaPtr,
+    cancelled: &std::sync::atomic::AtomicBool,
 ) {
     // Non-indexable files are few in a typical repo, so a serial pass with a
     // single reused chunk buffer beats spinning up the thread pool.
     let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
     let mut chunk = vec![0u8; crate::types::BINARY_CLASSIFICATION_CHUNK_SIZE];
+    use std::sync::atomic::Ordering;
 
-    for file in files {
+    for (i, file) in files.iter().enumerate() {
+        // check every 256 files to avoid useless work
+        if (i & 0xFF) == 0 && cancelled.load(Ordering::Acquire) {
+            return;
+        }
+
         // check only the files that we are able to grep
         if file.size == 0 || file.size > constants::MAX_FFFILE_SIZE {
             continue;

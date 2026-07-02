@@ -135,17 +135,21 @@ impl ScanJob {
         }
     }
 
-    /// Spawn the job on a dedicated OS thread. Returns immediately.
-    pub fn spawn(self) -> std::thread::JoinHandle<()> {
+    /// Run the job on `BACKGROUND_THREAD_POOL`. Returns immediately.
+    ///
+    /// Routed through the pool — and not a fresh `std::thread::spawn` — so the
+    /// orchestrator inherits rayon's QoS pin (USER_INITIATED). Without that
+    /// pin, an interactive nvim's USER_INTERACTIVE main thread spawns a child
+    /// at lower QoS, the walker's Zig worker pool inherits the demotion, and
+    /// the kernel drifts those workers onto E-cores. On chromium that turns a
+    /// ~800 ms walk into ~3 s.
+    pub fn spawn(self) {
         self.signals.scanning.store(true, Ordering::Release);
         let span = self.trace_span.clone();
-        std::thread::Builder::new()
-            .name("fff-scan".into())
-            .spawn(move || {
-                let _g = span.enter();
-                self.run();
-            })
-            .expect("failed to spawn fff-scan thread")
+        BACKGROUND_THREAD_POOL.spawn(move || {
+            let _g = span.enter();
+            self.run();
+        });
     }
 
     fn run(self) {
@@ -342,11 +346,17 @@ impl ScanJob {
                     non_indexable_files,
                     &unsafe_snapshot.base_path,
                     arena,
+                    &signals.cancelled,
                 );
             }
         } else {
             // this potentially a long running as we are not parallelizing it but it's okay
-            sniff_binary_for_non_indexable(files, &unsafe_snapshot.base_path, arena);
+            sniff_binary_for_non_indexable(
+                files,
+                &unsafe_snapshot.base_path,
+                arena,
+                &signals.cancelled,
+            );
         }
 
         // TODO Skipped as potentially unsafe - figure this out later

@@ -99,6 +99,16 @@ impl SharedFilePicker {
         Ok(self.0.picker.write())
     }
 
+    /// Signal the background scan to cancel. Non-blocking: post-scan
+    /// threads check this flag and bail out at their next cancellation point.
+    pub fn cancel(&self) {
+        if let Ok(guard) = self.read()
+            && let Some(picker) = guard.as_ref()
+        {
+            picker.cancel();
+        }
+    }
+
     /// Produce a non-owning handle to the same inner picker.
     /// Use it if you don't need to block internal threads from dropping while owning this ref
     pub(crate) fn weaken(&self) -> WeakFilePicker {
