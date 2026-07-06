@@ -403,11 +403,15 @@ export default function fffExtension(pi: ExtensionAPI) {
 
   function registerAutocompleteProvider(ctx: {
     ui: {
-      addAutocompleteProvider: (
+      addAutocompleteProvider?: (
         factory: (current: AutocompleteProvider) => AutocompleteProvider,
       ) => void;
     };
   }) {
+    // pi forks (e.g. omp) may not expose addAutocompleteProvider; skip UI wiring
+    // and let tools continue to work instead of failing session_start.
+    if (typeof ctx.ui.addAutocompleteProvider !== "function") return;
+
     ctx.ui.addAutocompleteProvider((current) => {
       const mentionProvider = createFffMentionProvider(getMentionItems);
 

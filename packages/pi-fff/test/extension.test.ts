@@ -161,6 +161,24 @@ describe("pi-fff autocomplete registration", () => {
     ]);
   });
 
+  test("session_start survives hosts without addAutocompleteProvider", async () => {
+    const setup = createPi();
+    const ctx = {
+      cwd: "/tmp/workspace",
+      ui: {
+        notify: mock(() => undefined),
+        setEditorComponent: mock(() => undefined),
+      },
+    };
+    fffExtension(setup.pi as any);
+
+    const sessionStart = setup.events.get("session_start");
+    await sessionStart?.({ reason: "startup" }, ctx);
+
+    expect(ctx.ui.notify).not.toHaveBeenCalled();
+    expect(createCalls).toHaveLength(1);
+  });
+
   test("delegates non-@ completions to the current provider", async () => {
     const { ctx } = await start();
     const factory = ctx.ui.addAutocompleteProvider.mock.calls[0][0];
