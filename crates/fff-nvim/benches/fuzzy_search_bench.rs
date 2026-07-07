@@ -8,7 +8,6 @@ use fff::{
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Initialize tracing to output to console
 fn init_tracing() {
     // use tracing_subscriber::EnvFilter;
     // use tracing_subscriber::fmt;
@@ -22,7 +21,6 @@ fn init_tracing() {
     //     .try_init();
 }
 
-/// Initialize FilePicker using shared state
 fn init_file_picker_internal(
     path: &str,
     shared_picker: &SharedFilePicker,
@@ -41,7 +39,6 @@ fn init_file_picker_internal(
     .map_err(|e| format!("Failed to create FilePicker: {:?}", e))
 }
 
-/// Helper function to wait for scanning to complete and get file count
 fn wait_for_scan_completion(
     shared_picker: &SharedFilePicker,
     timeout_secs: u64,
@@ -100,20 +97,10 @@ fn wait_for_scan_completion(
             ));
         }
 
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
-/// Clean up shared state
-fn cleanup_shared_state(shared_picker: &SharedFilePicker) {
-    if let Ok(mut picker_guard) = shared_picker.write() {
-        if let Some(mut picker) = picker_guard.take() {
-            picker.stop_background_monitor();
-        }
-    }
-}
-
-/// Initialize FilePicker once and return shared state
 fn setup_once() -> Result<(SharedFilePicker, SharedFrecency), String> {
     init_tracing();
 
@@ -145,7 +132,6 @@ fn setup_once() -> Result<(SharedFilePicker, SharedFrecency), String> {
     Ok((shared_picker, shared_frecency))
 }
 
-/// Benchmark for searching with various query patterns
 fn bench_search_queries(c: &mut Criterion) {
     let (sp, _sf) = match setup_once() {
         Ok(result) => result,
