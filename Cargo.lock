@@ -1534,9 +1534,9 @@ dependencies = [
 
 [[package]]
 name = "neo_frizbee"
-version = "0.10.3"
+version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0dd76fab81213d184cc28a7757791775bdcfd7f2a15e3558d7a4f7e4ee7de864"
+checksum = "12af02496d6e51f324af42ffbd1ed31eb275d4aedd17b18b2cb4542f103f86cb"
 dependencies = [
  "itertools 0.14.0",
  "raw-cpuid",
