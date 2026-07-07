@@ -593,7 +593,7 @@ fn normalize_byte_scalar(b: u8) -> u8 {
 #[inline(always)]
 fn normalize_bytes(src: &[u8], dst: &mut [u8]) {
     debug_assert!(dst.len() >= src.len());
-    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+    #[cfg(target_arch = "x86_64")]
     {
         if std::is_x86_feature_detected!("avx2") {
             unsafe { normalize_bytes_avx2(src, dst) };
@@ -620,7 +620,7 @@ fn normalize_bytes_scalar(src: &[u8], dst: &mut [u8]) {
 
 /// AVX2 normalize: 32 bytes/iter. AVX2 only has signed cmp, so unsigned
 /// range checks use `min(max(v, lo), hi) == v`.
-#[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn normalize_bytes_avx2(src: &[u8], dst: &mut [u8]) {
     use std::arch::x86_64::*;

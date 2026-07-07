@@ -101,6 +101,32 @@ jobs:
           path: crates/fff-core/tests/fuzz_git_watcher_stress.proptest-regressions
           if-no-files-found: ignore
 
+  build-i686:
+    name: Build i686-unknown-linux-gnu
+    runs-on: ubuntu-latest
+    # Verifies that fff-search compiles on 32-bit x86, where std::arch::x86_64
+    # is unavailable. SIMD paths are disabled on this target; only the scalar
+    # fallback should build. See issue #656.
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib g++-multilib
+
+      - name: Install Rust (i686 target)
+        uses: actions-rust-lang/setup-rust-toolchain@v1.15.4
+        with:
+          target: i686-unknown-linux-gnu
+          cache: true
+          cache-on-failure: true
+          cache-key: "v1-rust-i686"
+
+      - name: Build fff-search for i686
+        run: cargo build -p fff-search --target i686-unknown-linux-gnu
+
   fmt:
     name: cargo fmt
     runs-on: ubuntu-latest
