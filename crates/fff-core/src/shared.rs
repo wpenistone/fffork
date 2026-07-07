@@ -9,6 +9,7 @@ use crate::frecency::FrecencyTracker;
 use crate::git::GitStatusCache;
 use crate::query_tracker::QueryTracker;
 use crate::scan::ScanJob;
+use git2::Repository;
 
 /// Poll `.git/index.lock` until it disappears (git write completed), giving up
 /// after [`GIT_LOCK_MAX_WAIT`]. Used by [`SharedPicker::refresh_git_status`]
@@ -216,19 +217,19 @@ impl SharedFilePicker {
         Ok(())
     }
 
-    /// Refresh git statuses for all indexed files.
+    /// Refresh git statuses for all indexed files
+    #[tracing::instrument(level = "info", skip_all)]
     pub fn refresh_git_status(&self, shared_frecency: &SharedFrecency) -> Result<usize, Error> {
         use tracing::debug;
 
         let git_status = {
-            let guard = self.read()?;
-            let Some(ref picker) = *guard else {
-                return Err(Error::FilePickerMissing);
+            let git_root = {
+                let guard = self.read()?;
+                let Some(ref picker) = *guard else {
+                    return Err(Error::FilePickerMissing);
+                };
+                picker.git_root().map(|p| p.to_path_buf())
             };
-
-            let git_root = picker.git_root().map(|p| p.to_path_buf());
-            drop(guard); // updating git status could take very long time, there is not risky as we
-            // do not allow any mutations and deletions of files from the sync
 
             debug!(?git_root, "Refreshing git status for picker");
 
@@ -254,6 +255,37 @@ impl SharedFilePicker {
         };
 
         Ok(statuses_count)
+    }
+
+    /// Recompute and apply git status for a specific set of paths.
+    pub fn update_git_status_for_paths(
+        &self,
+        paths: &[PathBuf],
+        shared_frecency: &SharedFrecency,
+    ) -> Result<(), Error> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+
+        let git_root = {
+            let guard = self.read()?;
+            let Some(ref picker) = *guard else {
+                return Err(Error::FilePickerMissing);
+            };
+            picker.git_root().map(|p| p.to_path_buf())
+        };
+        let Some(git_root) = git_root else {
+            return Ok(());
+        };
+
+        wait_for_git_index_lock_release(&git_root);
+
+        let repo = Repository::open(&git_root)?;
+        let status = GitStatusCache::git_status_for_paths(&repo, paths)?;
+
+        let mut guard = self.write()?;
+        let picker = guard.as_mut().ok_or(Error::FilePickerMissing)?;
+        picker.update_git_statuses(status, shared_frecency)
     }
 }
 
@@ -323,8 +355,7 @@ impl<T: LmdbStore> SharedDb<T> {
             *guard = Some(tracker);
         }
 
-        // GC holds a read guard on this lock, so destroy / re-init wait
-        // for it naturally — no join handle, no race against file removal.
+        // GC holds a read guard on this lock, so destroy / re-init wait won't race
         spawn_lmdb_gc(self.inner.clone());
         Ok(())
     }
@@ -335,8 +366,7 @@ impl<T: LmdbStore> SharedDb<T> {
     /// access) are finished before the LMDB environment is closed and the files
     /// are removed.
     ///
-    /// Returns `Ok(Some(path))` with the deleted path, or `Ok(None)` if no
-    /// tracker was initialized.
+    /// Returns `Ok(Some(path))` with the deleted path, or `Ok(None)` if no tracker was initialized.
     pub fn destroy(&self) -> Result<Option<PathBuf>, Error> {
         let mut guard = self.write()?;
         let Some(tracker) = guard.take() else {

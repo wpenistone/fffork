@@ -100,10 +100,15 @@ jobs:
         if: failure()
         shell: bash
         run: |
-          echo "=== fff-test.log ==="
-          if [ -f fff-test.log ]; then
-            cat fff-test.log
-          else
+          # init_tracing writes session files named fff-test+<ts>+<pid>.log
+          found=0
+          for f in fff-test*.log; do
+            [ -f "$f" ] || continue
+            found=1
+            echo "=== $f ==="
+            cat "$f"
+          done
+          if [ "$found" = 0 ]; then
             echo "(no log file produced)"
           fi
 

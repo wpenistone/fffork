@@ -2,7 +2,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use rayon::prelude::*;
 use tracing::{error, info};
 
 use crate::FileSync;
@@ -10,10 +9,8 @@ use crate::background_watcher::BackgroundWatcher;
 use crate::bigram_filter::{build_bigram_index, sniff_binary_for_non_indexable};
 use crate::error::Error;
 use crate::file_picker::FFFMode;
-use crate::git::GitStatusCache;
 use crate::parallelism::BACKGROUND_THREAD_POOL;
 use crate::shared::{SharedFilePicker, SharedFrecency};
-use crate::simd_path::ArenaPtr;
 use crate::types::ContentCacheBudget;
 
 #[derive(Clone, Default)]
@@ -165,14 +162,10 @@ impl ScanJob {
         } = self;
 
         let _scanning = ScanningGuard::new(&signals, config.install_watcher);
-
-        // Reset the UI-visible counter; the walker bumps it per file
-        // and `get_scan_progress` reads it without locks.
         scanned_files_counter.store(0, Ordering::Relaxed);
 
-        // 1. Start git discovery and walk filesystem off-lock.
+        // 1. Walk the file system and collect the list of files
         let git_workdir = FileSync::discover_git_workdir(&base_path);
-        let status_handle = git_workdir.clone().map(FileSync::spawn_git_status);
         let sync = match FileSync::walk_filesystem(
             &base_path,
             git_workdir.clone(),
@@ -188,7 +181,8 @@ impl ScanJob {
             }
         };
 
-        // 2. Brief write to install the freshly-walked file list.
+        // 2. Populate the file list
+        let git_status_worker;
         if let Ok(mut guard) = shared_picker.write()
             && let Some(picker) = guard.as_mut()
         {
@@ -199,6 +193,7 @@ impl ScanJob {
 
             let live_count = sync.live_count;
             picker.commit_new_sync(sync);
+            git_status_worker = Arc::clone(&picker.git_status_worker);
 
             if config.auto_cache_budget && !picker.has_explicit_cache_budget() {
                 picker.set_cache_budget(ContentCacheBudget::new_for_repo(live_count));
@@ -208,18 +203,16 @@ impl ScanJob {
             return;
         }
 
-        // Files are now searchable — flip the scan signal *early* so
-        // UI progress polls see the picker as "ready" while we run the
-        // optional post-scan steps in the background.
-        signals.scanning.store(false, Ordering::Relaxed);
-
-        // in case we do a rescan, we have to resubscribe a watcher to the new set of directories
-        // all the already watched directories are not going to be resubscribed
-        if !config.install_watcher && !signals.cancelled.load(Ordering::Acquire) {
-            rescubscribe_watcher_post_scan(&shared_picker);
+        // Spawn the git status worker once. BUG PINNNING. If the user initiated git in the folder
+        // which is a real use case we need to have a way to start the git worker background thread dynamically
+        if git_workdir.is_some() && !signals.cancelled.load(Ordering::Acquire) {
+            git_status_worker.spawn_once(shared_picker.weaken(), shared_frecency.clone());
+            git_status_worker.request_full_rescan(); // this runs anyway
         }
 
-        let mut snapshot = if !signals.cancelled.load(Ordering::Acquire) {
+        // BUG pinning: take the snapshot *before* the storing the scan=true, otherwise there is a tiny
+        // race window when there scanned is set to true, but `post_scan_indexing_active` flag is `false`
+        let snapshot = if !signals.cancelled.load(Ordering::Acquire) {
             shared_picker.read().ok().and_then(|guard| {
                 guard
                     .as_ref()
@@ -229,24 +222,19 @@ impl ScanJob {
             None
         };
 
-        // 3. Post-scan warmup + bigram build — runs in parallel with the
-        // git-status thread to overlap the two expensive phases.
-        // Always runs (even with both flags off) so binary-content files
-        // with unknown extensions get reclassified before user search hits.
+        signals.scanning.store(false, Ordering::Relaxed); // file are searchable
+
+        // in case we do a rescan, we have to resubscribe a watcher to the new set of directories
+        // all the already watched directories are not going to be resubscribed (this is internally deduped)
+        if !config.install_watcher && !signals.cancelled.load(Ordering::Acquire) {
+            rescubscribe_watcher_post_scan(&shared_picker);
+        }
+
+        // 3. Runs post scna in parallel with git status collection
         if !signals.cancelled.load(Ordering::Acquire)
             && let Some(snap) = snapshot.as_ref()
         {
             Self::run_post_scan(&shared_picker, &signals, &config, snap);
-        }
-
-        // 4. Join and git status, this HAS to be done after the post scan
-        if !signals.cancelled.load(Ordering::Acquire)
-            && let Some(status_handle) = status_handle
-            && let Some(snapshot) = snapshot.as_mut()
-            // THIS DOES WAIT for potentially very long status query
-            && let Ok(Some(git_status)) = status_handle.join()
-        {
-            apply_git_status_and_frecency(git_status, &shared_frecency, mode, snapshot);
         }
 
         drop(snapshot); // SNAPSHOT SHOULD NOT BE USED AFTER THIS POINT
@@ -265,6 +253,7 @@ impl ScanJob {
                 mode,
                 config.enable_fs_root_scanning,
                 config.enable_home_dir_scanning,
+                git_status_worker,
                 tracing::Span::current(),
             ) {
                 Ok(watcher) => {
@@ -412,64 +401,4 @@ fn rescubscribe_watcher_post_scan(shared_picker: &SharedFilePicker) {
         watcher.request_watch_dir(dir.to_path_buf());
         std::ops::ControlFlow::Continue(())
     });
-}
-
-#[tracing::instrument(
-    level = "debug",
-    skip_all,
-    fields(file_count = tracing::field::Empty, dirty_count = tracing::field::Empty),
-)]
-fn apply_git_status_and_frecency(
-    git_cache: GitStatusCache,
-    shared_frecency: &SharedFrecency,
-    mode: FFFMode,
-    unsafe_snapshot: &mut crate::file_picker::PostScanUnsafeSnapshot,
-) {
-    let frecency = shared_frecency.read().ok();
-    let frecency_ref = frecency.as_ref().and_then(|f| f.as_ref());
-
-    let base_count = unsafe_snapshot.base_count;
-    let files: &mut [crate::types::FileItem] = &mut unsafe_snapshot.files[..base_count];
-    // Dir frecency goes through per-entry `AtomicI32`; a shared slice is
-    // enough and avoids any `&mut` aliasing against the Arc-shared buffer.
-    let dirs: &[crate::types::DirItem] = &unsafe_snapshot.dirs;
-    let arena = unsafe_snapshot
-        .arena
-        .as_ref()
-        .map(|s| s.as_arena_ptr())
-        .unwrap_or(ArenaPtr::null());
-
-    // Reset dir frecency before recomputation.
-    for dir in dirs.iter() {
-        dir.reset_frecency();
-    }
-
-    BACKGROUND_THREAD_POOL.install(|| {
-        files.par_iter_mut().for_each(|file| {
-            if unsafe_snapshot.cancelled.load(Ordering::Relaxed) {
-                return;
-            }
-
-            let mut buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-            let absolute_path =
-                file.write_absolute_path(arena, &unsafe_snapshot.base_path, &mut buf);
-
-            file.git_status = git_cache.lookup_status(absolute_path);
-            if let Some(frecency) = frecency_ref {
-                let _ =
-                    file.update_frecency_scores(frecency, arena, &unsafe_snapshot.base_path, mode);
-            }
-
-            let score = file.access_frecency_score as i32;
-            if score > 0 {
-                let dir_idx = file.parent_dir_index as usize;
-                if let Some(dir) = dirs.get(dir_idx) {
-                    dir.update_frecency_if_larger(score);
-                }
-            }
-        });
-    });
-
-    let span = tracing::Span::current();
-    span.record("dirty_count", git_cache.statuses_len());
 }

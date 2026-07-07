@@ -95,6 +95,7 @@
 //! ```
 
 mod background_watcher;
+mod git_status_worker;
 pub(crate) mod parallelism;
 mod scan;
 // public only for benchmarks — the inverted index is still re-exported via

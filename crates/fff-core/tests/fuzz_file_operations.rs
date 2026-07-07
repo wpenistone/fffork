@@ -1,14 +1,3 @@
-//! Randomized file-system mutation stress test.
-//!
-//! Seeds a directory with ~40 files across diverse content domains, builds the
-//! picker + bigram index, then runs 20 rounds of randomized create / edit /
-//! delete / rename / read-only operations. After every round the test verifies
-//! that plain-text grep, regex grep, and fuzzy file search all return correct
-//! results for every live and dead file.
-//!
-//! Uses a seeded RNG (`SmallRng::seed_from_u64`) for deterministic
-//! reproduction.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;

@@ -484,6 +484,10 @@ pub struct FilePicker {
     sync_data: FileSync,
     pub(crate) signals: ScanSignals,
     pub(crate) background_watcher: Option<BackgroundWatcher>,
+    /// Single serialized writer for all git-status updates (scan, watcher,
+    /// FFI). Owned by the picker so it exists before the first scan; its
+    /// consumer thread is spawned lazily once a git workdir is discovered.
+    pub(crate) git_status_worker: Arc<crate::git_status_worker::GitStatusWorker>,
     cache_budget: Arc<ContentCacheBudget>,
     has_explicit_cache_budget: bool,
     scanned_files_count: Arc<AtomicUsize>,
@@ -768,6 +772,7 @@ impl FilePicker {
 
         Ok(FilePicker {
             background_watcher: None,
+            git_status_worker: crate::git_status_worker::GitStatusWorker::new(),
             base_path: path,
             cache_budget: Arc::new(initial_budget),
             has_explicit_cache_budget: has_explicit_budget,
@@ -909,36 +914,10 @@ impl FilePicker {
         Ok(())
     }
 
-    /// Start the background file-system watcher.
-    ///
-    /// The picker must already be placed into `shared_picker` (the watcher
-    /// needs the shared handle to apply live updates). Call after
-    /// [`collect_files`](Self::collect_files) or after an initial scan.
-    pub fn spawn_background_watcher(
-        &mut self,
-        shared_picker: &SharedFilePicker,
-        shared_frecency: &SharedFrecency,
-    ) -> Result<(), Error> {
-        let git_workdir = self.sync_data.git_workdir.clone();
-        let watcher = BackgroundWatcher::new(
-            self.base_path.clone(),
-            git_workdir,
-            shared_picker.clone(),
-            shared_frecency.clone(),
-            self.mode,
-            self.enable_fs_root_scanning,
-            self.enable_home_dir_scanning,
-            self.trace_span.clone(),
-        )?;
-        self.background_watcher = Some(watcher);
-        self.signals.watcher_ready.store(true, Ordering::Release);
-        Ok(())
-    }
-
     /// Perform fuzzy search on files with a pre-parsed query.
     ///
-    /// The query should be parsed using [`FFFQuery`]::parse() before calling
-    /// this function. If a [`QueryTracker`] is provided, the search will
+    /// The query should be parsed using [`crate::FFFQuery`] before calling
+    /// this function. If a [`crate::QueryTracker`] is provided, the search will
     /// automatically look up the last selected file for this query and boost it
     #[tracing::instrument(skip_all, name = "Fuzzy file search", fields(query = query.raw_query))]
     pub fn fuzzy_search<'q>(
@@ -1370,12 +1349,10 @@ impl FilePicker {
 
         Some(PostScanUnsafeSnapshot {
             files: self.sync_data.files.clone(),
-            dirs: self.sync_data.dirs.clone(),
             arena: self.sync_data.chunked_paths.as_ref().map(Arc::clone),
             base_count: self.sync_data.base_count,
             indexable_count: self.sync_data.indexable_count,
             base_path: self.base_path.clone(),
-            cancelled: Arc::clone(&self.signals.cancelled),
             post_scan_flag: Arc::clone(&self.signals.post_scan_indexing_active),
             _budget: Arc::clone(&self.cache_budget),
         })
@@ -1744,6 +1721,9 @@ impl Drop for FilePicker {
         // Cancel any in-flight ScanJob bound to this picker's signals so
         // it cannot mutate the replacement picker after a swap.
         self.signals.cancelled.store(true, Ordering::Release);
+        // Wake the git-status consumer so it exits; never joined (it takes
+        // the picker write lock, a blocking join here could deadlock).
+        self.git_status_worker.signal_shutdown();
     }
 }
 
@@ -1774,14 +1754,12 @@ impl FileSlot {
 /// `ScanJob::run`, `scan_job_running == false` implies no live snapshot.
 pub(crate) struct PostScanUnsafeSnapshot {
     pub files: StableVec<FileItem>,
-    pub dirs: StableVec<crate::types::DirItem>,
     pub arena: Option<Arc<crate::simd_path::ChunkedPathStore>>,
     // TODO figure this out
     pub _budget: Arc<crate::types::ContentCacheBudget>,
     pub base_count: usize,
     pub indexable_count: usize,
     pub base_path: PathBuf,
-    pub cancelled: Arc<AtomicBool>,
     post_scan_flag: Arc<AtomicBool>,
 }
 

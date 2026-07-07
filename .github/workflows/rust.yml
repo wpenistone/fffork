@@ -50,7 +50,7 @@ jobs:
         run: cargo test --no-default-features --features zlob --workspace --exclude fff-nvim
 
   stress-test:
-    name: Stress Test (Watcher + Git)
+    name: Fuzz Tests
     runs-on: ${{ matrix.os }}
     strategy:
       # Keep going after one OS fails so we can see whether a bug
@@ -61,6 +61,10 @@ jobs:
     # Long-running; don't let a stuck watcher thread burn a full CI
     # timeout. Two scenarios should finish well under this limit.
     timeout-minutes: 20
+    env:
+      FFF_STRESS_CASES: "5"
+      FFF_STRESS_MIN_OPS: "30"
+      FFF_STRESS_MAX_OPS: "60"
     steps:
       - uses: actions/checkout@v5
 
@@ -77,21 +81,17 @@ jobs:
           cache-key: "v1-rust-stress-${{ matrix.os }}"
           components: rustfmt, clippy
 
-      - name: Stress test (seeded / deterministic)
+      - name: Stress test seeded
         shell: bash
         run: make test-stress-seeded
-        env:
-          FFF_STRESS_CASES: "3"
-          FFF_STRESS_MIN_OPS: "30"
-          FFF_STRESS_MAX_OPS: "50"
 
-      - name: Stress test (random / fuzzy)
+      - name: Stress test random
         shell: bash
         run: make test-stress-random
-        env:
-          FFF_STRESS_CASES: "5"
-          FFF_STRESS_MIN_OPS: "30"
-          FFF_STRESS_MAX_OPS: "60"
+
+      - name: Stress test regressions
+        shell: bash
+        run: make test-stress-regressions
 
       - name: Upload proptest regressions on failure
         if: failure()

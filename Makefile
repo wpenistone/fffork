@@ -12,19 +12,15 @@ FFF_STRESS_DEFAULT_SEED ?= 0xDEADBEEFCAFEBABE
 SHELL := bash
 # Order matters: `-c` must be last so bash treats the recipe as the script
 # string rather than the literal `-o` / `pipefail` tokens.
-.SHELLFLAGS := -o pipefail -ec
+.SHELLFLAGS := -o pipefail -euc
 
-.PHONY: build build-c-lib install uninstall test test-rust test-c-smoke test-c-api test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-bun-packaged prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-repos test-node-stress sync-js-api sync-js-api-check bump-homebrew-formula bump-install-mcp-sh test-bun-compile 
+.PHONY: build build-c-lib install uninstall test test-rust test-c-smoke test-c-api test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-bun-packaged prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-regressions test-stress-repos test-node-stress sync-js-api sync-js-api-check bump-homebrew-formula bump-install-mcp-sh test-bun-compile
 
 all: format test lint
 
-# Single source of truth for the shared FileFinder TS interface lives in
-# packages/shared/fff-api.ts. tsc cannot import across a package's
-# rootDir and the bun package publishes its raw src/, so the file is copied
-# into each package instead of symlinked.
 SYNC_API_SRC := packages/shared/fff-api.ts
 SYNC_API_TARGETS := packages/fff-node/src/fff-api.ts packages/fff-bun/src/fff-api.ts
-SYNC_API_BANNER := // ----------------------------------------------------------------------------\n// GENERATED FILE - DO NOT EDIT.\n// Source of truth: packages/shared/fff-api.ts\n// Run make sync-js-api from the repo root to regenerate.\n// ----------------------------------------------------------------------------\n\n
+SYNC_API_BANNER := // ----------------------------------------------------------------------------\n// GENERATED FILE - DO NOT EDIT.\n// Copied from: ${SYNC_API_SRC}\n// Run make sync-js-api from the repo root to regenerate.\n// ----------------------------------------------------------------------------\n\n
 
 sync-js-api:
 	@for target in $(SYNC_API_TARGETS); do \
@@ -128,13 +124,6 @@ test-lua: test-setup build
 		exit 1; \
 	fi
 
-# mini.test reference_screenshot snapshots. Separate runner because mini.test
-# spawns child processes and uses its own collector (incompatible with
-# PlenaryBustedDirectory). Streams output live via `tee` so failure diffs
-# appear as they happen instead of after a long capture-buffered silence.
-# `pcall` catches collect-time errors (e.g. parse error in the test file)
-# that would otherwise leave headless nvim hanging in its event loop because
-# the reporter's `cquit` never fires.
 test-lua-snap: test-setup build
 	@logfile=$$(mktemp); \
 	trap 'rm -f "$$logfile"' EXIT; \
@@ -238,6 +227,14 @@ test-stress-random:
 		--no-default-features --features zlob \
 		-- --nocapture stress_random
 
+test-stress-regressions:
+	RUSTFLAGS="$(STRESS_RUSTFLAGS)" \
+	cargo test --release \
+		-p fff-search \
+		--test fuzz_git_watcher_stress \
+		--no-default-features --features zlob \
+		-- --nocapture stress_regression stress_merge_conflict_convergence
+
 test-stress-repos:
 	RUSTFLAGS="$(STRESS_RUSTFLAGS)" \
 	cargo test --release \
@@ -246,7 +243,7 @@ test-stress-repos:
 		--no-default-features --features zlob \
 		-- --nocapture
 
-test-stress: test-stress-seeded test-stress-random test-stress-repos
+test-stress: test-stress-seeded test-stress-random test-stress-regressions test-stress-repos
 
 # Update version in a package.json, including optionalDependencies.
 # Usage: make set-npm-version PKG=packages/fff-bun VERSION=1.0.0-nightly.abc1234
