@@ -100,69 +100,62 @@ compile_error!(
      Enable one, e.g. `--features ripgrep` or `--features zlob`."
 );
 
-mod background_watcher;
-mod git_status_worker;
-pub(crate) mod parallelism;
-mod scan;
-// public only for benchmarks — the inverted index is still re-exported via
-// `pub use bigram_filter::*` below for external consumers.
-#[doc(hidden)]
-pub mod bigram_filter;
-pub mod bigram_query;
-pub mod constants;
-mod constraints;
-mod error;
-mod score;
-mod sort_buffer;
-pub(crate) mod stable_vec;
-// this is pub only for benchmarks
-pub mod case_insensitive_memmem;
+/// Primary entry points with thread-safe [`SharedFilePicker`](shared::FilePicker) instance
+pub mod shared;
+pub use shared::*;
 
-pub(crate) mod simd_path;
-
-/// Core file picker: filesystem indexing, background watching, and fuzzy search.
-///
+/// Core file picker single thread: filesystem indexing, background watching, and fuzzy search.
 /// See [`FilePicker`](file_picker::FilePicker) for the main entry point.
 pub mod file_picker;
+pub use file_picker::*;
 
 /// Database-backed persistence: frecency, query history, LMDB plumbing.
 pub mod dbs;
-pub use dbs::frecency;
+pub use dbs::*;
 
 /// Git status caching and repository detection utilities.
 pub mod git;
 
 /// Live grep search with regex, plain-text, and fuzzy matching modes.
-///
-/// Supports constraint filtering (file extensions, path segments, globs)
-/// and parallel execution via rayon.
 pub mod grep;
+pub use grep::*;
 
 /// Tracing/logging initialization and panic hook setup.
 pub mod log;
 
-/// Path manipulation utilities: cross platform canonicalization, tilde expansion, and
-/// directory distance penalties for search scoring.
+/// Various path utils might be handy for you to work with fff paths
 pub mod path_utils;
-
-pub use dbs::query_tracker;
 
 /// Core data types shared across the crate.
 pub mod types;
-
-mod ignore;
-/// Thread-safe shared handles for [`FilePicker`], [`FrecencyTracker`],
-/// and [`QueryTracker`].
-pub mod shared;
-pub mod walk;
-
-pub use bigram_filter::*;
-pub use dbs::db_healthcheck::{DbHealth, DbHealthChecker};
-pub use error::{Error, Result};
-pub use fff_query_parser::*;
-pub use file_picker::*;
-pub use frecency::*;
-pub use grep::*;
-pub use query_tracker::*;
-pub use shared::*;
 pub use types::*;
+
+pub mod constants;
+
+// ==================================
+// these are public only for benchmarks, no backward compatibility guaranteed
+#[doc(hidden)]
+pub mod bigram_filter;
+#[doc(hidden)]
+pub mod simd_string_utils;
+// ==================================
+
+mod background_watcher;
+mod constraints;
+mod error;
+mod git_status_worker;
+mod ignore;
+mod scan;
+mod score;
+mod sort_buffer;
+
+pub(crate) mod bigram_query;
+pub(crate) mod parallelism;
+pub(crate) mod simd_path;
+pub(crate) mod stable_vec;
+pub(crate) mod walk;
+
+// fff error
+pub use error::{Error, Result};
+
+pub use fff_query_parser::*;

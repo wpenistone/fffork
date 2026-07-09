@@ -331,7 +331,8 @@ fn parse_token<'a, C: ParserConfig>(token: &'a str, config: &C) -> Option<Constr
     }
 }
 
-/// Find first occurrence of byte in slice (fast memchr-like implementation)
+/// Scalar byte find. Queries are tiny (<100 bytes), so this stays dependency-free
+/// instead of pulling in the `memchr` crate; fff-core uses `memchr` for real haystacks.
 #[inline]
 fn memchr(needle: u8, haystack: &[u8]) -> Option<usize> {
     haystack.iter().position(|&b| b == needle)

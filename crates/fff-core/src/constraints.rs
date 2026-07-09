@@ -5,31 +5,7 @@ use smallvec::SmallVec;
 
 use crate::git::is_modified_status;
 use crate::simd_path::ArenaPtr;
-
-/// `needle` must already be lowercase.
-#[inline]
-fn contains_ascii_ci(haystack: &str, needle: &str) -> bool {
-    let h = haystack.as_bytes();
-    let n = needle.as_bytes();
-    if n.len() > h.len() {
-        return false;
-    }
-    if n.is_empty() {
-        return true;
-    }
-    let first = n[0];
-    for i in 0..=(h.len() - n.len()) {
-        if h[i].to_ascii_lowercase() == first
-            && h[i..i + n.len()]
-                .iter()
-                .zip(n)
-                .all(|(a, b)| a.to_ascii_lowercase() == *b)
-        {
-            return true;
-        }
-    }
-    false
-}
+use crate::simd_string_utils::memmem::find_case_insensitive_short;
 
 const PAR_THRESHOLD: usize = 10_000;
 
@@ -216,7 +192,7 @@ impl<'q, 'c> ConstraintPlan<'q, 'c> {
         overflow_arena: ArenaPtr,
     ) -> Self {
         let mut extensions = SmallVec::new();
-        let mut rest = SmallVec::new();
+        let mut rest: SmallVec<[&'c Constraint<'q>; 8]> = SmallVec::new();
         for c in constraints {
             match c {
                 Constraint::Extension(ext) => extensions.push(*ext),
@@ -284,56 +260,16 @@ impl<'q, 'c> ConstraintPlan<'q, 'c> {
 
         let mut glob_idx = 0;
         self.rest.iter().all(|c| {
-            let glob: &GlobStrategy = &self.glob;
-            let glob_idx: &mut usize = &mut glob_idx;
-            let negate = false;
-            let raw = match c {
-                Constraint::Glob(_) => {
-                    let m = match glob {
-                        GlobStrategy::None => true,
-                        GlobStrategy::Prepass(masks) => masks
-                            .get(*glob_idx)
-                            .and_then(|mask| mask.get(index).copied())
-                            .unwrap_or(false),
-                        GlobStrategy::Inline(patterns) => {
-                            item.write_relative_path(arena, &mut scratch.path);
-                            patterns
-                                .get(*glob_idx)
-                                .and_then(|p| p.as_ref())
-                                .map(|p| compiled_matches(p, &scratch.path))
-                                .unwrap_or(false)
-                        }
-                    };
-                    *glob_idx += 1;
-                    m
-                }
-                // Reachable only via `Not(Extension(_))` — bare extensions are split out
-                // up front and handled in `passes_extensions`.
-                Constraint::Extension(ext) => {
-                    item.write_file_name(arena, &mut scratch.fname);
-                    file_has_extension(&scratch.fname, ext)
-                }
-                Constraint::PathSegment(segment) => {
-                    item.write_relative_path(arena, &mut scratch.path);
-                    path_contains_segment(&scratch.path, segment)
-                }
-                Constraint::FilePath(suffix) => {
-                    item.write_relative_path(arena, &mut scratch.path);
-                    path_ends_with_suffix(&scratch.path, suffix)
-                }
-                Constraint::Text(text) => {
-                    // Only meaningful under negation (used as exclude filter).
-                    item.write_relative_path(arena, &mut scratch.path);
-                    contains_ascii_ci(&scratch.path, text)
-                }
-                Constraint::GitStatus(filter) => matches_git_status(item.git_status(), filter),
-                Constraint::Not(inner) => {
-                    return evaluate(item, index, inner, glob, glob_idx, !negate, arena, scratch);
-                }
-                // Pass-throughs — handled at higher levels.
-                Constraint::Parts(_) | Constraint::Exclude(_) | Constraint::FileType(_) => true,
-            };
-            if negate { !raw } else { raw }
+            evaluate(
+                item,
+                index,
+                c,
+                &self.glob,
+                &mut glob_idx,
+                false,
+                arena,
+                scratch,
+            )
         })
     }
 
@@ -403,7 +339,7 @@ fn evaluate<T: Constrainable>(
         Constraint::Text(text) => {
             // Only meaningful under negation (used as exclude filter).
             item.write_relative_path(arena, &mut scratch.path);
-            contains_ascii_ci(&scratch.path, text)
+            find_case_insensitive_short(scratch.path.as_bytes(), text.as_bytes()).is_some()
         }
         Constraint::GitStatus(filter) => matches_git_status(item.git_status(), filter),
         Constraint::Not(inner) => {

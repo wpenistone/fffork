@@ -1,9 +1,8 @@
 use crate::{
-    BigramFilter, BigramOverlay,
+    bigram_filter::{BigramFilter, BigramOverlay, extract_bigrams},
     bigram_query::{fuzzy_to_bigram_query, regex_to_bigram_query},
-    case_insensitive_memmem,
     constraints::{ConstraintPlan, ConstraintsBuffers},
-    extract_bigrams,
+    simd_string_utils::memmem,
     sort_buffer::sort_with_buffer,
     types::{ContentCacheBudget, FileItem, FileSliceExt, MmapSlot},
 };
@@ -21,14 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::Level;
 
-/// Detect if a line looks like a code definition (struct, fn, class, etc.).
-///
-/// Used at match time to tag `GrepMatch::is_definition` so that output
-/// formatters can sort/annotate definitions without re-scanning lines.
-///
-/// Hand-rolled keyword scanner — avoids regex overhead entirely.
-/// Strips optional visibility/modifier keywords, then checks if the next
-/// token is a definition keyword followed by a word boundary.
+/// Detect if a line looks like a code definition (struct, fn, class, etc.)
 pub fn is_definition_line(line: &str) -> bool {
     let s = line.trim_start().as_bytes();
     let s = skip_modifiers(s);
@@ -231,9 +223,7 @@ fn replace_unescaped_newline_escapes(text: &str) -> String {
 /// Controls how the grep pattern is interpreted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GrepMode {
-    /// Default mode: the query is treated as literal text.
-    /// The pattern is searched using SIMD-accelerated `memchr::memmem`.
-    /// Special regex characters in the query have no special meaning.
+    /// Literal plain text match: default path that doesn't require any regex machinery
     #[default]
     PlainText,
     /// Regex mode: the query is treated as a regular expression.
@@ -469,9 +459,7 @@ impl Matcher for PlainTextMatcher<'_> {
         let hay = &haystack[at..];
 
         let found = if self.case_insensitive {
-            // ASCII case-insensitive: lowercase the haystack slice on the fly.
-            // We scan with a rolling window to avoid allocating a full copy.
-            ascii_case_insensitive_find(hay, self.needle)
+            memmem::find(hay, self.needle)
         } else {
             memchr::memmem::find(hay, self.needle)
         };
@@ -483,93 +471,6 @@ impl Matcher for PlainTextMatcher<'_> {
     fn line_terminator(&self) -> Option<fff_grep::LineTerminator> {
         Some(fff_grep::LineTerminator::byte(b'\n'))
     }
-}
-
-/// ASCII case-insensitive substring search.
-///
-/// Uses a SIMD-accelerated two-byte scan (first + last byte of needle) via
-/// `memchr2_iter`, then verifies candidates with a fast byte comparison that
-/// leverages the fact that ASCII case differs only in bit 0x20.
-#[inline]
-fn ascii_case_insensitive_find(haystack: &[u8], needle_lower: &[u8]) -> Option<usize> {
-    let nlen = needle_lower.len();
-    if nlen == 0 {
-        return Some(0);
-    }
-
-    if haystack.len() < nlen {
-        return None;
-    }
-
-    let first_lo = needle_lower[0];
-    let first_hi = first_lo.to_ascii_uppercase();
-
-    // Single-byte needle: just find either case variant.
-    if nlen == 1 {
-        return memchr::memchr2(first_lo, first_hi, haystack);
-    }
-
-    let tail = &needle_lower[1..];
-    let end = haystack.len() - nlen;
-
-    // Scan for candidates where the first byte matches (either case).
-    for pos in memchr::memchr2_iter(first_lo, first_hi, &haystack[..=end]) {
-        // Verify the remaining bytes with bitwise ASCII case-insensitive compare.
-        // For ASCII letters, (a ^ b) & ~0x20 == 0 when they match ignoring case.
-        // For non-letters, exact equality is required; OR-ing with 0x20 maps both
-        // cases to lowercase and is correct for non-alpha bytes that are already equal.
-        let candidate = unsafe { haystack.get_unchecked(pos + 1..pos + nlen) };
-        if ascii_case_eq(candidate, tail) {
-            return Some(pos);
-        }
-    }
-    None
-}
-
-/// Fast ASCII case-insensitive byte slice comparison.
-///
-/// Returns true if `a` and `b` are equal when compared case-insensitively
-/// for ASCII bytes. Both slices must have the same length.
-#[inline]
-fn ascii_case_eq(a: &[u8], b: &[u8]) -> bool {
-    debug_assert_eq!(a.len(), b.len());
-    // Process 8 bytes at a time using u64 bitwise operations.
-    // For each byte: (x | 0x20) maps uppercase ASCII to lowercase.
-    // This is correct for letters. For non-letter bytes where the original
-    // values are equal, OR-ing with 0x20 preserves equality. For non-letter
-    // bytes where values differ, this can produce false positives only when
-    // they differ exactly by 0x20 — we do a fast exact-match check first
-    // to catch those rare cases.
-    let len = a.len();
-    let mut i = 0;
-
-    // Fast path: compare 8 bytes at a time
-    while i + 8 <= len {
-        let va = u64::from_ne_bytes(unsafe { *(a.as_ptr().add(i) as *const [u8; 8]) });
-        let vb = u64::from_ne_bytes(unsafe { *(b.as_ptr().add(i) as *const [u8; 8]) });
-
-        // Quick exact-match shortcut (common for non-alpha content)
-        if va != vb {
-            // Case-insensitive: OR each byte with 0x20 to fold case
-            const MASK: u64 = 0x2020_2020_2020_2020;
-            if (va | MASK) != (vb | MASK) {
-                return false;
-            }
-        }
-        i += 8;
-    }
-
-    // Handle remaining bytes
-    while i < len {
-        let ha = unsafe { *a.get_unchecked(i) };
-        let hb = unsafe { *b.get_unchecked(i) };
-        if ha != hb && (ha | 0x20) != (hb | 0x20) {
-            return false;
-        }
-        i += 1;
-    }
-
-    true
 }
 
 /// Maximum bytes of a matched line to keep for display. Prevents minified
@@ -720,10 +621,9 @@ fn truncate_display_bytes(bytes: &[u8]) -> &[u8] {
 
 /// Sink for `PlainText` mode.
 ///
-/// Highlights are extracted with SIMD-accelerated `memchr::memmem::Finder`.
-/// Case-insensitive matching lowercases the line into a stack buffer before
-/// searching, keeping positions 1:1 for ASCII.
-/// No regex engine is involved at any point.
+/// Highlights are extracted with `memchr::memmem::Finder` (case-sensitive)
+/// or the SIMD `simd_string_utils::memmem` search (case-insensitive). No regex engine is
+/// involved at any point.
 struct PlainTextSink<'r> {
     state: SinkState,
     finder: &'r memchr::memmem::Finder<'r>,
@@ -749,16 +649,11 @@ impl Sink for PlainTextSink<'_> {
         let mut first = true;
 
         if self.case_insensitive {
-            // Lowercase the display bytes into a stack buffer; positions are 1:1
-            // for ASCII so no mapping is needed.
-            let mut lowered = [0u8; MAX_LINE_DISPLAY_LEN];
-            let len = display_bytes.len().min(MAX_LINE_DISPLAY_LEN);
-            for (dst, &src) in lowered[..len].iter_mut().zip(display_bytes) {
-                *dst = src.to_ascii_lowercase();
-            }
-
+            // The finder was built over the lowered pattern, so its needle is
+            // exactly the `needle_lower` expected by `memmem::find`.
+            let needle_lower = self.finder.needle();
             let mut start_pos = 0usize;
-            while let Some(pos) = self.finder.find(&lowered[start_pos..len]) {
+            while let Some(pos) = memmem::find(&display_bytes[start_pos..], needle_lower) {
                 let abs_start = (start_pos + pos) as u32;
                 let abs_end = (abs_start + self.pattern_len).min(display_len);
                 if first {
@@ -1278,7 +1173,7 @@ where
                     // setup, and line-splitting for files that can't match.
                     if let Some(pf) = ctx.prefilter {
                         let found = if ctx.prefilter_case_insensitive {
-                            case_insensitive_memmem::search_packed_pair(content, pf.needle())
+                            memmem::find(content, pf.needle()).is_some()
                         } else {
                             pf.find(content).is_some()
                         };
