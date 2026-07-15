@@ -14,6 +14,7 @@ local M = {}
 --- @field access_frecency_score number Access-based frecency score
 --- @field modification_frecency_score number Modification-based frecency score
 --- @field git_status string|nil Git status string (e.g. 'modified', 'untracked') if file is in git repo
+--- @field match_ranges number[][]|nil Byte ranges for fuzzy query matches
 
 --- Render a file item line
 --- @param item FileItem File item from Rust
@@ -199,17 +200,67 @@ function M.apply_highlights(item, ctx, item_idx, buf, ns_id, line_idx, line_cont
     })
   end
 
-  -- 9. Query match
+  -- 9. Query matches
   if ctx.query and ctx.query ~= '' then
-    local match_start, match_end = string.find(line_content, ctx.query, 1, true)
-    if match_start and match_end then
-      vim.api.nvim_buf_set_extmark(
-        buf,
-        ns_id,
-        line_idx - 1,
-        match_start - 1,
-        { end_col = match_end, hl_group = ctx.config.hl.matched or 'IncSearch' }
-      )
+    local matched_hl = ctx.config.hl.matched or 'IncSearch'
+    local fuzzy_highlighting = ctx.config.file_picker and ctx.config.file_picker.fuzzy_query_highlighting
+
+    if not fuzzy_highlighting then
+      local match_start, match_end = string.find(line_content, ctx.query, 1, true)
+      if match_start and match_end then
+        vim.api.nvim_buf_set_extmark(buf, ns_id, line_idx - 1, match_start - 1, {
+          end_col = match_end,
+          hl_group = matched_hl,
+        })
+      end
+      return
+    end
+
+    local ranges = item.match_ranges
+    if not ranges or #ranges == 0 then return end
+
+    local rel_path = item.relative_path or ''
+    if type(rel_path) ~= 'string' then rel_path = tostring(rel_path) end
+
+    local original_dir_path = ''
+    local parent_dir = vim.fn.fnamemodify(rel_path, ':h')
+    if parent_dir ~= '.' and parent_dir ~= '' then original_dir_path = parent_dir end
+
+    local filename_rel_start = math.max(0, #rel_path - #filename)
+    local filename_rel_end = filename_rel_start + #filename
+    local filename_line_start = icon and (#icon + 1) or 0
+    local dir_line_start = filename_line_start + #filename + 1
+    local segments = { { filename_rel_start, filename_rel_end, filename_line_start } }
+
+    if original_dir_path ~= '' and dir_path == original_dir_path then
+      segments[#segments + 1] = { 0, #original_dir_path, dir_line_start }
+    end
+
+    local function apply_segment(raw_start, raw_end, segment)
+      local source_start, source_end, target_start = segment[1], segment[2], segment[3]
+      local start_col = math.max(raw_start, source_start)
+      local end_col = math.min(raw_end, source_end)
+      if end_col <= start_col then return end
+
+      local hl_start = target_start + (start_col - source_start)
+      local hl_end = target_start + (end_col - source_start)
+      if hl_start < #line_content and hl_end <= #line_content then
+        vim.api.nvim_buf_set_extmark(buf, ns_id, line_idx - 1, hl_start, {
+          end_col = hl_end,
+          hl_group = matched_hl,
+          priority = 200,
+        })
+      end
+    end
+
+    for _, range in ipairs(ranges) do
+      local raw_start = range[1] or 0
+      local raw_end = range[2] or 0
+      if raw_end > raw_start then
+        for _, segment in ipairs(segments) do
+          apply_segment(raw_start, raw_end, segment)
+        end
+      end
     end
   end
 end
