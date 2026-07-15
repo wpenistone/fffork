@@ -1,4 +1,4 @@
-<img alt="FFF" src="./assets/logo-orange.png" width="300">
+<a href="./assets/logo-orange.png"><img alt="FFF" src="./assets/logo-orange.png" width="300"></a>
 
 <p>
   <i>A file search toolkit for humans and AI agents. Really fast.</i>
@@ -824,3 +824,15 @@ Bug reports and pull requests welcome. Agentic coding tools are welcome to be us
 ## License
 
 [MIT](./LICENSE) & open source forever.
+
+## FAQ
+
+### What does FFF stand for?
+
+There is intentionally no single canonical definition. Pick your favourite:
+
+- **F**ast **F**ile **F**inder
+- **F**uzzy **F**ile **F**inder
+- will search **F**iles **F**or **F**ood
+
+The brand hex is `#F87216`, not `#FFF`. Logo variants: [orange](./assets/logo-orange.png) · [dark](./assets/logo-dark.png) · [light](./assets/logo-light.png).
