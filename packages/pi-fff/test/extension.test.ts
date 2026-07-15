@@ -34,7 +34,7 @@ function createMockFinder(): MockFinder {
   };
 }
 
-mock.module("@ff-labs/fff-node", () => ({
+const finderModule = {
   FileFinder: {
     create: mock((options: unknown) => {
       createCalls.push(options);
@@ -43,7 +43,10 @@ mock.module("@ff-labs/fff-node", () => ({
       return { ok: true, value: finder };
     }),
   },
-}));
+};
+
+mock.module("@ff-labs/fff-node", () => finderModule);
+mock.module("@ff-labs/fff-bun", () => finderModule);
 
 mock.module("@earendil-works/pi-tui", () => ({
   Text: class Text {

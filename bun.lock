@@ -63,8 +63,12 @@
       "peerDependencies": {
         "@earendil-works/pi-coding-agent": "*",
         "@earendil-works/pi-tui": "*",
+        "@ff-labs/fff-bun": "*",
         "@sinclair/typebox": "*",
       },
+      "optionalPeers": [
+        "@ff-labs/fff-bun",
+      ],
     },
   },
   "packages": {
