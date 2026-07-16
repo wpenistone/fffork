@@ -10,7 +10,11 @@ export function normalizePathConstraint(
   if (path.isAbsolute(trimmed)) {
     const relative = path.relative(cwd, trimmed).replaceAll(path.sep, "/");
     if (relative === "") return null;
-    if (relative.startsWith("../") || relative === ".." || path.isAbsolute(relative)) {
+    if (
+      relative.startsWith("../") ||
+      relative === ".." ||
+      path.isAbsolute(relative)
+    ) {
       throw new Error(
         `Path constraint must be relative to the workspace: ${pathConstraint}`,
       );
@@ -21,6 +25,9 @@ export function normalizePathConstraint(
   if (trimmed === "." || trimmed === "./") return null;
   // Strip a leading `./` so `./**/*.rs` and `**/*.rs` behave identically.
   if (trimmed.startsWith("./")) trimmed = trimmed.slice(2);
+
+  // wif we left with the ** it means anything so treat it as a cwd path
+  if (trimmed === "**" || trimmed === "**/" || trimmed === "**/*") return null;
 
   // FFF's glob matcher can treat a hidden directory root glob such as
   // `.agents/**` as empty, while the tool contract says this means "inside
