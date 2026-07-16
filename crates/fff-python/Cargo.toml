@@ -3,6 +3,9 @@ name = "fff-python"
 version = "0.9.6"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [lib]
 name = "fff_python"
 crate-type = ["cdylib"]

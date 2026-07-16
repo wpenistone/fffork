@@ -3,6 +3,9 @@ name = "fff-nvim"
 version = "0.9.6"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [lib]
 path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]

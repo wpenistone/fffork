@@ -390,6 +390,22 @@ impl ScanProgress {
 
 #[pyclass]
 #[derive(Clone)]
+pub struct WatchEvent {
+    #[pyo3(get)]
+    pub path: String,
+    #[pyo3(get)]
+    pub kind: String,
+}
+
+#[pymethods]
+impl WatchEvent {
+    fn __repr__(&self) -> String {
+        format!("WatchEvent(path={:?}, kind={:?})", self.path, self.kind)
+    }
+}
+
+#[pyclass]
+#[derive(Clone)]
 pub struct GrepCursor {
     #[pyo3(get)]
     pub offset: u32,

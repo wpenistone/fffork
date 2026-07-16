@@ -6,6 +6,9 @@ description = "Query parser for fff file finder - includes specific syntax for v
 license = "MIT"
 authors = ["Dmitriy Kovalenko <dmtr.kovalenko@outlok.com>"]
 
+[lints]
+workspace = true
+
 [lib]
 path = "src/lib.rs"
 

@@ -11,6 +11,9 @@ members = [
 
 resolver = "2"
 
+[workspace.lints.clippy]
+module_inception = "allow"
+
 [workspace.dependencies]
 fff-grep = { version = "0.9.6", path = "crates/fff-grep" }
 fff-query-parser = { version = "0.9.6", path = "crates/fff-query-parser", default-features = false }

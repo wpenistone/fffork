@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use fff::file_picker::FilePicker;
@@ -8,14 +10,16 @@ use fff::{
     FFFMode, FilePickerOptions, FuzzySearchOptions, GrepSearchOptions, PaginationArgs, QueryParser,
     SharedFilePicker, SharedFrecency, SharedQueryTracker,
 };
+use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::conversions::MixedItem;
 use crate::types::{
     DirItem, DirSearchResult, FileItem, GrepCursor, GrepMatch, GrepResult, MixedDirItem,
-    MixedFileItem, MixedSearchResult, ScanProgress, Score, SearchResult,
+    MixedFileItem, MixedSearchResult, ScanProgress, Score, SearchResult, WatchEvent,
 };
+use crate::watch::WatchSubscription;
 use crate::{parse_grep_mode, py_err};
 
 const DEFAULT_SEARCH_PAGE_SIZE: usize = 100;
@@ -267,11 +271,20 @@ impl FileFinder {
         slf
     }
 
-    fn __exit__(&mut self, _exc_type: PyObject, _exc_value: PyObject, _traceback: PyObject) {
-        let _ = self.close();
+    fn __exit__(
+        &mut self,
+        py: Python<'_>,
+        _exc_type: PyObject,
+        _exc_value: PyObject,
+        _traceback: PyObject,
+    ) {
+        let _ = self.close(py);
     }
 
-    fn close(&mut self) -> PyResult<()> {
+    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
+        // Release the GIL while an in-flight callback finishes.
+        let picker = self.picker.clone();
+        py.allow_threads(move || picker.shutdown_watches_and_wait());
         clear_shared_state(&self.picker, &self.frecency, &self.query_tracker);
         Ok(())
     }
@@ -726,6 +739,62 @@ impl FileFinder {
     fn wait_for_scan_blocking(&self, py: Python<'_>, timeout_ms: u64) -> PyResult<bool> {
         let picker = self.picker.clone();
         py.allow_threads(move || Ok(picker.wait_for_scan(Duration::from_millis(timeout_ms))))
+    }
+
+    /// Subscribe to filesystem changes matching `pattern`.
+    ///
+    /// Patterns may be base-relative globs (./ works), exact paths inside the indexed
+    /// tree, or existing directories. An empty pattern watches the whole tree.
+    ///
+    /// Events are debounced and submitted in batches per 100-ms window at most 128 events.
+    /// Gitignored and other ignored files are never triggering watcher.
+    #[pyo3(signature = (pattern, callback, *, ignore = None))]
+    fn watch(
+        &self,
+        py: Python<'_>,
+        pattern: Option<&str>,
+        callback: Py<PyAny>,
+        ignore: Option<Vec<String>>,
+    ) -> PyResult<WatchSubscription> {
+        if !callback.bind(py).is_callable() {
+            return Err(PyTypeError::new_err("callback must be callable"));
+        }
+
+        let pattern = pattern.unwrap_or_default().to_string();
+        let options = fff::WatchOptions {
+            ignore: ignore.unwrap_or_default(),
+        };
+
+        // Suppresses invocations racing an unsubscribe: the flag flips before
+        // core unwatch, so user code never runs after unsubscribe() returns.
+        let active = Arc::new(AtomicBool::new(true));
+        let active_cb = Arc::clone(&active);
+
+        let id = {
+            let picker = self.picker.clone();
+            py.allow_threads(move || {
+                picker.watch(&pattern, options, move |_id, events| {
+                    Python::with_gil(|py| {
+                        if !active_cb.load(Ordering::Acquire) {
+                            return;
+                        }
+                        let batch: Vec<WatchEvent> = events
+                            .iter()
+                            .map(|ev| WatchEvent {
+                                path: ev.path.to_string_lossy().to_string(),
+                                kind: ev.kind.as_str().to_string(),
+                            })
+                            .collect();
+                        if let Err(e) = callback.call1(py, (batch,)) {
+                            e.write_unraisable(py, None);
+                        }
+                    })
+                })
+            })
+            .map_err(py_err)?
+        };
+
+        Ok(WatchSubscription::new(self.picker.clone(), id.0, active))
     }
 
     fn reindex(&self, py: Python<'_>, new_path: PathBuf) -> PyResult<()> {

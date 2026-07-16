@@ -5,6 +5,9 @@ edition = "2024"
 description = "Raw C api of FFF file finder"
 license = "MIT"
 
+[lints]
+workspace = true
+
 [lib]
 crate-type = ["cdylib"]
 

@@ -74,6 +74,56 @@ if (dirs.ok) console.log(dirs.value.items.map((d) => d.relativePath));
 finder.destroy();
 ```
 
+## Watching files
+
+Subscribe to filesystem changes with a glob, an exact path, or a directory
+subtree. Events reflect applied index changes and are delivered in batches of
+up to 128, so callbacks stay cheap even under heavy churn.
+
+```typescript
+// Each path appears at most once per batch
+const sub = finder.watch("src/**/*.ts", (events) => {
+  for (const e of events) console.log(e.kind, e.path); // created | modified | removed | rescan
+});
+
+// No pattern: watch the entire indexed tree
+const all = finder.watch((events) => {
+  for (const e of events) console.log(e.kind, e.path);
+});
+
+// Unsubscribe: call the handle
+if (sub.ok) sub.value();
+```
+
+Directory subtrees are watched by passing the directory itself (parcel-watcher
+style), with per-subscription excludes:
+
+```typescript
+const dirSub = finder.watch(
+  projectRoot,
+  (events) => {
+    for (const e of events) console.log(e.kind, e.path);
+  },
+  { ignore: ["node_modules", "*.log"] },
+);
+```
+
+Notes:
+
+- Globs are matched against the base-path-relative path; absolute globs must
+  live under `basePath`. Wildcard-free patterns resolve inside the indexed
+  tree: an existing directory watches its whole subtree, anything else is an
+  exact file path.
+- `ignore` entries exclude matches per subscription: wildcards are globs,
+  everything else is a path prefix (a file or a whole subtree).
+- Gitignored paths never produce events.
+- A `rescan` event means changes were lost (index overflow, ignore-file
+  change) — re-stat anything you care about.
+- Unsubscribing takes effect synchronously on the JS thread: once it
+  returns, the callback will not be invoked again.
+- Watching requires the instance to be created with watching enabled
+  (the default).
+
 ## API Reference
 
 Verify the latest API in the local interface at [`./src/fff-api.ts`](./src/fff-api.ts). Every field and type is documented.

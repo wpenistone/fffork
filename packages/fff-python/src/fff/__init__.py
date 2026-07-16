@@ -19,6 +19,8 @@ from fff._fff_python import (
     ScanProgress,
     Score,
     SearchResult,
+    WatchEvent,
+    WatchSubscription,
 )
 from fff._fff_python import FileFinder as _FileFinder
 
@@ -66,5 +68,7 @@ __all__ = [
     "GrepResult",
     "GrepCursor",
     "ScanProgress",
+    "WatchEvent",
+    "WatchSubscription",
     "__version__",
 ]

@@ -294,8 +294,36 @@ export interface ScanProgress {
 }
 
 /**
- * Database health information
+ * Normalized watch event kind.
+ * A file removed and recreated in one processed batch is marked as modified.
+ *
+ * rescan = internal OS buffers were overloaded, some events might be missing.
+ * The `path` is going to be a folder needs to be rescanned
  */
+export type WatchEventKind = "created" | "modified" | "removed" | "rescan";
+
+/** A single filesystem change notification. */
+export interface WatchEvent {
+  /** Absolute path of the affected file (base path to rescan if `kind ==rescan`) */
+  path: string;
+  kind: WatchEventKind;
+}
+
+/** Options for watch subscriptions. */
+export interface WatchOptions {
+  /** Additional glob wildcard patterns to ignore */
+  ignore?: string[];
+}
+
+/**
+ * Receives normalized batches of up to 128 events. Each path appears once.
+ */
+export type WatchBatchCallback = (events: WatchEvent[]) => void;
+
+/** Call me to unsubscribe. */
+export type WatchUnsubscribe = () => void;
+
+/** Database health information */
 export interface DbHealth {
   /** Path to the database */
   path: string;
@@ -545,10 +573,16 @@ export interface FileFinderApi {
   glob(pattern: string, options?: GlobOptions): Result<SearchResult>;
 
   /** Fuzzy directory search. */
-  directorySearch(query: string, options?: DirSearchOptions): Result<DirSearchResult>;
+  directorySearch(
+    query: string,
+    options?: DirSearchOptions,
+  ): Result<DirSearchResult>;
 
   /** Fuzzy search over files and directories interleaved by score. */
-  mixedSearch(query: string, options?: SearchOptions): Result<MixedSearchResult>;
+  mixedSearch(
+    query: string,
+    options?: SearchOptions,
+  ): Result<MixedSearchResult>;
 
   /** Content search (live grep). */
   grep(query: string, options?: GrepOptions): Result<GrepResult>;
@@ -603,6 +637,25 @@ export interface FileFinderApi {
 
   /** Get a historical query by offset (0 = most recent). */
   getHistoricalQuery(offset: number): Result<string | null>;
+
+  /**
+   * Subscribe to filesystem changes matching `pattern`.
+   *
+   * Patterns may be base-relative globs (./ works), exact paths inside the indexed
+   * tree, or existing directories. An empty pattern watches the whole tree.
+   *
+   * Events are debounced and submitted in batches per 100-ms window at most 128 events.
+   * Gitignored and other ignored files are never triggering watcher.
+   */
+  watch(
+    callback: WatchBatchCallback,
+    options?: WatchOptions,
+  ): Result<WatchUnsubscribe>;
+  watch(
+    pattern: string,
+    callback: WatchBatchCallback,
+    options?: WatchOptions,
+  ): Result<WatchUnsubscribe>;
 
   /** Health/diagnostics information for this instance. */
   healthCheck(testPath?: string): Result<HealthCheck>;

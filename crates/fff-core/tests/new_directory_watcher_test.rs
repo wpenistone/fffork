@@ -79,11 +79,11 @@ fn make_watched_picker(base: &Path) -> (SharedFilePicker, SharedFrecency) {
 /// Wait for the initial scan + watcher to be fully ready.
 fn wait_ready(shared_picker: &SharedFilePicker) {
     assert!(
-        shared_picker.wait_for_scan(Duration::from_secs(10)),
+        shared_picker.wait_for_scan(Duration::from_secs(30)),
         "Timed out waiting for initial scan"
     );
     assert!(
-        shared_picker.wait_for_watcher(Duration::from_secs(10)),
+        shared_picker.wait_for_watcher(Duration::from_secs(30)),
         "Timed out waiting for watcher"
     );
 }

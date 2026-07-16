@@ -9,6 +9,7 @@ use crate::frecency::FrecencyTracker;
 use crate::git::GitStatusCache;
 use crate::query_tracker::QueryTracker;
 use crate::scan::ScanJob;
+use crate::watch::{WatchEvent, WatchId, WatchOptions, WatchRegistry};
 use git2::Repository;
 
 /// Poll `.git/index.lock` until it disappears (git write completed), giving up
@@ -73,12 +74,16 @@ pub struct SharedFilePicker(pub(crate) Arc<SharedPickerInner>);
 
 pub struct SharedPickerInner {
     picker: parking_lot::RwLock<Option<FilePicker>>,
+    /// Watch subscriptions live outside the picker lock so delivery and
+    /// (un)subscribing never contend with searches.
+    watchers: Arc<WatchRegistry>,
 }
 
 impl Default for SharedPickerInner {
     fn default() -> Self {
         Self {
             picker: parking_lot::RwLock::new(None),
+            watchers: Arc::new(WatchRegistry::default()),
         }
     }
 }
@@ -215,6 +220,71 @@ impl SharedFilePicker {
             }
         }
         Ok(())
+    }
+
+    /// Subscribe to filesystem changes matching `pattern`.
+    ///
+    /// Patterns may be base-relative globs (./ works), exact paths inside the indexed
+    /// tree, or existing directories. An empty pattern watches the whole tree.
+    ///
+    /// Events are debounced and submitted in batches per 100-ms window at most 128 events.
+    /// Gitignored and other ignored files are never triggering watcher.
+    pub fn watch(
+        &self,
+        pattern: &str,
+        options: WatchOptions,
+        callback: impl Fn(WatchId, &[WatchEvent]) + Send + Sync + 'static,
+    ) -> Result<WatchId, Error> {
+        let (base_path, has_watcher, watcher_ready) = {
+            let guard = self.read()?;
+            let picker = guard.as_ref().ok_or(Error::FilePickerMissing)?;
+
+            (
+                picker.base_path().to_path_buf(),
+                picker.has_watcher(),
+                picker.is_watcher_ready(),
+            )
+        };
+
+        if !has_watcher {
+            return Err(Error::WatcherDisabled);
+        }
+        if !watcher_ready {
+            return Err(Error::WatcherNotReady);
+        }
+
+        self.0
+            .watchers
+            .subscribe(&base_path, pattern, options, Box::new(callback))
+    }
+
+    /// Remove a watch subscription. Returns `true` if the id was active.
+    pub fn unwatch(&self, id: WatchId) -> bool {
+        self.0.watchers.unsubscribe(id)
+    }
+
+    /// Return whether a watch subscription is active.
+    pub fn is_watch_active(&self, id: WatchId) -> bool {
+        self.0.watchers.contains(id)
+    }
+
+    /// Remove every subscription without waiting for an executing callback.
+    pub fn shutdown_watches(&self) {
+        self.0.watchers.shutdown();
+    }
+
+    /// Remove every subscription and wait for an executing callback.
+    /// When called by that callback, it does not wait on itself.
+    pub fn shutdown_watches_and_wait(&self) {
+        self.0.watchers.shutdown_and_wait();
+    }
+
+    pub(crate) fn rebase_watches(&self, base_path: &Path) {
+        self.0.watchers.rebase(base_path);
+    }
+
+    pub(crate) fn watch_registry(&self) -> &Arc<WatchRegistry> {
+        &self.0.watchers
     }
 
     /// Refresh git statuses for all indexed files

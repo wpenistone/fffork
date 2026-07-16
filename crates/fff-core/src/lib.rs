@@ -20,6 +20,9 @@
 //! - [`grep`] — Live grep search supporting regex, plain-text, and fuzzy modes
 //!   with optional constraint filtering.
 //! - [`git`] — Git status caching and repository detection.
+//! - [`watch`] — Client-facing filesystem watch subscriptions: glob, exact
+//!   path, or directory subtree with normalized batch delivery
+//!   (see [`SharedFilePicker::watch`]).
 //!
 //! ## Shared State
 //!
@@ -140,7 +143,6 @@ pub use index::bigram_filter;
 pub mod simd_string_utils;
 // ==================================
 
-mod background_watcher;
 mod error;
 mod git_status_worker;
 mod ignore;
@@ -153,6 +155,12 @@ pub(crate) mod parallelism;
 pub(crate) mod simd_path;
 pub(crate) mod stable_vec;
 pub(crate) mod walk;
+
+/// Filesystem watch subscriptions with glob filtering and batched delivery,
+/// plus the background OS watcher.
+#[path = "watcher/mod.rs"]
+pub mod watch;
+pub use watch::{WatchEvent, WatchEventKind, WatchId, WatchOptions};
 
 // fff error
 pub use error::{Error, Result};

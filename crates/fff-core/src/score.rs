@@ -296,8 +296,14 @@ fn merge_byte_offsets(mut ranges: SmallVec<[(u32, u32); 4]>) -> SmallVec<[(u32, 
 fn resolve_dir_chunks(
     dir: &DirItem,
     arena: ArenaPtr,
+    overflow_arena: ArenaPtr,
     buf: &mut [*const u8; MAX_PATH_CHUNKS],
 ) -> Option<(usize, u16)> {
+    let arena = if dir.is_overflow() {
+        overflow_arena
+    } else {
+        arena
+    };
     let ptrs = dir.path.resolve_ptrs(arena, buf);
     Some((ptrs.len(), dir.path.byte_len))
 }
@@ -310,6 +316,7 @@ fn match_fuzzy_parts_dirs(
     options: &neo_frizbee::Config,
     max_threads: usize,
     arena: ArenaPtr,
+    overflow_arena: ArenaPtr,
 ) -> Vec<neo_frizbee::Match> {
     let valid_parts: Vec<&str> = fuzzy_parts
         .iter()
@@ -323,7 +330,7 @@ fn match_fuzzy_parts_dirs(
 
     let resolve_chunks_for_frizbee =
         |dir: &&DirItem, buf: &mut [*const u8; MAX_PATH_CHUNKS]| -> Option<(usize, u16)> {
-            resolve_dir_chunks(dir, arena, buf)
+            resolve_dir_chunks(dir, arena, overflow_arena, buf)
         };
 
     let first_part_matches = neo_frizbee::match_list_parallel_resolved(
@@ -390,19 +397,23 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
     dirs: &'a [DirItem],
     context: &ScoringContext,
     arena: ArenaPtr,
+    overflow_arena: ArenaPtr,
 ) -> (Vec<&'a DirItem>, Vec<Score>, usize) {
     if dirs.is_empty() {
         return (vec![], vec![], 0);
     }
 
     let parsed_query = context.query;
+    // Ghost dirs (all files tombstoned) never surface in search results.
     let working_dirs: Vec<&DirItem> = if parsed_query.constraints.is_empty() {
-        dirs.iter().collect()
+        dirs.iter().filter(|d| !d.is_deleted()).collect()
     } else {
-        match apply_constraints(dirs, &parsed_query.constraints, arena, arena) {
-            Some(filtered) if !filtered.is_empty() => filtered,
+        match apply_constraints(dirs, &parsed_query.constraints, arena, overflow_arena) {
+            Some(filtered) if !filtered.is_empty() => {
+                filtered.into_iter().filter(|d| !d.is_deleted()).collect()
+            }
             Some(_) => return (vec![], vec![], 0),
-            None => dirs.iter().collect(),
+            None => dirs.iter().filter(|d| !d.is_deleted()).collect(),
         }
     };
 
@@ -445,6 +456,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         &options,
         context.max_threads,
         arena,
+        overflow_arena,
     );
 
     let main_needle = valid_parts[0].as_bytes();
@@ -457,12 +469,17 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         .into_iter()
         .map(|path_match| {
             let dir = working_dirs[path_match.index as usize];
+            let dir_arena = if dir.is_overflow() {
+                overflow_arena
+            } else {
+                arena
+            };
             let base_score = path_match.score as i32;
             let frecency_boost = base_score.saturating_mul(dir.max_access_frecency()) / 100;
 
             // Distance penalty from current file's directory.
             let distance_penalty = if context.current_file.is_some() {
-                dir.path.write_to_string(arena, &mut dir_buf);
+                dir.path.write_to_string(dir_arena, &mut dir_buf);
                 calculate_distance_penalty(context.current_file, &dir_buf)
             } else {
                 0
@@ -473,7 +490,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
             let match_start_approx = path_match.end_col.saturating_sub(main_needle_len - 1);
             let is_dirname_match = match_start_approx >= last_seg_offset;
 
-            dir.write_dir_name(arena, &mut dirname_buf);
+            dir.write_dir_name(dir_arena, &mut dirname_buf);
             let dirname_len = dirname_buf.len();
             let is_exact_dirname = is_dirname_match
                 && main_needle_len as usize == dirname_len

@@ -5,13 +5,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tracing::{error, info};
 
 use crate::FileSync;
-use crate::background_watcher::BackgroundWatcher;
 use crate::error::Error;
 use crate::file_picker::FFFMode;
 use crate::index::{build_bigram_index, sniff_binary_for_non_indexable};
 use crate::parallelism::BACKGROUND_THREAD_POOL;
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::types::ContentCacheBudget;
+use crate::watch::BackgroundWatcher;
 
 #[derive(Clone, Default)]
 pub(crate) struct ScanSignals {
@@ -161,7 +161,7 @@ impl ScanJob {
             trace_span: _,
         } = self;
 
-        let _scanning = ScanningGuard::new(&signals, config.install_watcher);
+        let _scanning = ScanningGuard::new(&signals);
         scanned_files_counter.store(0, Ordering::Relaxed);
 
         // 1. Walk the file system and collect the list of files
@@ -259,8 +259,11 @@ impl ScanJob {
                 Ok(watcher) => {
                     if let Ok(mut guard) = shared_picker.write()
                         && let Some(picker) = guard.as_mut()
+                        && picker.base_path() == base_path
+                        && !signals.cancelled.load(Ordering::Acquire)
                     {
                         picker.background_watcher = Some(watcher);
+                        signals.watcher_ready.store(true, Ordering::Release);
                     }
                 }
                 Err(e) => error!(?e, "failed to initialize background watcher"),
@@ -355,30 +358,21 @@ impl ScanJob {
     }
 }
 
-/// RAII helper that flips the `scanning` signal on construction and
-/// resets it on drop (so early-returns can't leave it stuck on `true`).
-/// Also drives the `watcher_ready` signal on the initial-scan path.
+// Ensures early returns clear the scanning signal.
 struct ScanningGuard<'a> {
     signals: &'a ScanSignals,
-    release_watcher_ready_on_drop: bool,
 }
 
 impl<'a> ScanningGuard<'a> {
-    fn new(signals: &'a ScanSignals, release_watcher_ready_on_drop: bool) -> Self {
+    fn new(signals: &'a ScanSignals) -> Self {
         signals.scanning.store(true, Ordering::Relaxed);
-        Self {
-            signals,
-            release_watcher_ready_on_drop,
-        }
+        Self { signals }
     }
 }
 
 impl Drop for ScanningGuard<'_> {
     fn drop(&mut self) {
         self.signals.scanning.store(false, Ordering::Relaxed);
-        if self.release_watcher_ready_on_drop {
-            self.signals.watcher_ready.store(true, Ordering::Release);
-        }
     }
 }
 

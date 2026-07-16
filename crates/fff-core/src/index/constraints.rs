@@ -144,9 +144,9 @@ pub(crate) fn apply_constraints<'a, T: Constrainable + Sync>(
 }
 
 #[cfg(feature = "zlob")]
-type GlobPattern = zlob::ZlobPattern;
+pub(crate) type GlobPattern = zlob::ZlobPattern;
 #[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
-type GlobPattern = globset::GlobMatcher;
+pub(crate) type GlobPattern = globset::GlobMatcher;
 
 /// How `Constraint::Glob` is evaluated for each item.
 enum GlobStrategy {
@@ -371,14 +371,32 @@ fn matches_git_status(status: Option<git2::Status>, filter: &GitStatusFilter) ->
 
 #[inline]
 #[cfg(feature = "zlob")]
-fn compiled_matches(p: &GlobPattern, path: &str) -> bool {
+pub(crate) fn compiled_matches(p: &GlobPattern, path: &str) -> bool {
     p.matches_default(path)
 }
 
 #[inline]
 #[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
-fn compiled_matches(p: &GlobPattern, path: &str) -> bool {
+pub(crate) fn compiled_matches(p: &GlobPattern, path: &str) -> bool {
     p.is_match(path)
+}
+
+/// Append indices (into `rels`) of paths matching `p`, in input order.
+/// zlob backend: ONE FFI call for the whole batch.
+#[cfg(feature = "zlob")]
+pub(crate) fn glob_matches_into(p: &GlobPattern, rels: &[&str], out: &mut Vec<usize>) {
+    match p.match_indices(rels, p.flags()) {
+        Ok(ix) => out.extend_from_slice(ix.as_slice()),
+        Err(e) => {
+            tracing::warn!(?e, "zlob batch match failed, falling back to per-path");
+            out.extend((0..rels.len()).filter(|&i| p.matches_default(rels[i])));
+        }
+    }
+}
+
+#[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
+pub(crate) fn glob_matches_into(p: &GlobPattern, rels: &[&str], out: &mut Vec<usize>) {
+    out.extend((0..rels.len()).filter(|&i| p.is_match(rels[i])));
 }
 
 /// Decide between batch prepass and inline compiled patterns.
@@ -485,12 +503,12 @@ fn walk_globs<F: FnMut(&str)>(c: &Constraint<'_>, f: &mut F) {
 }
 
 #[cfg(feature = "zlob")]
-fn compile_one(pattern: &str) -> Option<GlobPattern> {
+pub(crate) fn compile_one(pattern: &str) -> Option<GlobPattern> {
     zlob::ZlobPattern::compile(pattern, zlob::ZlobFlags::RECOMMENDED).ok()
 }
 
 #[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
-fn compile_one(pattern: &str) -> Option<GlobPattern> {
+pub(crate) fn compile_one(pattern: &str) -> Option<GlobPattern> {
     globset::Glob::new(pattern)
         .ok()
         .map(|g| g.compile_matcher())

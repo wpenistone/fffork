@@ -84,6 +84,13 @@ jobs:
       - name: Install Rust
         run: rustup target add ${{ matrix.target }}
 
+      # Cache the per-target build dir and cargo-zigbuild binary. Keyed by
+      # target so matrix legs don't collide. See issue on slow release CI.
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          key: nvim-${{ matrix.target }}
+
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -215,6 +222,11 @@ jobs:
       - name: Install Rust
         run: rustup target add ${{ matrix.target }}
 
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          key: c-${{ matrix.target }}
+
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -327,6 +339,11 @@ jobs:
 
       - name: Install Rust
         run: rustup target add ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          key: mcp-${{ matrix.target }}
 
       - name: Install Zig
         uses: mlugg/setup-zig@v2

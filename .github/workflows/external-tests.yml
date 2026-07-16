@@ -80,7 +80,7 @@ jobs:
 
       - name: Build Rust binary
         if: ${{ !matrix.target }}
-        run: cargo build --release -p fff-nvim --no-default-features --features zlob
+        run: make build
 
       - name: Install Neovim
         uses: rhysd/action-setup-vim@v1

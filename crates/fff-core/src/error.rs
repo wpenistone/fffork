@@ -94,6 +94,21 @@ pub enum Error {
 
     #[error("Filesystem walk failed: {0}")]
     WalkFailed(String),
+
+    #[error("Invalid glob pattern '{pattern}': {reason}")]
+    InvalidGlobPattern { pattern: String, reason: String },
+
+    #[error("File system watching is disabled for this picker")]
+    WatcherDisabled,
+
+    #[error("File system watcher is not ready")]
+    WatcherNotReady,
+
+    #[error("Indexed base path changed while creating the watch subscription")]
+    WatchBaseChanged,
+
+    #[error("Failed to start watch callback dispatcher: {0}")]
+    WatchDispatcherStart(#[source] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

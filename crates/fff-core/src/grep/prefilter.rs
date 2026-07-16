@@ -123,7 +123,7 @@ fn prefilter_files<'a>(
 
             // Last partial word: mask bits past `boundary` once at word load.
             if last_word_bits != 0 {
-                // this will get only (mod 64) bits from the last word guaratee that it's 0 padded
+                // this will get only (mod 64) bits from the last word guarantee that it's 0 padded
                 let last_mask: u64 = (1u64 << last_word_bits) - 1;
                 let word = candidates[full_words] & last_mask;
                 if word != 0 {

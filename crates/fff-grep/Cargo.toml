@@ -6,6 +6,9 @@ authors = ["Dmitriy Kovalenko <dmtr.kovalenko@outlok.com>"]
 version = "0.9.6"
 edition = "2024"
 
+[lints]
+workspace = true
+
 [dependencies]
 bstr = { version = "1.6.2", default-features = false, features = ["std"] }
 memchr = "2.6.3"

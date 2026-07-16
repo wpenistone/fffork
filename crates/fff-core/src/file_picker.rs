@@ -26,12 +26,9 @@
 //! # Thread Safety
 //!
 //! `FilePicker` itself is **not** `Sync`!
-//! all concurrent access goes through [`SharedPicker`](crate::SharedPicker) .
-//! The background scanner and watcher acquire write locks only when mutating
-//! the file index, so read-heavy search workloads rarely contend.
+//! all concurrent access goes through [`crate::SharedFilePicker`]
 
 use crate::FFFStringStorage;
-use crate::background_watcher::BackgroundWatcher;
 use crate::constants::{MAX_OVERFLOW_FILES, PATH_BUF_SIZE};
 use crate::error::Error;
 use crate::frecency::FrecencyTracker;
@@ -48,6 +45,7 @@ use crate::types::{
     ContentCacheBudget, DirItem, DirSearchResult, FileItem, MixedItemRef, MixedSearchResult,
     PaginationArgs, Score, ScoringContext, SearchResult,
 };
+use crate::watch::BackgroundWatcher;
 use fff_query_parser::FFFQuery;
 use git2::{Repository, Status};
 use rayon::prelude::*;
@@ -98,7 +96,7 @@ pub(crate) struct FileSync {
     /// (parent_dir, filename):
     ///   `files[..indexable_count]` - indexable
     ///   `files[indexable_count..base_count]` - original-unindexable
-    ///   `files[base_count..]`— overflow (created on demand)
+    ///   `files[base_count..]` - overflow
     files: StableVec<FileItem>,
     indexable_count: usize,
     base_count: usize,
@@ -109,7 +107,12 @@ pub(crate) struct FileSync {
     /// concurrent readers observe a consistent view via the same shared
     /// allocation. Dir frecency is updated through the per-entry atomic
     /// (`DirItem::max_access_frecency`) without `&mut` aliasing.
+    /// Layout mirrors `files`: `dirs[..base_dirs_count]` is the sorted
+    /// scan-built region, `dirs[base_dirs_count..]` holds watcher-appended dirs.
     dirs: StableVec<DirItem>,
+    base_dirs_count: usize,
+    /// Number of dirs with at least one live file (mirrors `live_count`).
+    live_dirs_count: usize,
     /// Shared builder for overflow file paths. Each overflow file's ChunkedString
     /// uses `arena_override` pointing into this builder's arena.
     overflow_builder: Option<crate::simd_path::ChunkedPathStoreBuilder>,
@@ -130,7 +133,9 @@ impl FileSync {
             indexable_count: 0,
             base_count: 0,
             live_count: 0,
-            dirs: StableVec::from_vec_with_reserve(Vec::new(), 0),
+            dirs: StableVec::from_vec_with_reserve(Vec::new(), MAX_OVERFLOW_FILES),
+            base_dirs_count: 0,
+            live_dirs_count: 0,
             overflow_builder: None,
             git_workdir: None,
             bigram_index: None,
@@ -223,15 +228,12 @@ impl FileSync {
 
         // Binary search dirs to find the parent directory index.
         // Dir items store the relative path including trailing '/' (e.g. "src/components/").
+        // Only the scan-built region is sorted; watcher-appended dirs are not.
         let mut dir_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-        let dir_idx = self
-            .dirs
+        let dir_idx = self.dirs[..self.base_dirs_count]
             .binary_search_by(|d| d.read_relative_path(arena, &mut dir_buf).cmp(dir_rel))
             .ok();
 
-        // Binary search base files by (parent_dir, filename). Base files live in
-        // two internally-sorted partitions — indexable first, then unindexable —
-        // so we try each half in turn. Two O(log n) searches with short-circuit.
         if let Some(dir_idx) = dir_idx {
             let dir_idx = dir_idx as u32;
             let cmp_key = |f: &FileItem| {
@@ -271,10 +273,11 @@ impl FileSync {
 
     // TODO remove this function and make a better way to remove all files
     // from the directory without looping over the whole sync data list
-    /// Tombstones every file in the arena that matches certain predicate
-    fn tombstone_files_with_arena<F>(&mut self, mut predicate: F) -> usize
+    // Tombstones every matching arena file.
+    fn tombstone_files_with_arena<F, T>(&mut self, mut predicate: F, mut on_tombstone: T) -> usize
     where
         F: FnMut(&FileItem, ArenaPtr) -> bool,
+        T: FnMut(&FileItem, ArenaPtr),
     {
         let base_arena = self.arena_base_ptr();
         let overflow_arena = self.arena_overflow_ptr();
@@ -291,12 +294,98 @@ impl FileSync {
                 overflow_arena
             };
             if predicate(file, arena) {
+                on_tombstone(file, arena);
                 file.set_deleted(true);
                 tombstoned += 1;
             }
         }
         self.live_count -= tombstoned;
         tombstoned
+    }
+
+    /// Marks every dir matching `predicate` as deleted. Mirrors how dir-level
+    /// FS events (remove/move-out) invalidate whole subtrees.
+    fn tombstone_dirs_with_arena<F>(&mut self, mut predicate: F)
+    where
+        F: FnMut(&DirItem, ArenaPtr) -> bool,
+    {
+        let base_arena = self.arena_base_ptr();
+        let overflow_arena = self.arena_overflow_ptr();
+        let base_dirs_count = self.base_dirs_count;
+
+        let mut removed = 0usize;
+        for (idx, dir) in self.dirs.iter_mut().enumerate() {
+            if dir.is_deleted() {
+                continue;
+            }
+            let arena = if idx < base_dirs_count {
+                base_arena
+            } else {
+                overflow_arena
+            };
+            if predicate(dir, arena) && dir.set_deleted(true) {
+                removed += 1;
+            }
+        }
+        self.live_dirs_count -= removed;
+    }
+
+    /// Restores a dir to the live state (file appeared under it again).
+    fn revive_dir(&mut self, dir_idx: u32) {
+        if let Some(dir) = self.dirs.get_mut(dir_idx as usize)
+            && dir.set_deleted(false)
+        {
+            self.live_dirs_count += 1;
+        }
+    }
+
+    /// Finds the dir index for a '/'-canonical relative dir path
+    /// (with trailing '/', empty string for the base dir itself).
+    fn find_dir_index(&self, dir_rel: &str) -> Option<usize> {
+        let arena = self.arena_base_ptr();
+        let mut dir_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+        if let Ok(idx) = self.dirs[..self.base_dirs_count]
+            .binary_search_by(|d| d.read_relative_path(arena, &mut dir_buf).cmp(dir_rel))
+        {
+            return Some(idx);
+        }
+
+        // Watcher-appended region: unsorted, small (bounded by overflow cap).
+        let overflow_arena = self.arena_overflow_ptr();
+        self.dirs[self.base_dirs_count..]
+            .iter()
+            .position(|d| d.read_relative_path(overflow_arena, &mut dir_buf) == dir_rel)
+            .map(|pos| self.base_dirs_count + pos)
+    }
+
+    /// Finds or appends the DirItem for `dir_rel`, returning its index.
+    /// `None` when the dir table's overflow capacity is exhausted.
+    fn find_or_add_dir(&mut self, dir_rel: &str) -> Option<u32> {
+        if let Some(idx) = self.find_dir_index(dir_rel) {
+            return Some(idx as u32);
+        }
+
+        let builder = self.overflow_builder.get_or_insert_with(|| {
+            crate::simd_path::ChunkedPathStoreBuilder::new(MAX_OVERFLOW_FILES)
+        });
+        let chunked = builder.add_dir_immediate(dir_rel);
+
+        let last_seg = if dir_rel.is_empty() {
+            0
+        } else {
+            let trimmed = dir_rel.trim_end_matches(std::path::is_separator);
+            trimmed
+                .rfind(std::path::is_separator)
+                .map(|i| i + 1)
+                .unwrap_or(0) as u16
+        };
+
+        let idx = self.dirs.len();
+        if !self.dirs.push(DirItem::new_overflow(chunked, last_seg)) {
+            return None;
+        }
+        self.live_dirs_count += 1;
+        Some(idx as u32)
     }
 }
 
@@ -441,24 +530,23 @@ impl FileItem {
 /// Options for creating a [`FilePicker`].
 pub struct FilePickerOptions {
     pub base_path: String,
-    /// Pre-populate mmap caches for top-frecency files after the initial scan.
+    /// Pre-populate mmap caches for top-frecency files after the initial scan
     pub enable_mmap_cache: bool,
-    /// Build content index after the initial scan for faster content-aware filtering.
+    /// Build content index after the initial scan for faster content-aware filtering
     pub enable_content_indexing: bool,
     /// Mode of the picker impact the way file watcher events are handled and the scoring logic
     pub mode: FFFMode,
     /// Explicit cache budget. When `None`, the budget is auto-computed from
     /// the repo size after the initial scan completes.
     pub cache_budget: Option<ContentCacheBudget>,
-    /// When `false`, `new_with_shared_state` skips the background file watcher.
+    /// When `false` no background watcher will be created
     pub watch: bool,
-    /// Follow symbolic links during file indexing.
+    /// Follow symbolic links during file indexing
     pub follow_symlinks: bool,
-    /// Allow indexing the filesystem root (`/`). Off by default — these dirs
-    /// generate enormous fs-event traffic and are rarely the intended target.
+    /// Allow indexing the filesystem root (`/`)
     pub enable_fs_root_scanning: bool,
     /// Allow indexing the user's home directory. Off by default for the same
-    /// reason as `enable_fs_root_scanning`.
+    /// reason as `enable_fs_root_scanning`
     pub enable_home_dir_scanning: bool,
 }
 
@@ -560,6 +648,10 @@ impl FilePicker {
         self.watch
     }
 
+    pub fn is_watcher_ready(&self) -> bool {
+        self.background_watcher.is_some() && self.signals.watcher_ready.load(Ordering::Acquire)
+    }
+
     pub fn follows_symlinks(&self) -> bool {
         self.follow_symlinks
     }
@@ -655,12 +747,21 @@ impl FilePicker {
 
         if !dir_table.is_empty() {
             let arena = self.arena_base_ptr();
+            let overflow_arena = self.sync_data.arena_overflow_ptr();
             let mut path_buf = PathBuf::with_capacity(crate::simd_path::PATH_BUF_SIZE);
             let mut prev_relative_path = String::new();
 
             let mut scratch_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
             for dir_item in dir_table.iter() {
-                let full_relative_path = dir_item.read_relative_path(arena, &mut scratch_buf);
+                if dir_item.is_deleted() {
+                    continue;
+                }
+                let item_arena = if dir_item.is_overflow() {
+                    overflow_arena
+                } else {
+                    arena
+                };
+                let full_relative_path = dir_item.read_relative_path(item_arena, &mut scratch_buf);
                 let relative_path = full_relative_path.trim_end_matches(std::path::is_separator);
 
                 if relative_path.is_empty() {
@@ -747,6 +848,17 @@ impl FilePicker {
             error!("Base path does not exist: {}", options.base_path);
             return Err(Error::InvalidPath(path));
         }
+        // Relative bases (".", "sub/dir") are resolved against the cwd so
+        // they can be compared with the absolute paths reported by the OS
+        // watcher. Purely lexical: no symlinks are resolved. The
+        // `components()` pass drops interior `.` segments ("/cwd/.").
+        let path = if path.is_relative() {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&path).components().collect())
+                .unwrap_or(path)
+        } else {
+            path
+        };
         if path.parent().is_none() && !options.enable_fs_root_scanning {
             error!("Refusing to index filesystem root: {}", path.display());
             return Err(Error::FilesystemRoot(path));
@@ -758,7 +870,7 @@ impl FilePicker {
             return Err(Error::FilesystemRoot(path));
         }
 
-        // Windows-only: canonicalize with so the base path does NOT
+        // Windows-only: canonicalize with dunce so the base path does NOT
         // have the `\\?\` UNC prefix that `std::fs::canonicalize` adds.
         // libgit2's `repo.workdir()`
         #[cfg(windows)]
@@ -830,6 +942,9 @@ impl FilePicker {
         signals
             .scanning
             .store(true, std::sync::atomic::Ordering::Release);
+
+        // Update the watch base before publishing the new picker.
+        shared_picker.rebase_watches(&path);
 
         {
             let mut guard = shared_picker.write()?;
@@ -1033,7 +1148,7 @@ impl FilePicker {
             options.max_threads
         };
 
-        let total_dirs = dirs.len();
+        let total_dirs = self.sync_data.live_dirs_count;
 
         let effective_query = match &query.fuzzy_query {
             fff_query_parser::FuzzyQuery::Text(t) => *t,
@@ -1056,10 +1171,11 @@ impl FilePicker {
         };
 
         let arena = self.sync_data.arena_base_ptr();
+        let overflow_arena = self.sync_data.arena_overflow_ptr();
         let time = std::time::Instant::now();
 
         let (items, scores, total_matched) =
-            crate::score::fuzzy_match_and_score_dirs(dirs, &context, arena);
+            crate::score::fuzzy_match_and_score_dirs(dirs, &context, arena, overflow_arena);
 
         info!(
             ?query,
@@ -1569,11 +1685,25 @@ impl FilePicker {
         file_item.set_path(builder.add_file_immediate(&rel_path, file_item.path.filename_offset));
         file_item.set_overflow(true);
 
+        // Keep the dir table consistent: register (or revive) the parent dir
+        // so directory search reflects watcher-added files immediately.
+        let dir_rel = crate::path_utils::to_canonical_slashes(
+            &rel_path[..file_item.path.filename_offset as usize],
+        );
+
+        if let Some(dir_idx) = self.sync_data.find_or_add_dir(&dir_rel) {
+            file_item.parent_dir_index = dir_idx;
+        }
+        let parent_dir = file_item.parent_dir_index;
+
         if !self.sync_data.files.push(file_item) {
             return None;
         }
 
         self.sync_data.live_count += 1;
+        // Dir may have been tombstoned by an earlier removal; a new file
+        // under it proves it exists again.
+        self.sync_data.revive_dir(parent_dir);
         self.sync_data.files.last()
     }
 
@@ -1603,8 +1733,11 @@ impl FilePicker {
             return;
         }
         file.set_deleted(false);
+        let parent_dir = file.parent_dir_index;
 
         self.sync_data.live_count += 1;
+        // The path exists on disk again, so its parent dir does too.
+        self.sync_data.revive_dir(parent_dir);
     }
 
     /// Marks file as deleted, make sure that if you call this yourself these changes can be reverted
@@ -1622,22 +1755,75 @@ impl FilePicker {
 
     // TODO make this O(n)
     pub fn remove_all_files_in_dir(&mut self, dir: impl AsRef<Path>) -> usize {
-        let dir_path = dir.as_ref();
-        let relative_dir = self
-            .to_relative_path(dir_path)
-            .map(|c| c.into_owned())
-            .unwrap_or_default();
+        self.remove_all_files_in_dirs_inner(std::iter::once(dir.as_ref()), None)
+    }
 
-        let dir_prefix = if relative_dir.is_empty() {
-            String::new()
-        } else {
-            // Stored relative paths are '/'-canonical on every platform.
-            format!("{relative_dir}/")
-        };
+    /// Tombstones files under any of `dirs` in a single index scan.
+    pub(crate) fn remove_all_files_in_dirs_with_callback<'a>(
+        &mut self,
+        dirs: impl IntoIterator<Item = &'a Path>,
+        mut callback: impl FnMut(&Path),
+    ) -> usize {
+        self.remove_all_files_in_dirs_inner(dirs, Some(&mut callback))
+    }
 
-        self.sync_data.tombstone_files_with_arena(|file, arena| {
-            file.relative_path_starts_with(arena, &dir_prefix)
-        })
+    pub(crate) fn remove_all_files_in_dirs<'a>(
+        &mut self,
+        dirs: impl IntoIterator<Item = &'a Path>,
+    ) -> usize {
+        self.remove_all_files_in_dirs_inner(dirs, None)
+    }
+
+    fn remove_all_files_in_dirs_inner<'a>(
+        &mut self,
+        dirs: impl IntoIterator<Item = &'a Path>,
+        mut callback: Option<&mut dyn FnMut(&Path)>,
+    ) -> usize {
+        let mut dir_prefixes = Vec::new();
+        for dir_path in dirs {
+            let Some(relative_dir) = self
+                .to_relative_path(dir_path)
+                .map(|path| path.into_owned())
+            else {
+                continue;
+            };
+
+            if relative_dir.is_empty() {
+                dir_prefixes.push(String::new());
+            } else {
+                // Stored relative paths are '/'-canonical on every platform.
+                dir_prefixes.push(format!("{relative_dir}/"));
+            }
+        }
+
+        if dir_prefixes.is_empty() {
+            return 0;
+        }
+
+        let base_path = self.base_path.clone();
+        let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+        let tombstoned = self.sync_data.tombstone_files_with_arena(
+            |file, arena| {
+                dir_prefixes
+                    .iter()
+                    .any(|prefix| file.relative_path_starts_with(arena, prefix))
+            },
+            |file, arena| {
+                if let Some(callback) = callback.as_mut() {
+                    callback(file.write_absolute_path(arena, &base_path, &mut path_buf));
+                }
+            },
+        );
+
+        // The whole subtree is gone: tombstone the dirs too so directory
+        // search stops surfacing them.
+        let mut dir_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+        self.sync_data.tombstone_dirs_with_arena(|dir, arena| {
+            let rel = dir.read_relative_path(arena, &mut dir_buf);
+            dir_prefixes.iter().any(|prefix| rel.starts_with(prefix))
+        });
+
+        tombstoned
     }
 
     /// Use this to prevent any substantial background threads from acquiring the locks
@@ -1650,6 +1836,7 @@ impl FilePicker {
         if let Some(mut watcher) = self.background_watcher.take() {
             watcher.stop();
         }
+        self.signals.watcher_ready.store(false, Ordering::Release);
     }
 
     /// Quick way to check if scan is going without acquiring a lock for [Self::get_scan_progress]
@@ -1928,13 +2115,16 @@ impl FileSync {
         );
 
         let base_count = files.len();
+        let base_dirs_count = dirs.len();
 
         Ok(FileSync {
             files: StableVec::from_vec_with_reserve(files, MAX_OVERFLOW_FILES),
             indexable_count,
             base_count,
             live_count: base_count,
-            dirs: StableVec::from_vec_with_reserve(dirs, 0),
+            dirs: StableVec::from_vec_with_reserve(dirs, MAX_OVERFLOW_FILES),
+            base_dirs_count,
+            live_dirs_count: base_dirs_count,
             overflow_builder: None,
             git_workdir,
             bigram_index: None,
@@ -2251,5 +2441,45 @@ mod tests {
         assert_eq!(common_dir_prefix_len("src", "src"), 0);
         // "src" is emitted-as-dir; "src/x" extends it — full "src" is shared.
         assert_eq!(common_dir_prefix_len("src", "src/x"), 3);
+    }
+
+    #[test]
+    fn directory_removal_collects_each_tombstoned_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(dir.path()).unwrap();
+        let removed_dir = base.join("removed");
+        let kept = base.join("kept.txt");
+        let first = removed_dir.join("a.txt");
+        let second = removed_dir.join("nested/b.txt");
+        std::fs::create_dir_all(second.parent().unwrap()).unwrap();
+        std::fs::write(&first, b"a").unwrap();
+        std::fs::write(&second, b"b").unwrap();
+        std::fs::write(&kept, b"kept").unwrap();
+
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_string_lossy().into_owned(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+
+        let mut removed = Vec::new();
+        assert_eq!(
+            picker.remove_all_files_in_dirs_with_callback(
+                std::iter::once(removed_dir.as_path()),
+                |path| {
+                    removed.push(path.to_path_buf());
+                }
+            ),
+            2
+        );
+        removed.sort_unstable();
+        assert_eq!(removed, vec![first, second]);
+        assert!(picker.get_file_by_path(&kept).is_some());
+
+        let outside = base.parent().unwrap().join("outside");
+        assert_eq!(picker.remove_all_files_in_dir(&outside), 0);
+        assert!(picker.get_file_by_path(&kept).is_some());
     }
 }

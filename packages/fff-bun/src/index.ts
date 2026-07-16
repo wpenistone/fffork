@@ -24,6 +24,11 @@ export type {
   Score,
   SearchOptions,
   SearchResult,
+  WatchBatchCallback,
+  WatchEvent,
+  WatchEventKind,
+  WatchOptions,
+  WatchUnsubscribe,
 } from "./fff-api";
 
 export { FileFinder } from "./finder";

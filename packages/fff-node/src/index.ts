@@ -67,6 +67,11 @@ export type {
   Score,
   SearchOptions,
   SearchResult,
+  WatchBatchCallback,
+  WatchEvent,
+  WatchEventKind,
+  WatchOptions,
+  WatchUnsubscribe,
 } from "./fff-api.js";
 // Result helpers
 export { err, ok } from "./fff-api.js";

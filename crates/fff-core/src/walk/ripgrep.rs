@@ -1,7 +1,7 @@
-use crate::background_watcher::is_git_file;
 use crate::ignore::non_git_repo_overrides;
 use crate::types::FileItem;
 use crate::walk::WalkOutput;
+use crate::watch::is_git_file;
 use ignore::WalkBuilder;
 use std::path::Path;
 use std::sync::{
