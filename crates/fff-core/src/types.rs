@@ -593,6 +593,7 @@ impl FileItem {
                 Ok(n) => {
                     if detect_binary_content(&chunk[..n]) {
                         self.set_binary(true);
+                        break;
                     }
                 }
             }
