@@ -6,6 +6,7 @@
 //! `definitions` feature since only such consumers need it.
 
 /// Detect if a line looks like a code definition (struct, fn, class, etc.)
+#[inline]
 pub fn is_definition_line(line: &str) -> bool {
     let s = line.trim_start().as_bytes();
     let s = skip_modifiers(s);
@@ -27,22 +28,6 @@ const MODIFIERS: &[&[u8]] = &[
     b"public",
 ];
 
-/// Definition keywords to detect.
-const DEF_KEYWORDS: &[&[u8]] = &[
-    b"struct",
-    b"fn",
-    b"enum",
-    b"trait",
-    b"impl",
-    b"class",
-    b"interface",
-    b"function",
-    b"def",
-    b"func",
-    b"type",
-    b"module",
-    b"object",
-];
 
 /// Skip zero or more modifier keywords (including `pub(crate)` style visibility).
 fn skip_modifiers(mut s: &[u8]) -> &[u8] {
@@ -72,8 +57,22 @@ fn skip_modifiers(mut s: &[u8]) -> &[u8] {
 }
 
 /// Check if `s` starts with a definition keyword followed by a word boundary.
+#[inline]
 fn is_definition_keyword(s: &[u8]) -> bool {
-    for &kw in DEF_KEYWORDS {
+    let Some(&first) = s.first() else { return false };
+    let candidates: &[&[u8]] = match first {
+        b's' => &[b"struct"],
+        b'f' => &[b"fn", b"function", b"func"],
+        b'e' => &[b"enum"],
+        b't' => &[b"trait", b"type"],
+        b'i' => &[b"impl", b"interface"],
+        b'c' => &[b"class"],
+        b'd' => &[b"def"],
+        b'm' => &[b"module"],
+        b'o' => &[b"object"],
+        _ => return false,
+    };
+    for &kw in candidates {
         if s.starts_with(kw) {
             let after = s.get(kw.len());
             // Word boundary: end of input, or next byte is not alphanumeric/underscore
