@@ -146,15 +146,17 @@ impl GitStatusCache {
     }
 }
 
-#[inline]
+const MODIFIED_STATUS_MASK: Status = Status::from_bits_truncate(
+    Status::WT_MODIFIED.bits()
+        | Status::INDEX_MODIFIED.bits()
+        | Status::WT_NEW.bits()
+        | Status::INDEX_NEW.bits()
+        | Status::WT_RENAMED.bits(),
+);
+
+#[inline(always)]
 pub fn is_modified_status(status: Status) -> bool {
-    status.intersects(
-        Status::WT_MODIFIED
-            | Status::INDEX_MODIFIED
-            | Status::WT_NEW
-            | Status::INDEX_NEW
-            | Status::WT_RENAMED,
-    )
+    status.intersects(MODIFIED_STATUS_MASK)
 }
 
 pub fn format_git_status_opt(status: Option<Status>) -> Option<&'static str> {
