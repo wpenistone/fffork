@@ -1399,7 +1399,7 @@ impl FilePicker {
             .as_deref()
             .unwrap_or(&self.signals.cancelled);
 
-        SEARCH_THREAD_POOL.install(|| {
+        let run_grep = || {
             grep_search(
                 self.get_files(),
                 query,
@@ -1412,7 +1412,13 @@ impl FilePicker {
                 arena,
                 overflow_arena,
             )
-        })
+        };
+
+        if rayon::current_thread_index().is_some() {
+            run_grep()
+        } else {
+            SEARCH_THREAD_POOL.install(run_grep)
+        }
     }
 
     /// Multi-pattern grep search across indexed files.
