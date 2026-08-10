@@ -131,6 +131,7 @@ fn match_fuzzy_parts(
 }
 
 /// Match + score across base and overflow files, each with their own arena.
+#[cfg(test)]
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub(crate) fn fuzzy_match_and_score_files<'a>(
     files: &'a [FileItem],

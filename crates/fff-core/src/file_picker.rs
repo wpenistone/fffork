@@ -2138,7 +2138,9 @@ impl FileSync {
             .read()
             .map_err(|_| Error::AcquireFrecencyLock)?;
 
-        if let Some(frecency) = frecency.as_ref() {
+        if let Some(frecency) = frecency.as_ref()
+            && !frecency.is_empty()
+        {
             let dirs_ref = &dirs;
             BACKGROUND_THREAD_POOL.install(|| {
                 files.par_iter_mut().for_each(|file| {

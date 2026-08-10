@@ -217,6 +217,12 @@ impl FrecencyTracker {
         Ok(result)
     }
 
+    pub fn is_empty(&self) -> bool {
+        let Ok(rtxn) = self.env.read_txn() else { return true; };
+        let Ok(stat) = self.db.stat(&rtxn) else { return true; };
+        stat.entries == 0
+    }
+
     fn get_now(&self) -> u64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
