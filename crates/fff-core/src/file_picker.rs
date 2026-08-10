@@ -1083,7 +1083,23 @@ impl FilePicker {
         options: FuzzySearchOptions<'q>,
     ) -> SearchResult<'_> {
         let files = self.get_files();
-        let max_threads = if options.max_threads == 0 {
+
+
+        let total_files = self.live_file_count();
+        let location = query.location;
+
+        // Get effective query for max_typos calculation (without location suffix)
+        let effective_query = match &query.fuzzy_query {
+            fff_query_parser::FuzzyQuery::Text(t) => *t,
+            fff_query_parser::FuzzyQuery::Parts(parts) if !parts.is_empty() => parts[0],
+            _ => query.raw_query.trim(),
+        };
+
+        let max_threads = if options.max_threads == 1
+            || (options.max_threads <= 2 && effective_query.len() <= 2)
+        {
+            1
+        } else if options.max_threads == 0 {
             std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4)
@@ -1098,16 +1114,6 @@ impl FilePicker {
             current_file = ?options.current_file,
             "Fuzzy search",
         );
-
-        let total_files = self.live_file_count();
-        let location = query.location;
-
-        // Get effective query for max_typos calculation (without location suffix)
-        let effective_query = match &query.fuzzy_query {
-            fff_query_parser::FuzzyQuery::Text(t) => *t,
-            fff_query_parser::FuzzyQuery::Parts(parts) if !parts.is_empty() => parts[0],
-            _ => query.raw_query.trim(),
-        };
 
         // small queries with a large number of results can match absolutely everything
         let max_typos = (effective_query.len() as u16 / 4).clamp(2, 6);
