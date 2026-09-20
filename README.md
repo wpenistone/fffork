@@ -427,6 +427,12 @@ require('fff').setup({
   },
   git = {
     status_text_color = false, -- true to color filenames by git status
+    -- files that participated in the last N configured commits will get scoring bonus
+    recency = {
+      enabled = true, -- boost files from recent commits of the current branch
+      max_commits = 10, -- analyze the last N branch-specific commits
+      max_files_per_commit = 50, -- skip bulk commits touching more files than this
+    },
   },
   select = {
     -- Return winid to open the chosen file in, or nil to open in the original window
