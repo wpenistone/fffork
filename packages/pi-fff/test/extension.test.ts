@@ -99,6 +99,12 @@ mock.module("@ff-labs/fff-node", () => finderModule);
 mock.module("@ff-labs/fff-bun", () => finderModule);
 
 mock.module("@earendil-works/pi-tui", () => ({
+  MouseRegion: class MouseRegion {
+    constructor(
+      public component: any,
+      public onMouse: (event: any) => unknown,
+    ) {}
+  },
   Text: class Text {
     text: string;
     constructor(text: string) {
@@ -108,6 +114,8 @@ mock.module("@earendil-works/pi-tui", () => ({
       this.text = text;
     }
   },
+  sliceByColumn: (text: string, _start: number, end: number) => text.slice(0, end),
+  visibleWidth: (text: string) => text.length,
 }));
 
 const schema = (type: string) => (options?: unknown) => ({ type, options });
@@ -829,6 +837,63 @@ describe("pi-fff autocomplete registration", () => {
     expect(shouldTrigger).toBe(false);
     expect(current.applyCompletion).toHaveBeenCalledTimes(1);
     expect(current.shouldTriggerFileCompletion).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("compact tool rendering", () => {
+  const theme = {
+    bold: (text: string) => text,
+    fg: (_color: string, text: string) => text,
+  };
+
+  function toolByName(
+    setup: { pi: { registerTool: ReturnType<typeof mock> } },
+    name: string,
+  ) {
+    const tool = setup.pi.registerTool.mock.calls
+      .map(([tool]) => tool)
+      .find((tool) => tool.name === name);
+    expect(tool).toBeDefined();
+    return tool;
+  }
+
+  test("ffgrep renders collapsed by default and full when pi reports expanded", async () => {
+    const setup = await start("tools-and-ui");
+    const tool = toolByName(setup, "ffgrep");
+    const context = { state: {}, invalidate: mock(() => undefined), isError: false };
+
+    const call = tool.renderCall(
+      { pattern: "TODO", path: ".", limit: 3, context: 2 },
+      theme,
+      context,
+    );
+    expect(call.render(80)).toEqual(["ffgrep /TODO/ in . (limit 3, context 2)"]);
+
+    const defaultCall = tool.renderCall({ pattern: "TODO", path: "." }, theme, context);
+    expect(defaultCall.render(80)).toEqual(["ffgrep /TODO/ in ."]);
+
+    const content = [{ type: "text", text: "first\nsecond\nthird" }];
+    const collapsed = tool.renderResult({ content }, { expanded: false }, theme, context);
+    expect(collapsed.render(80)).toEqual(["first ... (2 more lines)"]);
+
+    const expanded = tool.renderResult({ content }, { expanded: true }, theme, context);
+    expect(expanded.text).toBe("first\nsecond\nthird");
+  });
+
+  test("fffind result follows the expanded option", async () => {
+    const setup = await start("tools-and-ui");
+    const tool = toolByName(setup, "fffind");
+    const context = { state: {}, invalidate: mock(() => undefined), isError: false };
+
+    const call = tool.renderCall({ pattern: "index", path: "src" }, theme, context);
+    expect(call.render(80)).toEqual(["fffind index in src"]);
+
+    const content = [{ type: "text", text: "src/index.ts\nsrc/main.ts" }];
+    const collapsed = tool.renderResult({ content }, { expanded: false }, theme, context);
+    expect(collapsed.render(80)).toEqual(["src/index.ts ... (1 more lines)"]);
+
+    const expanded = tool.renderResult({ content }, { expanded: true }, theme, context);
+    expect(expanded.text).toBe("src/index.ts\nsrc/main.ts");
   });
 });
 
