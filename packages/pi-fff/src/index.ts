@@ -658,23 +658,51 @@ export default function fffExtension(pi: ExtensionAPI) {
   };
 
   const pendingTools: (() => string)[] = [];
+  const registeredToolNames = new Set<string>();
+  // A renderer is attached to a concrete registered name. Keep that name outside
+  // row state so old fffgrep rows retain their title after mode changes to override.
+  const renderToolNames = new WeakMap<object, string>();
   let toolsRegistered = false;
+
+  function getRenderToolName(context: object, fallback: string): string {
+    return renderToolNames.get(context) ?? fallback;
+  }
+
+  function registerTool<TParams extends TSchema, TDetails = unknown, TState = any>(
+    resolveName: () => string,
+    definition: PendingToolDefinition<TParams, TDetails, TState>,
+  ): string {
+    const resolvedName = resolveName();
+    if (registeredToolNames.has(resolvedName)) return resolvedName;
+
+    const { promptGuidelines, renderCall, ...tool } = definition;
+    pi.registerTool({
+      ...tool,
+      name: resolvedName,
+      label: resolvedName,
+      promptGuidelines: promptGuidelines?.(toolNames),
+      renderCall: renderCall
+        ? (args, theme, context) => {
+            renderToolNames.set(context, resolvedName);
+            return renderCall(args, theme, context);
+          }
+        : undefined,
+    });
+    registeredToolNames.add(resolvedName);
+    return resolvedName;
+  }
 
   function queueTool<TParams extends TSchema, TDetails = unknown, TState = any>(
     resolveName: () => string,
     definition: PendingToolDefinition<TParams, TDetails, TState>,
   ): void {
-    pendingTools.push(() => {
-      const { promptGuidelines, ...tool } = definition;
-      const resolvedName = resolveName();
-      pi.registerTool({
-        ...tool,
-        name: resolvedName,
-        label: resolvedName,
-        promptGuidelines: promptGuidelines?.(toolNames),
-      });
-      return resolvedName;
-    });
+    pendingTools.push(() => registerTool(resolveName, definition));
+
+    // Pi restores historical tool rows before session_start. Register the
+    // FFF-named tools now so their renderers resolve. Pi activates every
+    // newly registered tool, so registerPendingTools prunes the names the
+    // final mode did not select.
+    registerTool(resolveName, definition);
   }
 
   // Pi carries the active tool list across /reload, so names activated under a
@@ -1103,11 +1131,11 @@ export default function fffExtension(pi: ExtensionAPI) {
       };
     },
 
-    renderCall(args, theme) {
+    renderCall(args, theme, context) {
       const pattern = args?.pattern ?? "";
       const path = args?.path ?? ".";
       let content =
-        theme.fg("toolTitle", theme.bold(toolNames.grep)) +
+        theme.fg("toolTitle", theme.bold(getRenderToolName(context, toolNames.grep))) +
         " " +
         theme.fg("accent", `/${pattern}/`) +
         theme.fg("toolOutput", ` in ${path}`);
@@ -1247,11 +1275,11 @@ export default function fffExtension(pi: ExtensionAPI) {
       };
     },
 
-    renderCall(args, theme) {
+    renderCall(args, theme, context) {
       const pattern = args?.pattern ?? "";
       const path = args?.path ?? ".";
       let content =
-        theme.fg("toolTitle", theme.bold(toolNames.find)) +
+        theme.fg("toolTitle", theme.bold(getRenderToolName(context, toolNames.find))) +
         " " +
         theme.fg("accent", pattern) +
         theme.fg("toolOutput", ` in ${path}`);
@@ -1354,7 +1382,10 @@ export default function fffExtension(pi: ExtensionAPI) {
         const patterns = args?.patterns ?? [];
         const constraints = args?.constraints;
         let content =
-          theme.fg("toolTitle", theme.bold(toolNames.multiGrep)) +
+          theme.fg(
+            "toolTitle",
+            theme.bold(getRenderToolName(context, toolNames.multiGrep)),
+          ) +
           " " +
           theme.fg("accent", patterns.map((p: string) => `"${p}"`).join(", "));
         if (constraints) content += theme.fg("toolOutput", ` (${constraints})`);
