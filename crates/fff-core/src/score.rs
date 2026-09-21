@@ -19,6 +19,14 @@ enum FileItems<'a> {
 
 impl<'a> FileItems<'a> {
     #[inline]
+    fn len(&self) -> usize {
+        match self {
+            FileItems::All(s) => s.len(),
+            FileItems::Filtered(v) => v.len(),
+        }
+    }
+
+    #[inline]
     fn index(&self, index: usize) -> &'a FileItem {
         match self {
             FileItems::All(s) => &s[index],
@@ -61,32 +69,17 @@ fn match_fuzzy_parts(
         return vec![];
     }
 
-    let resolve = |file: &FileItem,
-                   buf: &mut [*const u8; MAX_PATH_CHUNKS]|
-     -> Option<(usize, u16)> { resolve_file_chunks(file, arena, buf) };
-
-    // because we reassemble the vec of reference we have to use a different type
-    // to narrow down the [&FileItem] which would be resolved by frizbee as &&
-    let resolve_ref = |file: &&FileItem,
-                       buf: &mut [*const u8; MAX_PATH_CHUNKS]|
-     -> Option<(usize, u16)> { resolve_file_chunks(file, arena, buf) };
-
-    let first_part_matches = match working_files {
-        FileItems::All(files) => neo_frizbee::match_list_parallel_resolved(
-            valid_parts[0],
-            files,
-            &resolve,
-            options,
-            max_threads,
-        ),
-        FileItems::Filtered(files) => neo_frizbee::match_list_parallel_resolved(
-            valid_parts[0],
-            files.as_slice(),
-            &resolve_ref,
-            options,
-            max_threads,
-        ),
-    };
+    // Index-based resolver: no `Vec<&FileItem>` materialization for either the
+    // full list or the per-part subsets, and a single monomorphized hot loop.
+    let first_part_matches = neo_frizbee::match_range_parallel_resolved(
+        valid_parts[0],
+        working_files.len(),
+        &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+            resolve_file_chunks(working_files.index(index as usize), arena, buf)
+        },
+        options,
+        max_threads,
+    );
 
     if valid_parts.len() == 1 {
         return first_part_matches;
@@ -98,16 +91,16 @@ fn match_fuzzy_parts(
         let mut part_options = *options;
         part_options.max_typos = options.max_typos.map(|t| t.min(part.len() as u16));
 
-        // Collect the subset of files that survived the previous round.
-        let subset: Vec<&FileItem> = matches
-            .iter()
-            .map(|m| working_files.index(m.index as usize))
-            .collect();
-
-        let sub_matches = neo_frizbee::match_list_parallel_resolved(
+        // Match only the files that survived the previous round, addressed
+        // through the previous matches without collecting a subset.
+        let survivors = &matches;
+        let sub_matches = neo_frizbee::match_range_parallel_resolved(
             part,
-            subset.as_slice(),
-            &resolve_ref,
+            survivors.len(),
+            &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+                let file = working_files.index(survivors[index as usize].index as usize);
+                resolve_file_chunks(file, arena, buf)
+            },
             &part_options,
             max_threads,
         );
@@ -206,7 +199,7 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
         .any(|part| part.chars().any(|ch| ch.is_uppercase()));
     let config = neo_frizbee::Config {
         max_typos: Some(max_typos),
-        sort: false,
+        sort: neo_frizbee::SortStrategy::Unsorted,
         scoring: Scoring {
             capitalization_bonus: if has_uppercase { 8 } else { 0 },
             matching_case_bonus: if has_uppercase { 4 } else { 0 },
@@ -215,6 +208,8 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
         ..Default::default()
     };
 
+    // Match on `&str` so this shares frizbee's instantiation with fuzzy grep.
+    let path_strs: Vec<&str> = paths.iter().map(String::as_str).collect();
     for (idx, part) in parts.iter().copied().enumerate() {
         let mut part_config = config;
         if idx > 0 {
@@ -222,7 +217,7 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
         }
 
         let mut matcher = neo_frizbee::Matcher::new(part, &part_config);
-        for mut matched in matcher.match_list_indices(&paths) {
+        for mut matched in matcher.match_list_indices(&path_strs) {
             let item_idx = matched.index as usize;
             let Some(path) = paths.get(item_idx) else {
                 continue;
@@ -240,7 +235,7 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
     ranges_by_item
 }
 
-fn char_indices_to_byte_offsets(line: &str, char_indices: &[usize]) -> SmallVec<[(u32, u32); 4]> {
+fn char_indices_to_byte_offsets(line: &str, char_indices: &[u32]) -> SmallVec<[(u32, u32); 4]> {
     let char_byte_ranges: Vec<(usize, usize)> = line
         .char_indices()
         .map(|(byte_pos, ch)| (byte_pos, byte_pos + ch.len_utf8()))
@@ -248,7 +243,7 @@ fn char_indices_to_byte_offsets(line: &str, char_indices: &[usize]) -> SmallVec<
     let mut result: SmallVec<[(u32, u32); 4]> = SmallVec::with_capacity(char_indices.len());
 
     for &char_idx in char_indices {
-        let Some(&(start, end)) = char_byte_ranges.get(char_idx) else {
+        let Some(&(start, end)) = char_byte_ranges.get(char_idx as usize) else {
             continue;
         };
 
@@ -328,15 +323,12 @@ fn match_fuzzy_parts_dirs(
         return vec![];
     }
 
-    let resolve_chunks_for_frizbee =
-        |dir: &&DirItem, buf: &mut [*const u8; MAX_PATH_CHUNKS]| -> Option<(usize, u16)> {
-            resolve_dir_chunks(dir, arena, overflow_arena, buf)
-        };
-
-    let first_part_matches = neo_frizbee::match_list_parallel_resolved(
+    let first_part_matches = neo_frizbee::match_range_parallel_resolved(
         valid_parts[0],
-        working_dirs,
-        &resolve_chunks_for_frizbee,
+        working_dirs.len(),
+        &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+            resolve_dir_chunks(working_dirs[index as usize], arena, overflow_arena, buf)
+        },
         options,
         max_threads,
     );
@@ -351,16 +343,16 @@ fn match_fuzzy_parts_dirs(
         let mut part_options = *options;
         part_options.max_typos = options.max_typos.map(|t| t.min(part.len() as u16));
 
-        // Collect the subset of dirs that survived the previous round.
-        let subset: Vec<&DirItem> = matches
-            .iter()
-            .map(|m| working_dirs[m.index as usize])
-            .collect();
-
-        let sub_matches = neo_frizbee::match_list_parallel_resolved(
+        // Match only the dirs that survived the previous round, addressed
+        // through the previous matches without collecting a subset.
+        let survivors = &matches;
+        let sub_matches = neo_frizbee::match_range_parallel_resolved(
             part,
-            subset.as_slice(),
-            &resolve_chunks_for_frizbee,
+            survivors.len(),
+            &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+                let dir = working_dirs[survivors[index as usize].index as usize];
+                resolve_dir_chunks(dir, arena, overflow_arena, buf)
+            },
             &part_options,
             max_threads,
         );
@@ -441,7 +433,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
 
     let options = neo_frizbee::Config {
         max_typos: Some(context.max_typos),
-        sort: false,
+        sort: neo_frizbee::SortStrategy::Unsorted,
         scoring: Scoring {
             capitalization_bonus: if has_uppercase { 8 } else { 0 },
             matching_case_bonus: if has_uppercase { 4 } else { 0 },
@@ -645,7 +637,7 @@ fn match_and_score_in_arena<'a>(
 
     let options = neo_frizbee::Config {
         max_typos: Some(context.max_typos),
-        sort: false,
+        sort: neo_frizbee::SortStrategy::Unsorted,
         scoring: Scoring {
             capitalization_bonus: if has_uppercase { 8 } else { 0 },
             matching_case_bonus: if has_uppercase { 4 } else { 0 },
@@ -686,16 +678,18 @@ fn match_and_score_in_arena<'a>(
         if fallback_filenames.is_empty() {
             vec![]
         } else {
-            let mut matches = neo_frizbee::match_list_parallel(
-                fuzzy_parts[0],
-                &fallback_filenames,
-                &options,
-                if path_matches.len() > 4096 {
-                    context.max_threads.div_ceil(2048)
-                } else {
-                    1
-                },
-            );
+            // Match on `&str` so frizbee reuses the instantiation its index
+            // resolver already emits instead of a separate `Cow<str>` copy.
+            let filename_strs: Vec<&str> = fallback_filenames.iter().map(Cow::as_ref).collect();
+            let mut matches = neo_frizbee::Matcher::new(fuzzy_parts[0], &options)
+                .match_list_parallel(
+                    &filename_strs,
+                    if path_matches.len() > 4096 {
+                        context.max_threads.div_ceil(2048)
+                    } else {
+                        1
+                    },
+                );
 
             sort_by_key_with_buffer(&mut matches, |m| fallback_indices[m.index as usize]);
             matches
@@ -1496,21 +1490,21 @@ mod filename_bonus_tests {
 
         let options = neo_frizbee::Config {
             max_typos: Some(2),
-            sort: false,
+            sort: neo_frizbee::SortStrategy::Unsorted,
             ..Default::default()
         };
 
-        let matches = neo_frizbee::match_list("aipart", &[path], &options);
+        let matches = neo_frizbee::Matcher::new("aipart", &options).match_list(&[path]);
         assert!(!matches.is_empty(), "'aipart' should match the path");
 
-        let matches = neo_frizbee::match_list("core", &[path], &options);
+        let matches = neo_frizbee::Matcher::new("core", &options).match_list(&[path]);
         assert!(!matches.is_empty(), "'core' should match the path");
 
         let co_options = neo_frizbee::Config {
             max_typos: Some(2),
             ..options
         };
-        let matches = neo_frizbee::match_list("co", &[path], &co_options);
+        let matches = neo_frizbee::Matcher::new("co", &co_options).match_list(&[path]);
         assert!(!matches.is_empty(), "'co' should match the path");
     }
 
@@ -1520,14 +1514,14 @@ mod filename_bonus_tests {
 
         let options = neo_frizbee::Config {
             max_typos: Some(2),
-            sort: false,
+            sort: neo_frizbee::SortStrategy::Unsorted,
             ..Default::default()
         };
 
-        let matches = neo_frizbee::match_list("co", &[path.as_str()], &options);
+        let matches = neo_frizbee::Matcher::new("co", &options).match_list(&[path.as_str()]);
         assert!(!matches.is_empty(), "'co' should match the lowercase path");
 
-        let matches = neo_frizbee::match_list("core", &[path.as_str()], &options);
+        let matches = neo_frizbee::Matcher::new("core", &options).match_list(&[path.as_str()]);
         assert!(
             !matches.is_empty(),
             "'core' should match the lowercase path"
