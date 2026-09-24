@@ -396,7 +396,7 @@ fn family_gates(repo_id: &str) -> Vec<Cell> {
         ("fff-core/src/background_watcher", "background_watcher.rs"),
         ("fff-core/src/path_utils", "path_utils.rs"),
         ("fff-query-parser", "fff-query-parser"),
-        ("Agents.md", "Agents.md"),
+        ("AGENTS.md", "AGENTS.md"),
     ];
     cases
         .into_iter()
