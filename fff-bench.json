@@ -1,0 +1,33 @@
+{
+  "adapter": {
+    "enable_content_indexing": false,
+    "enable_mmap_cache": false,
+    "score_breakdown": true,
+    "top_k_log": 10
+  },
+  "history": {
+    "directory": ".fff-bench/history",
+    "record": true
+  },
+  "repos": [
+    {
+      "id": "default",
+      "role": [
+        "gates",
+        "confirm",
+        "screen"
+      ],
+      "source": {
+        "kind": "path",
+        "path": ".fff-bench/cache/static-repo"
+      }
+    }
+  ],
+  "schema_version": 1,
+  "suite": "agent-screen",
+  "workflow": {
+    "confirm_suite": "agent-confirm",
+    "diagnose_suite": "peak-diagnose",
+    "screen_suite": "agent-screen"
+  }
+}
