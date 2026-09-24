@@ -579,6 +579,11 @@ where
     let prefilter_strong = ctx.total_files > 0 && files_to_search.len() * 2 < ctx.total_files;
     let max_chunk = if prefilter_strong {
         base_chunk
+    } else if page_limit > 0 && page_limit <= 256 {
+        // Weak prefilter + small page: keep chunks modest so a page that fills
+        // early does not still open/read thousands of leftover files in an
+        // oversized chunk (families: io, cpu).
+        (base_chunk * 4).max(256)
     } else {
         (base_chunk * 256).max(8 * 1024)
     };
