@@ -202,17 +202,11 @@ impl FrecencyTracker {
                 db: Self::LABEL,
                 source,
             })?;
-        let result = self
-            .db
-            .get(&rtxn, &key_hash)
-            .map_err(|source| Error::DbRead {
-                db: Self::LABEL,
-                source,
-            })?;
-        rtxn.commit().map_err(|source| Error::DbCommit {
+        let result = self.db.get(&rtxn, &key_hash).map_err(|source| Error::DbRead {
             db: Self::LABEL,
             source,
         })?;
+        drop(rtxn);
 
         Ok(result)
     }
@@ -241,6 +235,13 @@ impl FrecencyTracker {
         #[cfg(windows)]
         let path: &Path = canonical.as_deref().unwrap_or(path);
 
+        Self::path_hash_raw(path)
+    }
+
+    /// Hash a path without canonicalize. For scan-built absolute paths that
+    /// are already spelled consistently from `base_path` this avoids one
+    /// Windows `canonicalize` syscall per file (families: io, cpu).
+    pub fn path_hash_raw(path: &Path) -> Result<[u8; 32]> {
         let Some(key) = path.to_str() else {
             return Err(Error::InvalidPath(path.to_path_buf()));
         };
@@ -382,7 +383,37 @@ impl FrecencyTracker {
             .ok()
             .flatten()
             .unwrap_or_default();
+        self.score_accesses(&accesses, self.get_now(), mode)
+    }
 
+    /// Score a batch of precomputed path hashes with one LMDB read txn.
+    ///
+    /// Use [`Self::path_hash_raw`] for scan-built absolute paths so hydration
+    /// does not canonicalize every file on Windows.
+    pub fn get_access_scores_for_hashes(&self, hashes: &[[u8; 32]], mode: FFFMode) -> Vec<i64> {
+        let mut out = vec![0i64; hashes.len()];
+        if hashes.is_empty() {
+            return out;
+        }
+
+        let Ok(rtxn) = self.env.read_txn() else {
+            return out;
+        };
+        let now = self.get_now();
+        for (slot, hash) in out.iter_mut().zip(hashes.iter()) {
+            let Ok(accesses) = self.db.get(&rtxn, hash) else {
+                continue;
+            };
+            let Some(accesses) = accesses else {
+                continue;
+            };
+            *slot = self.score_accesses(&accesses, now, mode);
+        }
+        drop(rtxn);
+        out
+    }
+
+    fn score_accesses(&self, accesses: &VecDeque<u64>, now: u64, mode: FFFMode) -> i64 {
         if accesses.is_empty() {
             return 0;
         }
@@ -398,7 +429,6 @@ impl FrecencyTracker {
             MAX_HISTORY_DAYS
         };
 
-        let now = self.get_now();
         let mut total_frecency = 0.0;
 
         let cutoff_time = now.saturating_sub((max_history_days * SECONDS_PER_DAY) as u64);
@@ -480,6 +510,36 @@ mod tests {
     fn hashes_nonexistent_path_without_error() {
         let missing = Path::new("/this/path/definitely/does/not/exist/frecency_test_xyz");
         assert!(FrecencyTracker::path_to_hash_bytes(missing).is_ok());
+    }
+
+    #[test]
+    fn batch_scores_match_single_lookup() {
+        let dir = std::env::temp_dir().join(format!("fff-frecency-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracker = FrecencyTracker::open(&dir).unwrap();
+
+        let a = Path::new("/tmp/fff_batch_a.rs");
+        let b = Path::new("/tmp/fff_batch_b.rs");
+        let now = tracker.get_now();
+        tracker.track_access(a).unwrap();
+
+        let hashes = [
+            FrecencyTracker::path_hash_raw(a).unwrap(),
+            FrecencyTracker::path_hash_raw(b).unwrap(),
+        ];
+        let batch = tracker.get_access_scores_for_hashes(&hashes, FFFMode::Neovim);
+        let single_a = tracker.get_access_score(a, FFFMode::Neovim);
+        let single_b = tracker.get_access_score(b, FFFMode::Neovim);
+        assert_eq!(batch.len(), 2);
+        // Single lookup canonicalizes on Windows; raw hash matches when the
+        // path spelling is already canonical (these temp paths are).
+        assert_eq!(batch[0], single_a);
+        assert_eq!(batch[1], single_b);
+        assert!(batch[0] > 0);
+        assert_eq!(batch[1], 0);
+        let _ = now;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn calculate_test_frecency_score(access_timestamps: &[u64], current_time: u64) -> i64 {
