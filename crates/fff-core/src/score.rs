@@ -698,7 +698,9 @@ fn match_and_score_in_arena<'a>(
                 .match_list_parallel(
                     &filename_strs,
                     if path_matches.len() > 4096 {
-                        context.max_threads.div_ceil(2048)
+                        // Was max_threads.div_ceil(2048), which is 1 for any
+                        // realistic pool and left 4T filename fallback serial.
+                        context.max_threads.clamp(1, 8)
                     } else {
                         1
                     },

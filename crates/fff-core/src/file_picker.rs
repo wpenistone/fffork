@@ -1109,12 +1109,12 @@ impl FilePicker {
             _ => query.raw_query.trim(),
         };
 
-        // Tiny queries are too small to amortize Rayon dispatch on modest
-        // indexes; on large indexes keep a small pool so closed-loop burst
-        // throughput does not collapse to one thread.
+        // Tiny queries are too small to amortize Rayon dispatch when the
+        // caller asked for a small pool. Never override an explicit request
+        // for 3+ threads — that collapsed 4T parallel efficiency.
         let max_threads = if options.max_threads == 1
-            || (effective_query.len() <= 1 && options.max_threads <= 4)
-            || (effective_query.len() <= 2 && options.max_threads <= 2 && total_files < 20_000)
+            || (effective_query.len() <= 1 && options.max_threads <= 2)
+            || (effective_query.len() <= 2 && options.max_threads == 2 && total_files < 20_000)
         {
             1
         } else if options.max_threads == 0 {
