@@ -160,8 +160,10 @@ impl ChunkedString {
         let start_chunk = fname_offset / SIMD_CHUNK_BYTES;
         let offset_in_chunk = fname_offset % SIMD_CHUNK_BYTES;
 
-        if offset_in_chunk == 0 && fname_len <= SIMD_CHUNK_BYTES {
-            let ptr = arena.chunk_ptr(indices[start_chunk]);
+        // Borrow when the filename fits in the remainder of its first chunk,
+        // including the common mid-chunk start after a directory prefix.
+        if offset_in_chunk + fname_len <= SIMD_CHUNK_BYTES {
+            let ptr = unsafe { arena.chunk_ptr(indices[start_chunk]).add(offset_in_chunk) };
             let slice = unsafe { core::slice::from_raw_parts(ptr, fname_len) };
             return Cow::Borrowed(unsafe { core::str::from_utf8_unchecked(slice) });
         }
