@@ -49,6 +49,21 @@ pub(crate) fn walk_collect_files(
         local_count: usize,
     }
 
+    impl<'a> FffVisitor<'a> {
+        fn flush_local(&mut self) {
+            if self.local_pairs.is_empty() && self.local_dirs.is_empty() {
+                return;
+            }
+            let mut guard = self.collected.lock();
+            guard.0.append(&mut self.local_pairs);
+            guard.1.append(&mut self.local_dirs);
+            drop(guard);
+            self.synced_files_count
+                .fetch_add(self.local_count, Ordering::Relaxed);
+            self.local_count = 0;
+        }
+    }
+
     impl<'a> ignore::ParallelVisitor for FffVisitor<'a> {
         fn visit(&mut self, result: Result<ignore::DirEntry, ignore::Error>) -> ignore::WalkState {
             let Ok(entry) = result else {
@@ -70,6 +85,12 @@ pub(crate) fn walk_collect_files(
 
                 self.local_pairs.push((file_item, rel_path));
                 self.local_count += 1;
+                // Flush before the local batch grows unbounded under bursty
+                // closed-loop walkers, so the final append is not one huge
+                // critical section and peak RSS stays flatter.
+                if self.local_pairs.len() >= 512 {
+                    self.flush_local();
+                }
             } else if entry.depth() > 0 && entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 let path = entry.path();
                 if !is_git_file(path)
@@ -87,14 +108,7 @@ pub(crate) fn walk_collect_files(
 
     impl<'a> Drop for FffVisitor<'a> {
         fn drop(&mut self) {
-            if self.local_pairs.is_empty() && self.local_dirs.is_empty() {
-                return;
-            }
-            let mut guard = self.collected.lock();
-            guard.0.append(&mut self.local_pairs);
-            guard.1.append(&mut self.local_dirs);
-            self.synced_files_count
-                .fetch_add(self.local_count, Ordering::Relaxed);
+            self.flush_local();
         }
     }
 
