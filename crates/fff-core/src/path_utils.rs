@@ -82,27 +82,43 @@ pub fn expand_tilde(path: &str) -> PathBuf {
 /// `candidate_dir` is the directory portion of the candidate path (e.g. `"src/components/"`).
 /// It may have a trailing `/` which is stripped internally.
 ///
-/// Zero-allocation: walks both directory part iterators in lockstep.
+/// Zero-allocation: byte walks both directory part iterators in lockstep.
 pub fn calculate_distance_penalty(current_file: Option<&str>, candidate_dir: &str) -> i32 {
     let Some(current_path) = current_file else {
         return 0;
     };
-
-    let current_dir = Path::new(current_path).parent().unwrap_or(Path::new(""));
-    let candidate = Path::new(candidate_dir);
-
-    if current_dir == candidate {
+    if candidate_dir.is_empty() {
         return 0;
     }
 
-    let mut current_parts = current_dir.components();
-    let mut candidate_parts = candidate.components();
+    let current_bytes = current_path.as_bytes();
+    let cand_bytes = candidate_dir.as_bytes();
+
+    let current_dir_bytes = match current_bytes.iter().rposition(|&b| b == b'/' || b == b'\\') {
+        Some(pos) => &current_bytes[..pos],
+        None => b"",
+    };
+    let cand_trimmed = match cand_bytes.iter().rposition(|&b| b != b'/' && b != b'\\') {
+        Some(pos) => &cand_bytes[..=pos],
+        None => b"",
+    };
+
+    if current_dir_bytes == cand_trimmed {
+        return 0;
+    }
+
+    let mut current_parts = current_dir_bytes
+        .split(|&b| b == b'/' || b == b'\\')
+        .filter(|s| !s.is_empty());
+    let mut cand_parts = cand_trimmed
+        .split(|&b| b == b'/' || b == b'\\')
+        .filter(|s| !s.is_empty());
 
     let mut common_len = 0usize;
     let mut current_total = 0usize;
 
     loop {
-        match (current_parts.next(), candidate_parts.next()) {
+        match (current_parts.next(), cand_parts.next()) {
             (Some(a), Some(b)) => {
                 current_total += 1;
                 if a == b {
