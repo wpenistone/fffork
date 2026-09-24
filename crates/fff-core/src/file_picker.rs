@@ -244,8 +244,8 @@ impl FileSync {
             let dir_idx = dir_idx as u32;
             let cmp_key = |f: &FileItem| {
                 f.parent_dir_index.cmp(&dir_idx).then_with(|| {
-                    let fname = f.path.filename_cow(arena.arena_for(f));
-                    fname.as_ref().cmp(filename)
+                    let fname = f.file_name(arena);
+                    fname.as_str().cmp(filename)
                 })
             };
 
@@ -2211,7 +2211,7 @@ impl FileSync {
                     .cmp(&!is_indexable(b))
                     // this just makes it faster in terms of allocation - we store the dir indexes
                     .then_with(|| a.parent_dir_index.cmp(&b.parent_dir_index))
-                    .then_with(|| a.path.filename_cow(arena.arena_for(a)).cmp(&b.path.filename_cow(arena.arena_for(b))))
+                    .then_with(|| a.file_name(arena).cmp(&b.file_name(arena)))
             });
         });
         let indexable_count = files.partition_point(is_indexable);
