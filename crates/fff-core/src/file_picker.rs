@@ -244,8 +244,8 @@ impl FileSync {
             let dir_idx = dir_idx as u32;
             let cmp_key = |f: &FileItem| {
                 f.parent_dir_index.cmp(&dir_idx).then_with(|| {
-                    let fname = f.file_name(arena);
-                    fname.as_str().cmp(filename)
+                    let fname = f.path.filename_cow(arena.arena_for(f));
+                    fname.as_ref().cmp(filename)
                 })
             };
 
@@ -540,6 +540,20 @@ impl FileItem {
             tracker.get_modification_score(self.modified, self.git_status, mode) as i16;
 
         Ok(())
+    }
+
+    /// Assign precomputed access score (scan hydration batch path).
+    pub(crate) fn set_access_frecency_score(&mut self, access_score: i64) {
+        self.access_frecency_score = access_score as i16;
+    }
+
+    pub(crate) fn set_modification_frecency_score(
+        &mut self,
+        tracker: &FrecencyTracker,
+        mode: FFFMode,
+    ) {
+        self.modification_frecency_score =
+            tracker.get_modification_score(self.modified, self.git_status, mode) as i16;
     }
 }
 
@@ -1095,8 +1109,12 @@ impl FilePicker {
             _ => query.raw_query.trim(),
         };
 
+        // Tiny queries are too small to amortize Rayon dispatch on modest
+        // indexes; on large indexes keep a small pool so closed-loop burst
+        // throughput does not collapse to one thread.
         let max_threads = if options.max_threads == 1
-            || (options.max_threads <= 2 && effective_query.len() <= 2)
+            || (effective_query.len() <= 1 && options.max_threads <= 4)
+            || (effective_query.len() <= 2 && options.max_threads <= 2 && total_files < 20_000)
         {
             1
         } else if options.max_threads == 0 {
@@ -2147,18 +2165,35 @@ impl FileSync {
         if let Some(frecency) = frecency.as_ref()
             && !frecency.is_empty()
         {
+            // Batch hydration: hash all scan-built absolute paths (no
+            // per-file canonicalize), one LMDB read txn, then assign.
+            let hashes: Vec<[u8; 32]> = BACKGROUND_THREAD_POOL.install(|| {
+                files
+                    .par_iter()
+                    .map(|file| {
+                        let mut abs_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+                        let abs = file.write_absolute_path(arena, base_path, &mut abs_buf);
+                        FrecencyTracker::path_hash_raw(abs).unwrap_or([0u8; 32])
+                    })
+                    .collect()
+            });
+            let scores = frecency.get_access_scores_for_hashes(&hashes, mode);
             let dirs_ref = &dirs;
             BACKGROUND_THREAD_POOL.install(|| {
-                files.par_iter_mut().for_each(|file| {
-                    let _ = file.update_frecency_scores(frecency, arena, base_path, mode);
-                    let score = file.access_frecency_score as i32;
-                    if score > 0 {
-                        let dir_idx = file.parent_dir_index as usize;
-                        if let Some(dir) = dirs_ref.get(dir_idx) {
-                            dir.update_frecency_if_larger(score);
+                files
+                    .par_iter_mut()
+                    .zip(scores)
+                    .for_each(|(file, access_score)| {
+                        file.set_access_frecency_score(access_score);
+                        file.set_modification_frecency_score(frecency, mode);
+                        let score = file.access_frecency_score as i32;
+                        if score > 0 {
+                            let dir_idx = file.parent_dir_index as usize;
+                            if let Some(dir) = dirs_ref.get(dir_idx) {
+                                dir.update_frecency_if_larger(score);
+                            }
                         }
-                    }
-                });
+                    });
             });
         }
         drop(frecency);
@@ -2176,7 +2211,7 @@ impl FileSync {
                     .cmp(&!is_indexable(b))
                     // this just makes it faster in terms of allocation - we store the dir indexes
                     .then_with(|| a.parent_dir_index.cmp(&b.parent_dir_index))
-                    .then_with(|| a.file_name(arena).cmp(&b.file_name(arena)))
+                    .then_with(|| a.path.filename_cow(arena.arena_for(a)).cmp(&b.path.filename_cow(arena.arena_for(b))))
             });
         });
         let indexable_count = files.partition_point(is_indexable);
