@@ -843,12 +843,33 @@ fn normalize_byte_scalar(b: u8) -> u8 {
 /// in `0..src.len()`. Inlined-scalar so LLVM auto-vectorises with the
 /// build's baseline SIMD; on x86_64 we runtime-dispatch to AVX2.
 /// Caller guarantees `dst.len() >= src.len()`.
+/// Cache CPUID once. `is_x86_feature_detected!` is not free on every call.
+#[inline(always)]
+fn has_avx2_cached() -> bool {
+    #[cfg(target_feature = "avx2")]
+    {
+        true
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        static HAS_AVX2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static INIT_AVX2: std::sync::Once = std::sync::Once::new();
+        INIT_AVX2.call_once(|| {
+            HAS_AVX2.store(
+                std::is_x86_feature_detected!("avx2"),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        });
+        HAS_AVX2.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 #[inline(always)]
 fn normalize_bytes(src: &[u8], dst: &mut [u8]) {
     debug_assert!(dst.len() >= src.len());
     #[cfg(target_arch = "x86_64")]
     {
-        if std::is_x86_feature_detected!("avx2") {
+        if has_avx2_cached() {
             unsafe { normalize_bytes_avx2(src, dst) };
             return;
         }
