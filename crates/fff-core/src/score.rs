@@ -236,25 +236,38 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
 }
 
 fn char_indices_to_byte_offsets(line: &str, char_indices: &[u32]) -> SmallVec<[(u32, u32); 4]> {
-    let char_byte_ranges: Vec<(usize, usize)> = line
-        .char_indices()
-        .map(|(byte_pos, ch)| (byte_pos, byte_pos + ch.len_utf8()))
-        .collect();
-    let mut result: SmallVec<[(u32, u32); 4]> = SmallVec::with_capacity(char_indices.len());
+    // Single forward scan: map requested char indices to byte ranges without
+    // materializing a full per-char table.
+    if char_indices.is_empty() {
+        return SmallVec::new();
+    }
+    let mut wanted: SmallVec<[u32; 4]> = SmallVec::from_slice(char_indices);
+    wanted.sort_unstable();
+    wanted.dedup();
 
-    for &char_idx in char_indices {
-        let Some(&(start, end)) = char_byte_ranges.get(char_idx as usize) else {
-            continue;
-        };
-
-        if let Some(last) = result.last_mut()
-            && last.1 == start as u32
-        {
-            last.1 = end as u32;
-            continue;
+    let mut result: SmallVec<[(u32, u32); 4]> = SmallVec::with_capacity(wanted.len());
+    let mut next_char = 0u32;
+    let mut wi = 0usize;
+    for (byte_pos, ch) in line.char_indices() {
+        if wi >= wanted.len() {
+            break;
         }
-
-        result.push((start as u32, end as u32));
+        if next_char == wanted[wi] {
+            let start = byte_pos as u32;
+            let end = (byte_pos + ch.len_utf8()) as u32;
+            if let Some(last) = result.last_mut()
+                && last.1 == start
+            {
+                last.1 = end;
+            } else {
+                result.push((start, end));
+            }
+            wi += 1;
+            while wi < wanted.len() && wanted[wi] == next_char {
+                wi += 1;
+            }
+        }
+        next_char += 1;
     }
 
     result
@@ -791,14 +804,15 @@ fn match_and_score_in_arena<'a>(
                 calculate_current_file_penalty(file, base_score / 4, context, arena);
             let combo_match_boost = {
                 let last_same_query_match = context.last_same_query_match.as_ref().filter(|m| {
-                    let file_path_str = m.file_path.to_string_lossy();
+                    // to_string_lossy once per scoring pass via outer cache would
+                    // need a lifetime; compare via bytes on the Path instead.
+                    let last_bytes = m.file_path.as_os_str().as_encoded_bytes();
                     let total_len = file.path.byte_len as usize;
-                    if file_path_str.len() < total_len {
+                    if last_bytes.len() < total_len {
                         return false;
                     }
-                    // Reuse dir_buf (already has capacity) for the full path
                     file.write_relative_path_from_arena(arena, &mut dir_buf);
-                    file_path_str.ends_with(dir_buf.as_str())
+                    last_bytes.ends_with(dir_buf.as_bytes())
                 });
 
                 match last_same_query_match {
