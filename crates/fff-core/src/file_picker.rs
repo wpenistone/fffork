@@ -2098,6 +2098,15 @@ pub struct ScanProgress {
 
 impl FileSync {
     pub(crate) fn discover_git_workdir(base_path: &Path) -> Option<PathBuf> {
+        // `discover` walks ancestors. A corpus staged under another repo
+        // (e.g. .fff-bench/cache/...) would inherit that parent git and
+        // change hidden/gitignore indexing vs a Temp freeze. Prefer the
+        // repo at base_path itself; otherwise keep monorepo-subdir behavior.
+        if base_path.join(".git").exists() {
+            return Repository::open(base_path)
+                .ok()
+                .and_then(|r| r.workdir().map(|w| crate::path_utils::normalize(w.to_path_buf())));
+        }
         let git_workdir = Repository::discover(base_path)
             .ok()
             .and_then(|repo| repo.workdir().map(Path::to_path_buf))
@@ -2185,36 +2194,43 @@ impl FileSync {
         if let Some(frecency) = frecency.as_ref()
             && !frecency.is_empty()
         {
-            // Batch hydration: hash all scan-built absolute paths (no
-            // per-file canonicalize), one LMDB read txn, then assign.
-            let hashes: Vec<[u8; 32]> = crate::parallelism::run_on_bg_pool(|| {
-                files
-                    .par_iter()
-                    .map(|file| {
-                        let mut abs_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-                        let abs = file.write_absolute_path(arena, base_path, &mut abs_buf);
-                        FrecencyTracker::path_hash_raw(abs).unwrap_or([0u8; 32])
-                    })
-                    .collect()
-            });
-            let scores = frecency.get_access_scores_for_hashes(&hashes, mode);
-            let dirs_ref = &dirs;
-            crate::parallelism::run_on_bg_pool(|| {
-                files
-                    .par_iter_mut()
-                    .zip(scores)
-                    .for_each(|(file, access_score)| {
-                        file.set_access_frecency_score(access_score);
-                        file.set_modification_frecency_score(frecency, mode);
-                        let score = file.access_frecency_score as i32;
-                        if score > 0 {
-                            let dir_idx = file.parent_dir_index as usize;
-                            if let Some(dir) = dirs_ref.get(dir_idx) {
-                                dir.update_frecency_if_larger(score);
+            // Batch hydration in chunks: one LMDB read txn per chunk, no
+            // per-file canonicalize. Chunking bounds peak RSS and page-fault
+            // churn on 200k+ trees (4T fault spikes in paired runs).
+            const FREQ_CHUNK: usize = 8 * 1024;
+            let mut offset = 0;
+            while offset < files.len() {
+                let end = (offset + FREQ_CHUNK).min(files.len());
+                let hashes: Vec<[u8; 32]> = crate::parallelism::run_on_bg_pool(|| {
+                    files[offset..end]
+                        .par_iter()
+                        .map(|file| {
+                            let mut abs_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+                            let abs = file.write_absolute_path(arena, base_path, &mut abs_buf);
+                            FrecencyTracker::path_hash_raw(abs).unwrap_or([0u8; 32])
+                        })
+                        .collect()
+                });
+                let scores = frecency.get_access_scores_for_hashes(&hashes, mode);
+                let dirs_ref = &dirs;
+                crate::parallelism::run_on_bg_pool(|| {
+                    files[offset..end]
+                        .par_iter_mut()
+                        .zip(scores)
+                        .for_each(|(file, access_score)| {
+                            file.set_access_frecency_score(access_score);
+                            file.set_modification_frecency_score(frecency, mode);
+                            let score = file.access_frecency_score as i32;
+                            if score > 0 {
+                                let dir_idx = file.parent_dir_index as usize;
+                                if let Some(dir) = dirs_ref.get(dir_idx) {
+                                    dir.update_frecency_if_larger(score);
+                                }
                             }
-                        }
-                    });
-            });
+                        });
+                });
+                offset = end;
+            }
         }
         drop(frecency);
 
