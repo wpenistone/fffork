@@ -1197,6 +1197,10 @@ pub(crate) fn sniff_binary_for_non_indexable(
             return;
         }
 
+        // Extension-classified binaries are already settled — do not reopen them.
+        if file.is_binary() {
+            continue;
+        }
         // check only the files that we are able to grep
         if file.size == 0 || file.size > constants::MAX_FFFILE_SIZE {
             continue;

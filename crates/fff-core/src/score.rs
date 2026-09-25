@@ -808,7 +808,7 @@ fn match_and_score_in_arena<'a>(
             };
             let git_recency_boost = file.git_recency_score as i32;
 
-            if context.current_file.is_some() || context.last_same_query_match.is_some() {
+            if context.current_file.is_some() {
                 file.write_dir_str(arena, &mut dir_buf);
             }
 

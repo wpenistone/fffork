@@ -583,7 +583,15 @@ impl FileItem {
             return;
         };
 
+        // Contract (see BINARY_CLASSIFICATION_CHUNK_SIZE): NUL in the first
+        // filesystem block settles classification. Never read the rest of a
+        // text file to EOF — that was tens of GB of extra I/O on 200k trees.
+        const MAX_SNIFF_CHUNKS: usize = 2;
+        let mut chunks_read = 0usize;
         loop {
+            if chunks_read >= MAX_SNIFF_CHUNKS {
+                break;
+            }
             match file.read(chunk) {
                 Ok(0) => break,
                 Err(e) => {
@@ -591,6 +599,7 @@ impl FileItem {
                     break;
                 }
                 Ok(n) => {
+                    chunks_read += 1;
                     if detect_binary_content(&chunk[..n]) {
                         self.set_binary(true);
                         break;

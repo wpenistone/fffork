@@ -2241,15 +2241,10 @@ impl FileSync {
                 && f.size <= crate::constants::MAX_INDEXABLE_FILE_SIZE as u64
         };
 
-        crate::parallelism::run_on_bg_pool(|| {
-            files.par_sort_unstable_by(|a, b| {
-                (!is_indexable(a))
-                    .cmp(&!is_indexable(b))
-                    // this just makes it faster in terms of allocation - we store the dir indexes
-                    .then_with(|| a.parent_dir_index.cmp(&b.parent_dir_index))
-                    .then_with(|| a.file_name(arena).cmp(&b.file_name(arena)))
-            });
-        });
+        // Previous pass already ordered by (dir, file). Only need a stable
+        // partition so non-indexable files land at the end without allocating
+        // Strings per comparison (that was ~8M mallocs on a 227k tree).
+        files.sort_by_key(|f| !is_indexable(f));
         let indexable_count = files.partition_point(is_indexable);
 
         // Ask the allocator to return freed pages to the OS.
@@ -2260,7 +2255,7 @@ impl FileSync {
         let dir_table_bytes = dirs.len() * std::mem::size_of::<DirItem>()
             + dirs
                 .iter()
-                .map(|d| d.relative_path(arena).len())
+                .map(|d| d.path.byte_len as usize)
                 .sum::<usize>();
 
         let total_time = scan_start.elapsed();
