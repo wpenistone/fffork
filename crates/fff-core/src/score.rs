@@ -713,7 +713,6 @@ fn match_and_score_in_arena<'a>(
 
     let mut next_filename_match_cursor = 0;
     let mut dir_buf = String::with_capacity(64);
-    let mut fname_buf = String::with_capacity(32);
     let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
 
     let results: Vec<_> = path_matches
@@ -767,8 +766,9 @@ fn match_and_score_in_arena<'a>(
 
             let is_exact_filename = simd_filename_match.is_some_and(|m| m.exact)
                 || (end_col_filename_match && main_needle_len as usize == fname_len && {
-                    file.write_file_name_from_arena(arena, &mut fname_buf);
-                    main_needle.eq_ignore_ascii_case(fname_buf.as_bytes())
+                    // Borrowed filename when it fits one chunk — no String write.
+                    let fname = file.path.filename_cow(arena);
+                    main_needle.eq_ignore_ascii_case(fname.as_bytes())
                 });
 
             let mut has_special_filename_bonus = false;
@@ -789,10 +789,10 @@ fn match_and_score_in_arena<'a>(
                     max_bonus
                 }
             } else if !is_filename_match && (5..=11).contains(&fname_len) {
-                file.write_file_name_from_arena(arena, &mut fname_buf);
+                let fname = file.path.filename_cow(arena);
                 // 5% bonus for special file but not as much as file name to avoid situations
                 // when you have /user_service/server.rs and /user_service/server/mod.rs
-                if is_special_entry_point_file(&fname_buf) {
+                if is_special_entry_point_bytes(fname.as_bytes()) {
                     has_special_filename_bonus = true;
                     base_score * 5 / 100
                 } else {
@@ -902,25 +902,30 @@ fn match_and_score_in_arena<'a>(
 }
 
 fn is_special_entry_point_file(filename: &str) -> bool {
+    is_special_entry_point_bytes(filename.as_bytes())
+}
+
+/// Byte compare avoids materializing a `String` per scored match.
+fn is_special_entry_point_bytes(filename: &[u8]) -> bool {
     matches!(
         filename,
-        "mod.rs"
-            | "lib.rs"
-            | "main.rs"
-            | "index.js"
-            | "index.jsx"
-            | "index.ts"
-            | "index.tsx"
-            | "index.mjs"
-            | "index.cjs"
-            | "index.vue"
-            | "__init__.py"
-            | "__main__.py"
-            | "main.go"
-            | "main.c"
-            | "index.php"
-            | "main.rb"
-            | "index.rb"
+        b"mod.rs"
+            | b"lib.rs"
+            | b"main.rs"
+            | b"index.js"
+            | b"index.jsx"
+            | b"index.ts"
+            | b"index.tsx"
+            | b"index.mjs"
+            | b"index.cjs"
+            | b"index.vue"
+            | b"__init__.py"
+            | b"__main__.py"
+            | b"main.go"
+            | b"main.c"
+            | b"index.php"
+            | b"main.rb"
+            | b"index.rb"
     )
 }
 
