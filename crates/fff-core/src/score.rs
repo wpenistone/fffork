@@ -115,10 +115,11 @@ fn match_fuzzy_parts(
         return vec![];
     }
 
+    let max_path = working_files.max_path_len();
     let threads = effective_match_threads(
         working_files.len(),
         valid_parts[0].len(),
-        working_files.max_path_len(),
+        max_path,
         options.max_typos,
         max_threads,
     );
@@ -151,7 +152,7 @@ fn match_fuzzy_parts(
         let sub_threads = effective_match_threads(
             survivors.len(),
             part.len(),
-            working_files.max_path_len(),
+            max_path,
             part_options.max_typos,
             max_threads,
         );
