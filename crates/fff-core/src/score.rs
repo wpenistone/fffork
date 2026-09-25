@@ -787,14 +787,29 @@ fn match_and_score_in_arena<'a>(
         }
     };
 
-    let mut next_filename_match_cursor = 0;
-    let mut dir_buf = String::with_capacity(64);
-    let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+    // Map filename-fallback hits by path-match index so the scoring loop can
+    // be parallel without a sequential cursor. `fallback_indices` is strictly
+    // increasing (build order); the fallback match list is sorted by it.
+    let mut fallback_hit: Vec<Option<(bool, i32)>> = vec![None; path_matches.len()];
+    for m in &filename_fallback_matches {
+        let mi = fallback_indices[m.index as usize] as usize;
+        if mi < fallback_hit.len() {
+            fallback_hit[mi] = Some((m.exact, m.score as i32));
+        }
+    }
 
-    let results: Vec<_> = path_matches
-        .into_iter()
-        .enumerate()
-        .map(|(match_idx, path_match)| {
+    let results: Vec<_> = crate::parallelism::run_on_bg_pool(|| {
+        path_matches
+            .par_iter()
+            .enumerate()
+            .map_init(
+                || {
+                    (
+                        String::with_capacity(64),
+                        [0u8; crate::simd_path::PATH_BUF_SIZE],
+                    )
+                },
+                |(dir_buf, path_buf), (match_idx, path_match)| {
             let file_idx = path_match.index as usize;
             let file = working_files.index(file_idx);
 
@@ -809,11 +824,11 @@ fn match_and_score_in_arena<'a>(
             let git_recency_boost = file.git_recency_score as i32;
 
             if context.current_file.is_some() {
-                file.write_dir_str(arena, &mut dir_buf);
+                file.write_dir_str(arena, dir_buf);
             }
 
             let distance_penalty = if context.current_file.is_some() {
-                calculate_distance_penalty(context.current_file, &dir_buf)
+                calculate_distance_penalty(context.current_file, dir_buf)
             } else {
                 0
             };
@@ -823,16 +838,7 @@ fn match_and_score_in_arena<'a>(
 
             let end_col_filename_match = match_start_approx >= filename_start;
             let simd_filename_match = if !end_col_filename_match {
-                filename_fallback_matches
-                    .get(next_filename_match_cursor)
-                    .and_then(|m| {
-                        if fallback_indices[m.index as usize] == match_idx as u32 {
-                            next_filename_match_cursor += 1;
-                            Some(m)
-                        } else {
-                            None
-                        }
-                    })
+                fallback_hit.get(match_idx).copied().flatten()
             } else {
                 None
             };
@@ -840,7 +846,7 @@ fn match_and_score_in_arena<'a>(
             let is_filename_match = end_col_filename_match || simd_filename_match.is_some();
             let fname_len = file.path.byte_len as usize - file.path.filename_offset as usize;
 
-            let is_exact_filename = simd_filename_match.is_some_and(|m| m.exact)
+            let is_exact_filename = simd_filename_match.is_some_and(|(exact, _)| exact)
                 || (end_col_filename_match && main_needle_len as usize == fname_len && {
                     // Borrowed filename when it fits one chunk — no String write.
                     let fname = file.path.filename_cow(arena);
@@ -857,9 +863,9 @@ fn match_and_score_in_arena<'a>(
                 // like "rename" in "rename.ts" gets the full bonus, while a scattered
                 // subsequence like r-e-n-a-m-e in "generateSessionName.ts" gets much less.
                 let max_bonus = (base_score / 6).min(30);
-                if let Some(fm) = simd_filename_match {
+                if let Some((_, fm_score)) = simd_filename_match {
                     let max_possible = main_needle_len as i32 * 16;
-                    let quality = (fm.score as i32).min(max_possible);
+                    let quality = fm_score.min(max_possible);
                     max_bonus * quality / max_possible
                 } else {
                     max_bonus
@@ -889,7 +895,7 @@ fn match_and_score_in_arena<'a>(
                     if last_bytes.len() < total_len {
                         return false;
                     }
-                    file.write_relative_path_from_arena(arena, &mut dir_buf);
+                    file.write_relative_path_from_arena(arena, dir_buf);
                     last_bytes.ends_with(dir_buf.as_bytes())
                 });
 
@@ -908,7 +914,7 @@ fn match_and_score_in_arena<'a>(
             // Uses suffix overlap — bytes matching from the end. A full prefix
             // match is just the 100% coverage case, so no separate branch needed.
             let path_alignment_bonus = if query_contains_path_separator {
-                let rel_path = file.path.read_to_buf(arena, &mut path_buf);
+                let rel_path = file.path.read_to_buf(arena, path_buf);
                 let path_bytes = rel_path.as_bytes();
                 let common_suffix = main_needle
                     .iter()
@@ -971,9 +977,10 @@ fn match_and_score_in_arena<'a>(
             };
 
             (file, score)
-        })
-        .collect();
-
+                },
+            )
+            .collect::<Vec<_>>()
+    });
     results
 }
 
