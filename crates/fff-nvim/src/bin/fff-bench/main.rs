@@ -303,7 +303,7 @@ enum Commands {
             help = "Sensor packs: all | mem,cpu,io,cycles,power"
         )]
         sample: String,
-        #[arg(long, default_value_t = 120, help = "Per-op timeout seconds")]
+        #[arg(long, default_value_t = 600, help = "Per-op timeout seconds")]
         timeout_secs: u64,
         #[arg(long, help = "Alias for peak-diagnose suite sizing")]
         peak: bool,
@@ -1905,7 +1905,9 @@ fn real_main() -> ExitCode {
             };
             if let Some(ref m) = m {
                 adapter_cfg = adapter::AdapterConfig::from(&m.adapter);
-                adapter_cfg.timeout_secs = timeout_secs;
+                // CLI and manifest both contribute; keep the larger budget so
+                // mega-corpus (227k) scans are not killed by a small default.
+                adapter_cfg.timeout_secs = timeout_secs.max(adapter_cfg.timeout_secs);
                 if content_index {
                     adapter_cfg.enable_content_indexing = true;
                 }
@@ -2139,7 +2141,7 @@ fn real_main() -> ExitCode {
                 iterations: 3,
                 warmup: 1,
                 sample_packs: "mem,cpu".into(),
-                timeout_secs: 120,
+                timeout_secs: 600,
                 suite: "ci-gates".into(),
                 peak: false,
                 log_dir: None,

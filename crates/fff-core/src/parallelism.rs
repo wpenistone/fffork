@@ -82,3 +82,17 @@ pub static SEARCH_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
         .build()
         .expect("failed to create search rayon pool")
 });
+
+/// Run `f` on `BACKGROUND_THREAD_POOL` unless we are already inside a rayon
+/// worker. Nested `install()` from a pool worker deadlocks on large scans
+/// (the spawn task occupies a worker while `install` waits for workers).
+pub fn run_on_bg_pool<R>(f: impl FnOnce() -> R + Send) -> R
+where
+    R: Send,
+{
+    if rayon::current_thread_index().is_some() {
+        f()
+    } else {
+        BACKGROUND_THREAD_POOL.install(f)
+    }
+}

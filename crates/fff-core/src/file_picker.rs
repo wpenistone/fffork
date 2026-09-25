@@ -581,6 +581,10 @@ pub struct FilePickerOptions {
     /// Ranking boost for files that participated in recent commits of the
     /// current branch. Enabled with default limits unless overridden.
     pub git_recency: GitRecencyConfig,
+    /// Do not discover .git, run git status, or apply git recency. Worktree
+    /// search only — required for mega-corpus benches (sumo_fork has a 2.7GB
+    /// .git that is not a search corpus).
+    pub skip_git: bool,
 }
 
 impl Default for FilePickerOptions {
@@ -596,6 +600,7 @@ impl Default for FilePickerOptions {
             enable_fs_root_scanning: false,
             enable_home_dir_scanning: false,
             git_recency: GitRecencyConfig::default(),
+            skip_git: false,
         }
     }
 }
@@ -620,6 +625,7 @@ pub struct FilePicker {
     enable_fs_root_scanning: bool,
     enable_home_dir_scanning: bool,
     git_recency_config: GitRecencyConfig,
+    skip_git: bool,
     trace_span: tracing::Span,
     trace_id: String,
 }
@@ -701,6 +707,10 @@ impl FilePicker {
 
     pub fn home_dir_scanning_enabled(&self) -> bool {
         self.enable_home_dir_scanning
+    }
+
+    pub fn skips_git(&self) -> bool {
+        self.skip_git
     }
 
     pub fn git_recency_config(&self) -> GitRecencyConfig {
@@ -944,6 +954,7 @@ impl FilePicker {
             enable_fs_root_scanning: options.enable_fs_root_scanning,
             enable_home_dir_scanning: options.enable_home_dir_scanning,
             git_recency_config: options.git_recency,
+            skip_git: options.skip_git,
             trace_span,
             trace_id,
         })
@@ -973,6 +984,7 @@ impl FilePicker {
         let follow_symlinks = picker.follow_symlinks;
         let enable_fs_root_scanning = picker.enable_fs_root_scanning;
         let enable_home_dir_scanning = picker.enable_home_dir_scanning;
+        let skip_git = picker.skip_git;
 
         let signals = picker.scan_signals();
         let scanned_files_counter = picker.scanned_files_counter();
@@ -1015,6 +1027,7 @@ impl FilePicker {
                 follow_symlinks,
                 enable_fs_root_scanning,
                 enable_home_dir_scanning,
+                skip_git,
             },
         )
         .spawn();
@@ -1034,7 +1047,11 @@ impl FilePicker {
         self.signals.scanning.store(true, Ordering::Relaxed);
         self.scanned_files_count.store(0, Ordering::Relaxed);
 
-        let git_workdir = FileSync::discover_git_workdir(&self.base_path);
+        let git_workdir = if self.skip_git {
+            None
+        } else {
+            FileSync::discover_git_workdir(&self.base_path)
+        };
         let git_handle = git_workdir.clone().map(FileSync::spawn_git_status);
 
         let empty_frecency = SharedFrecency::default();
@@ -2136,7 +2153,7 @@ impl FileSync {
         let ignore_rules = ignore_rules.map(Arc::new);
 
         // group walked dirs and files with a dir part to the same order
-        BACKGROUND_THREAD_POOL.install(|| {
+        crate::parallelism::run_on_bg_pool(|| {
             rayon::join(
                 || {
                     pairs.par_sort_unstable_by(|(a, path_a), (b, path_b)| {
@@ -2170,7 +2187,7 @@ impl FileSync {
         {
             // Batch hydration: hash all scan-built absolute paths (no
             // per-file canonicalize), one LMDB read txn, then assign.
-            let hashes: Vec<[u8; 32]> = BACKGROUND_THREAD_POOL.install(|| {
+            let hashes: Vec<[u8; 32]> = crate::parallelism::run_on_bg_pool(|| {
                 files
                     .par_iter()
                     .map(|file| {
@@ -2182,7 +2199,7 @@ impl FileSync {
             });
             let scores = frecency.get_access_scores_for_hashes(&hashes, mode);
             let dirs_ref = &dirs;
-            BACKGROUND_THREAD_POOL.install(|| {
+            crate::parallelism::run_on_bg_pool(|| {
                 files
                     .par_iter_mut()
                     .zip(scores)
@@ -2208,7 +2225,7 @@ impl FileSync {
                 && f.size <= crate::constants::MAX_INDEXABLE_FILE_SIZE as u64
         };
 
-        BACKGROUND_THREAD_POOL.install(|| {
+        crate::parallelism::run_on_bg_pool(|| {
             files.par_sort_unstable_by(|a, b| {
                 (!is_indexable(a))
                     .cmp(&!is_indexable(b))

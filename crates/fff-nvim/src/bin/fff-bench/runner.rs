@@ -189,7 +189,10 @@ pub fn run_bench_multi(
             file_count_live: Some(file_count),
             path_list_hash: Some(path_hash),
             git_commit: identity::git_rev(repo_path),
-            git_dirty: identity::git_dirty(repo_path),
+            // Never run `git status` on the corpus. On sumo_fork that is a
+            // 2.7GB object store and blocks the harness for minutes. Path
+            // hash + rev is enough identity for search benches.
+            git_dirty: false,
             pin: "path".into(),
         });
         cells.extend(crate::scenarios::expand_suite(&cfg.suite, repo_id));

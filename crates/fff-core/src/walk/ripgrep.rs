@@ -73,8 +73,7 @@ pub(crate) fn walk_collect_files(
             if entry.file_type().is_some_and(|ft| ft.is_file()) {
                 let path = entry.path();
 
-                // Ignore walkers sometimes surface files inside `.git/`
-                // when the base is itself a git repo — skip them.
+                // Match July walker: filter .git files, do not touch dirs here.
                 if is_git_file(path) {
                     return ignore::WalkState::Continue;
                 }
@@ -85,19 +84,10 @@ pub(crate) fn walk_collect_files(
 
                 self.local_pairs.push((file_item, rel_path));
                 self.local_count += 1;
-                // Flush before the local batch grows unbounded under bursty
-                // closed-loop walkers, so the final append is not one huge
-                // critical section and peak RSS stays flatter.
-                if self.local_pairs.len() >= 512 {
-                    self.flush_local();
-                }
             } else if entry.depth() > 0 && entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 let path = entry.path();
-                // Never descend into `.git/` — object stores are huge (multi-GB)
-                // and are not searchable paths. `hidden(!is_git_repo)` still
-                // allows other dot-dirs (.github, .config).
                 if is_git_file(path) {
-                    return ignore::WalkState::Skip;
+                    return ignore::WalkState::Continue;
                 }
                 if let Ok(rel) = path.strip_prefix(&self.base_path)
                 {

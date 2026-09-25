@@ -177,8 +177,8 @@ impl FffAdapter {
                 enable_content_indexing: cfg.enable_content_indexing,
                 mode: FFFMode::Neovim,
                 watch,
-                // Bench measures search, not git metadata. Recency/status on
-                // multi-GB .git repos is unbounded and pollutes wall/cycles.
+                // Worktree search only. .git is not a search corpus.
+                skip_git: true,
                 git_recency: fff::git_recency::GitRecencyConfig {
                     enabled: false,
                     max_commits: 0,

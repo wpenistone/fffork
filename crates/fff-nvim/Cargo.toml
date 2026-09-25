@@ -51,6 +51,10 @@ uuid = { version = "1", features = ["v4"] }
 name = "fff-bench"
 path = "src/bin/fff-bench/main.rs"
 
+[[bin]]
+name = "fff-profile-driver"
+path = "src/bin/fff-profile-driver.rs"
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = { version = "0.8", features = ["small_rng"] }
