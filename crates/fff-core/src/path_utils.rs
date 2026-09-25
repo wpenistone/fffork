@@ -150,6 +150,67 @@ pub fn calculate_distance_penalty(current_file: Option<&str>, candidate_dir: &st
 mod tests {
     use super::*;
 
+    /// Reference implementation using `Path::components` (July / upstream
+    /// semantics). Used to catch byte-walk scoring drift (checksum mismatches).
+    fn penalty_via_components(current_file: Option<&str>, candidate_dir: &str) -> i32 {
+        let Some(current_path) = current_file else {
+            return 0;
+        };
+        let current_dir = Path::new(current_path).parent().unwrap_or(Path::new(""));
+        let candidate = Path::new(candidate_dir);
+        if current_dir == candidate {
+            return 0;
+        }
+        let mut current_parts = current_dir.components();
+        let mut candidate_parts = candidate.components();
+        let mut common_len = 0usize;
+        let mut current_total = 0usize;
+        loop {
+            match (current_parts.next(), candidate_parts.next()) {
+                (Some(a), Some(b)) => {
+                    current_total += 1;
+                    if a == b {
+                        common_len += 1;
+                    } else {
+                        current_total += current_parts.count();
+                        break;
+                    }
+                }
+                (Some(_), None) => {
+                    current_total += 1 + current_parts.count();
+                    break;
+                }
+                (None, _) => break,
+            }
+        }
+        let depth = current_total - common_len;
+        if depth == 0 {
+            0
+        } else {
+            (-(depth as i32)).max(-20)
+        }
+    }
+
+    #[test]
+    fn byte_walk_matches_path_components() {
+        let cases: &[(Option<&str>, &str)] = &[
+            (Some("examples/user/test/main.rs"), "examples/user/test/"),
+            (Some("examples/user/test/subdir/file.rs"), "examples/user/test/"),
+            (Some("crates/fff-core/src/score.rs"), "crates/fff-core/src/"),
+            (Some("crates/fff-core/src/score.rs"), "score/"),
+            (Some("src/score.rs"), "src/"),
+            (Some("score.rs"), "score/"),
+            (Some("a/b/c/d/e.rs"), "a/b/"),
+            (Some("main.rs"), ""),
+            (Some("dir/file.rs"), "other/"),
+        ];
+        for (cur, cand) in cases {
+            let a = calculate_distance_penalty(*cur, cand);
+            let b = penalty_via_components(*cur, cand);
+            assert_eq!(a, b, "penalty mismatch cur={cur:?} cand={cand:?}");
+        }
+    }
+
     #[test]
     #[cfg(not(target_family = "windows"))]
     fn test_calculate_distance_penalty() {
