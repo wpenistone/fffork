@@ -984,10 +984,6 @@ fn match_and_score_in_arena<'a>(
     results
 }
 
-fn is_special_entry_point_file(filename: &str) -> bool {
-    is_special_entry_point_bytes(filename.as_bytes())
-}
-
 /// Byte compare avoids materializing a `String` per scored match.
 fn is_special_entry_point_bytes(filename: &[u8]) -> bool {
     matches!(

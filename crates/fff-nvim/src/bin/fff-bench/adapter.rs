@@ -575,6 +575,7 @@ mod tests {
             enable_mmap_cache: false,
             score_breakdown: true,
             top_k_log: 3,
+            timeout_secs: None,
         };
         let c = AdapterConfig::from(&m);
         assert!(c.enable_content_indexing);
