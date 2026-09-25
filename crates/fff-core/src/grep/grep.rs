@@ -457,6 +457,10 @@ fn grep_search_parsed<'a>(
 /// preserved as-is (escaped backslash + literal `n`, e.g. `\\nvim-data`).
 pub(super) fn replace_newline_escapes(text: &str) -> Option<(String, usize)> {
     let bytes = text.as_bytes();
+    // Most queries have no backslash escape — skip the Vec entirely.
+    if !bytes.contains(&b'\\') {
+        return None;
+    }
     let mut result = Vec::with_capacity(bytes.len());
     let mut first_newline_pos: Option<usize> = None;
     let mut i = 0;

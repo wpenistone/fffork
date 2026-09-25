@@ -811,10 +811,22 @@ impl FileItem {
         }
 
         let len = self.size as usize;
-        buf.resize(len, 0);
+        // Avoid memset-fill of `len` before read_exact overwrites it.
+        buf.clear();
+        buf.reserve(len);
 
-        let mut file = std::fs::File::open(&abs).ok()?;
-        file.read_exact(buf).ok()?;
+        let mut file = match std::fs::File::open(&abs) {
+            Ok(f) => f,
+            Err(_) => return None,
+        };
+        // SAFETY: read_exact writes every reserved byte or we truncate.
+        unsafe {
+            buf.set_len(len);
+        }
+        if file.read_exact(buf).is_err() {
+            buf.clear();
+            return None;
+        }
         Some(buf.as_slice())
     }
 }
