@@ -40,6 +40,9 @@ pub(crate) struct ScanConfig {
     pub(crate) follow_symlinks: bool,
     pub(crate) enable_fs_root_scanning: bool,
     pub(crate) enable_home_dir_scanning: bool,
+    /// Skip all git discovery/status/recency. Bench and search-only workloads
+    /// should never touch .git (multi-GB object stores are not search paths).
+    pub(crate) skip_git: bool,
 }
 
 /// A fully-configured scan job ready to run on a background thread.
@@ -93,6 +96,7 @@ impl ScanJob {
             follow_symlinks: picker.follows_symlinks(),
             enable_fs_root_scanning: picker.fs_root_scanning_enabled(),
             enable_home_dir_scanning: picker.home_dir_scanning_enabled(),
+            skip_git: picker.skips_git(),
         };
 
         drop(guard); // just a sanity check
@@ -165,7 +169,11 @@ impl ScanJob {
         scanned_files_counter.store(0, Ordering::Relaxed);
 
         // 1. Walk the file system and collect the list of files
-        let git_workdir = FileSync::discover_git_workdir(&base_path);
+        let git_workdir = if config.skip_git {
+            None
+        } else {
+            FileSync::discover_git_workdir(&base_path)
+        };
         let sync = match FileSync::walk_filesystem(
             &base_path,
             git_workdir.clone(),
