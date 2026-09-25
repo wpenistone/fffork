@@ -27,6 +27,24 @@ impl<'a> FileItems<'a> {
     }
 
     #[inline]
+    fn max_path_len(&self) -> usize {
+        let mut m = 0usize;
+        match self {
+            FileItems::All(s) => {
+                for f in s.iter() {
+                    m = m.max(f.path.byte_len as usize);
+                }
+            }
+            FileItems::Filtered(v) => {
+                for f in v.iter() {
+                    m = m.max(f.path.byte_len as usize);
+                }
+            }
+        }
+        m
+    }
+
+    #[inline]
     fn index(&self, index: usize) -> &'a FileItem {
         match self {
             FileItems::All(s) => &s[index],
@@ -50,6 +68,34 @@ fn resolve_file_chunks(
     Some((ptrs.len(), file.path.byte_len))
 }
 
+/// Thread dispatch only pays off past ~1k candidates; below that it adds
+/// latency. Scale by estimated DP work so 1T stays 1T and 4T is used when
+/// the corpus is large enough (keeps 4T efficiency honest).
+const MATCH_WORK_PER_THREAD: usize = 200_000;
+
+fn effective_match_threads(
+    item_count: usize,
+    needle_len: usize,
+    max_haystack_len: usize,
+    max_typos: Option<u16>,
+    max_threads: usize,
+) -> usize {
+    if item_count < 1024 {
+        return 1;
+    }
+    let selectivity = match max_typos {
+        Some(t) if t >= 3 => 25,
+        Some(_) => 50,
+        None => 100,
+    };
+    let work = (item_count as u64)
+        .saturating_mul(needle_len.max(1) as u64)
+        .saturating_mul(max_haystack_len.min(512).div_ceil(16).max(1) as u64)
+        .saturating_mul(selectivity)
+        / 100;
+    (work.div_ceil(MATCH_WORK_PER_THREAD as u64) as usize).clamp(1, max_threads.max(1))
+}
+
 #[inline]
 fn match_fuzzy_parts(
     fuzzy_parts: &[&str],
@@ -69,6 +115,14 @@ fn match_fuzzy_parts(
         return vec![];
     }
 
+    let threads = effective_match_threads(
+        working_files.len(),
+        valid_parts[0].len(),
+        working_files.max_path_len(),
+        options.max_typos,
+        max_threads,
+    );
+
     // Index-based resolver: no `Vec<&FileItem>` materialization for either the
     // full list or the per-part subsets, and a single monomorphized hot loop.
     let first_part_matches = neo_frizbee::match_range_parallel_resolved(
@@ -78,7 +132,7 @@ fn match_fuzzy_parts(
             resolve_file_chunks(working_files.index(index as usize), arena, buf)
         },
         options,
-        max_threads,
+        threads,
     );
 
     if valid_parts.len() == 1 {
@@ -94,6 +148,13 @@ fn match_fuzzy_parts(
         // Match only the files that survived the previous round, addressed
         // through the previous matches without collecting a subset.
         let survivors = &matches;
+        let sub_threads = effective_match_threads(
+            survivors.len(),
+            part.len(),
+            working_files.max_path_len(),
+            part_options.max_typos,
+            max_threads,
+        );
         let sub_matches = neo_frizbee::match_range_parallel_resolved(
             part,
             survivors.len(),
@@ -102,11 +163,11 @@ fn match_fuzzy_parts(
                 resolve_file_chunks(file, arena, buf)
             },
             &part_options,
-            max_threads,
+            sub_threads,
         );
 
         if sub_matches.is_empty() {
-            return vec![]; // break early! 
+            return vec![]; // break early!
         }
 
         // Map sub_matches back to original indices, average scores across all parts.
@@ -336,6 +397,13 @@ fn match_fuzzy_parts_dirs(
         return vec![];
     }
 
+    let dir_threads = effective_match_threads(
+        working_dirs.len(),
+        valid_parts[0].len(),
+        256,
+        options.max_typos,
+        max_threads,
+    );
     let first_part_matches = neo_frizbee::match_range_parallel_resolved(
         valid_parts[0],
         working_dirs.len(),
@@ -343,7 +411,7 @@ fn match_fuzzy_parts_dirs(
             resolve_dir_chunks(working_dirs[index as usize], arena, overflow_arena, buf)
         },
         options,
-        max_threads,
+        dir_threads,
     );
 
     if valid_parts.len() == 1 {
@@ -359,6 +427,13 @@ fn match_fuzzy_parts_dirs(
         // Match only the dirs that survived the previous round, addressed
         // through the previous matches without collecting a subset.
         let survivors = &matches;
+        let sub_dir_threads = effective_match_threads(
+            survivors.len(),
+            part.len(),
+            256,
+            part_options.max_typos,
+            max_threads,
+        );
         let sub_matches = neo_frizbee::match_range_parallel_resolved(
             part,
             survivors.len(),
@@ -367,7 +442,7 @@ fn match_fuzzy_parts_dirs(
                 resolve_dir_chunks(dir, arena, overflow_arena, buf)
             },
             &part_options,
-            max_threads,
+            sub_dir_threads,
         );
 
         if sub_matches.is_empty() {
