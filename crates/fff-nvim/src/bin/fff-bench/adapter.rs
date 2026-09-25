@@ -30,7 +30,8 @@ impl Default for AdapterConfig {
             enable_mmap_cache: false,
             score_breakdown: true,
             top_k_log: 10,
-            timeout_secs: 120,
+            // Mega-corpus (sumo_fork ~227k) cold scan exceeds 120s on Windows.
+            timeout_secs: 600,
             mode: "neovim".into(),
         }
     }
@@ -43,7 +44,7 @@ impl From<&AdapterManifest> for AdapterConfig {
             enable_mmap_cache: m.enable_mmap_cache,
             score_breakdown: m.score_breakdown,
             top_k_log: m.top_k_log.max(1),
-            timeout_secs: 120,
+            timeout_secs: m.timeout_secs.unwrap_or(600),
             mode: "neovim".into(),
         }
     }
@@ -176,6 +177,13 @@ impl FffAdapter {
                 enable_content_indexing: cfg.enable_content_indexing,
                 mode: FFFMode::Neovim,
                 watch,
+                // Bench measures search, not git metadata. Recency/status on
+                // multi-GB .git repos is unbounded and pollutes wall/cycles.
+                git_recency: fff::git_recency::GitRecencyConfig {
+                    enabled: false,
+                    max_commits: 0,
+                    max_files_per_commit: 0,
+                },
                 ..Default::default()
             },
         )

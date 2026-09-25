@@ -1056,6 +1056,10 @@ impl FilePicker {
             self.cache_budget.reset();
         }
 
+        // Files are searchable before git status/recency finish. Joining those
+        // here blocked `scanning=false` for minutes on multi-GB .git repos.
+        self.signals.scanning.store(false, Ordering::Relaxed);
+
         if let Some(handle) = git_handle
             && let Ok(Some(git_cache)) = handle.join()
         {
@@ -1080,7 +1084,6 @@ impl FilePicker {
             self.apply_git_recency(recency.as_ref());
         }
 
-        self.signals.scanning.store(false, Ordering::Relaxed);
         Ok(())
     }
 

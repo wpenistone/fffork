@@ -93,8 +93,13 @@ pub(crate) fn walk_collect_files(
                 }
             } else if entry.depth() > 0 && entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 let path = entry.path();
-                if !is_git_file(path)
-                    && let Ok(rel) = path.strip_prefix(&self.base_path)
+                // Never descend into `.git/` — object stores are huge (multi-GB)
+                // and are not searchable paths. `hidden(!is_git_repo)` still
+                // allows other dot-dirs (.github, .config).
+                if is_git_file(path) {
+                    return ignore::WalkState::Skip;
+                }
+                if let Ok(rel) = path.strip_prefix(&self.base_path)
                 {
                     let mut rel = crate::path_utils::to_canonical_slashes(&rel.to_string_lossy())
                         .into_owned();

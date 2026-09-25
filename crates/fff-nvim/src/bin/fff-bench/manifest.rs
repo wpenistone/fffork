@@ -82,6 +82,9 @@ pub struct AdapterManifest {
     pub score_breakdown: bool,
     #[serde(default = "default_top_k")]
     pub top_k_log: usize,
+    /// Scan/watch wait budget in seconds (mega-corpus needs minutes).
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 fn default_true() -> bool {
