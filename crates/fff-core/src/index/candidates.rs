@@ -102,6 +102,58 @@ pub(crate) fn fuzzy_candidates(
     Some(add_all_modified(candidates, overlay))
 }
 
+/// Path-name fuzzy prefilter using the **search** typo budget.
+///
+/// Necessary condition (consecutive bigrams): `T` typos destroy at most `2T`
+/// adjacent bigrams, so at least `n - 2T` of the needle's bigrams appear in
+/// the path. Expressed over evenly spaced probes as OR of all
+/// `C(probes, required)` AND-branches (`required = probes - 2T`).
+/// Returns `None` when `required == 0` (too loose to filter).
+pub(crate) fn path_fuzzy_candidates(
+    index: Option<&BigramFilter>,
+    overlay: Option<&BigramOverlay>,
+    pattern: &str,
+    max_typos: u16,
+) -> Option<Vec<u64>> {
+    let index = ready_index(index)?;
+    // Insertions/deletions shift every later bigram, so "2T bigrams destroyed"
+    // is false for real typos. Only `max_typos == 0` admits a sound AND of
+    // consecutive needle bigrams. (score/file_picker_ use typos≥2 — no filter.)
+    if max_typos != 0 {
+        return None;
+    }
+    let lower: Vec<u8> = pattern.bytes().map(|b| b.to_ascii_lowercase()).collect();
+    if lower.len() < 2 {
+        return None;
+    }
+    let mut keys: Vec<u16> = Vec::new();
+    for w in lower.windows(2) {
+        if (32..=126).contains(&w[0]) && (32..=126).contains(&w[1]) {
+            keys.push(((w[0] as u16) << 8) | w[1] as u16);
+        }
+    }
+    if keys.is_empty() {
+        return None;
+    }
+    // AND every consecutive needle bigram — necessary for a typo-free fuzzy hit.
+    let mut result: Option<Vec<u64>> = None;
+    for &k in &keys {
+        let key_bytes = [(k >> 8) as u8, (k & 0xff) as u8];
+        let Some(col) = index.query(&key_bytes) else {
+            continue;
+        };
+        result = Some(match result {
+            None => col,
+            Some(mut a) => {
+                a.iter_mut().zip(col.iter()).for_each(|(x, y)| *x &= *y);
+                a
+            }
+        });
+    }
+    let result = result?;
+    Some(add_all_modified(result, overlay))
+}
+
 #[inline]
 fn ready_index(index: Option<&BigramFilter>) -> Option<&BigramFilter> {
     index.filter(|idx| idx.is_ready())

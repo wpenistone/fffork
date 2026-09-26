@@ -121,6 +121,9 @@ pub(crate) struct FileSync {
     overflow_builder: Option<crate::simd_path::ChunkedPathStoreBuilder>,
     bigram_index: Option<Arc<BigramFilter>>,
     bigram_overlay: Option<Arc<parking_lot::RwLock<BigramOverlay>>>,
+    /// Inverted bigram index over relative **paths** (not file contents).
+    /// Used to prefilter fuzzy file-name/path search before Smith-Waterman.
+    path_bigram_index: Option<Arc<BigramFilter>>,
     /// Chunk-level deduped path store. Arc so post-scan snapshots can hold
     /// the arena alive while iterating file paths.
     chunked_paths: Option<Arc<crate::simd_path::ChunkedPathStore>>,
@@ -143,6 +146,7 @@ impl FileSync {
             git_workdir: None,
             bigram_index: None,
             bigram_overlay: None,
+            path_bigram_index: None,
             chunked_paths: None,
             ignore_rules: None,
         }
@@ -1180,6 +1184,7 @@ impl FilePicker {
             combo_boost_score_multiplier: options.combo_boost_score_multiplier,
             min_combo_count: options.min_combo_count,
             pagination: options.pagination,
+            path_bigram: self.sync_data.path_bigram_index.as_deref(),
         };
 
         let time = std::time::Instant::now();
@@ -1253,6 +1258,7 @@ impl FilePicker {
             combo_boost_score_multiplier: 0,
             min_combo_count: 0,
             pagination: options.pagination,
+            path_bigram: self.sync_data.path_bigram_index.as_deref(),
         };
 
         let arena = self.sync_data.arena_base_ptr();
@@ -2295,9 +2301,25 @@ impl FileSync {
             git_workdir,
             bigram_index: None,
             bigram_overlay: None,
+            // Built lazily on first typo-0 fuzzy search (`ensure_path_bigram`)
+            // so scan peak RSS does not include the bigram builder slab.
+            path_bigram_index: None,
             chunked_paths: Some(Arc::new(chunked_paths)),
             ignore_rules,
         })
+    }
+
+    /// Build (once) the path bigram index used to prefilter typo-free fuzzy
+    /// queries. Deferred from scan so peak RSS does not include the builder
+    /// slab for workloads that never ask for a zero-typo filter.
+    pub(crate) fn ensure_path_bigram(&mut self) {
+        if self.path_bigram_index.is_some() {
+            return;
+        }
+        let files: &[FileItem] = &self.files;
+        let arena = self.arena_base_ptr();
+        let idx = crate::index::build_path_bigram_index(files, arena);
+        self.path_bigram_index = Some(Arc::new(idx));
     }
 }
 

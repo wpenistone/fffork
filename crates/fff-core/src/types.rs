@@ -904,6 +904,9 @@ pub struct ScoringContext<'a> {
     pub combo_boost_score_multiplier: i32,
     pub min_combo_count: u32,
     pub pagination: PaginationArgs,
+    /// Optional inverted bigram index over relative paths; used to prefilter
+    /// fuzzy candidates before Smith-Waterman.
+    pub path_bigram: Option<&'a crate::index::BigramFilter>,
 }
 
 impl ScoringContext<'_> {

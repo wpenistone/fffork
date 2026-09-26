@@ -1178,6 +1178,32 @@ pub(crate) fn build_bigram_index(
     index
 }
 
+/// Inverted bigram index over **relative path bytes** (not file contents).
+/// Built once per scan with zero disk I/O; used to reject hopeless fuzzy
+/// path candidates before Smith-Waterman.
+#[tracing::instrument(skip_all, name = "Building Path Bigram Index", level = tracing::Level::DEBUG)]
+pub(crate) fn build_path_bigram_index(
+    files: &[crate::types::FileItem],
+    arena: crate::simd_path::ArenaPtr,
+) -> BigramFilter {
+    let builder = BigramIndexBuilder::new(files.len());
+    let skip_builder = BigramIndexBuilder::new(files.len());
+    let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+
+    for (file_idx, file) in files.iter().enumerate() {
+        if file.is_deleted() {
+            continue;
+        }
+        let path = file.path.read_to_buf(arena, &mut path_buf);
+        builder.add_file_content(&skip_builder, file_idx, path.as_bytes());
+    }
+
+    let mut index = builder.compress(None);
+    // Skip-1 index doubles memory; path strings are short enough that the
+    // consecutive index is enough for the spaced-probe prefilter.
+    index
+}
+
 #[tracing::instrument(skip_all, name = "Sniffing Large Files Binary", level = tracing::Level::DEBUG)]
 pub(crate) fn sniff_binary_for_non_indexable(
     files: &[FileItem],

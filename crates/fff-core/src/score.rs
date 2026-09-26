@@ -233,6 +233,7 @@ fn match_fuzzy_parts(
     options: &neo_frizbee::Config,
     max_threads: usize,
     arena: ArenaPtr,
+    path_bigram: Option<&crate::index::BigramFilter>,
 ) -> Vec<neo_frizbee::Match> {
     let valid_parts: Vec<&str> = fuzzy_parts
         .iter()
@@ -264,17 +265,61 @@ fn match_fuzzy_parts(
 
     // Index-based resolver: no `Vec<&FileItem>` materialization for either the
     // full list or the per-part subsets, and a single monomorphized hot loop.
-    // (Byte-presence prefilter A/B'd: 0.84–0.89× vs upstream — frizbee’s own
-    // SIMD prefilter is already cheaper than an extra pass over every path.)
-    let first_part_matches = with_cached_matcher(valid_parts[0], options, |matcher| {
-        matcher.match_range_parallel_resolved(
-            working_files.len(),
-            &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
-                resolve_file_chunks(working_files.index(index as usize), arena, buf)
-            },
-            threads,
-        )
+    // Path bigram index rejects hopeless candidates before Smith-Waterman when
+    // the typo budget leaves a real constraint (`required = probes - 2*typos > 0`).
+    let cand_idxs: Option<Vec<u32>> = path_bigram.and_then(|idx| {
+        let bits = crate::index::path_fuzzy_candidates(
+            Some(idx),
+            None,
+            valid_parts[0],
+            options.max_typos.unwrap_or(0),
+        )?;
+        let mut idxs = Vec::new();
+        for (word_i, word) in bits.iter().enumerate() {
+            let mut w = *word;
+            while w != 0 {
+                let b = w.trailing_zeros() as usize;
+                w &= w - 1;
+                let fi = word_i * 64 + b;
+                if fi < working_files.len() {
+                    idxs.push(fi as u32);
+                }
+            }
+        }
+        Some(idxs)
     });
+
+    let first_part_matches = if let Some(survivors) = &cand_idxs {
+        let local = with_cached_matcher(valid_parts[0], options, |matcher| {
+            matcher.match_list_parallel_resolved(
+                survivors,
+                &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+                    resolve_file_chunks(working_files.index(*index as usize), arena, buf)
+                },
+                threads,
+            )
+        });
+        // match_list_* reports positions in `survivors`, not working_files.
+        local
+            .into_iter()
+            .map(|mut m| {
+                if let Some(&orig) = survivors.get(m.index as usize) {
+                    m.index = orig;
+                }
+                m
+            })
+            .collect()
+    } else {
+        with_cached_matcher(valid_parts[0], options, |matcher| {
+            matcher.match_range_parallel_resolved(
+                working_files.len(),
+                &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+                    resolve_file_chunks(working_files.index(index as usize), arena, buf)
+                },
+                threads,
+            )
+        })
+    };
 
     if valid_parts.len() == 1 {
         return first_part_matches;
@@ -951,6 +996,7 @@ fn match_and_score_in_arena<'a>(
                 &options,
                 context.max_threads,
                 arena,
+                context.path_bigram,
             );
             let matches_arc = Arc::new(matches);
             if let Some(((cache, _, _), key)) = raw_cache.zip(cache_key) {
@@ -1578,6 +1624,7 @@ mod tests {
             combo_boost_score_multiplier: 100,
             min_combo_count: 3,
 
+            path_bigram: None,
             pagination: PaginationArgs {
                 offset: 0,
                 limit: 0,
@@ -1630,6 +1677,7 @@ mod tests {
             combo_boost_score_multiplier: 100,
             min_combo_count: 3,
 
+            path_bigram: None,
             pagination: PaginationArgs {
                 offset: 0,
                 limit: 0,
@@ -1680,6 +1728,7 @@ mod tests {
             combo_boost_score_multiplier: 100,
             min_combo_count: 3,
 
+            path_bigram: None,
             pagination: PaginationArgs {
                 offset: 0,
                 limit: 0,
@@ -1768,6 +1817,7 @@ mod filename_bonus_tests {
             combo_boost_score_multiplier: 100,
             min_combo_count: 3,
 
+            path_bigram: None,
             pagination: PaginationArgs {
                 offset: 0,
                 limit: 100,
@@ -2010,6 +2060,7 @@ mod git_recency_scoring_tests {
             project_path: None,
             combo_boost_score_multiplier: 100,
             min_combo_count: 3,
+            path_bigram: None,
             pagination: PaginationArgs {
                 offset: 0,
                 limit: 100,
@@ -2099,6 +2150,7 @@ mod typo_resistance_tests {
             project_path: None,
             combo_boost_score_multiplier: 100,
             min_combo_count: 3,
+            path_bigram: None,
             pagination: PaginationArgs {
                 offset: 0,
                 limit: 100,
@@ -2207,6 +2259,7 @@ mod constraint_only_query_tests {
             project_path: None,
             combo_boost_score_multiplier: 100,
             min_combo_count: 3,
+            path_bigram: None,
             pagination: PaginationArgs {
                 offset: 0,
                 limit: 50,
@@ -2258,6 +2311,7 @@ mod constraint_only_query_tests {
             project_path: None,
             combo_boost_score_multiplier: 100,
             min_combo_count: 3,
+            path_bigram: None,
             pagination: PaginationArgs {
                 offset: 0,
                 limit: 50,
