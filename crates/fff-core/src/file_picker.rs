@@ -2244,7 +2244,28 @@ impl FileSync {
         // Previous pass already ordered by (dir, file). Only need a stable
         // partition so non-indexable files land at the end without allocating
         // Strings per comparison (that was ~8M mallocs on a 227k tree).
-        files.sort_by_key(|f| !is_indexable(f));
+        //
+        // `sort_by_key` is a stable merge sort and reserves O(n) scratch
+        // (~5MB on a 227k FileItem tree) which showed up as peak RSS. The
+        // key is a bool, so a stable compact does the same ordering in O(n)
+        // time and O(k) extra (k = non-indexable count). FileItem::clone is
+        // an 8-byte path-index copy.
+        {
+            let mut tail: Vec<FileItem> = Vec::new();
+            let mut write = 0usize;
+            for read in 0..files.len() {
+                if is_indexable(&files[read]) {
+                    if write != read {
+                        files[write] = files[read].clone();
+                    }
+                    write += 1;
+                } else {
+                    tail.push(files[read].clone());
+                }
+            }
+            files.truncate(write);
+            files.append(&mut tail);
+        }
         let indexable_count = files.partition_point(is_indexable);
 
         // Ask the allocator to return freed pages to the OS.

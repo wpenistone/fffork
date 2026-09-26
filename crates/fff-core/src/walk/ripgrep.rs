@@ -84,10 +84,19 @@ pub(crate) fn walk_collect_files(
 
                 self.local_pairs.push((file_item, rel_path));
                 self.local_count += 1;
+                // Flush before the local batch grows unbounded under bursty
+                // closed-loop walkers, so the final append is not one huge
+                // critical section and peak RSS stays flatter.
+                if self.local_pairs.len() >= 512 {
+                    self.flush_local();
+                }
             } else if entry.depth() > 0 && entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 let path = entry.path();
+                // Never descend into `.git/` — object stores are huge (multi-GB)
+                // and are not searchable paths. `hidden(!is_git_repo)` still
+                // allows other dot-dirs (.github, .config).
                 if is_git_file(path) {
-                    return ignore::WalkState::Continue;
+                    return ignore::WalkState::Skip;
                 }
                 if let Ok(rel) = path.strip_prefix(&self.base_path)
                 {
@@ -119,8 +128,8 @@ pub(crate) fn walk_collect_files(
                 collected: self.collected,
                 synced_files_count: self.synced_files_count,
                 base_path: self.base_path.clone(),
-                local_pairs: Vec::with_capacity(2048),
-                local_dirs: Vec::with_capacity(256),
+                local_pairs: Vec::with_capacity(512),
+                local_dirs: Vec::with_capacity(64),
                 local_count: 0,
             })
         }

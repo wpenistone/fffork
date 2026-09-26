@@ -522,3 +522,193 @@ fn regex_fallback_keeps_file_path_scope_issue_756() {
         "regex fallback must not leak outside the FilePath scope"
     );
 }
+
+/// Page-full early-stop must not change the first page: the match sequence
+/// returned for `page_limit = N` is byte-identical to the prefix of the
+/// unlimited search. Covers both the plain-text path (`perform_grep`) and the
+/// fuzzy path (`fuzzy_grep_search`).
+fn assert_page_identity<F>(label: &str, page_limit: usize, run: F)
+where
+    F: Fn(usize) -> Vec<(String, u64, usize, String)>,
+{
+    let unlimited = run(usize::MAX);
+    let page = run(page_limit);
+
+    assert!(
+        page.len() >= page_limit.min(unlimited.len()),
+        "{label}: page_limit={page_limit} returned {} matches, expected at least {}",
+        page.len(),
+        page_limit.min(unlimited.len())
+    );
+    assert!(
+        page.len() <= unlimited.len(),
+        "{label}: page has more matches ({}) than unlimited ({})",
+        page.len(),
+        unlimited.len()
+    );
+
+    // The page must be an exact prefix of the unlimited result (order + content).
+    for (i, (p, u)) in page.iter().zip(unlimited.iter()).enumerate() {
+        assert_eq!(
+            p, u,
+            "{label}: page_limit={page_limit} diverges from unlimited at match {i}"
+        );
+    }
+}
+
+#[test]
+fn plain_page_full_early_stop_preserves_first_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = crate::path_utils::canonicalize(dir.path()).unwrap();
+
+    // 40 files × 3 matches each = 120 matches. With page_limit=10 the page
+    // tips on an early file and the gate must skip later files without
+    // dropping any match from the first page.
+    for i in 0..40 {
+        let content = format!("hit {} alpha\nhit {} beta\nhit {} gamma\n", i, i, i);
+        std::fs::write(base.join(format!("f{:02}.txt", i)), content).unwrap();
+    }
+    // A few non-matching files between matches to exercise the prefix tracker
+    // across zero-match completions.
+    for i in 0..10 {
+        std::fs::write(base.join(format!("empty{}.txt", i)), "nothing here\n").unwrap();
+    }
+
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: base.to_str().unwrap().into(),
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+
+    let run = |page_limit: usize| -> Vec<(String, u64, usize, String)> {
+        let parsed = crate::grep::parse_grep_query("hit");
+        let result = picker.grep(
+            &parsed,
+            &crate::GrepSearchOptions {
+                page_limit,
+                max_matches_per_file: 200,
+                ..Default::default()
+            },
+        );
+        result
+            .matches
+            .iter()
+            .map(|m| {
+                let path = result.files[m.file_index].relative_path(&picker).to_string();
+                (path, m.line_number, m.col, m.line_content.clone())
+            })
+            .collect()
+    };
+
+    for &limit in &[1, 5, 10, 25, 50, 100] {
+        assert_page_identity("plain", limit, &run);
+    }
+}
+
+#[test]
+fn fuzzy_page_full_early_stop_preserves_first_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = crate::path_utils::canonicalize(dir.path()).unwrap();
+
+    // Identifiers the fuzzy matcher will rank; each file has two hits.
+    for i in 0..30 {
+        let content = format!(
+            "fn encode_frame_{i}() {{}}\nfn decode_frame_{i}() {{}}\n",
+            i = i
+        );
+        std::fs::write(base.join(format!("mod{i:02}.rs", i = i)), content).unwrap();
+    }
+    for i in 0..10 {
+        std::fs::write(base.join(format!("noise{i}.txt", i = i)), "unrelated\n").unwrap();
+    }
+
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: base.to_str().unwrap().into(),
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+
+    let run = |page_limit: usize| -> Vec<(String, u64, usize, String)> {
+        let parsed = crate::grep::parse_grep_query("encodeframe");
+        let result = picker.grep(
+            &parsed,
+            &crate::GrepSearchOptions {
+                mode: super::GrepMode::Fuzzy,
+                page_limit,
+                max_matches_per_file: 200,
+                ..Default::default()
+            },
+        );
+        result
+            .matches
+            .iter()
+            .map(|m| {
+                let path = result.files[m.file_index].relative_path(&picker).to_string();
+                (path, m.line_number, m.col, m.line_content.clone())
+            })
+            .collect()
+    };
+
+    for &limit in &[1, 3, 8, 20, 60] {
+        assert_page_identity("fuzzy", limit, &run);
+    }
+}
+
+/// Walk every page and confirm coverage + no duplicates: the early-stop must
+/// not strand matches between pages.
+#[test]
+fn plain_page_pagination_covers_all_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = crate::path_utils::canonicalize(dir.path()).unwrap();
+
+    for i in 0..25 {
+        std::fs::write(
+            base.join(format!("p{:02}.txt", i)),
+            format!("token {i} one\ntoken {i} two\n"),
+        )
+        .unwrap();
+    }
+
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: base.to_str().unwrap().into(),
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+
+    let parsed = crate::grep::parse_grep_query("token");
+    let mut opts = crate::GrepSearchOptions {
+        page_limit: 7,
+        max_matches_per_file: 200,
+        ..Default::default()
+    };
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut pages = 0;
+    loop {
+        let result = picker.grep(&parsed, &opts);
+        for m in &result.matches {
+            let key = format!(
+                "{}:{}:{}",
+                result.files[m.file_index].relative_path(&picker),
+                m.line_number,
+                m.line_content
+            );
+            assert!(!seen.contains(&key), "duplicate across pages: {key}");
+            seen.push(key);
+        }
+        pages += 1;
+        assert!(pages <= 40, "pagination did not terminate");
+        if result.next_file_offset == 0 {
+            break;
+        }
+        opts.file_offset = result.next_file_offset;
+    }
+
+    assert_eq!(seen.len(), 50, "expected 25 files × 2 matches = 50");
+}

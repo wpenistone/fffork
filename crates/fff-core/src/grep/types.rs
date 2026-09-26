@@ -1,7 +1,7 @@
 use crate::types::FileItem;
 use smallvec::SmallVec;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 pub use crate::constants::MAX_FFFILE_SIZE;
 
@@ -285,6 +285,111 @@ impl<'a> GrepResult<'a> {
             next_file_offset,
             regex_fallback_error: None,
             literal_fallback: false,
+        }
+    }
+}
+
+/// Ordered page-fill gate for the parallel chunk search.
+///
+/// Workers record each file's match count as they finish. A confirmed-prefix
+/// cursor advances only over the leading consecutive completed files, so
+/// `confirmed_matches` always equals the match count of local files
+/// `0..confirmed_len` in chunk order. Once that prefix plus the matches from
+/// earlier chunks already covers the page, `is_full()` latches true and later
+/// files are skipped: they sit after the tipping file in `(file_index, line)`
+/// order and cannot enter the current page.
+///
+/// Correctness (first page unchanged):
+/// - The serial consumer fills the page from chunk results in file order and
+///   stops at the first file where the cumulative match count reaches
+///   `page_limit`. Call that file `k`.
+/// - `is_full()` latches only when `base + confirmed_matches >= page_limit`
+///   and at least one confirmed file matched, so `k` lies strictly inside the
+///   confirmed prefix (`k < confirmed_len`) and has already been searched.
+/// - Every file skipped after the latch has `local_idx >= confirmed_len > k`,
+///   hence contributes matches only after the page is already full.
+/// - Interaction with abort (`first_skipped` / `resume_at`): the serial
+///   consumer drops results with global index `>= resume_at`. If the confirmed
+///   prefix stays below that boundary, `confirmed_matches` counts only real
+///   (non-dropped) matches and `k` is in the prefix. If the prefix crosses the
+///   boundary, then every file with global index `< resume_at` is already
+///   inside the prefix (done), so the consumer still sees all real matches;
+///   skipped files all have global index `>= resume_at` and would be dropped
+///   anyway. Either way the page is identical.
+pub(crate) struct PageFillGate {
+    /// `0` = pending, `n + 1` = completed with `n` matches. The `+ 1` shift
+    /// distinguishes "finished, zero matches" from "not started".
+    counts: Vec<AtomicU32>,
+    /// Number of leading local indices that have completed.
+    confirmed_len: AtomicUsize,
+    /// Sum of match counts over that confirmed prefix.
+    confirmed_matches: AtomicUsize,
+    /// Matches contributed by earlier chunks (already consumed into the page).
+    base_matches: usize,
+    page_limit: usize,
+    full: AtomicBool,
+}
+
+impl PageFillGate {
+    pub(crate) fn new(len: usize, base_matches: usize, page_limit: usize) -> Self {
+        Self {
+            counts: (0..len).map(|_| AtomicU32::new(0)).collect(),
+            confirmed_len: AtomicUsize::new(0),
+            confirmed_matches: AtomicUsize::new(0),
+            base_matches,
+            page_limit,
+            full: AtomicBool::new(false),
+        }
+    }
+
+    /// Whether the current page is provably full from lower-indexed files.
+    #[inline]
+    pub(crate) fn is_full(&self) -> bool {
+        self.full.load(Ordering::Relaxed)
+    }
+
+    /// Record that local file `local_idx` finished with `n` matches (`0` for
+    /// no-match, unreadable, prefiltered, or skipped files). Advances the
+    /// confirmed prefix and latches `full` once the page is covered.
+    pub(crate) fn record_done(&self, local_idx: usize, n: usize) {
+        // `n + 1` so "done with zero matches" is not confused with "pending".
+        self.counts[local_idx].store(n as u32 + 1, Ordering::Release);
+
+        let mut pos = self.confirmed_len.load(Ordering::Acquire);
+        loop {
+            if pos >= self.counts.len() {
+                break;
+            }
+            let c = self.counts[pos].load(Ordering::Acquire);
+            if c == 0 {
+                break;
+            }
+            // One worker claims each advance so the count is added exactly once.
+            match self.confirmed_len.compare_exchange(
+                pos,
+                pos + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.confirmed_matches
+                        .fetch_add(c as usize - 1, Ordering::Relaxed);
+                    pos += 1;
+                }
+                Err(actual) => pos = actual,
+            }
+        }
+
+        if !self.full.load(Ordering::Relaxed) {
+            let confirmed = self.confirmed_matches.load(Ordering::Acquire);
+            // Require at least one confirmed match so `page_limit == 0` still
+            // waits for the first hit (the serial consumer only fires after a
+            // matching file). For `page_limit > 0` the >= check already implies
+            // a hit when `base_matches < page_limit`.
+            let covered = self.base_matches.saturating_add(confirmed);
+            if confirmed > 0 && covered >= self.page_limit {
+                self.full.store(true, Ordering::Release);
+            }
         }
     }
 }

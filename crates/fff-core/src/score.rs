@@ -83,6 +83,9 @@ fn effective_match_threads(
     if item_count < 1024 {
         return 1;
     }
+    if max_threads <= 1 {
+        return 1;
+    }
     let selectivity = match max_typos {
         Some(t) if t >= 3 => 25,
         Some(_) => 50,
@@ -115,14 +118,22 @@ fn match_fuzzy_parts(
         return vec![];
     }
 
-    let max_path = working_files.max_path_len();
-    let threads = effective_match_threads(
-        working_files.len(),
-        valid_parts[0].len(),
-        max_path,
-        options.max_typos,
-        max_threads,
-    );
+    // max_path_len is O(n) over every FileItem; only worth it when it can
+    // change the thread count (1T and tiny sets always stay serial).
+    let mut cached_max_path: Option<usize> = None;
+    let threads = if max_threads <= 1 || working_files.len() < 1024 {
+        1
+    } else {
+        let max_path = working_files.max_path_len();
+        cached_max_path = Some(max_path);
+        effective_match_threads(
+            working_files.len(),
+            valid_parts[0].len(),
+            max_path,
+            options.max_typos,
+            max_threads,
+        )
+    };
 
     // Index-based resolver: no `Vec<&FileItem>` materialization for either the
     // full list or the per-part subsets, and a single monomorphized hot loop.
@@ -149,13 +160,18 @@ fn match_fuzzy_parts(
         // Match only the files that survived the previous round, addressed
         // through the previous matches without collecting a subset.
         let survivors = &matches;
-        let sub_threads = effective_match_threads(
-            survivors.len(),
-            part.len(),
-            max_path,
-            part_options.max_typos,
-            max_threads,
-        );
+        let sub_threads = if max_threads <= 1 || survivors.len() < 1024 {
+            1
+        } else {
+            let max_path = cached_max_path.unwrap_or_else(|| working_files.max_path_len());
+            effective_match_threads(
+                survivors.len(),
+                part.len(),
+                max_path,
+                part_options.max_typos,
+                max_threads,
+            )
+        };
         let sub_matches = neo_frizbee::match_range_parallel_resolved(
             part,
             survivors.len(),
@@ -788,28 +804,41 @@ fn match_and_score_in_arena<'a>(
     };
 
     // Map filename-fallback hits by path-match index so the scoring loop can
-    // be parallel without a sequential cursor. `fallback_indices` is strictly
+    // run without a sequential cursor. `fallback_indices` is strictly
     // increasing (build order); the fallback match list is sorted by it.
-    let mut fallback_hit: Vec<Option<(bool, i32)>> = vec![None; path_matches.len()];
-    for m in &filename_fallback_matches {
-        let mi = fallback_indices[m.index as usize] as usize;
-        if mi < fallback_hit.len() {
-            fallback_hit[mi] = Some((m.exact, m.score as i32));
+    // Skip the table entirely when nothing fell back — common on filename-hit
+    // queries like `file_picker_`.
+    let fallback_hit: Vec<Option<(bool, i32)>> = if filename_fallback_matches.is_empty() {
+        Vec::new()
+    } else {
+        let mut hit: Vec<Option<(bool, i32)>> = vec![None; path_matches.len()];
+        for m in &filename_fallback_matches {
+            let mi = fallback_indices[m.index as usize] as usize;
+            if mi < hit.len() {
+                hit[mi] = Some((m.exact, m.score as i32));
+            }
         }
-    }
+        hit
+    };
 
-    let results: Vec<_> = crate::parallelism::run_on_bg_pool(|| {
-        path_matches
-            .par_iter()
-            .enumerate()
-            .map_init(
-                || {
-                    (
-                        String::with_capacity(64),
-                        [0u8; crate::simd_path::PATH_BUF_SIZE],
-                    )
-                },
-                |(dir_buf, path_buf), (match_idx, path_match)| {
+    // Rayon dispatch + per-worker 4KB scratch costs more than scoring itself
+    // below a few thousand matches (file_picker_-class queries). Short
+    // high-match queries still fan out so the 200k-match path keeps its win.
+    const PARALLEL_SCORE_MIN: usize = 4096;
+
+    type ScoreScratch = (String, [u8; crate::simd_path::PATH_BUF_SIZE]);
+    let make_scratch = || {
+        (
+            String::with_capacity(64),
+            [0u8; crate::simd_path::PATH_BUF_SIZE],
+        )
+    };
+
+    let score_one = |scratch: &mut ScoreScratch,
+                     match_idx: usize,
+                     path_match: &neo_frizbee::Match|
+     -> (&'a FileItem, Score) {
+        let (dir_buf, path_buf) = scratch;
             let file_idx = path_match.index as usize;
             let file = working_files.index(file_idx);
 
@@ -977,10 +1006,26 @@ fn match_and_score_in_arena<'a>(
             };
 
             (file, score)
-                },
-            )
-            .collect::<Vec<_>>()
-    });
+    };
+
+    let results: Vec<_> = if path_matches.len() < PARALLEL_SCORE_MIN {
+        let mut scratch = make_scratch();
+        path_matches
+            .iter()
+            .enumerate()
+            .map(|(match_idx, path_match)| score_one(&mut scratch, match_idx, path_match))
+            .collect()
+    } else {
+        crate::parallelism::run_on_bg_pool(|| {
+            path_matches
+                .par_iter()
+                .enumerate()
+                .map_init(make_scratch, |scratch, (match_idx, path_match)| {
+                    score_one(scratch, match_idx, path_match)
+                })
+                .collect::<Vec<_>>()
+        })
+    };
     results
 }
 

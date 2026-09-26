@@ -1,7 +1,7 @@
 use super::prefilter::prefilter_with_filepath_retry;
 use super::regex::{RegexMatcher, RegexSink, build_regex};
 use super::sink::{SinkState, debug_assert_newline_terminator};
-use super::types::{GrepMatch, GrepMode, GrepResult, GrepSearchOptions};
+use super::types::{GrepMatch, GrepMode, GrepResult, GrepSearchOptions, PageFillGate};
 use crate::index::{
     BigramFilter, BigramOverlay, bigram_boundary, fuzzy_candidates, literal_candidates,
     regex_candidates,
@@ -565,6 +565,9 @@ where
     // Lowest index an abort skipped; everything below it was searched, so it is
     // the resume point for the next page. usize::MAX means no abort happened.
     let first_skipped = AtomicUsize::new(usize::MAX);
+    // `usize::MAX` means "collect everything" — no page can fill, so skip the
+    // per-chunk gate overhead entirely.
+    let gate_enabled = page_limit < usize::MAX;
 
     let mut result_files: Vec<&'a FileItem> = Vec::new();
     let mut all_matches: Vec<GrepMatch> = Vec::new();
@@ -605,6 +608,12 @@ where
         // Unless enforced, the budget stays dormant until something matched.
         let budget = time_budget.filter(|_| options.enforce_time_budget || all_matches.len() > 1);
 
+        // Per-chunk page-fill gate: workers skip later files once the ordered
+        // prefix of this chunk already covers the page (see PageFillGate docs).
+        let gate = gate_enabled.then(|| {
+            PageFillGate::new(chunk.len(), all_matches.len(), page_limit)
+        });
+
         let chunk_results: Vec<(usize, &'a FileItem, Vec<GrepMatch>)> = chunk
             .par_iter()
             .enumerate()
@@ -614,43 +623,57 @@ where
                 // scoped threads with a predefined local scratch buffers because of spawn cost
                 || (Vec::with_capacity(64 * 1024), MmapSlot::default(), false),
                 |(buf, mmap_slot, aborted), (local_idx, file)| {
-                    // check the clock on every 8th file only; `aborted` latches for the
-                    // rest of this worker's range. File 0 is never skipped so a page
-                    // always consumes at least one file (cursor 0 means "done").
                     let idx = chunk_offset + local_idx;
-                    if !*aborted && local_idx % 8 == 0 && idx > 0 {
-                        *aborted = ctx.abort_signal.load(Ordering::Relaxed)
-                            || budget.is_some_and(|b| search_start.elapsed() > b);
+                    let found = (|| -> Option<Vec<GrepMatch>> {
+                        // Page already full from lower-indexed files: skip. This
+                        // is not an abort, so `first_skipped` is untouched and
+                        // the resume cursor stays on the tipping file.
+                        if gate.as_ref().is_some_and(|g| g.is_full()) {
+                            return None;
+                        }
+                        // check the clock on every 8th file only; `aborted` latches for the
+                        // rest of this worker's range. File 0 is never skipped so a page
+                        // always consumes at least one file (cursor 0 means "done").
+                        if !*aborted && local_idx % 8 == 0 && idx > 0 {
+                            *aborted = ctx.abort_signal.load(Ordering::Relaxed)
+                                || budget.is_some_and(|b| search_start.elapsed() > b);
+                        }
+                        if *aborted {
+                            first_skipped.fetch_min(idx, Ordering::Relaxed);
+                            return None;
+                        }
+
+                        let content = file.get_content_for_search(
+                            buf,
+                            mmap_slot,
+                            ctx.arena_for_file(file),
+                            ctx.base_path,
+                            ctx.budget,
+                        )?;
+
+                        // Fast whole-file memmem check before entering the
+                        // grep-searcher machinery. Skips Vec alloc, Searcher
+                        // setup, and line-splitting for files that can't match.
+                        if let Some(pf) = ctx.prefilter
+                            && pf.find(content).is_none()
+                        {
+                            return None;
+                        }
+
+                        let file_matches = search_file(content, options.max_matches_per_file);
+
+                        if file_matches.is_empty() {
+                            return None;
+                        }
+
+                        Some(file_matches)
+                    })();
+
+                    if let Some(g) = &gate {
+                        g.record_done(local_idx, found.as_ref().map_or(0, Vec::len));
                     }
-                    if *aborted {
-                        first_skipped.fetch_min(idx, Ordering::Relaxed);
-                        return None;
-                    }
 
-                    let content = file.get_content_for_search(
-                        buf,
-                        mmap_slot,
-                        ctx.arena_for_file(file),
-                        ctx.base_path,
-                        ctx.budget,
-                    )?;
-
-                    // Fast whole-file memmem check before entering the
-                    // grep-searcher machinery. Skips Vec alloc, Searcher
-                    // setup, and line-splitting for files that can't match.
-                    if let Some(pf) = ctx.prefilter
-                        && pf.find(content).is_none()
-                    {
-                        return None;
-                    }
-
-                    let file_matches = search_file(content, options.max_matches_per_file);
-
-                    if file_matches.is_empty() {
-                        return None;
-                    }
-
-                    Some((idx, *file, file_matches))
+                    found.map(|m| (idx, *file, m))
                 },
             )
             .flatten()
