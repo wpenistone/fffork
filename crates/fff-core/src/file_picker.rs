@@ -2241,31 +2241,19 @@ impl FileSync {
                 && f.size <= crate::constants::MAX_INDEXABLE_FILE_SIZE as u64
         };
 
-        // Previous pass already ordered by (dir, file). Only need a stable
-        // partition so non-indexable files land at the end without allocating
-        // Strings per comparison (that was ~8M mallocs on a 227k tree).
-        //
-        // `sort_by_key` is a stable merge sort and reserves O(n) scratch
-        // (~5MB on a 227k FileItem tree) which showed up as peak RSS. The
-        // key is a bool, so a stable compact does the same ordering in O(n)
-        // time and O(k) extra (k = non-indexable count). FileItem::clone is
-        // an 8-byte path-index copy.
-        {
-            let mut tail: Vec<FileItem> = Vec::new();
-            let mut write = 0usize;
-            for read in 0..files.len() {
-                if is_indexable(&files[read]) {
-                    if write != read {
-                        files[write] = files[read].clone();
-                    }
-                    write += 1;
-                } else {
-                    tail.push(files[read].clone());
-                }
-            }
-            files.truncate(write);
-            files.append(&mut tail);
-        }
+        // Match upstream's (indexable, parent_dir, filename) order exactly.
+        // The O(n) compact is not enough: `par_sort_unstable_by` on
+        // file_name(arena) is not the same key as the walk-path sort, and
+        // downstream binary_search / match index maps assume this order.
+        // Thread-local scratch keeps the RSS win vs sort_by_key's O(n) temp.
+        BACKGROUND_THREAD_POOL.install(|| {
+            files.par_sort_unstable_by(|a, b| {
+                (!is_indexable(a))
+                    .cmp(&(!is_indexable(b)))
+                    .then_with(|| a.parent_dir_index.cmp(&b.parent_dir_index))
+                    .then_with(|| a.file_name(arena).cmp(&b.file_name(arena)))
+            });
+        });
         let indexable_count = files.partition_point(is_indexable);
 
         // Ask the allocator to return freed pages to the OS.

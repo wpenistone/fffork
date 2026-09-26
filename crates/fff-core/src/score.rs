@@ -10,34 +10,20 @@ use fff_query_parser::{FFFQuery, FuzzyQuery};
 use neo_frizbee::{Matcher, Scoring};
 use rayon::prelude::*;
 use smallvec::SmallVec;
-use std::cell::RefCell;
 use std::{borrow::Cow, path::MAIN_SEPARATOR};
 
-/// Reuse a `Matcher` across searches with the same needle+config. The free
-/// `neo_frizbee::match_range_parallel_resolved` builds a fresh Matcher every
-/// call (prefilter + SW kernels); typing hits that once per keystroke.
-thread_local! {
-    static MATCHER_CACHE: RefCell<Option<(String, neo_frizbee::Config, Matcher)>> =
-        const { RefCell::new(None) };
-}
-
+/// Build a frizbee `Matcher` for one search. Construction is not free
+/// (prefilter + SW kernels); a thread-local cache would be a typing win but
+/// 0.13.3 matcher reuse changed `total_matched` on linux `score` (checksum
+/// gate). Keep fresh construction until reuse is proven result-identical.
 #[inline]
 fn with_cached_matcher<R>(
     needle: &str,
     options: &neo_frizbee::Config,
     run: impl FnOnce(&mut Matcher) -> R,
 ) -> R {
-    MATCHER_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        let reusable = cache.as_ref().is_some_and(|(n, cfg, _)| {
-            n.as_str() == needle && cfg == options
-        });
-        if !reusable {
-            *cache = Some((needle.to_string(), *options, Matcher::new(needle, options)));
-        }
-        let (_, _, matcher) = cache.as_mut().expect("matcher cache initialized");
-        run(matcher)
-    })
+    let mut matcher = Matcher::new(needle, options);
+    run(&mut matcher)
 }
 
 enum FileItems<'a> {
