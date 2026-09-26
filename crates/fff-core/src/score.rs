@@ -394,27 +394,28 @@ fn fuzzy_match_and_score_files_impl<'a>(
     //
     // putting them first in the list makes sorting more efficient and gives
     // them tiebreaker advantage in case sorting is the same
-    let results = if files.len() > base_count {
-        let mut results = match_and_score_in_arena(
+    let (results, total_matched) = if files.len() > base_count {
+        let (mut results, mut total) = match_and_score_in_arena(
             &files[base_count..],
             context,
             overflow_arena,
             cache.map(|c| (c, generation, 1u8)),
         );
 
-        results.extend(match_and_score_in_arena(
+        let (base_results, base_total) = match_and_score_in_arena(
             &files[..base_count],
             context,
             base_arena,
             cache.map(|c| (c, generation, 0u8)),
-        ));
-
-        results
+        );
+        results.extend(base_results);
+        total += base_total;
+        (results, total)
     } else {
         match_and_score_in_arena(files, context, base_arena, cache.map(|c| (c, generation, 0u8)))
     };
 
-    sort_and_paginate(results, context)
+    sort_and_paginate(results, context, total_matched)
 }
 
 pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
@@ -884,9 +885,9 @@ fn match_and_score_in_arena<'a>(
     context: &ScoringContext,
     arena: ArenaPtr,
     raw_cache: Option<(&parking_lot::Mutex<RawMatchCache>, u64, u8)>,
-) -> Vec<(&'a FileItem, Score)> {
+) -> (Vec<(&'a FileItem, Score)>, usize) {
     if files.is_empty() {
-        return vec![];
+        return (vec![], 0);
     }
 
     let parsed = context.query;
@@ -896,7 +897,7 @@ fn match_and_score_in_arena<'a>(
         match apply_constraints(files, &parsed.constraints, arena, arena) {
             Some(filtered) if !filtered.is_empty() => FileItems::Filtered(filtered),
             Some(_) => {
-                return vec![];
+                return (vec![], 0);
             }
             None => FileItems::All(files),
         }
@@ -906,7 +907,9 @@ fn match_and_score_in_arena<'a>(
         FuzzyQuery::Text(t) if t.len() >= 2 => std::slice::from_ref(t),
         FuzzyQuery::Parts(parts) if !parts.is_empty() => parts.as_slice(),
         _ => {
-            return score_filtered_by_frecency(&working_files, context, arena);
+            let scored = score_filtered_by_frecency(&working_files, context, arena);
+            let n = scored.len();
+            return (scored, n);
         }
     };
 
@@ -1208,6 +1211,97 @@ fn match_and_score_in_arena<'a>(
             (file, score)
     };
 
+    // Keep only the best `offset+limit` scored rows in a min-heap so we never
+    // materialize 200k+ Score structs for a 100-item page. total_matched is
+    // still the full path_matches count.
+    let page_cap = context
+        .pagination
+        .offset
+        .saturating_add(if context.pagination.limit > 0 {
+            context.pagination.limit
+        } else {
+            usize::MAX / 4
+        })
+        .saturating_add(1);
+    let use_topk = page_cap < path_matches.len() && path_matches.len() > 256;
+
+    struct Ranked<'a> {
+        total: i32,
+        stamp: u64,
+        file: &'a FileItem,
+        score: Score,
+    }
+    impl PartialEq for Ranked<'_> {
+        fn eq(&self, other: &Self) -> bool {
+            self.total == other.total && self.stamp == other.stamp
+        }
+    }
+    impl Eq for Ranked<'_> {}
+    impl PartialOrd for Ranked<'_> {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for Ranked<'_> {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.total
+                .cmp(&other.total)
+                .then_with(|| self.stamp.cmp(&other.stamp))
+        }
+    }
+
+    if use_topk {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let mut heap: BinaryHeap<Reverse<Ranked<'a>>> = BinaryHeap::new();
+        let mut stamp = 0u64;
+        let mut push = |item: (&'a FileItem, Score)| {
+            let entry = Ranked {
+                total: item.1.total,
+                stamp,
+                file: item.0,
+                score: item.1,
+            };
+            stamp = stamp.wrapping_add(1);
+            if heap.len() < page_cap {
+                heap.push(Reverse(entry));
+            } else if heap.peek().is_some_and(|Reverse(w)| entry.total > w.total) {
+                heap.pop();
+                heap.push(Reverse(entry));
+            }
+        };
+        if path_matches.len() < PARALLEL_SCORE_MIN {
+            let mut scratch = make_scratch();
+            for (match_idx, path_match) in path_matches.iter().enumerate() {
+                push(score_one(&mut scratch, match_idx, path_match));
+            }
+        } else {
+            let scored: Vec<_> = crate::parallelism::run_on_bg_pool(|| {
+                path_matches
+                    .par_iter()
+                    .enumerate()
+                    .map_init(make_scratch, |scratch, (match_idx, path_match)| {
+                        score_one(scratch, match_idx, path_match)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            for item in scored {
+                push(item);
+            }
+        }
+        drop(push);
+        let mut results: Vec<(&'a FileItem, Score)> = heap
+            .into_iter()
+            .map(|Reverse(r)| (r.file, r.score))
+            .collect();
+        results.sort_unstable_by(|a, b| {
+            b.1.total
+                .cmp(&a.1.total)
+                .then_with(|| b.0.modified.cmp(&a.0.modified))
+        });
+        return (results, path_matches.len());
+    }
+
     let results: Vec<_> = if path_matches.len() < PARALLEL_SCORE_MIN {
         let mut scratch = make_scratch();
         path_matches
@@ -1226,7 +1320,8 @@ fn match_and_score_in_arena<'a>(
                 .collect::<Vec<_>>()
         })
     };
-    results
+    let n = results.len();
+    (results, n)
 }
 
 /// Byte compare avoids materializing a `String` per scored match.
@@ -1339,9 +1434,8 @@ fn calculate_current_file_penalty(
 fn sort_and_paginate<'a>(
     mut results: Vec<(&'a FileItem, Score)>,
     context: &ScoringContext,
+    total_matched: usize,
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
-    let total_matched = results.len();
-
     if total_matched == 0 {
         return (vec![], vec![], 0);
     }
@@ -1491,7 +1585,8 @@ mod tests {
         };
 
         // Test with full sort - returns all results sorted descending
-        let (items, scores, total) = sort_and_paginate(results.clone(), &context);
+        let total = results.len();
+        let (items, scores, total) = sort_and_paginate(results.clone(), &context, total);
 
         // Should return all 10 items sorted by score descending
         assert_eq!(total, 10);
@@ -1541,7 +1636,8 @@ mod tests {
             },
         };
 
-        let (items, scores, _) = sort_and_paginate(results, &context);
+        let n = results.len();
+        let (items, scores, _) = sort_and_paginate(results, &context, n);
 
         // Should return all 5 items sorted: 200(9000), 200(1000), 100(8000), 100(5000), 100(3000)
         assert_eq!(scores.len(), 5);
@@ -1591,7 +1687,8 @@ mod tests {
         };
 
         // Returns all results sorted descending
-        let (items, scores, _) = sort_and_paginate(results, &context);
+        let n = results.len();
+        let (items, scores, _) = sort_and_paginate(results, &context, n);
 
         assert_eq!(scores.len(), 3);
         assert_eq!(scores[0].total, 200);
