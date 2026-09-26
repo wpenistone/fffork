@@ -38,7 +38,9 @@ use crate::grep::{GrepResult, GrepSearchOptions, grep_search, multi_grep_search}
 use crate::index::{BigramFilter, BigramOverlay};
 use crate::query_tracker::QueryTracker;
 use crate::scan::{ScanConfig, ScanJob, ScanSignals};
-use crate::score::{fuzzy_match_and_score_files, fuzzy_match_byte_offsets_for_page};
+use crate::score::{
+    RawMatchCache, fuzzy_match_and_score_files_cached, fuzzy_match_byte_offsets_for_page,
+};
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::simd_path::ArenaPtr;
 use crate::stable_vec::StableVec;
@@ -627,6 +629,9 @@ pub struct FilePicker {
     git_recency_config: GitRecencyConfig,
     skip_git: bool,
     trace_span: tracing::Span,
+    /// Repeated identical searches on a frozen index reuse raw frizbee matches.
+    raw_match_cache: parking_lot::Mutex<RawMatchCache>,
+    index_generation: u64,
     trace_id: String,
 }
 
@@ -957,7 +962,16 @@ impl FilePicker {
             skip_git: options.skip_git,
             trace_span,
             trace_id,
+            raw_match_cache: parking_lot::Mutex::new(RawMatchCache::default()),
+            index_generation: 0,
         })
+    }
+
+    /// Bump index generation and drop cached raw matches after a file-set change.
+    #[inline]
+    pub(crate) fn invalidate_raw_matches(&mut self) {
+        self.index_generation = self.index_generation.wrapping_add(1);
+        self.raw_match_cache.get_mut().clear();
     }
 
     /// Create a picker, place it into the shared handle, and spawn background
@@ -1065,6 +1079,7 @@ impl FilePicker {
         )?;
 
         self.sync_data = sync;
+        self.invalidate_raw_matches();
 
         if !self.has_explicit_cache_budget {
             let file_count = self.sync_data.files().len();
@@ -1187,12 +1202,14 @@ impl FilePicker {
         let base_arena = self.sync_data.arena_base_ptr();
         let overflow_arena = self.sync_data.arena_overflow_ptr();
 
-        let (items, scores, total_matched) = fuzzy_match_and_score_files(
+        let (items, scores, total_matched) = fuzzy_match_and_score_files_cached(
             files,
             &context,
             self.sync_data.base_count,
             base_arena,
             overflow_arena,
+            &self.raw_match_cache,
+            self.index_generation,
         );
         let match_byte_offsets =
             fuzzy_match_byte_offsets_for_page(query, &items, max_typos, base_arena, overflow_arena);
@@ -1570,6 +1587,7 @@ impl FilePicker {
 
     pub(crate) fn commit_new_sync(&mut self, sync: FileSync) {
         self.sync_data = sync;
+        self.invalidate_raw_matches();
         self.cache_budget.reset();
     }
 
@@ -1821,6 +1839,7 @@ impl FilePicker {
         // Dir may have been tombstoned by an earlier removal; a new file
         // under it proves it exists again.
         self.sync_data.revive_dir(parent_dir);
+        self.invalidate_raw_matches();
         self.sync_data.files.last()
     }
 
@@ -1833,6 +1852,7 @@ impl FilePicker {
         file.set_deleted(true);
         file.invalidate_mmap(&self.cache_budget);
         file.git_status = None;
+        self.invalidate_raw_matches();
 
         // Only base-region files participate in the bigram overlay
         if index < self.sync_data.base_count

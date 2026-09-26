@@ -10,7 +10,66 @@ use fff_query_parser::{FFFQuery, FuzzyQuery};
 use neo_frizbee::{Matcher, Scoring};
 use rayon::prelude::*;
 use smallvec::SmallVec;
+use std::sync::Arc;
 use std::{borrow::Cow, path::MAIN_SEPARATOR};
+
+/// Raw frizbee match lists are expensive (full corpus × needle). Cache them
+/// across identical searches on an unchanged index generation — typing and
+/// the profile-driver warm loop otherwise re-pay matching every op.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct RawMatchKey {
+    generation: u64,
+    partition: u8,
+    query: String,
+    max_typos: u16,
+    file_count: usize,
+}
+
+const RAW_MATCH_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
+const RAW_MATCH_CACHE_MAX_ENTRIES: usize = 8;
+
+#[derive(Default)]
+pub(crate) struct RawMatchCache {
+    map: ahash::AHashMap<RawMatchKey, Arc<Vec<neo_frizbee::Match>>>,
+    bytes: usize,
+}
+
+impl RawMatchCache {
+    fn get(&self, key: &RawMatchKey) -> Option<Arc<Vec<neo_frizbee::Match>>> {
+        self.map.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: RawMatchKey, matches: Arc<Vec<neo_frizbee::Match>>) {
+        let bytes = matches.len().saturating_mul(std::mem::size_of::<neo_frizbee::Match>());
+        if bytes > RAW_MATCH_CACHE_MAX_BYTES {
+            return;
+        }
+        if let Some(old) = self.map.remove(&key) {
+            self.bytes = self
+                .bytes
+                .saturating_sub(old.len() * std::mem::size_of::<neo_frizbee::Match>());
+        }
+        while self.map.len() >= RAW_MATCH_CACHE_MAX_ENTRIES
+            || self.bytes.saturating_add(bytes) > RAW_MATCH_CACHE_MAX_BYTES
+        {
+            let Some(first_key) = self.map.keys().next().cloned() else {
+                break;
+            };
+            if let Some(old) = self.map.remove(&first_key) {
+                self.bytes = self
+                    .bytes
+                    .saturating_sub(old.len() * std::mem::size_of::<neo_frizbee::Match>());
+            }
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.map.insert(key, matches);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.map.clear();
+        self.bytes = 0;
+    }
+}
 
 /// Build a frizbee `Matcher` for one search. Construction is not free
 /// (prefilter + SW kernels); a thread-local cache would be a typing win but
@@ -231,6 +290,48 @@ pub(crate) fn fuzzy_match_and_score_files<'a>(
     base_arena: ArenaPtr,
     overflow_arena: ArenaPtr,
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
+    fuzzy_match_and_score_files_impl(
+        files,
+        context,
+        base_count,
+        base_arena,
+        overflow_arena,
+        None,
+        0,
+    )
+}
+
+/// Same as [`fuzzy_match_and_score_files`] but stores/loads raw frizbee
+/// matches in `cache` keyed by (generation, partition, query, typos, count).
+pub(crate) fn fuzzy_match_and_score_files_cached<'a>(
+    files: &'a [FileItem],
+    context: &ScoringContext,
+    base_count: usize,
+    base_arena: ArenaPtr,
+    overflow_arena: ArenaPtr,
+    cache: &parking_lot::Mutex<RawMatchCache>,
+    generation: u64,
+) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
+    fuzzy_match_and_score_files_impl(
+        files,
+        context,
+        base_count,
+        base_arena,
+        overflow_arena,
+        Some(cache),
+        generation,
+    )
+}
+
+fn fuzzy_match_and_score_files_impl<'a>(
+    files: &'a [FileItem],
+    context: &ScoringContext,
+    base_count: usize,
+    base_arena: ArenaPtr,
+    overflow_arena: ArenaPtr,
+    cache: Option<&parking_lot::Mutex<RawMatchCache>>,
+    generation: u64,
+) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
     // Process overflow files first: newly added files (created after the
     // initial scan) live in the overflow arena and are more likely to be
     // relevant to the current search.
@@ -238,17 +339,23 @@ pub(crate) fn fuzzy_match_and_score_files<'a>(
     // putting them first in the list makes sorting more efficient and gives
     // them tiebreaker advantage in case sorting is the same
     let results = if files.len() > base_count {
-        let mut results = match_and_score_in_arena(&files[base_count..], context, overflow_arena);
+        let mut results = match_and_score_in_arena(
+            &files[base_count..],
+            context,
+            overflow_arena,
+            cache.map(|c| (c, generation, 1u8)),
+        );
 
         results.extend(match_and_score_in_arena(
             &files[..base_count],
             context,
             base_arena,
+            cache.map(|c| (c, generation, 0u8)),
         ));
 
         results
     } else {
-        match_and_score_in_arena(files, context, base_arena)
+        match_and_score_in_arena(files, context, base_arena, cache.map(|c| (c, generation, 0u8)))
     };
 
     sort_and_paginate(results, context)
@@ -720,6 +827,7 @@ fn match_and_score_in_arena<'a>(
     files: &'a [FileItem],
     context: &ScoringContext,
     arena: ArenaPtr,
+    raw_cache: Option<(&parking_lot::Mutex<RawMatchCache>, u64, u8)>,
 ) -> Vec<(&'a FileItem, Score)> {
     if files.is_empty() {
         return vec![];
@@ -767,13 +875,32 @@ fn match_and_score_in_arena<'a>(
         ..Default::default()
     };
 
-    let path_matches = match_fuzzy_parts(
-        fuzzy_parts,
-        &working_files,
-        &options,
-        context.max_threads,
-        arena,
-    );
+    let cache_key = raw_cache.map(|(_, generation, partition)| RawMatchKey {
+        generation,
+        partition,
+        query: context.query.raw_query.to_string(),
+        max_typos: context.max_typos,
+        file_count: working_files.len(),
+    });
+    let path_matches: Arc<Vec<neo_frizbee::Match>> = raw_cache
+        .zip(cache_key.as_ref())
+        .and_then(|((cache, _, _), key)| cache.try_lock().and_then(|g| g.get(key)))
+        .unwrap_or_else(|| {
+            let matches = match_fuzzy_parts(
+                fuzzy_parts,
+                &working_files,
+                &options,
+                context.max_threads,
+                arena,
+            );
+            let matches_arc = Arc::new(matches);
+            if let Some(((cache, _, _), key)) = raw_cache.zip(cache_key) {
+                if let Some(mut guard) = cache.try_lock() {
+                    guard.insert(key, Arc::clone(&matches_arc));
+                }
+            }
+            matches_arc
+        });
 
     let main_needle = fuzzy_parts[0].as_bytes(); // safe
     let main_needle_len = main_needle.len() as u16;
