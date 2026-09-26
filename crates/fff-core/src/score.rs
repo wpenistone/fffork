@@ -7,10 +7,38 @@ use crate::{
     types::{DirItem, FileItem, Score, ScoringContext},
 };
 use fff_query_parser::{FFFQuery, FuzzyQuery};
-use neo_frizbee::Scoring;
+use neo_frizbee::{Matcher, Scoring};
 use rayon::prelude::*;
 use smallvec::SmallVec;
+use std::cell::RefCell;
 use std::{borrow::Cow, path::MAIN_SEPARATOR};
+
+/// Reuse a `Matcher` across searches with the same needle+config. The free
+/// `neo_frizbee::match_range_parallel_resolved` builds a fresh Matcher every
+/// call (prefilter + SW kernels); typing hits that once per keystroke.
+thread_local! {
+    static MATCHER_CACHE: RefCell<Option<(String, neo_frizbee::Config, Matcher)>> =
+        const { RefCell::new(None) };
+}
+
+#[inline]
+fn with_cached_matcher<R>(
+    needle: &str,
+    options: &neo_frizbee::Config,
+    run: impl FnOnce(&mut Matcher) -> R,
+) -> R {
+    MATCHER_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let reusable = cache.as_ref().is_some_and(|(n, cfg, _)| {
+            n.as_str() == needle && cfg == options
+        });
+        if !reusable {
+            *cache = Some((needle.to_string(), *options, Matcher::new(needle, options)));
+        }
+        let (_, _, matcher) = cache.as_mut().expect("matcher cache initialized");
+        run(matcher)
+    })
+}
 
 enum FileItems<'a> {
     All(&'a [FileItem]),
@@ -137,15 +165,15 @@ fn match_fuzzy_parts(
 
     // Index-based resolver: no `Vec<&FileItem>` materialization for either the
     // full list or the per-part subsets, and a single monomorphized hot loop.
-    let first_part_matches = neo_frizbee::match_range_parallel_resolved(
-        valid_parts[0],
-        working_files.len(),
-        &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
-            resolve_file_chunks(working_files.index(index as usize), arena, buf)
-        },
-        options,
-        threads,
-    );
+    let first_part_matches = with_cached_matcher(valid_parts[0], options, |matcher| {
+        matcher.match_range_parallel_resolved(
+            working_files.len(),
+            &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+                resolve_file_chunks(working_files.index(index as usize), arena, buf)
+            },
+            threads,
+        )
+    });
 
     if valid_parts.len() == 1 {
         return first_part_matches;
@@ -172,16 +200,16 @@ fn match_fuzzy_parts(
                 max_threads,
             )
         };
-        let sub_matches = neo_frizbee::match_range_parallel_resolved(
-            part,
-            survivors.len(),
-            &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
-                let file = working_files.index(survivors[index as usize].index as usize);
-                resolve_file_chunks(file, arena, buf)
-            },
-            &part_options,
-            sub_threads,
-        );
+        let sub_matches = with_cached_matcher(part, &part_options, |matcher| {
+            matcher.match_range_parallel_resolved(
+                survivors.len(),
+                &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+                    let file = working_files.index(survivors[index as usize].index as usize);
+                    resolve_file_chunks(file, arena, buf)
+                },
+                sub_threads,
+            )
+        });
 
         if sub_matches.is_empty() {
             return vec![]; // break early!
@@ -294,8 +322,10 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
             part_config.max_typos = config.max_typos.map(|t| t.min(part.len() as u16));
         }
 
-        let mut matcher = neo_frizbee::Matcher::new(part, &part_config);
-        for mut matched in matcher.match_list_indices(&path_strs) {
+        let matched_list = with_cached_matcher(part, &part_config, |m| {
+            m.match_list_indices(&path_strs)
+        });
+        for mut matched in matched_list {
             let item_idx = matched.index as usize;
             let Some(path) = paths.get(item_idx) else {
                 continue;
@@ -421,15 +451,15 @@ fn match_fuzzy_parts_dirs(
         options.max_typos,
         max_threads,
     );
-    let first_part_matches = neo_frizbee::match_range_parallel_resolved(
-        valid_parts[0],
-        working_dirs.len(),
-        &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
-            resolve_dir_chunks(working_dirs[index as usize], arena, overflow_arena, buf)
-        },
-        options,
-        dir_threads,
-    );
+    let first_part_matches = with_cached_matcher(valid_parts[0], options, |matcher| {
+        matcher.match_range_parallel_resolved(
+            working_dirs.len(),
+            &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+                resolve_dir_chunks(working_dirs[index as usize], arena, overflow_arena, buf)
+            },
+            dir_threads,
+        )
+    });
 
     if valid_parts.len() == 1 {
         return first_part_matches;
@@ -451,16 +481,16 @@ fn match_fuzzy_parts_dirs(
             part_options.max_typos,
             max_threads,
         );
-        let sub_matches = neo_frizbee::match_range_parallel_resolved(
-            part,
-            survivors.len(),
-            &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
-                let dir = working_dirs[survivors[index as usize].index as usize];
-                resolve_dir_chunks(dir, arena, overflow_arena, buf)
-            },
-            &part_options,
-            sub_dir_threads,
-        );
+        let sub_matches = with_cached_matcher(part, &part_options, |matcher| {
+            matcher.match_range_parallel_resolved(
+                survivors.len(),
+                &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+                    let dir = working_dirs[survivors[index as usize].index as usize];
+                    resolve_dir_chunks(dir, arena, overflow_arena, buf)
+                },
+                sub_dir_threads,
+            )
+        });
 
         if sub_matches.is_empty() {
             return vec![];
@@ -786,8 +816,8 @@ fn match_and_score_in_arena<'a>(
             // Match on `&str` so frizbee reuses the instantiation its index
             // resolver already emits instead of a separate `Cow<str>` copy.
             let filename_strs: Vec<&str> = fallback_filenames.iter().map(Cow::as_ref).collect();
-            let mut matches = neo_frizbee::Matcher::new(fuzzy_parts[0], &options)
-                .match_list_parallel(
+            let mut matches = with_cached_matcher(fuzzy_parts[0], &options, |matcher| {
+                matcher.match_list_parallel(
                     &filename_strs,
                     if path_matches.len() > 4096 {
                         // Was max_threads.div_ceil(2048), which is 1 for any
@@ -796,7 +826,8 @@ fn match_and_score_in_arena<'a>(
                     } else {
                         1
                     },
-                );
+                )
+            });
 
             sort_by_key_with_buffer(&mut matches, |m| fallback_indices[m.index as usize]);
             matches
