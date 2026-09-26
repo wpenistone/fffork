@@ -71,6 +71,60 @@ impl RawMatchCache {
     }
 }
 
+/// Necessary-condition prefilter: a fuzzy hit with `max_typos = T` needs at
+/// least `needle_len - T` distinct needle bytes to appear in the path (any
+/// order). O(path + needle) with a 256-byte presence table — no LCS DP, no
+/// path concatenation. Never rejects a true match.
+#[inline]
+fn path_bytes_allow(needle: &[u8], chunk_ptrs: &[*const u8], chunk_count: usize, byte_len: u16, max_typos: u16) -> bool {
+    let need = needle.len().saturating_sub(max_typos as usize);
+    if need == 0 {
+        return true;
+    }
+    if (byte_len as usize) < need {
+        return false;
+    }
+    let fold = |b: u8| if b.is_ascii_uppercase() { b + 32 } else { b };
+    let mut present = [false; 256];
+    let mut left = byte_len as usize;
+    for &ptr in chunk_ptrs.iter().take(chunk_count) {
+        if left == 0 {
+            break;
+        }
+        let take = left.min(crate::simd_path::SIMD_CHUNK_BYTES);
+        let chunk = unsafe { std::slice::from_raw_parts(ptr, crate::simd_path::SIMD_CHUNK_BYTES) };
+        for &b in &chunk[..take] {
+            present[fold(b) as usize] = true;
+        }
+        left -= take;
+    }
+    let mut hits = 0usize;
+    for &b in needle {
+        if present[fold(b) as usize] {
+            hits += 1;
+            if hits >= need {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Resolve path chunks for frizbee; drop paths that cannot fuzzy-match.
+fn resolve_file_chunks_prefiltered(
+    file: &FileItem,
+    arena: ArenaPtr,
+    buf: &mut [*const u8; MAX_PATH_CHUNKS],
+    needle: &[u8],
+    max_typos: u16,
+) -> Option<(usize, u16)> {
+    let (chunks, byte_len) = resolve_file_chunks(file, arena, buf)?;
+    if !path_bytes_allow(needle, buf, chunks, byte_len, max_typos) {
+        return None;
+    }
+    Some((chunks, byte_len))
+}
+
 /// Build a frizbee `Matcher` for one search. Construction is not free
 /// (prefilter + SW kernels); a thread-local cache would be a typing win but
 /// 0.13.3 matcher reuse changed `total_matched` on linux `score` (checksum
@@ -210,6 +264,8 @@ fn match_fuzzy_parts(
 
     // Index-based resolver: no `Vec<&FileItem>` materialization for either the
     // full list or the per-part subsets, and a single monomorphized hot loop.
+    // (Byte-presence prefilter A/B'd: 0.84–0.89× vs upstream — frizbee’s own
+    // SIMD prefilter is already cheaper than an extra pass over every path.)
     let first_part_matches = with_cached_matcher(valid_parts[0], options, |matcher| {
         matcher.match_range_parallel_resolved(
             working_files.len(),
