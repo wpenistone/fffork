@@ -265,29 +265,12 @@ fn match_fuzzy_parts(
 
     // Index-based resolver: no `Vec<&FileItem>` materialization for either the
     // full list or the per-part subsets, and a single monomorphized hot loop.
-    // Path bigram index rejects hopeless candidates before Smith-Waterman when
-    // the typo budget leaves a real constraint (`required = probes - 2*typos > 0`).
-    let cand_idxs: Option<Vec<u32>> = path_bigram.and_then(|idx| {
-        let bits = crate::index::path_fuzzy_candidates(
-            Some(idx),
-            None,
-            valid_parts[0],
-            options.max_typos.unwrap_or(0),
-        )?;
-        let mut idxs = Vec::new();
-        for (word_i, word) in bits.iter().enumerate() {
-            let mut w = *word;
-            while w != 0 {
-                let b = w.trailing_zeros() as usize;
-                w &= w - 1;
-                let fi = word_i * 64 + b;
-                if fi < working_files.len() {
-                    idxs.push(fi as u32);
-                }
-            }
-        }
-        Some(idxs)
-    });
+    // NOTE: pigeonhole exact-substring prefilter was A/B'd and **rejected**.
+    // FFF matching is Smith-Waterman / subsequence-with-gaps, not substring
+    // embedding — a true hit need not contain any contiguous needle piece
+    // (`file_picker_` collapsed 51907→2092). Fall through to full frizbee.
+    let cand_idxs: Option<Vec<u32>> = None;
+    let _ = (arena, working_files.len());
 
     let first_part_matches = if let Some(survivors) = &cand_idxs {
         let local = with_cached_matcher(valid_parts[0], options, |matcher| {
@@ -299,7 +282,6 @@ fn match_fuzzy_parts(
                 threads,
             )
         });
-        // match_list_* reports positions in `survivors`, not working_files.
         local
             .into_iter()
             .map(|mut m| {
@@ -986,6 +968,8 @@ fn match_and_score_in_arena<'a>(
         max_typos: context.max_typos,
         file_count: working_files.len(),
     });
+    let phase_timing = std::env::var_os("FFF_PHASE_TIMING").is_some();
+    let t_match = std::time::Instant::now();
     let path_matches: Arc<Vec<neo_frizbee::Match>> = raw_cache
         .zip(cache_key.as_ref())
         .and_then(|((cache, _, _), key)| cache.try_lock().and_then(|g| g.get(key)))
@@ -1006,6 +990,15 @@ fn match_and_score_in_arena<'a>(
             }
             matches_arc
         });
+    let match_elapsed = t_match.elapsed();
+    if phase_timing {
+        eprintln!(
+            "PHASE match_us={} n_matches={} n_files={}",
+            match_elapsed.as_micros(),
+            path_matches.len(),
+            working_files.len()
+        );
+    }
 
     let main_needle = fuzzy_parts[0].as_bytes(); // safe
     let main_needle_len = main_needle.len() as u16;
@@ -1270,6 +1263,8 @@ fn match_and_score_in_arena<'a>(
         })
         .saturating_add(1);
     let use_topk = page_cap < path_matches.len() && path_matches.len() > 256;
+    let t_score = std::time::Instant::now();
+    let score_entrance_count = path_matches.len();
 
     struct Ranked<'a> {
         total: i32,
@@ -1345,6 +1340,13 @@ fn match_and_score_in_arena<'a>(
                 .cmp(&a.1.total)
                 .then_with(|| b.0.modified.cmp(&a.0.modified))
         });
+        if phase_timing {
+            eprintln!(
+                "PHASE score_us={} (topk) n={}",
+                t_score.elapsed().as_micros(),
+                score_entrance_count
+            );
+        }
         return (results, path_matches.len());
     }
 
@@ -1367,6 +1369,13 @@ fn match_and_score_in_arena<'a>(
         })
     };
     let n = results.len();
+    if phase_timing {
+        eprintln!(
+            "PHASE score_us={} (full) n={}",
+            t_score.elapsed().as_micros(),
+            score_entrance_count
+        );
+    }
     (results, n)
 }
 
