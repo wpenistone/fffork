@@ -263,13 +263,13 @@ fn match_fuzzy_parts(
         )
     };
 
-    // Inter-sequence SW: frizbee prefilter for match set, then re-score
-    // with our validated SW (replicates frizbee's gap model exactly).
-    // Falls back to full frizbee path when interseq is disabled.
-    let cand_idxs: Option<Vec<u32>> = None;
-    let use_interseq = std::env::var_os("FFF_INTERSEQ_SW").map_or(false, |v| v != "0");
-    let first_part_matches = if use_interseq {
-        // Phase 1: frizbee prefilter only (skip its SW)
+    // Inter-sequence SW: frizbee prefilter for match set + trim windows,
+    // then re-score with validated SW that replicates frizbee's gap model
+    // on the SAME trimmed slices with the SAME include_prefix semantics.
+    let first_part_matches = {
+        let t_prefilter = std::time::Instant::now();
+        // Phase 1: frizbee prefilter only (skip its SW). The skip_sw path
+        // encodes (start_pos_adj, end_pos) in (score, end_col).
         unsafe {
             std::env::set_var("FRIZBEE_SKIP_SW", "1");
         }
@@ -285,53 +285,133 @@ fn match_fuzzy_parts(
         unsafe {
             std::env::remove_var("FRIZBEE_SKIP_SW");
         }
+        let prefilter_ms = t_prefilter.elapsed().as_secs_f64() * 1e3;
 
-        // Phase 2: re-score with inter-sequence SW
+        // Phase 2: re-score with inter-sequence SW on trimmed windows.
         let has_upper = valid_parts[0].chars().any(|c| c.is_uppercase());
         let p = crate::interseq_sw::SwParams::for_query(has_upper);
         let needle = valid_parts[0].as_bytes();
-        let mut buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-        for m in &mut matches {
+
+        let t_collect = std::time::Instant::now();
+        let mut all_bytes: Vec<u8> = Vec::with_capacity(matches.len().saturating_mul(64));
+        let mut trims: Vec<(usize, usize, usize, bool, bool, usize)> =
+            Vec::with_capacity(matches.len());
+
+        let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+        for m in &matches {
             let file = working_files.index(m.index as usize);
-            let hay = file.path.read_to_buf(arena, &mut buf);
-            let (score, end_col) =
-                crate::interseq_sw::score_one_scalar_full(needle, hay.as_bytes(), &p, true);
-            // Add exact_match_bonus when needle == haystack (frizbee compat)
-            let exact = needle.eq_ignore_ascii_case(hay.as_bytes());
-            m.score = if exact { score + 8 } else { score };
-            m.end_col = end_col;
+            let hay = file.path.read_to_buf(arena, &mut path_buf);
+            let hay_bytes = hay.as_bytes();
+            let start_adj = m.score as usize;
+            let end_pos = m.end_col as usize;
+            let end_clamped = end_pos.min(hay_bytes.len());
+            let start_clamped = start_adj.min(end_clamped);
+            let trimmed = &hay_bytes[start_clamped..end_clamped];
+            let include_prefix = start_clamped == 0;
+            let include_exact = start_clamped == 0 && end_clamped == hay_bytes.len();
+
+            let off = all_bytes.len();
+            all_bytes.extend_from_slice(trimmed);
+            trims.push((off, trimmed.len(), start_clamped, include_prefix, include_exact, m.index as usize));
+        }
+        let collect_ms = t_collect.elapsed().as_secs_f64() * 1e3;
+
+        let t_batch = std::time::Instant::now();
+        let mut scores = vec![0u16; matches.len()];
+        let mut end_cols = vec![0u16; matches.len()];
+        #[cfg(target_arch = "x86_64")]
+        let avx2_ok = is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("sse4.1");
+        #[cfg(not(target_arch = "x86_64"))]
+        let avx2_ok = false;
+
+        // u8 fast path: 32 lanes, valid when max score < 256.
+        // max_score = m*(match+max_bonus) + prefix + exact = m*16 + 20.
+        let use_u8 = avx2_ok && needle.len() <= 14;
+        let batch_sz: usize = if use_u8 { 32 } else { 16 };
+
+        // Reusable SoA scratch (grows as needed, never shrinks).
+        let mut soa_scratch: Vec<u8> = Vec::new();
+        for (batch_i, chunk) in trims.chunks(batch_sz).enumerate() {
+            let n = chunk.len();
+            let max_len = chunk.iter().map(|t| t.1).max().unwrap_or(0);
+            if max_len == 0 {
+                continue;
+            }
+
+            // Build SoA from trimmed slices. Stride = batch_sz to match the kernel.
+            let soa_len = max_len * batch_sz;
+            if soa_scratch.len() < soa_len {
+                soa_scratch.resize(soa_len, 0);
+            } else {
+                soa_scratch[..soa_len].fill(0);
+            }
+            let soa = &mut soa_scratch[..soa_len];
+            let mut prefix_mask: u32 = 0;
+            for (k, &(off, len, _, inc_prefix, _, _)) in chunk.iter().enumerate() {
+                let src = &all_bytes[off..off + len];
+                for (j, &b) in src.iter().enumerate() {
+                    soa[j * batch_sz + k] = b;
+                }
+                if inc_prefix {
+                    prefix_mask |= 1u32 << k;
+                }
+            }
+
+            let base = batch_i * batch_sz;
+            #[cfg(target_arch = "x86_64")]
+            if use_u8 {
+                unsafe {
+                    crate::interseq_sw::avx2::score_batch_avx2_u8(
+                        needle, soa, max_len, &p, prefix_mask,
+                        &mut scores[base..base + n],
+                        &mut end_cols[base..base + n],
+                    );
+                }
+                continue;
+            }
+            #[cfg(target_arch = "x86_64")]
+            if avx2_ok && needle.len() <= 16 {
+                unsafe {
+                    crate::interseq_sw::avx2::score_batch_avx2(
+                        needle, soa, max_len, &p, prefix_mask as u16,
+                        &mut scores[base..base + n],
+                        &mut end_cols[base..base + n],
+                    );
+                }
+                continue;
+            }
+            // Scalar fallback for this batch
+            for (k, &(off, len, _, inc_prefix, _, _)) in chunk.iter().enumerate() {
+                let src = &all_bytes[off..off + len];
+                let (s, e) =
+                    crate::interseq_sw::score_one_scalar_full(needle, src, &p, inc_prefix);
+                scores[base + k] = s;
+                end_cols[base + k] = e;
+            }
+        }
+        let batch_ms = t_batch.elapsed().as_secs_f64() * 1e3;
+
+        let t_assemble = std::time::Instant::now();
+        for (i, m) in matches.iter_mut().enumerate() {
+            let &(_, _, start_adj, _, include_exact, _) = &trims[i];
+            let trimmed = &all_bytes[trims[i].0..trims[i].0 + trims[i].1];
+            let exact = include_exact && needle.eq_ignore_ascii_case(trimmed);
+            let bonus = if exact { 8u16 } else { 0 };
+            m.score = scores[i].saturating_add(bonus);
+            m.end_col = end_cols[i]
+                .saturating_add(start_adj.min(u16::MAX as usize) as u16);
             m.exact = exact;
         }
+        let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1e3;
+
+        if std::env::var_os("FFF_PHASE_TIMING").is_some() {
+            eprintln!(
+                "PHASE interseq prefilter_ms={prefilter_ms:.1} collect_ms={collect_ms:.1} batch_ms={batch_ms:.1} assemble_ms={assemble_ms:.1} n={}",
+                matches.len()
+            );
+        }
         matches
-    } else if let Some(survivors) = &cand_idxs {
-        let local = with_cached_matcher(valid_parts[0], options, |matcher| {
-            matcher.match_list_parallel_resolved(
-                survivors,
-                &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
-                    resolve_file_chunks(working_files.index(*index as usize), arena, buf)
-                },
-                threads,
-            )
-        });
-        local
-            .into_iter()
-            .map(|mut m| {
-                if let Some(&orig) = survivors.get(m.index as usize) {
-                    m.index = orig;
-                }
-                m
-            })
-            .collect()
-    } else {
-        with_cached_matcher(valid_parts[0], options, |matcher| {
-            matcher.match_range_parallel_resolved(
-                working_files.len(),
-                &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
-                    resolve_file_chunks(working_files.index(index as usize), arena, buf)
-                },
-                threads,
-            )
-        })
     };
 
     if valid_parts.len() == 1 {

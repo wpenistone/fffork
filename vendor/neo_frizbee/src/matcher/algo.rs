@@ -52,6 +52,8 @@ pub struct MatcherImpl<P: PrefilterKernel, S: SmithWatermanKernel> {
     min_haystack_len: usize,
     prefilter: P,
     smith_waterman: S,
+    // Measurement knob: skip the SW score (accept-only) when FRIZBEE_SKIP_SW=1.
+    skip_sw: bool,
 }
 
 impl<P, S> MatcherImpl<P, S>
@@ -71,6 +73,7 @@ where
                 .unwrap_or(0),
             prefilter: P::new(needle, case_sensitive),
             smith_waterman: S::new(needle, &config.scoring, case_sensitive),
+            skip_sw: std::env::var_os("FRIZBEE_SKIP_SW").is_some(),
         }
     }
 
@@ -95,12 +98,26 @@ where
                 if matched {
                     let (trimmed, start_pos, include_exact) =
                         trim_haystack(haystack, start_pos, end_pos);
-                    matches.push(self.smith_waterman_one::<UNICODE>(
-                        trimmed,
-                        index,
-                        start_pos,
-                        include_exact,
-                    ));
+                    if self.skip_sw {
+                        // Encode prefilter window for the caller's re-scorer:
+                        // score = start_pos (pre-adjust), end_col = end_pos.
+                        // Caller must replicate trim_haystack + include_prefix.
+                        matches.push(Match {
+                            index,
+                            score: start_pos.min(u16::MAX as usize) as u16,
+                            exact: false,
+                            #[cfg(feature = "match_end_col")]
+                            end_col: end_pos.min(u16::MAX as usize) as u16,
+                        });
+                        let _ = (trimmed, include_exact);
+                    } else {
+                        matches.push(self.smith_waterman_one::<UNICODE>(
+                            trimmed,
+                            index,
+                            start_pos,
+                            include_exact,
+                        ));
+                    }
                 }
             }
         }
