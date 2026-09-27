@@ -24,6 +24,8 @@ pub(crate) struct Prefilter<B: Backend> {
     paths: Vec<PathState<B::Mask>>,
     /// Case-folded needle bytes for the Myers LCS gate (≤64 chars).
     needle_folded: Vec<u8>,
+    /// Cached PEQ table for LCS bit-parallel (2 KiB). Rebuilt only on new().
+    lcs_peq: Option<Box<[u64; 256]>>,
     /// Adaptive LCS gate: disabled when the first samples show a high pass
     /// rate (bit-parallel LCS then costs more than the SIMD walker).
     lcs_disabled: std::sync::atomic::AtomicBool,
@@ -38,6 +40,7 @@ impl<B: Backend> Clone for Prefilter<B> {
             needle_unicode: self.needle_unicode.clone(),
             paths: self.paths.clone(),
             needle_folded: self.needle_folded.clone(),
+            lcs_peq: self.lcs_peq.clone(),
             lcs_disabled: std::sync::atomic::AtomicBool::new(
                 self.lcs_disabled.load(std::sync::atomic::Ordering::Relaxed),
             ),
@@ -67,11 +70,18 @@ impl<B: Backend> Prefilter<B> {
             needle.bytes().map(crate::myers::fold).collect()
         };
 
+        let lcs_peq = if needle_folded.len() <= crate::myers::MAX_NEEDLE_BITS {
+            Some(Box::new(crate::myers::peq_table(&needle_folded)))
+        } else {
+            None
+        };
+
         Self {
             needle_ascii,
             needle_unicode,
             paths: Vec::new(),
             needle_folded,
+            lcs_peq,
             lcs_disabled: std::sync::atomic::AtomicBool::new(false),
             lcs_samples: std::sync::atomic::AtomicU32::new(0),
             lcs_rejects: std::sync::atomic::AtomicU32::new(0),
@@ -106,6 +116,11 @@ impl<B: Backend> Prefilter<B> {
                     .store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
+    }
+
+    #[inline]
+    pub(crate) fn lcs_peq(&self) -> Option<&[u64; 256]> {
+        self.lcs_peq.as_deref()
     }
 
     #[inline]

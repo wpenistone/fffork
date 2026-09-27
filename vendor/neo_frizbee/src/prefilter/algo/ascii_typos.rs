@@ -273,7 +273,12 @@ impl<B: Backend> Prefilter<B> {
         // LCS would be pure overhead on `file_picker_`-class queries).
         if needle_len <= crate::myers::MAX_NEEDLE_BITS && self.lcs_gate_active() {
             let need = needle_len - max_typos;
-            let ok = crate::myers::lcs_ge_bit(self.needle_folded(), haystack, need);
+            let ok = match self.lcs_peq() {
+                Some(peq) => {
+                    crate::myers::lcs_ge_bit_peq(peq, needle_len, haystack, need)
+                }
+                None => crate::myers::lcs_ge_bit(self.needle_folded(), haystack, need),
+            };
             self.note_lcs_sample(!ok);
             if !ok {
                 return (false, 0, 0);
