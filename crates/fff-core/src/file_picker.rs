@@ -1401,6 +1401,7 @@ impl FilePicker {
         SEARCH_THREAD_POOL.install(|| {
             grep_search(
                 self.get_files(),
+                self.live_file_count(),
                 query,
                 options,
                 self.cache_budget(),
