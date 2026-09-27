@@ -263,15 +263,47 @@ fn match_fuzzy_parts(
         )
     };
 
-    // Index-based resolver: no `Vec<&FileItem>` materialization for either the
-    // full list or the per-part subsets, and a single monomorphized hot loop.
-    // LCS pack+DP A/B: 0.41–0.45× vs upstream (frizbee SIMD prefilter is
-    // already cheaper than an extra full-corpus LCS). Keep path_pack/myers
-    // for a future in-matcher bit-parallel gate; do not pay pack+LCS here.
+    // Inter-sequence SW: frizbee prefilter for match set, then re-score
+    // with our validated SW (replicates frizbee's gap model exactly).
+    // Falls back to full frizbee path when interseq is disabled.
     let cand_idxs: Option<Vec<u32>> = None;
-    let _ = (arena, working_files.len());
+    let use_interseq = std::env::var_os("FFF_INTERSEQ_SW").map_or(false, |v| v != "0");
+    let first_part_matches = if use_interseq {
+        // Phase 1: frizbee prefilter only (skip its SW)
+        unsafe {
+            std::env::set_var("FRIZBEE_SKIP_SW", "1");
+        }
+        let mut matches = with_cached_matcher(valid_parts[0], options, |matcher| {
+            matcher.match_range_parallel_resolved(
+                working_files.len(),
+                &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+                    resolve_file_chunks(working_files.index(index as usize), arena, buf)
+                },
+                threads,
+            )
+        });
+        unsafe {
+            std::env::remove_var("FRIZBEE_SKIP_SW");
+        }
 
-    let first_part_matches = if let Some(survivors) = &cand_idxs {
+        // Phase 2: re-score with inter-sequence SW
+        let has_upper = valid_parts[0].chars().any(|c| c.is_uppercase());
+        let p = crate::interseq_sw::SwParams::for_query(has_upper);
+        let needle = valid_parts[0].as_bytes();
+        let mut buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+        for m in &mut matches {
+            let file = working_files.index(m.index as usize);
+            let hay = file.path.read_to_buf(arena, &mut buf);
+            let (score, end_col) =
+                crate::interseq_sw::score_one_scalar_full(needle, hay.as_bytes(), &p, true);
+            // Add exact_match_bonus when needle == haystack (frizbee compat)
+            let exact = needle.eq_ignore_ascii_case(hay.as_bytes());
+            m.score = if exact { score + 8 } else { score };
+            m.end_col = end_col;
+            m.exact = exact;
+        }
+        matches
+    } else if let Some(survivors) = &cand_idxs {
         let local = with_cached_matcher(valid_parts[0], options, |matcher| {
             matcher.match_list_parallel_resolved(
                 survivors,
