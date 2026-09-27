@@ -141,23 +141,22 @@ pub fn lcs_ge_bit(needle: &[u8], hay: &[u8], need: usize) -> bool {
 /// Same as [`lcs_ge_bit`] but reuses a precomputed `peq` table (2 KiB).
 /// Hot path: Prefilter caches one table per needle instead of rebuilding
 /// it for every haystack.
-#[inline]
+#[inline(always)]
 pub fn lcs_ge_bit_peq(peq: &[u64; 256], m: usize, hay: &[u8], need: usize) -> bool {
     if need == 0 {
         return true;
     }
-    if m > MAX_NEEDLE_BITS {
-        return false; // caller must not use peq path for long needles
-    }
-    if m == 0 || hay.len() < need {
+    if m == 0 || m > MAX_NEEDLE_BITS || hay.len() < need {
         return false;
     }
     let mask = bit_mask(m);
     let mut s = 0u64;
     let mut hits = 0usize;
     let mut left = hay.len();
+    // Tight loop: no bounds checks on peq (fixed 256).
+    let peq_ptr = peq.as_ptr();
     for &h in hay {
-        let x = peq[fold(h) as usize] | s;
+        let x = unsafe { *peq_ptr.add(fold(h) as usize) } | s;
         let y = ((s << 1) | 1) & mask;
         let ns = x & !x.wrapping_sub(y);
         if ns != s {
