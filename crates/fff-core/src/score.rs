@@ -1290,12 +1290,21 @@ fn match_and_score_in_arena<'a>(
         }
     }
 
+    // Cheap upper bound on `Score.total` when combo/current_file/path-align
+    // are all inert. filename ≤ 40% base, git_status ≤ 15% base, frecency is
+    // `base * freq / 100`. Skip `score_one` when this bound cannot beat the
+    // current kth best. Ranking stays exact.
+    let prunable = context.current_file.is_none()
+        && context.last_same_query_match.is_none()
+        && !query_contains_path_separator;
+
     if use_topk {
         use std::cmp::Reverse;
         use std::collections::BinaryHeap;
         let mut heap: BinaryHeap<Reverse<Ranked<'a>>> = BinaryHeap::new();
         let mut stamp = 0u64;
-        let mut push = |item: (&'a FileItem, Score)| {
+        let mut consider = |heap: &mut BinaryHeap<Reverse<Ranked<'a>>>,
+                            item: (&'a FileItem, Score)| {
             let entry = Ranked {
                 total: item.1.total,
                 stamp,
@@ -1313,7 +1322,21 @@ fn match_and_score_in_arena<'a>(
         if path_matches.len() < PARALLEL_SCORE_MIN {
             let mut scratch = make_scratch();
             for (match_idx, path_match) in path_matches.iter().enumerate() {
-                push(score_one(&mut scratch, match_idx, path_match));
+                if prunable && heap.len() >= page_cap {
+                    let file = working_files.index(path_match.index as usize);
+                    let base = path_match.score as i32;
+                    let freq = file.total_frecency_score().max(0);
+                    let ub = base
+                        .saturating_add(base.saturating_mul(freq) / 100)
+                        .saturating_add(base * 2 / 5)
+                        .saturating_add(base * 15 / 100)
+                        .saturating_add(file.git_recency_score.max(0) as i32);
+                    if heap.peek().is_some_and(|Reverse(w)| ub < w.total) {
+                        continue;
+                    }
+                }
+                let item = score_one(&mut scratch, match_idx, path_match);
+                consider(&mut heap, item);
             }
         } else {
             let scored: Vec<_> = crate::parallelism::run_on_bg_pool(|| {
@@ -1326,10 +1349,9 @@ fn match_and_score_in_arena<'a>(
                     .collect::<Vec<_>>()
             });
             for item in scored {
-                push(item);
+                consider(&mut heap, item);
             }
         }
-        drop(push);
         let mut results: Vec<(&'a FileItem, Score)> = heap
             .into_iter()
             .map(|Reverse(r)| (r.file, r.score))
