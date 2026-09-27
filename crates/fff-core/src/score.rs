@@ -265,10 +265,9 @@ fn match_fuzzy_parts(
 
     // Index-based resolver: no `Vec<&FileItem>` materialization for either the
     // full list or the per-part subsets, and a single monomorphized hot loop.
-    // NOTE: pigeonhole exact-substring prefilter was A/B'd and **rejected**.
-    // FFF matching is Smith-Waterman / subsequence-with-gaps, not substring
-    // embedding — a true hit need not contain any contiguous needle piece
-    // (`file_picker_` collapsed 51907→2092). Fall through to full frizbee.
+    // LCS pack+DP A/B: 0.41–0.45× vs upstream (frizbee SIMD prefilter is
+    // already cheaper than an extra full-corpus LCS). Keep path_pack/myers
+    // for a future in-matcher bit-parallel gate; do not pay pack+LCS here.
     let cand_idxs: Option<Vec<u32>> = None;
     let _ = (arena, working_files.len());
 
