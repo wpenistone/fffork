@@ -145,15 +145,44 @@ impl Matcher {
     ) where
         F: Fn(u32, &mut [*const u8; N]) -> Option<(usize, u16)>,
     {
+        let mut sink = |m: Match| matches.push(m);
+        self.match_range_resolved_each_with(range, resolve, &mut sink, scratch);
+    }
+
+    /// Streaming form: each `Match` is delivered to `sink` without retaining
+    /// a `Vec` of the full result set.
+    pub fn match_range_resolved_each<F, const N: usize>(
+        &mut self,
+        len: usize,
+        resolve: &F,
+        sink: &mut dyn FnMut(Match),
+    ) where
+        F: Fn(u32, &mut [*const u8; N]) -> Option<(usize, u16)>,
+    {
+        let mut scratch = ResolvedScratch::default();
+        self.match_range_resolved_each_with(0..len as u32, resolve, sink, &mut scratch);
+    }
+
+    /// Streaming core: each hit is passed to `sink` without building a `Vec`
+    /// of every match in the range.
+    pub(super) fn match_range_resolved_each_with<F, const N: usize>(
+        &mut self,
+        range: Range<u32>,
+        resolve: &F,
+        sink: &mut dyn FnMut(Match),
+        scratch: &mut ResolvedScratch,
+    ) where
+        F: Fn(u32, &mut [*const u8; N]) -> Option<(usize, u16)>,
+    {
         let mut chunk_ptrs = [core::ptr::null::<u8>(); N];
 
         // Empty patterns match every resolvable item
         if self.patterns.is_empty() {
-            matches.extend(
-                range
-                    .filter(|&index| resolve(index, &mut chunk_ptrs).is_some())
-                    .map(|index| Match::from_index(index as usize)),
-            );
+            for index in range {
+                if resolve(index, &mut chunk_ptrs).is_some() {
+                    sink(Match::from_index(index as usize));
+                }
+            }
             return;
         }
 
@@ -227,10 +256,10 @@ impl Matcher {
             self.match_list_into(&haystacks, 0, hits);
             // Backends emit matches in input order, so `hit.index` is the position of the
             // gathered haystack; map it back to the item index
-            matches.extend(hits.drain(..).map(|mut hit| {
+            for mut hit in hits.drain(..) {
                 hit.index = spans[hit.index as usize].0;
-                hit
-            }));
+                sink(hit);
+            }
         }
     }
 }

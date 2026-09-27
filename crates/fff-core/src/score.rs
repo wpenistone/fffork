@@ -968,6 +968,21 @@ fn match_and_score_in_arena<'a>(
         file_count: working_files.len(),
     });
     let phase_timing = std::env::var_os("FFF_PHASE_TIMING").is_some();
+    let phase_sink = std::env::var("FFF_PHASE_TIMING").unwrap_or_default();
+    let phase_log = |msg: String| {
+        if phase_timing {
+            if phase_sink.is_empty() || phase_sink == "1" {
+                eprintln!("{msg}");
+            } else {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&phase_sink)
+                {
+                    let _ = writeln!(f, "{msg}");
+                }
+            }
+        }
+    };
+    let t_fn = std::time::Instant::now();
     let t_match = std::time::Instant::now();
     let path_matches: Arc<Vec<neo_frizbee::Match>> = raw_cache
         .zip(cache_key.as_ref())
@@ -990,14 +1005,12 @@ fn match_and_score_in_arena<'a>(
             matches_arc
         });
     let match_elapsed = t_match.elapsed();
-    if phase_timing {
-        eprintln!(
-            "PHASE match_us={} n_matches={} n_files={}",
-            match_elapsed.as_micros(),
-            path_matches.len(),
-            working_files.len()
-        );
-    }
+    phase_log(format!(
+        "PHASE match_us={} n_matches={} n_files={}",
+        match_elapsed.as_micros(),
+        path_matches.len(),
+        working_files.len()
+    ));
 
     let main_needle = fuzzy_parts[0].as_bytes(); // safe
     let main_needle_len = main_needle.len() as u16;
