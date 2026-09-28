@@ -1,0 +1,16 @@
+[package]
+name = "fff-profile-driver"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+fff = { package = "fff-search", path = "../../crates/fff-core" }
+neo_frizbee = { path = "../../vendor/neo_frizbee", features = ["match_end_col"] }
+
+[profile.release]
+debug = true
+lto = "fat"
+codegen-units = 1
+opt-level = 3

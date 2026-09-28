@@ -330,66 +330,76 @@ fn match_fuzzy_parts(
         let use_u8 = avx2_ok && needle.len() <= 14;
         let batch_sz: usize = if use_u8 { 32 } else { 16 };
 
-        // Reusable SoA scratch (grows as needed, never shrinks).
-        let mut soa_scratch: Vec<u8> = Vec::new();
-        for (batch_i, chunk) in trims.chunks(batch_sz).enumerate() {
-            let n = chunk.len();
-            let max_len = chunk.iter().map(|t| t.1).max().unwrap_or(0);
-            if max_len == 0 {
-                continue;
-            }
+        // Parallel batches: each worker owns a SoA scratch and a disjoint
+        // output slice. Serial loop was the 4T regression (prefilter already
+        // fans out, then this phase serialized the pool).
+        crate::parallelism::run_on_bg_pool(|| {
+            use rayon::prelude::*;
+            scores
+                .par_chunks_mut(batch_sz)
+                .zip(end_cols.par_chunks_mut(batch_sz))
+                .zip(trims.par_chunks(batch_sz))
+                .enumerate()
+                .for_each(|(batch_i, ((score_chunk, ecol_chunk), chunk))| {
+                    let n = chunk.len();
+                    let max_len = chunk.iter().map(|t| t.1).max().unwrap_or(0);
+                    if max_len == 0 {
+                        return;
+                    }
 
-            // Build SoA from trimmed slices. Stride = batch_sz to match the kernel.
-            let soa_len = max_len * batch_sz;
-            if soa_scratch.len() < soa_len {
-                soa_scratch.resize(soa_len, 0);
-            } else {
-                soa_scratch[..soa_len].fill(0);
-            }
-            let soa = &mut soa_scratch[..soa_len];
-            let mut prefix_mask: u32 = 0;
-            for (k, &(off, len, _, inc_prefix, _, _)) in chunk.iter().enumerate() {
-                let src = &all_bytes[off..off + len];
-                for (j, &b) in src.iter().enumerate() {
-                    soa[j * batch_sz + k] = b;
-                }
-                if inc_prefix {
-                    prefix_mask |= 1u32 << k;
-                }
-            }
+                    let soa_len = max_len * batch_sz;
+                    let mut soa_scratch = vec![0u8; soa_len];
+                    let mut prefix_mask: u32 = 0;
+                    for (k, &(off, len, _, inc_prefix, _, _)) in chunk.iter().enumerate() {
+                        let src = &all_bytes[off..off + len];
+                        for (j, &b) in src.iter().enumerate() {
+                            soa_scratch[j * batch_sz + k] = b;
+                        }
+                        if inc_prefix {
+                            prefix_mask |= 1u32 << k;
+                        }
+                    }
 
-            let base = batch_i * batch_sz;
-            #[cfg(target_arch = "x86_64")]
-            if use_u8 {
-                unsafe {
-                    crate::interseq_sw::avx2::score_batch_avx2_u8(
-                        needle, soa, max_len, &p, prefix_mask,
-                        &mut scores[base..base + n],
-                        &mut end_cols[base..base + n],
-                    );
-                }
-                continue;
-            }
-            #[cfg(target_arch = "x86_64")]
-            if avx2_ok && needle.len() <= 16 {
-                unsafe {
-                    crate::interseq_sw::avx2::score_batch_avx2(
-                        needle, soa, max_len, &p, prefix_mask as u16,
-                        &mut scores[base..base + n],
-                        &mut end_cols[base..base + n],
-                    );
-                }
-                continue;
-            }
-            // Scalar fallback for this batch
-            for (k, &(off, len, _, inc_prefix, _, _)) in chunk.iter().enumerate() {
-                let src = &all_bytes[off..off + len];
-                let (s, e) =
-                    crate::interseq_sw::score_one_scalar_full(needle, src, &p, inc_prefix);
-                scores[base + k] = s;
-                end_cols[base + k] = e;
-            }
-        }
+                    #[cfg(target_arch = "x86_64")]
+                    if use_u8 {
+                        unsafe {
+                            crate::interseq_sw::avx2::score_batch_avx2_u8(
+                                needle,
+                                &soa_scratch,
+                                max_len,
+                                &p,
+                                prefix_mask,
+                                &mut score_chunk[..n],
+                                &mut ecol_chunk[..n],
+                            );
+                        }
+                        return;
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    if avx2_ok && needle.len() <= 16 {
+                        unsafe {
+                            crate::interseq_sw::avx2::score_batch_avx2(
+                                needle,
+                                &soa_scratch,
+                                max_len,
+                                &p,
+                                prefix_mask as u16,
+                                &mut score_chunk[..n],
+                                &mut ecol_chunk[..n],
+                            );
+                        }
+                        return;
+                    }
+                    for (k, &(off, len, _, inc_prefix, _, _)) in chunk.iter().enumerate() {
+                        let src = &all_bytes[off..off + len];
+                        let (s, e) =
+                            crate::interseq_sw::score_one_scalar_full(needle, src, &p, inc_prefix);
+                        score_chunk[k] = s;
+                        ecol_chunk[k] = e;
+                    }
+                    let _ = batch_i;
+                });
+        });
         let batch_ms = t_batch.elapsed().as_secs_f64() * 1e3;
 
         let t_assemble = std::time::Instant::now();
