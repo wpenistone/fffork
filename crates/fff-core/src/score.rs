@@ -295,8 +295,22 @@ fn match_fuzzy_parts(
         let t_collect = std::time::Instant::now();
         // Metadata only — do **not** copy trimmed path bytes into a giant
         // `all_bytes` buffer (that was ~14 MB of page faults per query).
-        // (file_idx, start, end, include_prefix, include_exact)
-        let mut trims: Vec<(u32, u32, u32, bool, bool)> = Vec::with_capacity(matches.len());
+        // Thread-local buffers so repeat queries do not re-fault pages.
+        thread_local! {
+            static TRIMS: std::cell::RefCell<Vec<(u32, u32, u32, bool, bool)>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+            static SCORES: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
+            static ECOLS: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let mut trims = TRIMS.with(|c| {
+            let mut b = c.borrow_mut();
+            b.clear();
+            if b.capacity() < matches.len() {
+                b.reserve(matches.len());
+            }
+            std::mem::take(&mut *b)
+        });
+        trims.clear();
         {
             let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
             for m in &matches {
@@ -319,8 +333,18 @@ fn match_fuzzy_parts(
         let collect_ms = t_collect.elapsed().as_secs_f64() * 1e3;
 
         let t_batch = std::time::Instant::now();
-        let mut scores = vec![0u16; matches.len()];
-        let mut end_cols = vec![0u16; matches.len()];
+        let mut scores = SCORES.with(|c| {
+            let mut b = c.borrow_mut();
+            b.clear();
+            b.resize(matches.len(), 0);
+            std::mem::take(&mut *b)
+        });
+        let mut end_cols = ECOLS.with(|c| {
+            let mut b = c.borrow_mut();
+            b.clear();
+            b.resize(matches.len(), 0);
+            std::mem::take(&mut *b)
+        });
         #[cfg(target_arch = "x86_64")]
         let avx2_ok = is_x86_feature_detected!("avx2")
             && is_x86_feature_detected!("sse4.1");
@@ -448,6 +472,11 @@ fn match_fuzzy_parts(
             }
         }
         let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1e3;
+
+        // Return buffers to thread-local reuse (no free/alloc next query).
+        TRIMS.with(|c| *c.borrow_mut() = trims);
+        SCORES.with(|c| *c.borrow_mut() = scores);
+        ECOLS.with(|c| *c.borrow_mut() = end_cols);
 
         if std::env::var_os("FFF_PHASE_TIMING").is_some() {
             eprintln!(
