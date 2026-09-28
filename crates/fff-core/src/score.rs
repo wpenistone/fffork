@@ -293,26 +293,28 @@ fn match_fuzzy_parts(
         let needle = valid_parts[0].as_bytes();
 
         let t_collect = std::time::Instant::now();
-        let mut all_bytes: Vec<u8> = Vec::with_capacity(matches.len().saturating_mul(64));
-        let mut trims: Vec<(usize, usize, usize, bool, bool, usize)> =
-            Vec::with_capacity(matches.len());
-
-        let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-        for m in &matches {
-            let file = working_files.index(m.index as usize);
-            let hay = file.path.read_to_buf(arena, &mut path_buf);
-            let hay_bytes = hay.as_bytes();
-            let start_adj = m.score as usize;
-            let end_pos = m.end_col as usize;
-            let end_clamped = end_pos.min(hay_bytes.len());
-            let start_clamped = start_adj.min(end_clamped);
-            let trimmed = &hay_bytes[start_clamped..end_clamped];
-            let include_prefix = start_clamped == 0;
-            let include_exact = start_clamped == 0 && end_clamped == hay_bytes.len();
-
-            let off = all_bytes.len();
-            all_bytes.extend_from_slice(trimmed);
-            trims.push((off, trimmed.len(), start_clamped, include_prefix, include_exact, m.index as usize));
+        // Metadata only — do **not** copy trimmed path bytes into a giant
+        // `all_bytes` buffer (that was ~14 MB of page faults per query).
+        // (file_idx, start, end, include_prefix, include_exact)
+        let mut trims: Vec<(u32, u32, u32, bool, bool)> = Vec::with_capacity(matches.len());
+        {
+            let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+            for m in &matches {
+                let file = working_files.index(m.index as usize);
+                let hay = file.path.read_to_buf(arena, &mut path_buf);
+                let hay_len = hay.len();
+                let start_adj = m.score as usize;
+                let end_pos = m.end_col as usize;
+                let end_clamped = end_pos.min(hay_len);
+                let start_clamped = start_adj.min(end_clamped);
+                trims.push((
+                    m.index,
+                    start_clamped as u32,
+                    end_clamped as u32,
+                    start_clamped == 0,
+                    start_clamped == 0 && end_clamped == hay_len,
+                ));
+            }
         }
         let collect_ms = t_collect.elapsed().as_secs_f64() * 1e3;
 
@@ -326,29 +328,34 @@ fn match_fuzzy_parts(
         let avx2_ok = false;
 
         // u8 fast path: 32 lanes, valid when max score < 256.
-        // max_score = m*(match+max_bonus) + prefix + exact = m*16 + 20.
         let use_u8 = avx2_ok && needle.len() <= 14;
         let batch_sz: usize = if use_u8 { 32 } else { 16 };
 
-        // Parallel batches: each worker owns a SoA scratch and a disjoint
-        // output slice. Serial loop was the 4T regression (prefilter already
-        // fans out, then this phase serialized the pool).
         crate::parallelism::run_on_bg_pool(|| {
             use rayon::prelude::*;
             scores
                 .par_chunks_mut(batch_sz)
                 .zip(end_cols.par_chunks_mut(batch_sz))
                 .zip(trims.par_chunks(batch_sz))
-                .enumerate()
-                .for_each(|(batch_i, ((score_chunk, ecol_chunk), chunk))| {
+                .for_each(|((score_chunk, ecol_chunk), chunk)| {
                     let n = chunk.len();
-                    let max_len = chunk.iter().map(|t| t.1).max().unwrap_or(0);
+                    let mut max_len = 0usize;
+                    let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+                    let mut slices: Vec<(usize, usize, bool)> = Vec::with_capacity(n);
+                    for &(fi, s, e, inc_prefix, _) in chunk.iter() {
+                        let file = working_files.index(fi as usize);
+                        let hay = file.path.read_to_buf(arena, &mut path_buf);
+                        // Keep (offset, len, inc_prefix) into a tiny per-batch
+                        // copy of just this batch's trimmed bytes.
+                        let off = slices.len();
+                        let _ = off;
+                        let trimmed = &hay.as_bytes()[s as usize..e as usize];
+                        max_len = max_len.max(trimmed.len());
+                        slices.push((trimmed.len(), s as usize, inc_prefix));
+                    }
                     if max_len == 0 {
                         return;
                     }
-
-                    // Thread-local SoA scratch: no per-batch heap (was a
-                    // major page-fault source on 227k corpora).
                     thread_local! {
                         static SOA: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
                     }
@@ -360,13 +367,13 @@ fn match_fuzzy_parts(
                         }
                         std::mem::take(&mut *b)
                     });
-                    if soa_scratch.len() > soa_len {
-                        soa_scratch.truncate(soa_len);
-                    }
+                    soa_scratch.truncate(soa_len);
                     soa_scratch[..soa_len].fill(0);
                     let mut prefix_mask: u32 = 0;
-                    for (k, &(off, len, _, inc_prefix, _, _)) in chunk.iter().enumerate() {
-                        let src = &all_bytes[off..off + len];
+                    for (k, &(fi, s, e, inc_prefix, _)) in chunk.iter().enumerate() {
+                        let file = working_files.index(fi as usize);
+                        let hay = file.path.read_to_buf(arena, &mut path_buf);
+                        let src = &hay.as_bytes()[s as usize..e as usize];
                         for (j, &b) in src.iter().enumerate() {
                             soa_scratch[j * batch_sz + k] = b;
                         }
@@ -407,29 +414,38 @@ fn match_fuzzy_parts(
                         SOA.with(|c| *c.borrow_mut() = soa_scratch);
                         return;
                     }
-                    for (k, &(off, len, _, inc_prefix, _, _)) in chunk.iter().enumerate() {
-                        let src = &all_bytes[off..off + len];
-                        let (s, e) =
+                    for (k, &(fi, s, e, inc_prefix, _)) in chunk.iter().enumerate() {
+                        let file = working_files.index(fi as usize);
+                        let hay = file.path.read_to_buf(arena, &mut path_buf);
+                        let src = &hay.as_bytes()[s as usize..e as usize];
+                        let (sc, ec) =
                             crate::interseq_sw::score_one_scalar_full(needle, src, &p, inc_prefix);
-                        score_chunk[k] = s;
-                        ecol_chunk[k] = e;
+                        score_chunk[k] = sc;
+                        ecol_chunk[k] = ec;
                     }
                     SOA.with(|c| *c.borrow_mut() = soa_scratch);
-                    let _ = batch_i;
+                    let _ = &slices;
                 });
         });
         let batch_ms = t_batch.elapsed().as_secs_f64() * 1e3;
 
         let t_assemble = std::time::Instant::now();
-        for (i, m) in matches.iter_mut().enumerate() {
-            let &(_, _, start_adj, _, include_exact, _) = &trims[i];
-            let trimmed = &all_bytes[trims[i].0..trims[i].0 + trims[i].1];
-            let exact = include_exact && needle.eq_ignore_ascii_case(trimmed);
-            let bonus = if exact { 8u16 } else { 0 };
-            m.score = scores[i].saturating_add(bonus);
-            m.end_col = end_cols[i]
-                .saturating_add(start_adj.min(u16::MAX as usize) as u16);
-            m.exact = exact;
+        {
+            let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+            for (i, m) in matches.iter_mut().enumerate() {
+                let (fi, start_adj, end_pos, _, include_exact) = trims[i];
+                let exact = include_exact && {
+                    let file = working_files.index(fi as usize);
+                    let hay = file.path.read_to_buf(arena, &mut path_buf);
+                    needle.eq_ignore_ascii_case(hay.as_bytes())
+                        && (end_pos as usize) == hay.len()
+                };
+                let bonus = if exact { 8u16 } else { 0 };
+                m.score = scores[i].saturating_add(bonus);
+                m.end_col = end_cols[i]
+                    .saturating_add(start_adj.min(u16::MAX as u32) as u16);
+                m.exact = exact;
+            }
         }
         let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1e3;
 
