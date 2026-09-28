@@ -1668,8 +1668,9 @@ mod tests {
             .collect();
         let (store, strings) =
             crate::simd_path::build_chunked_path_store_from_strings(&names, &files);
-        for (file, path) in files.iter_mut().zip(strings) {
+        for (i, (file, path)) in files.iter_mut().zip(strings).enumerate() {
             file.set_path(path);
+            file.set_presence(crate::presence::mask_of(names[i].as_bytes()));
         }
 
         let index = build_bigram_index(&files, base, store.as_arena_ptr());

@@ -253,6 +253,10 @@ pub struct FileItem {
     pub git_recency_score: i16,
     pub git_status: Option<git2::Status>,
     pub(crate) path: crate::simd_path::ChunkedString,
+    /// Scan-time 64-bit character-presence mask of the relative path
+    /// (see crate::presence). Sound necessary condition for fuzzy
+    /// LCS >= |q| - max_typos; never rejects a true match.
+    pub(crate) presence: u64,
     pub(crate) parent_dir_index: u32,
     flags: AtomicU8,
     /// Lazy mmap cache (boxed, set once). Only populated by the actual file
@@ -272,6 +276,7 @@ impl Clone for FileItem {
     fn clone(&self) -> Self {
         Self {
             path: self.path.clone(),
+            presence: self.presence,
             parent_dir_index: self.parent_dir_index,
             size: self.size,
             modified: self.modified,
@@ -317,6 +322,7 @@ impl FileItem {
 
         Self {
             path,
+            presence: 0,
             parent_dir_index: u32::MAX,
             size,
             modified,
@@ -339,6 +345,16 @@ impl FileItem {
 
     pub(crate) fn set_path(&mut self, path: crate::simd_path::ChunkedString) {
         self.path = path;
+    }
+
+    pub(crate) fn set_presence(&mut self, mask: u64) {
+        self.presence = mask;
+    }
+
+    /// Scan-time character-presence mask of the relative path.
+    #[inline(always)]
+    pub(crate) fn presence_mask(&self) -> u64 {
+        self.presence
     }
 
     pub fn dir_str(&self, arena: impl FFFStringStorage) -> String {

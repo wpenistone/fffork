@@ -160,6 +160,7 @@ mod score;
 mod sort_buffer;
 pub(crate) mod interseq_sw;
 pub(crate) mod path_pack;
+pub(crate) mod presence;
 
 pub(crate) mod index;
 pub(crate) mod parallelism;

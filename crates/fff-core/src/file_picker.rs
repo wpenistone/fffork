@@ -1243,11 +1243,19 @@ impl FilePicker {
                     let live = self.live.lock();
                     (live.query.clone(), live.candidates.clone())
                 };
+                // Presence-index prune of the previous hit set before the
+                // expensive matcher: a longer query only tightens the
+                // necessary condition, so mask rejects are sound here too.
+                let new_q = context.effective_query().as_bytes();
                 let subset: Vec<&FileItem> = prev_cand
                     .iter()
                     .filter_map(|&i| files.get(i as usize))
+                    .filter(|f| {
+                        let m = f.presence_mask();
+                        m == 0 || crate::presence::allows(m, new_q, max_typos)
+                    })
                     .collect();
-                eprintln!("LIVE_NARROW prev={} cand={}", prev_q, subset.len());
+                eprintln!("LIVE_NARROW prev={} cand={} masked={}", prev_q, prev_cand.len(), subset.len());
                 if !subset.is_empty() {
                     let mut local_hits: Vec<u32> = Vec::new();
                     let out = crate::score::with_hit_capture(&mut local_hits, || {
@@ -1906,6 +1914,7 @@ impl FilePicker {
         });
 
         file_item.set_path(builder.add_file_immediate(&rel_path, file_item.path.filename_offset));
+        file_item.set_presence(crate::presence::mask_of(rel_path.as_bytes()));
         file_item.set_overflow(true);
 
         // Keep the dir table consistent: register (or revive) the parent dir
@@ -2506,6 +2515,7 @@ fn populates_dirs_files_chunked_storage<'a>(
         }
 
         file.path = chunk_storage.add_file_immediate(rel, file.path.filename_offset);
+        file.set_presence(crate::presence::mask_of(rel.as_bytes()));
         file.parent_dir_index = current_dir_idx;
     }
 

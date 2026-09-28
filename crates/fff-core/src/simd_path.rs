@@ -440,6 +440,7 @@ mod tests {
         let (store, strings) = build_chunked_path_store_from_strings(&path_strings, &files);
         for (i, file) in files.iter_mut().enumerate() {
             file.set_path(strings[i].clone());
+            file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
         }
         (store, strings, files)
     }

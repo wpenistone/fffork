@@ -71,46 +71,12 @@ impl RawMatchCache {
     }
 }
 
-/// Necessary-condition prefilter: a fuzzy hit with `max_typos = T` needs at
-/// least `needle_len - T` distinct needle bytes to appear in the path (any
-/// order). O(path + needle) with a 256-byte presence table — no LCS DP, no
-/// path concatenation. Never rejects a true match.
+/// Scan-time presence-index prefilter (see `crate::presence`). O(needle)
+/// per path, no path-byte access — the point of the index is that a reject
+/// never touches the path arena (keeps first-keystroke faults down).
+/// A zero mask means "not indexed" (test fixtures) and is allowed through;
+/// production scan always fills the mask. Never rejects a true match.
 #[inline]
-fn path_bytes_allow(needle: &[u8], chunk_ptrs: &[*const u8], chunk_count: usize, byte_len: u16, max_typos: u16) -> bool {
-    let need = needle.len().saturating_sub(max_typos as usize);
-    if need == 0 {
-        return true;
-    }
-    if (byte_len as usize) < need {
-        return false;
-    }
-    let fold = |b: u8| if b.is_ascii_uppercase() { b + 32 } else { b };
-    let mut present = [false; 256];
-    let mut left = byte_len as usize;
-    for &ptr in chunk_ptrs.iter().take(chunk_count) {
-        if left == 0 {
-            break;
-        }
-        let take = left.min(crate::simd_path::SIMD_CHUNK_BYTES);
-        let chunk = unsafe { std::slice::from_raw_parts(ptr, crate::simd_path::SIMD_CHUNK_BYTES) };
-        for &b in &chunk[..take] {
-            present[fold(b) as usize] = true;
-        }
-        left -= take;
-    }
-    let mut hits = 0usize;
-    for &b in needle {
-        if present[fold(b) as usize] {
-            hits += 1;
-            if hits >= need {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-/// Resolve path chunks for frizbee; drop paths that cannot fuzzy-match.
 fn resolve_file_chunks_prefiltered(
     file: &FileItem,
     arena: ArenaPtr,
@@ -118,11 +84,11 @@ fn resolve_file_chunks_prefiltered(
     needle: &[u8],
     max_typos: u16,
 ) -> Option<(usize, u16)> {
-    let (chunks, byte_len) = resolve_file_chunks(file, arena, buf)?;
-    if !path_bytes_allow(needle, buf, chunks, byte_len, max_typos) {
+    let mask = file.presence_mask();
+    if mask != 0 && !crate::presence::allows(mask, needle, max_typos) {
         return None;
     }
-    Some((chunks, byte_len))
+    resolve_file_chunks(file, arena, buf)
 }
 
 /// Build a frizbee `Matcher` for one search. Construction is not free
@@ -303,7 +269,13 @@ fn match_fuzzy_parts(
                 matcher.match_range_parallel_resolved(
                     working_files.len(),
                     &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
-                        resolve_file_chunks(working_files.index(index as usize), arena, buf)
+                        resolve_file_chunks_prefiltered(
+                            working_files.index(index as usize),
+                            arena,
+                            buf,
+                            valid_parts[0].as_bytes(),
+                            options.max_typos.unwrap_or(u16::MAX),
+                        )
                     },
                     threads,
                 )
@@ -339,11 +311,12 @@ fn match_fuzzy_parts(
         });
         trims.clear();
         {
-            let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+            // byte_len only — do not copy path bytes here. This loop is
+            // serial over every match; a full read_to_buf per match was a
+            // measurable fault source on cold path arenas.
             for m in &matches {
                 let file = working_files.index(m.index as usize);
-                let hay = file.path.read_to_buf(arena, &mut path_buf);
-                let hay_len = hay.len();
+                let hay_len = file.path.byte_len as usize;
                 let start_adj = m.score as usize;
                 let end_pos = m.end_col as usize;
                 let end_clamped = end_pos.min(hay_len);
@@ -546,9 +519,9 @@ fn match_fuzzy_parts(
             scores[oi as usize] = perm_scores[i];
             end_cols[oi as usize] = perm_ecols[i];
         }
-        ORDER.with(|c| *c.borrow_mut() = order);
-        PERM_SCORES.with(|c| *c.borrow_mut() = perm_scores);
-        PERM_ECOLS.with(|c| *c.borrow_mut() = perm_ecols);
+        ORDER.with(|c| reclaim(&mut c.borrow_mut(), order));
+        PERM_SCORES.with(|c| reclaim(&mut c.borrow_mut(), perm_scores));
+        PERM_ECOLS.with(|c| reclaim(&mut c.borrow_mut(), perm_ecols));
         let batch_ms = t_batch.elapsed().as_secs_f64() * 1e3;
 
         let t_assemble = std::time::Instant::now();
@@ -572,9 +545,18 @@ fn match_fuzzy_parts(
         let assemble_ms = t_assemble.elapsed().as_secs_f64() * 1e3;
 
         // Return buffers to thread-local reuse (no free/alloc next query).
-        TRIMS.with(|c| *c.borrow_mut() = trims);
-        SCORES.with(|c| *c.borrow_mut() = scores);
-        ECOLS.with(|c| *c.borrow_mut() = end_cols);
+        // Cap retained capacity so one huge match set does not pin TLS
+        // forever — RSS matters as much as fault count on flat corpora.
+        const TLS_RETAIN: usize = 64 * 1024;
+        fn reclaim<T>(b: &mut Vec<T>, v: Vec<T>) {
+            *b = v;
+            if b.capacity() > TLS_RETAIN {
+                b.shrink_to(TLS_RETAIN);
+            }
+        }
+        TRIMS.with(|c| reclaim(&mut c.borrow_mut(), trims));
+        SCORES.with(|c| reclaim(&mut c.borrow_mut(), scores));
+        ECOLS.with(|c| reclaim(&mut c.borrow_mut(), end_cols));
 
         if std::env::var_os("FFF_PHASE_TIMING").is_some() {
             eprintln!(
@@ -615,7 +597,13 @@ fn match_fuzzy_parts(
                 survivors.len(),
                 &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
                     let file = working_files.index(survivors[index as usize].index as usize);
-                    resolve_file_chunks(file, arena, buf)
+                    resolve_file_chunks_prefiltered(
+                        file,
+                        arena,
+                        buf,
+                        part.as_bytes(),
+                        part_options.max_typos.unwrap_or(u16::MAX),
+                    )
                 },
                 sub_threads,
             )
@@ -1936,6 +1924,7 @@ mod tests {
                     .unwrap_or(0) as u16;
                 let mut file = FileItem::new_raw(filename_start, 0, modified, None, false);
                 file.set_path(strings[i].clone());
+                file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
                 let score_obj = Score {
                     total: score,
                     base_score: score,
@@ -2138,6 +2127,7 @@ mod filename_bonus_tests {
         let mut result: Vec<FileItem> = items;
         for (i, file) in result.iter_mut().enumerate() {
             file.set_path(strings[i].clone());
+                file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
         }
         std::mem::forget(store);
         (result, arena)
@@ -2158,6 +2148,7 @@ mod filename_bonus_tests {
         let mut result: Vec<FileItem> = items;
         for (i, file) in result.iter_mut().enumerate() {
             file.set_path(strings[i].clone());
+                file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
             file.access_frecency_score = specs[i].1;
         }
         std::mem::forget(store);
@@ -2411,6 +2402,7 @@ mod git_recency_scoring_tests {
         let mut result: Vec<FileItem> = items;
         for (i, file) in result.iter_mut().enumerate() {
             file.set_path(strings[i].clone());
+                file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
             file.git_recency_score = specs[i].1;
         }
         std::mem::forget(store);
@@ -2497,6 +2489,7 @@ mod typo_resistance_tests {
         let mut result: Vec<FileItem> = items;
         for (i, file) in result.iter_mut().enumerate() {
             file.set_path(strings[i].clone());
+                file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
         }
         std::mem::forget(store);
         (result, arena)
@@ -2611,6 +2604,7 @@ mod constraint_only_query_tests {
         let mut files: Vec<FileItem> = items;
         for (i, file) in files.iter_mut().enumerate() {
             file.set_path(strings[i].clone());
+                file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
         }
         files[0].git_status = Some(git2::Status::WT_MODIFIED);
         files[1].git_status = Some(git2::Status::CURRENT);
@@ -2663,6 +2657,7 @@ mod constraint_only_query_tests {
         let mut files: Vec<FileItem> = items;
         for (i, file) in files.iter_mut().enumerate() {
             file.set_path(strings[i].clone());
+                file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
         }
         files[0].git_status = Some(git2::Status::WT_MODIFIED);
         files[1].git_status = Some(git2::Status::CURRENT);
