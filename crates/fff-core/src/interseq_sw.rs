@@ -524,9 +524,9 @@ mod tests {
     /// Compare against frizbee's Matcher (the ground truth) using fff's
     /// scoring config (matching_case_bonus=0 for lowercase queries).
     fn frizbee_score(needle: &str, haystack: &str) -> u16 {
-        let _guard = ENV_LOCK.lock().unwrap();
+        
         // Ensure skip_sw is OFF for the ground-truth measurement
-        unsafe { std::env::remove_var("FRIZBEE_SKIP_SW"); }
+        
         let has_upper = needle.chars().any(|c| c.is_uppercase());
         let cfg = neo_frizbee::Config {
             max_typos: Some(6),
@@ -688,11 +688,11 @@ mod tests {
         for &(needle, full) in cases {
             // Get frizbee's prefilter window via skip_sw (hold env lock)
             let skip_matches = {
-                let _guard = ENV_LOCK.lock().unwrap();
-                unsafe { std::env::set_var("FRIZBEE_SKIP_SW", "1"); }
-                let mut m = neo_frizbee::Matcher::new(needle, &cfg);
-                let sm = m.match_list(std::slice::from_ref(&full));
-                unsafe { std::env::remove_var("FRIZBEE_SKIP_SW"); }
+                
+                
+                let sm = neo_frizbee::with_skip_sw(|| { let mut m = neo_frizbee::Matcher::new(needle, &cfg); m.match_list(std::slice::from_ref(&full)) });
+                
+                
                 sm
             };
 

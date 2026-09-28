@@ -181,7 +181,7 @@ fn main() {
         for (i, item) in result.items.iter().enumerate() {
             acc = acc
                 .wrapping_mul(0x9E3779B97F4A7C15u64 as usize)
-                .wrapping_add(item.path.byte_len as usize)
+                .wrapping_add(item.relative_path_len())
                 .wrapping_add(i * 17);
         }
         for s in &result.scores {
@@ -223,6 +223,64 @@ fn main() {
                 let _ = writeln!(f, "{}", item.relative_path(picker_ref));
             }
         }
+    }
+
+    // Realistic typing scenario: type:<string> times one search per prefix
+    // (s, sc, sco, ...) with no cross-prefix warmup — first keystroke after
+    // open, then each next character.
+    if let Some(full) = query.strip_prefix("type:") {
+        eprintln!("SCENARIO typing={full}");
+        let mut prev_us = 0.0;
+        for n in 1..=full.len() {
+            let q = &full[..n];
+            let p2 = parser.parse(q);
+            let t0 = Instant::now();
+            let (total_matched, items_len) = {
+                let guard = shared_picker.read().expect("picker lock");
+                let picker = guard.as_ref().expect("picker");
+                let r = picker.fuzzy_search(
+                    &p2,
+                    None,
+                    FuzzySearchOptions {
+                        max_threads: threads,
+                        current_file: None,
+                        project_path: Some(root_path),
+                        combo_boost_score_multiplier: 100,
+                        min_combo_count: 3,
+                        pagination: PaginationArgs { offset: 0, limit: 100 },
+                    },
+                );
+                (r.total_matched, r.items.len())
+            };
+            let us = t0.elapsed().as_secs_f64() * 1e6;
+            let delta = us - prev_us;
+            prev_us = us;
+            eprintln!(
+                "TYPE q={:?} us={:.1} delta_us={:.1} total_matched={} items={}",
+                q, us, delta, total_matched, items_len
+            );
+        }
+        // Second pass: repeat the full query (follow-up / re-query).
+        let t0 = Instant::now();
+        {
+            let guard = shared_picker.read().expect("picker lock");
+            let picker = guard.as_ref().expect("picker");
+            let _ = picker.fuzzy_search(
+                &parsed,
+                None,
+                FuzzySearchOptions {
+                    max_threads: threads,
+                    current_file: None,
+                    project_path: Some(root_path),
+                    combo_boost_score_multiplier: 100,
+                    min_combo_count: 3,
+                    pagination: PaginationArgs { offset: 0, limit: 100 },
+                },
+            );
+        }
+        let us = t0.elapsed().as_secs_f64() * 1e6;
+        eprintln!("TYPE repeat_us={:.1}", us);
+        return;
     }
 
     let mut checksum = 0usize;

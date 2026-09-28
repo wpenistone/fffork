@@ -25,6 +25,7 @@ mod resolved;
 use algo::{MANY_TYPOS, NO_PREFILTER, Specialized};
 use backend::*;
 pub use iter::{FuzzyMatch, FuzzyMatchExt, FuzzyMatchIndices};
+pub use algo::with_skip_sw;
 
 /// Many variants so we use a macro to expand to the correct impl
 macro_rules! dispatch {

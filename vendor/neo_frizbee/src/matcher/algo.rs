@@ -52,8 +52,25 @@ pub struct MatcherImpl<P: PrefilterKernel, S: SmithWatermanKernel> {
     min_haystack_len: usize,
     prefilter: P,
     smith_waterman: S,
-    // Measurement knob: skip the SW score (accept-only) when FRIZBEE_SKIP_SW=1.
+    // Accept-only mode: skip SW scoring (prefilter still runs). Thread-local
+    // so parallel tests / other matchers are not affected (env vars are process
+    // global and raced with ranking tests).
     skip_sw: bool,
+}
+
+thread_local! {
+    static SKIP_SW: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+/// Run `f` with SW scoring disabled (accept-only / trim windows only).
+pub fn with_skip_sw<R>(f: impl FnOnce() -> R) -> R {
+    SKIP_SW.with(|c| {
+        let prev = c.get();
+        c.set(true);
+        let r = f();
+        c.set(prev);
+        r
+    })
 }
 
 impl<P, S> MatcherImpl<P, S>
@@ -73,7 +90,7 @@ where
                 .unwrap_or(0),
             prefilter: P::new(needle, case_sensitive),
             smith_waterman: S::new(needle, &config.scoring, case_sensitive),
-            skip_sw: std::env::var_os("FRIZBEE_SKIP_SW").is_some(),
+            skip_sw: SKIP_SW.with(|c| c.get()),
         }
     }
 
@@ -98,7 +115,7 @@ where
                 if matched {
                     let (trimmed, start_pos, include_exact) =
                         trim_haystack(haystack, start_pos, end_pos);
-                    if self.skip_sw {
+                    if self.skip_sw || SKIP_SW.with(|c| c.get()) {
                         // Encode prefilter window for the caller's re-scorer:
                         // score = start_pos (pre-adjust), end_col = end_pos.
                         // Caller must replicate trim_haystack + include_prefix.

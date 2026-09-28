@@ -270,21 +270,17 @@ fn match_fuzzy_parts(
         let t_prefilter = std::time::Instant::now();
         // Phase 1: frizbee prefilter only (skip its SW). The skip_sw path
         // encodes (start_pos_adj, end_pos) in (score, end_col).
-        unsafe {
-            std::env::set_var("FRIZBEE_SKIP_SW", "1");
-        }
-        let mut matches = with_cached_matcher(valid_parts[0], options, |matcher| {
-            matcher.match_range_parallel_resolved(
-                working_files.len(),
-                &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
-                    resolve_file_chunks(working_files.index(index as usize), arena, buf)
-                },
-                threads,
-            )
+        let mut matches = neo_frizbee::with_skip_sw(|| {
+            with_cached_matcher(valid_parts[0], options, |matcher| {
+                matcher.match_range_parallel_resolved(
+                    working_files.len(),
+                    &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+                        resolve_file_chunks(working_files.index(index as usize), arena, buf)
+                    },
+                    threads,
+                )
+            })
         });
-        unsafe {
-            std::env::remove_var("FRIZBEE_SKIP_SW");
-        }
         let prefilter_ms = t_prefilter.elapsed().as_secs_f64() * 1e3;
 
         // Phase 2: re-score with inter-sequence SW on trimmed windows.

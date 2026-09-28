@@ -132,6 +132,7 @@ use r#const::*;
 
 pub use r#const::SIMD_CHUNK_BYTES;
 pub use matcher::Matcher;
+pub use matcher::algo::with_skip_sw;
 pub use pattern::{Pattern, PatternConfig};
 pub use sort::radix_sort_matches;
 

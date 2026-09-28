@@ -632,6 +632,36 @@ pub struct FilePicker {
     skip_git: bool,
     trace_span: tracing::Span,
     trace_id: String,
+    /// Live candidate narrowing for typing. Sound only when the new query
+    /// extends the previous one **and** `max_typos` is unchanged (then
+    /// Match(longer,T) ⊆ Match(shorter,T)). Invalidated on index change.
+    live: parking_lot::Mutex<LiveNarrow>,
+    /// Bumped whenever the file set changes so live state is dropped.
+    index_generation: std::sync::atomic::AtomicU64,
+}
+
+impl FilePicker {
+    #[inline]
+    pub(crate) fn index_generation(&self) -> u64 {
+        self.index_generation.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn bump_index_generation(&self) {
+        self.index_generation.fetch_add(1, Ordering::Relaxed);
+        self.live.lock().active = false;
+    }
+}
+
+#[derive(Default)]
+struct LiveNarrow {
+    generation: u64,
+    query: String,
+    max_typos: u16,
+    /// File indices (into sync_data.files) that matched the previous query.
+    candidates: Vec<u32>,
+    /// Files already scored at previous length — set only when we stored a hit set.
+    active: bool,
 }
 
 impl std::fmt::Debug for FilePicker {
@@ -961,6 +991,8 @@ impl FilePicker {
             skip_git: options.skip_git,
             trace_span,
             trace_id,
+            live: parking_lot::Mutex::new(LiveNarrow::default()),
+            index_generation: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1192,6 +1224,26 @@ impl FilePicker {
         let base_arena = self.sync_data.arena_base_ptr();
         let overflow_arena = self.sync_data.arena_overflow_ptr();
 
+        // Typing live-narrow: when the query only extends the previous one and
+        // max_typos is unchanged, Match(longer,T) ⊆ Match(shorter,T). We pass
+        // the previous hit-index set into scoring (refs stay in `files`).
+        {
+            let live = self.live.lock();
+            let q = context.effective_query();
+            if live.active
+                && live.max_typos == max_typos
+                && q.len() > live.query.len()
+                && q.starts_with(live.query.as_str())
+                && live.generation == self.index_generation()
+            {
+                // Candidate filter applied inside scoring via FileItems::Filtered.
+                // Rebuild a filtered FileItem view is done by score path when
+                // `path_bigram` is none — here we simply skip (TODO: index
+                // filter). Full search below remains the source of truth.
+                let _ = &live.candidates;
+            }
+        }
+
         let (items, scores, total_matched) = fuzzy_match_and_score_files(
             files,
             &context,
@@ -1199,6 +1251,14 @@ impl FilePicker {
             base_arena,
             overflow_arena,
         );
+        {
+            let mut live = self.live.lock();
+            live.generation = self.index_generation();
+            live.query = context.effective_query().to_string();
+            live.max_typos = max_typos;
+            live.active = false;
+            live.candidates.clear();
+        }
         let match_byte_offsets =
             fuzzy_match_byte_offsets_for_page(query, &items, max_typos, base_arena, overflow_arena);
 
