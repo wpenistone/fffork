@@ -393,6 +393,16 @@ pub(crate) mod avx2 {
         let cap_v = set1(p.capitalization_bonus as u8);
         let case_v = set1(p.matching_case_bonus as u8);
         let prefix_v = set1(p.prefix_bonus as u8);
+        // Hoist class thresholds out of the hot column loop (was set1 per column).
+        let a_lo = set1(b'A' - 1);
+        let z_hi = set1(b'Z' + 1);
+        let la_lo = set1(b'a' - 1);
+        let lz_hi = set1(b'z' + 1);
+        let d0_lo = set1(b'0' - 1);
+        let d9_hi = set1(b'9' + 1);
+        let hi80 = set1(0x80);
+        let need_case = p.capitalization_bonus != 0 || p.matching_case_bonus != 0;
+        let need_delim = p.delimiter_bonus != 0;
 
         let prefix_lanes = {
             let mut arr = [0u8; 32];
@@ -401,6 +411,14 @@ pub(crate) mod avx2 {
             }
             _mm256_loadu_si256(arr.as_ptr() as *const __m256i)
         };
+
+        // Pre-broadcast needle bytes (was set1 twice per needle row per column).
+        let mut nc_v = [zero; 33];
+        let mut nf_v = [zero; 33];
+        for i in 0..m {
+            nc_v[i + 1] = set1(needle[i]);
+            nf_v[i + 1] = set1(flip_case(needle[i]));
+        }
 
         let mut h = [[zero; 33]; 2];
         let mut e = [[zero; 33]; 2];
@@ -418,28 +436,33 @@ pub(crate) mod avx2 {
             // Load 32 bytes at position j
             let hay = _mm256_loadu_si256(soa.as_ptr().add(j * LANES8) as *const __m256i);
 
-            let ge_a = _mm256_cmpgt_epi8(hay, set1(b'A' - 1));
-            let le_z = _mm256_cmpgt_epi8(set1(b'Z' + 1), hay);
-            let is_upper = _mm256_and_si256(ge_a, le_z);
-            let ge_la = _mm256_cmpgt_epi8(hay, set1(b'a' - 1));
-            let le_lz = _mm256_cmpgt_epi8(set1(b'z' + 1), hay);
-            let is_lower = _mm256_and_si256(ge_la, le_lz);
-            let ge_0 = _mm256_cmpgt_epi8(hay, set1(b'0' - 1));
-            let le_9 = _mm256_cmpgt_epi8(set1(b'9' + 1), hay);
-            let is_digit = _mm256_and_si256(ge_0, le_9);
-            let is_letter = _mm256_or_si256(is_upper, is_lower);
-            let alnum = _mm256_or_si256(is_letter, is_digit);
-            let not_alnum = _mm256_andnot_si256(alnum, ones);
-            // Unsigned < 128: high bit not set. (Signed cmpgt would treat 128-255 as negative.)
-            let high_bit = _mm256_and_si256(hay, set1(0x80));
-            let lt_128 = _mm256_cmpeq_epi8(high_bit, zero);
-            let is_delim = _mm256_and_si256(not_alnum, lt_128);
-            let not_delim = _mm256_andnot_si256(is_delim, ones);
-
-            let cap_mask = _mm256_and_si256(is_upper, prev_lower);
-            let cap_bonus = _mm256_and_si256(cap_mask, cap_v);
-            let dm = _mm256_and_si256(prev_delim, not_delim);
-            let delim_bonus = _mm256_and_si256(dm, delim_v);
+            // Character class masks — skip entirely when case/delim bonuses are 0
+            // (typical lowercase query). Saves ~10 SIMD ops per column.
+            let (is_lower, is_delim_unused, cap_bonus, delim_bonus) = if need_case || need_delim {
+                let ge_a = _mm256_cmpgt_epi8(hay, a_lo);
+                let le_z = _mm256_cmpgt_epi8(z_hi, hay);
+                let is_upper = _mm256_and_si256(ge_a, le_z);
+                let ge_la = _mm256_cmpgt_epi8(hay, la_lo);
+                let le_lz = _mm256_cmpgt_epi8(lz_hi, hay);
+                let is_lower = _mm256_and_si256(ge_la, le_lz);
+                let ge_0 = _mm256_cmpgt_epi8(hay, d0_lo);
+                let le_9 = _mm256_cmpgt_epi8(d9_hi, hay);
+                let is_digit = _mm256_and_si256(ge_0, le_9);
+                let is_letter = _mm256_or_si256(is_upper, is_lower);
+                let alnum = _mm256_or_si256(is_letter, is_digit);
+                let not_alnum = _mm256_andnot_si256(alnum, ones);
+                let high_bit = _mm256_and_si256(hay, hi80);
+                let lt_128 = _mm256_cmpeq_epi8(high_bit, zero);
+                let is_delim = _mm256_and_si256(not_alnum, lt_128);
+                let not_delim = _mm256_andnot_si256(is_delim, ones);
+                let cap_mask = _mm256_and_si256(is_upper, prev_lower);
+                let cap_bonus = _mm256_and_si256(cap_mask, cap_v);
+                let dm = _mm256_and_si256(prev_delim, not_delim);
+                let delim_bonus = _mm256_and_si256(dm, delim_v);
+                (is_lower, is_delim, cap_bonus, delim_bonus)
+            } else {
+                (zero, zero, zero, zero)
+            };
             let prefix_bonus = if j == 0 {
                 _mm256_and_si256(prefix_v, prefix_lanes)
             } else {
@@ -453,10 +476,8 @@ pub(crate) mod avx2 {
             match_state[nxt][0] = zero;
 
             for i in 1..=m {
-                let nc = set1(needle[i - 1]);
-                let nf = set1(flip_case(needle[i - 1]));
-                let eq_nc = _mm256_cmpeq_epi8(hay, nc);
-                let eq_nf = _mm256_cmpeq_epi8(hay, nf);
+                let eq_nc = _mm256_cmpeq_epi8(hay, nc_v[i]);
+                let eq_nf = _mm256_cmpeq_epi8(hay, nf_v[i]);
                 let mm = _mm256_or_si256(eq_nc, eq_nf);
                 match_state[nxt][i] = mm;
 
@@ -495,7 +516,7 @@ pub(crate) mod avx2 {
 
             cur = nxt;
             prev_lower = is_lower;
-            prev_delim = is_delim;
+            prev_delim = is_delim_unused;
         }
 
         // Extract per-lane scores (u8 -> u16) and end_cols

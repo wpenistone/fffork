@@ -416,14 +416,29 @@ fn match_fuzzy_parts(
                         std::mem::take(&mut *b)
                     });
                     soa_scratch.truncate(soa_len);
+                    // Fill SoA: zero then overwrite. Store rows contiguously
+                    // (j * batch_sz + 0..n) — one cache line per haystack pos.
                     soa_scratch[..soa_len].fill(0);
                     let mut prefix_mask: u32 = 0;
+                    // Path-major staging then row stores (avoids strided writes).
                     for (k, &(fi, s, e, inc_prefix, _)) in chunk.iter().enumerate() {
                         let file = working_files.index(fi as usize);
                         let hay = file.path.read_to_buf(arena, &mut path_buf);
                         let src = &hay.as_bytes()[s as usize..e as usize];
-                        for (j, &b) in src.iter().enumerate() {
-                            soa_scratch[j * batch_sz + k] = b;
+                        let mut j = 0usize;
+                        // 8-byte chunks where possible
+                        while j + 8 <= src.len() {
+                            let v = u64::from_le_bytes(src[j..j + 8].try_into().unwrap());
+                            let row = j * batch_sz + k;
+                            // scatter 8 bytes at stride batch_sz
+                            for t in 0..8 {
+                                soa_scratch[row + t * batch_sz] = ((v >> (8 * t)) & 0xff) as u8;
+                            }
+                            j += 8;
+                        }
+                        while j < src.len() {
+                            soa_scratch[j * batch_sz + k] = src[j];
+                            j += 1;
                         }
                         if inc_prefix {
                             prefix_mask |= 1u32 << k;
