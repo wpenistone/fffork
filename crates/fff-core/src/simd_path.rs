@@ -345,12 +345,14 @@ pub(crate) struct ChunkedPathStoreBuilder {
 
 impl ChunkedPathStoreBuilder {
     pub fn new(estimated_files: usize) -> Self {
-        // most paths fit into 64 bytes = 4 chunks; dedup keeps the arena well below that
-        let est_indices = estimated_files * 4;
+        // Most paths fit into 32 bytes = 2 chunks. Dedup keeps the arena
+        // below that; do not over-reserve the HashMap table (it is the
+        // largest transient allocation during scan on flat corpora).
+        let est_indices = estimated_files * 2;
         Self {
             arena: Vec::with_capacity(est_indices / 2),
             indices: Vec::with_capacity(est_indices),
-            chunk_dedup: AHashMap::with_capacity(est_indices / 2),
+            chunk_dedup: AHashMap::with_capacity(est_indices / 4),
         }
     }
 

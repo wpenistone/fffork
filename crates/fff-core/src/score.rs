@@ -85,7 +85,11 @@ fn resolve_file_chunks_prefiltered(
     max_typos: u16,
 ) -> Option<(usize, u16)> {
     let mask = file.presence_mask();
-    if mask != 0 && !crate::presence::allows(mask, needle, max_typos) {
+    let need = needle.len().saturating_sub(max_typos as usize);
+    // Gate on selectivity: short queries (need<=2) match almost every path,
+    // so the mask check is pure overhead. Live-narrow always applies the
+    // full check (smaller candidate set, higher value per reject).
+    if mask != 0 && need >= 3 && !crate::presence::allows(mask, needle, max_typos) {
         return None;
     }
     resolve_file_chunks(file, arena, buf)

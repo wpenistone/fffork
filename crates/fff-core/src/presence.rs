@@ -65,6 +65,22 @@ pub(crate) fn allows(path_mask: u64, needle: &[u8], max_typos: u16) -> bool {
     if need == 0 {
         return true;
     }
+    // Fast path: all needle bytes fold to distinct bits, so the multiplicity
+    // count equals the popcount of the AND. One AND + popcount vs a loop.
+    let mut needle_mask = 0u64;
+    let mut dup = false;
+    for &b in needle {
+        let bit = 1u64 << fold_bit(b);
+        if needle_mask & bit != 0 {
+            dup = true;
+            break;
+        }
+        needle_mask |= bit;
+    }
+    if !dup {
+        return (path_mask & needle_mask).count_ones() as usize >= need;
+    }
+    // Slow path: needle has duplicate folded bits, multiplicity matters.
     let mut hits = 0usize;
     for &b in needle {
         if path_mask & (1u64 << fold_bit(b)) != 0 {

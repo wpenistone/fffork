@@ -68,6 +68,27 @@ mod sensors {
         pub rss_mb: f64,
     }
 
+    /// Current working set (not peak) for RSS attribution probes.
+    pub fn ws_mb() -> f64 {
+        unsafe {
+            let h = GetCurrentProcess();
+            let mut pm = ProcessMemoryCounters {
+                cb: size_of::<ProcessMemoryCounters>() as u32,
+                page_faults: 0,
+                peak_working_set: 0,
+                working_set: 0,
+                quota_peak_paged: 0,
+                quota_paged: 0,
+                quota_peak_nonpaged: 0,
+                quota_nonpaged: 0,
+                pagefile: 0,
+                peak_pagefile: 0,
+            };
+            GetProcessMemoryInfo(h, &mut pm, pm.cb);
+            pm.working_set as f64 / (1024.0 * 1024.0)
+        }
+    }
+
     pub fn snap() -> Snap {
         unsafe {
             let h = GetCurrentProcess();
@@ -120,6 +141,7 @@ mod sensors {
         pub faults: u32,
         pub rss_mb: f64,
     }
+    pub fn ws_mb() -> f64 { 0.0 }
     pub fn snap() -> Snap {
         Snap { cpu_100ns: 0, cycles: 0, read_bytes: 0, faults: 0, rss_mb: 0.0 }
     }
@@ -149,10 +171,23 @@ fn main() {
         },
     )
     .expect("open corpus");
+    eprintln!("RSS_PROBE before_scan ws_mb={:.2}", sensors::ws_mb());
+    let ws_peak = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let ws_peak = ws_peak.clone();
+        std::thread::spawn(move || loop {
+            let ws = (sensors::ws_mb() * 100.0) as u64;
+            ws_peak.fetch_max(ws, std::sync::atomic::Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        });
+    }
     assert!(
         shared_picker.wait_for_scan(Duration::from_secs(600)),
         "scan timed out"
     );
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    eprintln!("RSS_PROBE after_scan ws_mb={:.2} polled_peak={:.2}",
+        sensors::ws_mb(), ws_peak.load(std::sync::atomic::Ordering::Relaxed) as f64 / 100.0);
 
     let parser = QueryParser::<FileSearchConfig>::default();
     let parsed = parser.parse(query);
@@ -215,6 +250,7 @@ fn main() {
             result.items.len(),
             picker.get_files().len()
         );
+        eprintln!("RSS_PROBE after_first_search ws_mb={:.2}", sensors::ws_mb());
         if let Ok(_out) = std::env::var("FFF_DUMP_PATHS") {
             use std::io::Write as _;
             let mut f = std::fs::File::create(&_out).expect("dump");
@@ -287,6 +323,7 @@ fn main() {
     for _ in 0..100 {
         checksum ^= search();
     }
+    eprintln!("RSS_PROBE after_warmup ws_mb={:.2}", sensors::ws_mb());
 
     let s0 = sensors::snap();
     let started = Instant::now();
@@ -295,6 +332,7 @@ fn main() {
     }
     let elapsed = started.elapsed();
     let s1 = sensors::snap();
+    eprintln!("RSS_PROBE after_loop ws_mb={:.2} peak_mb={:.2}", sensors::ws_mb(), s1.rss_mb);
 
     let n = iterations as f64;
     let us_per_op = elapsed.as_secs_f64() * 1_000_000.0 / n;

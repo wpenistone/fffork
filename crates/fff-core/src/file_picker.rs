@@ -2293,10 +2293,8 @@ impl FileSync {
         walked_dirs.dedup();
 
         let mut builder = crate::simd_path::ChunkedPathStoreBuilder::new(pairs.len());
-        let dirs = populates_dirs_files_chunked_storage(&mut pairs, &walked_dirs, &mut builder);
+        let (mut files, dirs) = populates_dirs_files_chunked_storage(pairs, &walked_dirs, &mut builder);
         drop(walked_dirs);
-
-        let mut files: Vec<FileItem> = pairs.into_iter().map(|(file, _)| file).collect();
         let chunked_paths = builder.finish();
         let arena = chunked_paths.as_arena_ptr();
 
@@ -2465,30 +2463,31 @@ pub(crate) fn warmup_mmaps(
 /// `walked_dirs` (every dir the walker visited: sorted, '/'-terminated,
 /// deduped), merging file parents in a single lockstep sweep so dirs with no
 /// files (empty subtrees, pure ancestors) are indexed and searchable too.
-fn populates_dirs_files_chunked_storage<'a>(
-    pairs: &'a mut [(FileItem, String)],
+fn populates_dirs_files_chunked_storage(
+    pairs: Vec<(FileItem, String)>,
     walked_dirs: &[String],
     chunk_storage: &mut crate::simd_path::ChunkedPathStoreBuilder,
-) -> Vec<DirItem> {
+) -> (Vec<FileItem>, Vec<DirItem>) {
     let mut dirs: Vec<DirItem> = Vec::with_capacity(walked_dirs.len() + 1);
     let mut dir_iter = walked_dirs.iter().peekable();
 
     // Root-level files sort first and their "" parent is never a walker dir.
     if pairs
         .first()
-        .is_some_and(|(f, _)| f.path.filename_offset == 0)
+        .is_some_and(|(f, _): &(FileItem, String)| f.path.filename_offset == 0)
     {
         push_dir_item(&mut dirs, chunk_storage, "");
     }
 
     // Detects contiguous same-dir runs (pairs are sorted by dir) so the
-    // merge below runs once per directory, not once per file.
-    let mut prev_dir: &'a str = "";
+    // merge below runs once per directory, not once per file.  `prev_dir`
+    // is owned because each iteration consumes its `rel` String.
+    let mut prev_dir: String = String::new();
     let mut current_dir_idx: u32 = 0;
 
-    for (file, rel) in pairs.iter_mut() {
-        let rel: &'a str = rel;
-        let dir_part: &'a str = &rel[..file.path.filename_offset as usize];
+    let mut out_files: Vec<FileItem> = Vec::with_capacity(pairs.len());
+    for (mut file, rel) in pairs {
+        let dir_part: &str = &rel[..file.path.filename_offset as usize];
 
         if prev_dir != dir_part {
             // Flush walked dirs up to and including this file's parent,
@@ -2511,19 +2510,21 @@ fn populates_dirs_files_chunked_storage<'a>(
             }
 
             current_dir_idx = (dirs.len() - 1) as u32;
-            prev_dir = dir_part;
+            prev_dir.clear();
+            prev_dir.push_str(dir_part);
         }
 
-        file.path = chunk_storage.add_file_immediate(rel, file.path.filename_offset);
+        file.path = chunk_storage.add_file_immediate(&rel, file.path.filename_offset);
         file.set_presence(crate::presence::mask_of(rel.as_bytes()));
         file.parent_dir_index = current_dir_idx;
+        out_files.push(file);
     }
 
     for dir in dir_iter {
         push_dir_item(&mut dirs, chunk_storage, dir);
     }
 
-    dirs
+    (out_files, dirs)
 }
 
 fn push_dir_item(
@@ -2841,7 +2842,7 @@ mod tests {
             .collect();
 
         let mut builder = crate::simd_path::ChunkedPathStoreBuilder::new(pairs.len());
-        let dirs = populates_dirs_files_chunked_storage(&mut pairs, &walked, &mut builder);
+        let (files, dirs) = populates_dirs_files_chunked_storage(pairs, &walked, &mut builder);
         let store = builder.finish();
         let arena = store.as_arena_ptr();
 
@@ -2850,7 +2851,7 @@ mod tests {
         assert_eq!(table, ["", "empty/", "src/", "src/deep/", "src/deeper/"]);
 
         // Every file's parent_dir_index points at its own dir entry.
-        for (file, _) in &pairs {
+        for file in &files {
             let dir = &dirs[file.parent_dir_index as usize];
             let rel = file.relative_path(arena);
             assert!(
