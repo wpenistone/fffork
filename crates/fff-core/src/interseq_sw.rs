@@ -199,6 +199,103 @@ pub(crate) mod avx2 {
         soa
     }
 
+    /// 8×8 byte matrix transpose via SSE2 unpack shuffles.
+    ///
+    /// `dst[j * dst_stride + i] = src[i * src_stride + j]` for i, j in 0..8.
+    /// Reads 8 contiguous bytes from each of 8 source rows and writes 8
+    /// contiguous bytes to each of 8 destination rows (AoS → SoA tiles).
+    ///
+    /// # Safety
+    /// Caller must ensure `src` has 8 rows of `src_stride` readable bytes and
+    /// `dst` has 8 rows of `dst_stride` writable bytes; `dst` may alias `src`
+    /// only when both strides are equal and the tiles coincide exactly.
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    pub(crate) unsafe fn transpose_8x8(
+        src: *const u8,
+        src_stride: usize,
+        dst: *mut u8,
+        dst_stride: usize,
+    ) {
+        unsafe {
+            let load = |i: usize| _mm_loadl_epi64(src.add(i * src_stride) as *const __m128i);
+            let a0 = load(0);
+            let a1 = load(1);
+            let a2 = load(2);
+            let a3 = load(3);
+            let a4 = load(4);
+            let a5 = load(5);
+            let a6 = load(6);
+            let a7 = load(7);
+
+            // Byte pairs (rows 0-1, 2-3, 4-5, 6-7).
+            let p0 = _mm_unpacklo_epi8(a0, a1);
+            let p1 = _mm_unpacklo_epi8(a2, a3);
+            let p2 = _mm_unpacklo_epi8(a4, a5);
+            let p3 = _mm_unpacklo_epi8(a6, a7);
+
+            // 16-bit interleave → 4-wide row groups at column quartets.
+            let q0 = _mm_unpacklo_epi16(p0, p1);
+            let q1 = _mm_unpackhi_epi16(p0, p1);
+            let q2 = _mm_unpacklo_epi16(p2, p3);
+            let q3 = _mm_unpackhi_epi16(p2, p3);
+
+            // 32-bit interleave → full 8-lane output rows packed two per register.
+            let r0 = _mm_unpacklo_epi32(q0, q2); // rows 0, 1
+            let r1 = _mm_unpackhi_epi32(q0, q2); // rows 2, 3
+            let r2 = _mm_unpacklo_epi32(q1, q3); // rows 4, 5
+            let r3 = _mm_unpackhi_epi32(q1, q3); // rows 6, 7
+
+            _mm_storel_epi64(dst as *mut __m128i, r0);
+            _mm_storel_epi64(dst.add(dst_stride) as *mut __m128i, _mm_srli_si128(r0, 8));
+            _mm_storel_epi64(dst.add(2 * dst_stride) as *mut __m128i, r1);
+            _mm_storel_epi64(dst.add(3 * dst_stride) as *mut __m128i, _mm_srli_si128(r1, 8));
+            _mm_storel_epi64(dst.add(4 * dst_stride) as *mut __m128i, r2);
+            _mm_storel_epi64(dst.add(5 * dst_stride) as *mut __m128i, _mm_srli_si128(r2, 8));
+            _mm_storel_epi64(dst.add(6 * dst_stride) as *mut __m128i, r3);
+            _mm_storel_epi64(dst.add(7 * dst_stride) as *mut __m128i, _mm_srli_si128(r3, 8));
+        }
+    }
+
+    /// Fill SoA from path-major staged bytes using 8×8 shuffle transpose tiles.
+    ///
+    /// `stage` is path-major: path `k` lives at `stage[k * rows + j]` and is
+    /// zero-padded to `rows`. `out` is position-major SoA with `stride` lanes
+    /// per row: `out[j * stride + k]`. `rows` and `stride` must both be
+    /// multiples of 8 (`rows` = padded max trimmed len, `stride` = lane count).
+    /// Every SoA byte is written; no pre-zeroing of `out` is required.
+    ///
+    /// # Safety
+    /// Caller must ensure `stage.len() >= stride * rows` and
+    /// `out.len() >= rows * stride`, and AVX2-capable target is not required
+    /// (SSE2 only) but must not race with concurrent aliasing writes.
+    #[target_feature(enable = "sse2")]
+    pub(crate) unsafe fn soa_from_stage(
+        stage: &[u8],
+        rows: usize,
+        stride: usize,
+        out: &mut [u8],
+    ) {
+        debug_assert_eq!(rows % 8, 0);
+        debug_assert_eq!(stride % 8, 0);
+        let mut k0 = 0usize;
+        while k0 < stride {
+            let mut j0 = 0usize;
+            while j0 < rows {
+                unsafe {
+                    transpose_8x8(
+                        stage.as_ptr().add(k0 * rows + j0),
+                        rows,
+                        out.as_mut_ptr().add(j0 * stride + k0),
+                        stride,
+                    );
+                }
+                j0 += 8;
+            }
+            k0 += 8;
+        }
+    }
+
     /// Score a batch of up to 16 pre-trimmed haystacks using inter-sequence AVX2 SW.
     /// `include_prefix` is a per-lane bitmask (bit i = lane i gets prefix bonus at j=0).
     /// Returns per-lane (score, end_col_local) where end_col_local is the last
@@ -807,6 +904,91 @@ mod tests {
                     simd_ecol[k], scalar_ecol,
                     "batch[{k}]={h:?}: simd_ecol={} scalar_ecol={}",
                     simd_ecol[k], scalar_ecol
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn transpose_8x8_is_exact_matrix_transpose() {
+        // src[i][j] = i * 8 + j, differing src/dst strides.
+        let mut src = [0u8; 8 * 11];
+        for i in 0..8 {
+            for j in 0..8 {
+                src[i * 11 + j] = (i * 8 + j) as u8;
+            }
+        }
+        let mut dst = [0xAAu8; 8 * 13];
+        unsafe {
+            super::avx2::transpose_8x8(src.as_ptr(), 11, dst.as_mut_ptr(), 13);
+        }
+        for i in 0..8 {
+            for j in 0..8 {
+                assert_eq!(
+                    dst[j * 13 + i],
+                    (i * 8 + j) as u8,
+                    "dst[{j}][{i}] != src[{i}][{j}]"
+                );
+            }
+        }
+        // Untouched dst bytes stay put.
+        assert_eq!(dst[8], 0xAA);
+        assert_eq!(dst[12], 0xAA);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn soa_from_stage_matches_build_soa() {
+        let cases: &[&[&str]] = &[
+            &["a", "", "bb", "ccc", "dddd", "eeeee", "ffffff", "ggggggg"],
+            &["", "x", "yz", "1234", "56789", "abcdef", "ghijklm", "mnopqrs"],
+            &["src/score.rs", "a", "", "very/long/path/name/that/spans/many/chunks/x", "zz"],
+            &["01234567", "8", "89abcdef", "", "foo", "barbaz", "q", "wertyuiop"],
+        ];
+        for batch in cases {
+            for &stride in &[16usize, 32] {
+                let max_len = batch.iter().map(|h| h.len()).max().unwrap_or(0);
+                let rows = max_len.div_ceil(8) * 8;
+                if rows == 0 {
+                    continue;
+                }
+                let mut stage = vec![0u8; stride * rows];
+                for (k, h) in batch.iter().enumerate().take(stride) {
+                    stage[k * rows..k * rows + h.len()].copy_from_slice(h.as_bytes());
+                }
+                let mut out = vec![0u8; rows * stride];
+                unsafe {
+                    super::avx2::soa_from_stage(&stage, rows, stride, &mut out);
+                }
+                let hays: Vec<&[u8]> = batch.iter().map(|h| h.as_bytes()).collect();
+                let expect = super::avx2::build_soa(&hays, rows, stride);
+                assert_eq!(out, expect, "stride={stride} batch={batch:?}");
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn soa_from_stage_dense_roundtrip_layout() {
+        // Unambiguous layout probe: stage[k * rows + j] = k * 16 + j (mod 256).
+        let (rows, stride) = (16usize, 32usize);
+        let mut stage = vec![0u8; rows * stride];
+        for k in 0..stride {
+            for j in 0..rows {
+                stage[k * rows + j] = ((k * 16 + j) % 256) as u8;
+            }
+        }
+        let mut out = vec![0u8; rows * stride];
+        unsafe {
+            super::avx2::soa_from_stage(&stage, rows, stride, &mut out);
+        }
+        for k in 0..stride {
+            for j in 0..rows {
+                assert_eq!(
+                    out[j * stride + k],
+                    ((k * 16 + j) % 256) as u8,
+                    "soa[{j}][{k}]"
                 );
             }
         }

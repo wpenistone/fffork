@@ -180,6 +180,35 @@ impl ChunkedString {
         Cow::Owned(out)
     }
 
+    /// Copy path bytes `[start, end)` into `out` (needs `end - start` bytes),
+    /// touching only the arena chunks that cover the window. One arena pass,
+    /// no full-path bounce buffer. Short/missing trailing chunks zero-fill.
+    pub fn copy_window_to(&self, arena: ArenaPtr, start: u32, end: u32, out: &mut [u8]) {
+        let total = self.byte_len as usize;
+        let start = (start as usize).min(total);
+        let end = (end as usize).min(total);
+        let len = end.saturating_sub(start);
+        if len == 0 {
+            return;
+        }
+        debug_assert!(out.len() >= len);
+        let indices = self.indices(arena);
+        let start_chunk = start / SIMD_CHUNK_BYTES;
+        let offset_in_chunk = start % SIMD_CHUNK_BYTES;
+        let chunks_to_copy = chunks_needed(offset_in_chunk + len).min(indices.len().saturating_sub(start_chunk));
+
+        let mut written = 0usize;
+        for (i, &idx) in indices[start_chunk..start_chunk + chunks_to_copy].iter().enumerate() {
+            let chunk_bytes =
+                unsafe { core::slice::from_raw_parts(arena.chunk_ptr(idx), SIMD_CHUNK_BYTES) };
+            let s = if i == 0 { offset_in_chunk } else { 0 };
+            let e = SIMD_CHUNK_BYTES.min(s + (len - written));
+            out[written..written + (e - s)].copy_from_slice(&chunk_bytes[s..e]);
+            written += e - s;
+        }
+        out[written..len].fill(0);
+    }
+
     /// Truncates at `buf.len()` if exceeded -- use `[u8; PATH_BUF_SIZE]` to avoid.
     #[inline]
     pub fn read_to_buf<'a>(&self, arena: ArenaPtr, buf: &'a mut [u8]) -> &'a str {
