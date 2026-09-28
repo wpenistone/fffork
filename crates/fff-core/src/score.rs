@@ -347,8 +347,23 @@ fn match_fuzzy_parts(
                         return;
                     }
 
+                    // Thread-local SoA scratch: no per-batch heap (was a
+                    // major page-fault source on 227k corpora).
+                    thread_local! {
+                        static SOA: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+                    }
                     let soa_len = max_len * batch_sz;
-                    let mut soa_scratch = vec![0u8; soa_len];
+                    let mut soa_scratch = SOA.with(|c| {
+                        let mut b = c.borrow_mut();
+                        if b.len() < soa_len {
+                            b.resize(soa_len, 0);
+                        }
+                        std::mem::take(&mut *b)
+                    });
+                    if soa_scratch.len() > soa_len {
+                        soa_scratch.truncate(soa_len);
+                    }
+                    soa_scratch[..soa_len].fill(0);
                     let mut prefix_mask: u32 = 0;
                     for (k, &(off, len, _, inc_prefix, _, _)) in chunk.iter().enumerate() {
                         let src = &all_bytes[off..off + len];
@@ -373,6 +388,7 @@ fn match_fuzzy_parts(
                                 &mut ecol_chunk[..n],
                             );
                         }
+                        SOA.with(|c| *c.borrow_mut() = soa_scratch);
                         return;
                     }
                     #[cfg(target_arch = "x86_64")]
@@ -388,6 +404,7 @@ fn match_fuzzy_parts(
                                 &mut ecol_chunk[..n],
                             );
                         }
+                        SOA.with(|c| *c.borrow_mut() = soa_scratch);
                         return;
                     }
                     for (k, &(off, len, _, inc_prefix, _, _)) in chunk.iter().enumerate() {
@@ -397,6 +414,7 @@ fn match_fuzzy_parts(
                         score_chunk[k] = s;
                         ecol_chunk[k] = e;
                     }
+                    SOA.with(|c| *c.borrow_mut() = soa_scratch);
                     let _ = batch_i;
                 });
         });
