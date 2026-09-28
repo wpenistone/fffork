@@ -325,6 +325,9 @@ fn match_fuzzy_parts(
                 const { std::cell::RefCell::new(Vec::new()) };
             static SCORES: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
             static ECOLS: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
+            static ORDER: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+            static PERM_SCORES: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
+            static PERM_ECOLS: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
         }
         let mut trims = TRIMS.with(|c| {
             let mut b = c.borrow_mut();
@@ -378,129 +381,174 @@ fn match_fuzzy_parts(
         // u8 fast path: 32 lanes, valid when max score < 256.
         let use_u8 = avx2_ok && needle.len() <= 14;
         let batch_sz: usize = if use_u8 { 32 } else { 16 };
+        let use_simd = avx2_ok && needle.len() <= 16;
+
+        // Length-ordered batches: group similar trimmed window lengths into the
+        // same SIMD wave so per-batch max_len (SoA rows / DP columns) stays close
+        // to the lanes' own lengths and 32-lane batches stay full. `order` is a
+        // permutation of match indices (stable on equal lengths); results are
+        // scattered back through the inverse map so `scores[i]` stays in the
+        // original match order for the assemble phase.
+        let n_matches = trims.len();
+        let mut order = ORDER.with(|c| {
+            let mut b = c.borrow_mut();
+            b.clear();
+            if b.capacity() < n_matches {
+                b.reserve(n_matches);
+            }
+            std::mem::take(&mut *b)
+        });
+        order.clear();
+        order.extend(0..n_matches as u32);
+        order.sort_by_key(|&oi| {
+            let (_, s, e, _, _) = trims[oi as usize];
+            e - s
+        });
+        let mut perm_scores = PERM_SCORES.with(|c| {
+            let mut b = c.borrow_mut();
+            b.clear();
+            b.resize(n_matches, 0);
+            std::mem::take(&mut *b)
+        });
+        let mut perm_ecols = PERM_ECOLS.with(|c| {
+            let mut b = c.borrow_mut();
+            b.clear();
+            b.resize(n_matches, 0);
+            std::mem::take(&mut *b)
+        });
 
         crate::parallelism::run_on_bg_pool(|| {
             use rayon::prelude::*;
-            scores
-                .par_chunks_mut(batch_sz)
-                .zip(end_cols.par_chunks_mut(batch_sz))
-                .zip(trims.par_chunks(batch_sz))
-                .for_each(|((score_chunk, ecol_chunk), chunk)| {
-                    let n = chunk.len();
+            order
+                .par_chunks(batch_sz)
+                .zip(perm_scores.par_chunks_mut(batch_sz))
+                .zip(perm_ecols.par_chunks_mut(batch_sz))
+                .for_each(|((ord, sc_out), ec_out)| {
+                    let n = ord.len();
+                    // max_len from trim metadata only — no arena reads here.
                     let mut max_len = 0usize;
-                    let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-                    let mut slices: Vec<(usize, usize, bool)> = Vec::with_capacity(n);
-                    for &(fi, s, e, inc_prefix, _) in chunk.iter() {
-                        let file = working_files.index(fi as usize);
-                        let hay = file.path.read_to_buf(arena, &mut path_buf);
-                        // Keep (offset, len, inc_prefix) into a tiny per-batch
-                        // copy of just this batch's trimmed bytes.
-                        let off = slices.len();
-                        let _ = off;
-                        let trimmed = &hay.as_bytes()[s as usize..e as usize];
-                        max_len = max_len.max(trimmed.len());
-                        slices.push((trimmed.len(), s as usize, inc_prefix));
+                    for &oi in ord.iter() {
+                        let (_, s, e, _, _) = trims[oi as usize];
+                        max_len = max_len.max((e - s) as usize);
                     }
                     if max_len == 0 {
                         return;
                     }
+                    // Padded row count so the 8×8 transpose covers full tiles.
+                    let rows = max_len.div_ceil(8) * 8;
                     thread_local! {
                         static SOA: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+                        static STAGE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
                     }
-                    let soa_len = max_len * batch_sz;
-                    let mut soa_scratch = SOA.with(|c| {
+                    let buf_len = rows * batch_sz;
+                    let mut stage = STAGE.with(|c| {
                         let mut b = c.borrow_mut();
-                        if b.len() < soa_len {
-                            b.resize(soa_len, 0);
+                        if b.len() < buf_len {
+                            b.resize(buf_len, 0);
                         }
                         std::mem::take(&mut *b)
                     });
-                    soa_scratch.truncate(soa_len);
-                    // Fill SoA: zero then overwrite. Store rows contiguously
-                    // (j * batch_sz + 0..n) — one cache line per haystack pos.
-                    soa_scratch[..soa_len].fill(0);
+                    stage.truncate(buf_len);
+                    // Zero padding past each lane's trimmed length; the transpose
+                    // tiles below then cover batch_sz lanes × rows with no edges.
+                    stage[..buf_len].fill(0);
+
                     let mut prefix_mask: u32 = 0;
-                    // Path-major staging then row stores (avoids strided writes).
-                    for (k, &(fi, s, e, inc_prefix, _)) in chunk.iter().enumerate() {
+                    // Single arena pass per path: copy just the [s, e) window
+                    // from chunk pointers into path-major staging. Prefetch the
+                    // next path's arena chunks during this copy (no bounce copy).
+                    let mut next_ptrs = [std::ptr::null::<u8>(); MAX_PATH_CHUNKS];
+                    for (k, &oi) in ord.iter().enumerate() {
+                        let (fi, s, e, inc_prefix, _) = trims[oi as usize];
                         let file = working_files.index(fi as usize);
-                        let hay = file.path.read_to_buf(arena, &mut path_buf);
-                        let src = &hay.as_bytes()[s as usize..e as usize];
-                        // Prefetch next path's arena bytes while scattering this one.
                         #[cfg(target_arch = "x86_64")]
-                        if k + 1 < chunk.len() {
-                            let nf = working_files.index(chunk[k + 1].0 as usize);
-                            let mut nb = [0u8; crate::simd_path::PATH_BUF_SIZE];
-                            let npath = nf.path.read_to_buf(arena, &mut nb);
-                            unsafe {
-                                std::arch::x86_64::_mm_prefetch(
-                                    npath.as_ptr() as *const i8,
-                                    std::arch::x86_64::_MM_HINT_T0,
-                                );
+                        if k + 1 < n {
+                            let nf = working_files.index(trims[ord[k + 1] as usize].0 as usize);
+                            let nptrs = nf.path.resolve_ptrs(arena, &mut next_ptrs);
+                            for &p in nptrs.iter().take(4) {
+                                unsafe {
+                                    std::arch::x86_64::_mm_prefetch(
+                                        p as *const i8,
+                                        std::arch::x86_64::_MM_HINT_T0,
+                                    );
+                                }
                             }
                         }
-                        let mut j = 0usize;
-                        while j + 8 <= src.len() {
-                            let v = u64::from_le_bytes(src[j..j + 8].try_into().unwrap());
-                            let row = j * batch_sz + k;
-                            for t in 0..8 {
-                                soa_scratch[row + t * batch_sz] = ((v >> (8 * t)) & 0xff) as u8;
-                            }
-                            j += 8;
-                        }
-                        while j < src.len() {
-                            soa_scratch[j * batch_sz + k] = src[j];
-                            j += 1;
-                        }
+                        let dst = &mut stage[k * rows..k * rows + (e - s) as usize];
+                        file.path.copy_window_to(arena, s, e, dst);
                         if inc_prefix {
                             prefix_mask |= 1u32 << k;
                         }
                     }
 
                     #[cfg(target_arch = "x86_64")]
-                    if use_u8 {
+                    if use_simd {
+                        // 8×8 shuffle transpose: path-major stage → position-major
+                        // SoA (one cache line per haystack column for the kernels).
+                        let mut soa = SOA.with(|c| {
+                            let mut b = c.borrow_mut();
+                            if b.len() < buf_len {
+                                b.resize(buf_len, 0);
+                            }
+                            std::mem::take(&mut *b)
+                        });
+                        soa.truncate(buf_len);
                         unsafe {
-                            crate::interseq_sw::avx2::score_batch_avx2_u8(
-                                needle,
-                                &soa_scratch,
-                                max_len,
-                                &p,
-                                prefix_mask,
-                                &mut score_chunk[..n],
-                                &mut ecol_chunk[..n],
+                            crate::interseq_sw::avx2::soa_from_stage(
+                                &stage,
+                                rows,
+                                batch_sz,
+                                &mut soa,
                             );
+                            if use_u8 {
+                                crate::interseq_sw::avx2::score_batch_avx2_u8(
+                                    needle,
+                                    &soa,
+                                    max_len,
+                                    &p,
+                                    prefix_mask,
+                                    &mut sc_out[..n],
+                                    &mut ec_out[..n],
+                                );
+                            } else {
+                                crate::interseq_sw::avx2::score_batch_avx2(
+                                    needle,
+                                    &soa,
+                                    max_len,
+                                    &p,
+                                    prefix_mask as u16,
+                                    &mut sc_out[..n],
+                                    &mut ec_out[..n],
+                                );
+                            }
                         }
-                        SOA.with(|c| *c.borrow_mut() = soa_scratch);
+                        SOA.with(|c| *c.borrow_mut() = soa);
+                        STAGE.with(|c| *c.borrow_mut() = stage);
                         return;
                     }
-                    #[cfg(target_arch = "x86_64")]
-                    if avx2_ok && needle.len() <= 16 {
-                        unsafe {
-                            crate::interseq_sw::avx2::score_batch_avx2(
-                                needle,
-                                &soa_scratch,
-                                max_len,
-                                &p,
-                                prefix_mask as u16,
-                                &mut score_chunk[..n],
-                                &mut ecol_chunk[..n],
-                            );
-                        }
-                        SOA.with(|c| *c.borrow_mut() = soa_scratch);
-                        return;
-                    }
-                    for (k, &(fi, s, e, inc_prefix, _)) in chunk.iter().enumerate() {
-                        let file = working_files.index(fi as usize);
-                        let hay = file.path.read_to_buf(arena, &mut path_buf);
-                        let src = &hay.as_bytes()[s as usize..e as usize];
+                    // Scalar path (no AVX2, or needle wider than SIMD lanes):
+                    // score the staged trimmed slices — same single arena pass.
+                    for (k, &oi) in ord.iter().enumerate() {
+                        let (_, s, e, inc_prefix, _) = trims[oi as usize];
+                        let src = &stage[k * rows..k * rows + (e - s) as usize];
                         let (sc, ec) =
                             crate::interseq_sw::score_one_scalar_full(needle, src, &p, inc_prefix);
-                        score_chunk[k] = sc;
-                        ecol_chunk[k] = ec;
+                        sc_out[k] = sc;
+                        ec_out[k] = ec;
                     }
-                    SOA.with(|c| *c.borrow_mut() = soa_scratch);
-                    let _ = &slices;
+                    STAGE.with(|c| *c.borrow_mut() = stage);
                 });
         });
+
+        // Inverse order map: restore the original match order so assemble's
+        // `scores[i]` / `end_cols[i]` line up with `trims[i]` / `matches[i]`.
+        for (i, &oi) in order.iter().enumerate() {
+            scores[oi as usize] = perm_scores[i];
+            end_cols[oi as usize] = perm_ecols[i];
+        }
+        ORDER.with(|c| *c.borrow_mut() = order);
+        PERM_SCORES.with(|c| *c.borrow_mut() = perm_scores);
+        PERM_ECOLS.with(|c| *c.borrow_mut() = perm_ecols);
         let batch_ms = t_batch.elapsed().as_secs_f64() * 1e3;
 
         let t_assemble = std::time::Instant::now();
