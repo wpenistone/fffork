@@ -236,6 +236,22 @@ pub(crate) mod avx2 {
         let cap_v = set1(p.capitalization_bonus);
         let case_v = set1(p.matching_case_bonus);
         let prefix_v = set1(p.prefix_bonus);
+        // Hoist class/needle broadcasts out of the per-column loop.
+        let a_lo = set1(b'A' as u16 - 1);
+        let z_hi = set1(b'Z' as u16 + 1);
+        let la_lo = set1(b'a' as u16 - 1);
+        let lz_hi = set1(b'z' as u16 + 1);
+        let d0_lo = set1(b'0' as u16 - 1);
+        let d9_hi = set1(b'9' as u16 + 1);
+        let lt128 = set1(128);
+        let need_case = p.capitalization_bonus != 0 || p.matching_case_bonus != 0;
+        let need_delim = p.delimiter_bonus != 0;
+        let mut nc_v = [zero; 17];
+        let mut nf_v = [zero; 17];
+        for i in 0..m {
+            nc_v[i + 1] = set1(needle[i] as u16);
+            nf_v[i + 1] = set1(flip_case(needle[i]) as u16);
+        }
 
         // Per-lane prefix mask: lanes with include_prefix get prefix_bonus at j=0.
         let prefix_lanes = {
@@ -265,28 +281,30 @@ pub(crate) mod avx2 {
             let raw = _mm_loadu_si128(soa.as_ptr().add(j * LANES) as *const __m128i);
             let hay = _mm256_cvtepu8_epi16(raw);
 
-            // Character class masks (frizbee: NOT(letter|digit|>127) = delimiter)
-            let ge_a = _mm256_cmpgt_epi16(hay, set1(b'A' as u16 - 1));
-            let le_z = _mm256_cmpgt_epi16(set1(b'Z' as u16 + 1), hay);
-            let is_upper = _mm256_and_si256(ge_a, le_z);
-            let ge_la = _mm256_cmpgt_epi16(hay, set1(b'a' as u16 - 1));
-            let le_lz = _mm256_cmpgt_epi16(set1(b'z' as u16 + 1), hay);
-            let is_lower = _mm256_and_si256(ge_la, le_lz);
-            let ge_0 = _mm256_cmpgt_epi16(hay, set1(b'0' as u16 - 1));
-            let le_9 = _mm256_cmpgt_epi16(set1(b'9' as u16 + 1), hay);
-            let is_digit = _mm256_and_si256(ge_0, le_9);
-            let is_letter = _mm256_or_si256(is_upper, is_lower);
-            let alnum = _mm256_or_si256(is_letter, is_digit);
-            let not_alnum = _mm256_andnot_si256(alnum, ones);
-            let lt_128 = _mm256_cmpgt_epi16(set1(128), hay);
-            let is_delim = _mm256_and_si256(not_alnum, lt_128);
-            let not_delim = _mm256_andnot_si256(is_delim, ones);
-
-            // Bonuses (frizbee: delimiter = prev_delim AND NOT curr_delim)
-            let cap_mask = _mm256_and_si256(is_upper, prev_lower);
-            let cap_bonus = _mm256_and_si256(cap_mask, cap_v);
-            let dm = _mm256_and_si256(prev_delim, not_delim);
-            let delim_bonus = _mm256_and_si256(dm, delim_v);
+            let (is_lower, is_delim_st, cap_bonus, delim_bonus) = if need_case || need_delim {
+                let ge_a = _mm256_cmpgt_epi16(hay, a_lo);
+                let le_z = _mm256_cmpgt_epi16(z_hi, hay);
+                let is_upper = _mm256_and_si256(ge_a, le_z);
+                let ge_la = _mm256_cmpgt_epi16(hay, la_lo);
+                let le_lz = _mm256_cmpgt_epi16(lz_hi, hay);
+                let is_lower = _mm256_and_si256(ge_la, le_lz);
+                let ge_0 = _mm256_cmpgt_epi16(hay, d0_lo);
+                let le_9 = _mm256_cmpgt_epi16(d9_hi, hay);
+                let is_digit = _mm256_and_si256(ge_0, le_9);
+                let is_letter = _mm256_or_si256(is_upper, is_lower);
+                let alnum = _mm256_or_si256(is_letter, is_digit);
+                let not_alnum = _mm256_andnot_si256(alnum, ones);
+                let lt_128 = _mm256_cmpgt_epi16(lt128, hay);
+                let is_delim = _mm256_and_si256(not_alnum, lt_128);
+                let not_delim = _mm256_andnot_si256(is_delim, ones);
+                let cap_mask = _mm256_and_si256(is_upper, prev_lower);
+                let cap_bonus = _mm256_and_si256(cap_mask, cap_v);
+                let dm = _mm256_and_si256(prev_delim, not_delim);
+                let delim_bonus = _mm256_and_si256(dm, delim_v);
+                (is_lower, is_delim, cap_bonus, delim_bonus)
+            } else {
+                (zero, zero, zero, zero)
+            };
             let prefix_bonus = if j == 0 {
                 _mm256_and_si256(prefix_v, prefix_lanes)
             } else {
@@ -300,10 +318,8 @@ pub(crate) mod avx2 {
             match_state[nxt][0] = zero;
 
             for i in 1..=m {
-                let nc = set1(needle[i - 1] as u16);
-                let nf = set1(flip_case(needle[i - 1]) as u16);
-                let eq_nc = _mm256_cmpeq_epi16(hay, nc);
-                let eq_nf = _mm256_cmpeq_epi16(hay, nf);
+                let eq_nc = _mm256_cmpeq_epi16(hay, nc_v[i]);
+                let eq_nf = _mm256_cmpeq_epi16(hay, nf_v[i]);
                 let mm = _mm256_or_si256(eq_nc, eq_nf);
                 match_state[nxt][i] = mm;
 
@@ -342,7 +358,7 @@ pub(crate) mod avx2 {
 
             cur = nxt;
             prev_lower = is_lower;
-            prev_delim = is_delim;
+            prev_delim = is_delim_st;
         }
 
         // Extract per-lane scores and end_cols

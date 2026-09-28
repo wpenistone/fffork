@@ -425,12 +425,23 @@ fn match_fuzzy_parts(
                         let file = working_files.index(fi as usize);
                         let hay = file.path.read_to_buf(arena, &mut path_buf);
                         let src = &hay.as_bytes()[s as usize..e as usize];
+                        // Prefetch next path's arena bytes while scattering this one.
+                        #[cfg(target_arch = "x86_64")]
+                        if k + 1 < chunk.len() {
+                            let nf = working_files.index(chunk[k + 1].0 as usize);
+                            let mut nb = [0u8; crate::simd_path::PATH_BUF_SIZE];
+                            let npath = nf.path.read_to_buf(arena, &mut nb);
+                            unsafe {
+                                std::arch::x86_64::_mm_prefetch(
+                                    npath.as_ptr() as *const i8,
+                                    std::arch::x86_64::_MM_HINT_T0,
+                                );
+                            }
+                        }
                         let mut j = 0usize;
-                        // 8-byte chunks where possible
                         while j + 8 <= src.len() {
                             let v = u64::from_le_bytes(src[j..j + 8].try_into().unwrap());
                             let row = j * batch_sz + k;
-                            // scatter 8 bytes at stride batch_sz
                             for t in 0..8 {
                                 soa_scratch[row + t * batch_sz] = ((v >> (8 * t)) & 0xff) as u8;
                             }
