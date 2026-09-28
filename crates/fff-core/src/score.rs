@@ -139,6 +139,34 @@ fn with_cached_matcher<R>(
     run(&mut matcher)
 }
 
+thread_local! {
+    static HIT_CAPTURE: std::cell::RefCell<Option<Vec<u32>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Collect match indices from the next `fuzzy_search` (typing live-narrow).
+pub(crate) fn capture_hit_indices(iter: impl Iterator<Item = u32>) {
+    HIT_CAPTURE.with(|c| {
+        if let Some(v) = c.borrow_mut().as_mut() {
+            v.clear();
+            v.extend(iter);
+        }
+    });
+}
+
+pub(crate) fn with_hit_capture<T>(sink: &mut Vec<u32>, f: impl FnOnce() -> T) -> T {
+    HIT_CAPTURE.with(|c| {
+        *c.borrow_mut() = Some(std::mem::take(sink));
+    });
+    let t = f();
+    HIT_CAPTURE.with(|c| {
+        if let Some(v) = c.borrow_mut().take() {
+            *sink = v;
+        }
+    });
+    t
+}
+
 enum FileItems<'a> {
     All(&'a [FileItem]),
     Filtered(Vec<&'a FileItem>),
@@ -544,6 +572,32 @@ fn match_fuzzy_parts(
     matches
 }
 
+/// Score only `subset` (refs into the full file slice) — used for typing
+/// live-narrow. `total_matched` is the subset hit count (a superset of the
+/// true hit set when narrowing is sound).
+pub(crate) fn fuzzy_match_and_score_subset<'a>(
+    subset: Vec<&'a FileItem>,
+    context: &ScoringContext,
+    base_count: usize,
+    base_arena: ArenaPtr,
+    overflow_arena: ArenaPtr,
+) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
+    let n = subset.len();
+    let (results, total) = match_and_score_in_arena(
+        FileItems::Filtered(subset),
+        context,
+        base_arena,
+        None,
+    );
+    let _ = base_count;
+    let _ = overflow_arena;
+    let mut out = sort_and_paginate(results, context, total);
+    // total_matched here is hits among the subset only.
+    let _ = n;
+    out.2 = total;
+    out
+}
+
 /// Match + score across base and overflow files, each with their own arena.
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub(crate) fn fuzzy_match_and_score_files<'a>(
@@ -603,14 +657,14 @@ fn fuzzy_match_and_score_files_impl<'a>(
     // them tiebreaker advantage in case sorting is the same
     let (results, total_matched) = if files.len() > base_count {
         let (mut results, mut total) = match_and_score_in_arena(
-            &files[base_count..],
+            FileItems::All(&files[base_count..]),
             context,
             overflow_arena,
             cache.map(|c| (c, generation, 1u8)),
         );
 
         let (base_results, base_total) = match_and_score_in_arena(
-            &files[..base_count],
+            FileItems::All(&files[..base_count]),
             context,
             base_arena,
             cache.map(|c| (c, generation, 0u8)),
@@ -619,7 +673,12 @@ fn fuzzy_match_and_score_files_impl<'a>(
         total += base_total;
         (results, total)
     } else {
-        match_and_score_in_arena(files, context, base_arena, cache.map(|c| (c, generation, 0u8)))
+        match_and_score_in_arena(
+            FileItems::All(files),
+            context,
+            base_arena,
+            cache.map(|c| (c, generation, 0u8)),
+        )
     };
 
     sort_and_paginate(results, context, total_matched)
@@ -1088,25 +1147,31 @@ fn sort_and_paginate_dirs<'a>(
 }
 
 fn match_and_score_in_arena<'a>(
-    files: &'a [FileItem],
+    files: FileItems<'a>,
     context: &ScoringContext,
     arena: ArenaPtr,
     raw_cache: Option<(&parking_lot::Mutex<RawMatchCache>, u64, u8)>,
 ) -> (Vec<(&'a FileItem, Score)>, usize) {
-    if files.is_empty() {
+    if files.len() == 0 {
         return (vec![], 0);
     }
 
     let parsed = context.query;
     let working_files: FileItems<'a> = if parsed.constraints.is_empty() {
-        FileItems::All(files)
+        files
     } else {
-        match apply_constraints(files, &parsed.constraints, arena, arena) {
-            Some(filtered) if !filtered.is_empty() => FileItems::Filtered(filtered),
-            Some(_) => {
-                return (vec![], 0);
+        // apply_constraints needs a slice; only All can be filtered further
+        match files {
+            FileItems::All(all) => {
+                match apply_constraints(all, &parsed.constraints, arena, arena) {
+                    Some(filtered) if !filtered.is_empty() => FileItems::Filtered(filtered),
+                    Some(_) => {
+                        return (vec![], 0);
+                    }
+                    None => FileItems::All(all),
+                }
             }
-            None => FileItems::All(files),
+            other => other,
         }
     };
 
@@ -1192,6 +1257,12 @@ fn match_and_score_in_arena<'a>(
         path_matches.len(),
         working_files.len()
     ));
+
+    // Expose raw match indices for typing live-narrow (Match(longer,T) ⊆
+    // Match(shorter,T) when T is unchanged).
+    crate::score::capture_hit_indices(
+        path_matches.iter().map(|m| m.index),
+    );
 
     let main_needle = fuzzy_parts[0].as_bytes(); // safe
     let main_needle_len = main_needle.len() as u16;

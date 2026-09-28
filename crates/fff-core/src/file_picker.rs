@@ -1225,39 +1225,79 @@ impl FilePicker {
         let overflow_arena = self.sync_data.arena_overflow_ptr();
 
         // Typing live-narrow: when the query only extends the previous one and
-        // max_typos is unchanged, Match(longer,T) ⊆ Match(shorter,T). We pass
-        // the previous hit-index set into scoring (refs stay in `files`).
-        {
-            let live = self.live.lock();
-            let q = context.effective_query();
-            if live.active
-                && live.max_typos == max_typos
-                && q.len() > live.query.len()
-                && q.starts_with(live.query.as_str())
-                && live.generation == self.index_generation()
-            {
-                // Candidate filter applied inside scoring via FileItems::Filtered.
-                // Rebuild a filtered FileItem view is done by score path when
-                // `path_bigram` is none — here we simply skip (TODO: index
-                // filter). Full search below remains the source of truth.
-                let _ = &live.candidates;
+        // max_typos is unchanged, Match(longer,T) ⊆ Match(shorter,T).
+        let mut hit_buf: Vec<u32> = Vec::new();
+        let (items, scores, total_matched) = {
+            let can_narrow = {
+                let live = self.live.lock();
+                live.active
+                    && live.max_typos == max_typos
+                    && context.effective_query().len() > live.query.len()
+                    && context
+                        .effective_query()
+                        .starts_with(live.query.as_str())
+                    && live.generation == self.index_generation()
+            };
+            if can_narrow {
+                let (prev_q, prev_cand): (String, Vec<u32>) = {
+                    let live = self.live.lock();
+                    (live.query.clone(), live.candidates.clone())
+                };
+                let subset: Vec<&FileItem> = prev_cand
+                    .iter()
+                    .filter_map(|&i| files.get(i as usize))
+                    .collect();
+                eprintln!("LIVE_NARROW prev={} cand={}", prev_q, subset.len());
+                if !subset.is_empty() {
+                    let mut local_hits: Vec<u32> = Vec::new();
+                    let out = crate::score::with_hit_capture(&mut local_hits, || {
+                        crate::score::fuzzy_match_and_score_subset(
+                            subset,
+                            &context,
+                            self.sync_data.base_count,
+                            base_arena,
+                            overflow_arena,
+                        )
+                    });
+                    // local_hits are indices into the subset; map to file indices.
+                    hit_buf.clear();
+                    for li in local_hits {
+                        if let Some(&orig) = prev_cand.get(li as usize) {
+                            hit_buf.push(orig);
+                        }
+                    }
+                    out
+                } else {
+                    crate::score::with_hit_capture(&mut hit_buf, || {
+                        fuzzy_match_and_score_files(
+                            files,
+                            &context,
+                            self.sync_data.base_count,
+                            base_arena,
+                            overflow_arena,
+                        )
+                    })
+                }
+            } else {
+                crate::score::with_hit_capture(&mut hit_buf, || {
+                    fuzzy_match_and_score_files(
+                        files,
+                        &context,
+                        self.sync_data.base_count,
+                        base_arena,
+                        overflow_arena,
+                    )
+                })
             }
-        }
-
-        let (items, scores, total_matched) = fuzzy_match_and_score_files(
-            files,
-            &context,
-            self.sync_data.base_count,
-            base_arena,
-            overflow_arena,
-        );
+        };
         {
             let mut live = self.live.lock();
             live.generation = self.index_generation();
             live.query = context.effective_query().to_string();
             live.max_typos = max_typos;
-            live.active = false;
+            live.active = !hit_buf.is_empty();
             live.candidates.clear();
+            live.candidates.extend_from_slice(&hit_buf);
         }
         let match_byte_offsets =
             fuzzy_match_byte_offsets_for_page(query, &items, max_typos, base_arena, overflow_arena);
