@@ -76,7 +76,33 @@ impl RawMatchCache {
 /// never touches the path arena (keeps first-keystroke faults down).
 /// A zero mask means "not indexed" (test fixtures) and is allowed through;
 /// production scan always fills the mask. Never rejects a true match.
+/// Alignment window produced by the match-set phase. After this boundary
+/// `Match.score` is only ever a score — no more skip_sw smuggling.
+#[derive(Clone, Copy)]
+struct MatchWindow {
+    file_idx: u32,
+    start: u32,
+    end: u32,
+    include_prefix: bool,
+    include_exact: bool,
+}
+
 #[inline]
+fn decode_match_window(m: &neo_frizbee::Match, hay_len: usize) -> MatchWindow {
+    // skip_sw packs (start_pos_adj, end_pos) into (score, end_col).
+    let start_adj = m.score as usize;
+    let end_pos = m.end_col as usize;
+    let end = end_pos.min(hay_len);
+    let start = start_adj.min(end);
+    MatchWindow {
+        file_idx: m.index,
+        start: start as u32,
+        end: end as u32,
+        include_prefix: start == 0,
+        include_exact: start == 0 && end == hay_len,
+    }
+}
+
 fn resolve_file_chunks_prefiltered(
     file: &FileItem,
     arena: ArenaPtr,
@@ -311,27 +337,14 @@ fn match_fuzzy_parts(
         if collapsed {
             for m in matches.iter_mut() {
                 let file = working_files.index(m.index as usize);
-                let hay_len = file.path.byte_len as usize;
-                let start_adj = m.score as usize;
-                let end_pos = m.end_col as usize;
-                let end_clamped = end_pos.min(hay_len);
-                let start_clamped = start_adj.min(end_clamped);
-                let win = end_clamped.saturating_sub(start_clamped).max(1);
+                let w = decode_match_window(m, file.path.byte_len as usize);
+                let win = w.end.saturating_sub(w.start).max(1) as usize;
                 let conc = ((64usize.saturating_sub(win.min(64))) as u16) * 2;
-                let fname_bonus = {
-                    let fname_off = file.path.filename_offset as usize;
-                    if start_clamped >= fname_off {
-                        40u16
-                    } else {
-                        0
-                    }
-                };
-                // Skip path reads on the collapse path: exact is rare among
-                // 226k hits and read_to_buf per hit dominated read_b/op.
-                let exact = false;
+                let fname_off = file.path.filename_offset as usize;
+                let fname_bonus = if (w.start as usize) >= fname_off { 40u16 } else { 0 };
                 m.score = conc.saturating_add(fname_bonus);
-                m.end_col = end_clamped.min(u16::MAX as usize) as u16;
-                m.exact = exact;
+                m.end_col = w.end.min(u16::MAX as u32) as u16;
+                m.exact = false;
             }
             let collect_ms = t_collect.elapsed().as_secs_f64() * 1e3;
             if std::env::var_os("FFF_PHASE_TIMING").is_some() {
@@ -402,20 +415,17 @@ fn match_fuzzy_parts(
             let mut trims = TRIMS.with(|c| take_tls(c, n_matches));
             trims.clear();
             {
-                // byte_len only — do not copy path bytes here.
+                // Decode skip_sw windows once at the boundary. byte_len only —
+                // do not copy path bytes here.
                 for m in matches_chunk.iter() {
                     let file = working_files.index(m.index as usize);
-                    let hay_len = file.path.byte_len as usize;
-                    let start_adj = m.score as usize;
-                    let end_pos = m.end_col as usize;
-                    let end_clamped = end_pos.min(hay_len);
-                    let start_clamped = start_adj.min(end_clamped);
+                    let w = decode_match_window(m, file.path.byte_len as usize);
                     trims.push((
-                        m.index,
-                        start_clamped as u32,
-                        end_clamped as u32,
-                        start_clamped == 0,
-                        start_clamped == 0 && end_clamped == hay_len,
+                        w.file_idx,
+                        w.start,
+                        w.end,
+                        w.include_prefix,
+                        w.include_exact,
                     ));
                 }
             }
