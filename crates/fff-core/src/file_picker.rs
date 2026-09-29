@@ -800,6 +800,26 @@ impl FilePicker {
         self.sync_data.files()
     }
 
+    /// Sequentially touch per-file search metadata after the scan so the
+    /// first keystroke does not pay the page-fault cost of FileItem +
+    /// presence_mask (227k × ~64 B ≈ 14 MB of cold pages).
+    /// Read-only; does not change results. Call once before `scanning=false`.
+    pub fn prefault_search_metadata(&self) {
+        let files = self.sync_data.files();
+        let mut acc = 0u64;
+        for f in files.iter() {
+            acc = acc
+                .wrapping_add(f.presence_mask())
+                .wrapping_add(f.path.byte_len as u64);
+        }
+        std::hint::black_box(acc);
+        // Overflow arena FileItems share the same layout.
+        for f in self.sync_data.overflow_files().iter() {
+            acc = acc.wrapping_add(f.presence_mask());
+        }
+        std::hint::black_box(acc);
+    }
+
     /// Count of live (non-tombstoned) files. O(1).
     #[inline]
     pub fn live_file_count(&self) -> usize {
@@ -1255,7 +1275,9 @@ impl FilePicker {
                         m == 0 || crate::presence::allows(m, new_q, max_typos)
                     })
                     .collect();
-                eprintln!("LIVE_NARROW prev={} cand={} masked={}", prev_q, prev_cand.len(), subset.len());
+                if cfg!(debug_assertions) || std::env::var_os("FFF_PHASE_TIMING").is_some() {
+                    eprintln!("LIVE_NARROW prev={} cand={} masked={}", prev_q, prev_cand.len(), subset.len());
+                }
                 if !subset.is_empty() {
                     let mut local_hits: Vec<u32> = Vec::new();
                     let out = crate::score::with_hit_capture(&mut local_hits, || {

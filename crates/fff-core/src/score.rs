@@ -376,12 +376,15 @@ fn match_fuzzy_parts(
             collect_ms += t_chunk.elapsed().as_secs_f64() * 1e3;
 
             let t_batch = std::time::Instant::now();
-            let mut scores = SCORES.with(|c| take_tls(c, n_matches));
+            // 64-byte align the batch output buffers: batch_sz=32 u16 is
+            // exactly one cache line, so aligned batches do not false-share
+            // at par_chunks boundaries (MESI line ping-pong).
+            let mut scores = SCORES.with(|c| take_tls(c, n_matches + 32));
             scores.clear();
-            scores.resize(n_matches, 0);
-            let mut end_cols = ECOLS.with(|c| take_tls(c, n_matches));
+            scores.resize(n_matches + 32, 0);
+            let mut end_cols = ECOLS.with(|c| take_tls(c, n_matches + 32));
             end_cols.clear();
-            end_cols.resize(n_matches, 0);
+            end_cols.resize(n_matches + 32, 0);
 
             // Length-ordered batches within the chunk so per-batch max_len
             // stays close to the lanes' own lengths.
@@ -392,19 +395,27 @@ fn match_fuzzy_parts(
                 let (_, s, e, _, _) = trims[oi as usize];
                 e - s
             });
-            let mut perm_scores = PERM_SCORES.with(|c| take_tls(c, n_matches));
+            let mut perm_scores = PERM_SCORES.with(|c| take_tls(c, n_matches + 32));
             perm_scores.clear();
-            perm_scores.resize(n_matches, 0);
-            let mut perm_ecols = PERM_ECOLS.with(|c| take_tls(c, n_matches));
+            perm_scores.resize(n_matches + 32, 0);
+            let mut perm_ecols = PERM_ECOLS.with(|c| take_tls(c, n_matches + 32));
             perm_ecols.clear();
-            perm_ecols.resize(n_matches, 0);
+            perm_ecols.resize(n_matches + 32, 0);
+
+            fn align64_u16(buf: &mut [u16], n: usize) -> &mut [u16] {
+                let addr = buf.as_ptr() as usize;
+                let pad = ((64 - (addr % 64)) % 64) / 2;
+                &mut buf[pad..pad + n]
+            }
+            let ps_aligned = align64_u16(&mut perm_scores, n_matches);
+            let pe_aligned = align64_u16(&mut perm_ecols, n_matches);
 
             crate::parallelism::run_on_bg_pool(|| {
                 use rayon::prelude::*;
                 order
                     .par_chunks(batch_sz)
-                    .zip(perm_scores.par_chunks_mut(batch_sz))
-                    .zip(perm_ecols.par_chunks_mut(batch_sz))
+                    .zip(ps_aligned.par_chunks_mut(batch_sz))
+                    .zip(pe_aligned.par_chunks_mut(batch_sz))
                     .for_each(|((ord, sc_out), ec_out)| {
                         let n = ord.len();
                         let mut max_len = 0usize;
@@ -512,9 +523,10 @@ fn match_fuzzy_parts(
             });
 
             // Inverse order map into the chunk-local score arrays.
+            // Read from the 64-byte-aligned batch outputs (true per-line).
             for (i, &oi) in order.iter().enumerate() {
-                scores[oi as usize] = perm_scores[i];
-                end_cols[oi as usize] = perm_ecols[i];
+                scores[oi as usize] = ps_aligned[i];
+                end_cols[oi as usize] = pe_aligned[i];
             }
             batch_ms += t_batch.elapsed().as_secs_f64() * 1e3;
 

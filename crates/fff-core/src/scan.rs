@@ -230,6 +230,14 @@ impl ScanJob {
             None
         };
 
+        // Fault in FileItem + presence_mask pages before the first search
+        // so keystroke 1 does not absorb the 227k-item cold-miss cost.
+        if let Ok(guard) = shared_picker.read()
+            && let Some(picker) = guard.as_ref()
+        {
+            picker.prefault_search_metadata();
+        }
+
         signals.scanning.store(false, Ordering::Relaxed); // file are searchable
 
         // in case we do a rescan, we have to resubscribe a watcher to the new set of directories
