@@ -350,8 +350,14 @@ fn match_fuzzy_parts(
             std::mem::take(&mut *b)
         });
         #[cfg(target_arch = "x86_64")]
-        let avx2_ok = is_x86_feature_detected!("avx2")
-            && is_x86_feature_detected!("sse4.1");
+        // Portability: FFF_FORCE_SCALAR=1 skips AVX2 (SSE2/scalar path only).
+        // Used to measure low-spec chips; must stay result-identical.
+        let force_scalar = std::env::var_os("FFF_FORCE_SCALAR").is_some();
+        let avx2_ok = if force_scalar {
+            false
+        } else {
+            is_x86_feature_detected!("avx2") && is_x86_feature_detected!("sse4.1")
+        };
         #[cfg(not(target_arch = "x86_64"))]
         let avx2_ok = false;
 
