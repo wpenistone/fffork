@@ -2784,3 +2784,108 @@ mod constraint_only_query_tests {
         assert_eq!(items[0].relative_path(arena), "a.rs");
     }
 }
+
+/// Executable ranking policy. If these fail, result order changed —
+/// update this spec deliberately, not as a side effect of a perf patch.
+///
+/// Policy (base = SW score):
+/// 1. exact filename match > fuzzy filename match > path-only match
+/// 2. at equal match quality, higher frecency wins
+/// 3. special entry-point names (mod.rs, index.ts, …) beat ordinary
+///    path-only matches but lose to filename hits
+#[cfg(test)]
+mod ranking_policy_tests {
+    use super::*;
+    use crate::types::PaginationArgs;
+    use fff_query_parser::QueryParser;
+
+    fn make(specs: &[(&str, i16)]) -> (Vec<FileItem>, ArenaPtr) {
+        let path_strings: Vec<String> = specs.iter().map(|(p, _)| p.to_string()).collect();
+        let items: Vec<FileItem> = specs
+            .iter()
+            .map(|(p, _)| {
+                let fname = p.rfind(std::path::is_separator).map(|i| i + 1).unwrap_or(0) as u16;
+                FileItem::new_raw(fname, 0, 0, None, false)
+            })
+            .collect();
+        let (store, strings) =
+            crate::simd_path::build_chunked_path_store_from_strings(&path_strings, &items);
+        let arena = store.as_arena_ptr();
+        let mut result = items;
+        for (i, file) in result.iter_mut().enumerate() {
+            file.set_path(strings[i].clone());
+            file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
+            file.access_frecency_score = specs[i].1;
+        }
+        std::mem::forget(store);
+        (result, arena)
+    }
+
+    fn rank(files: &[FileItem], query: &str, arena: ArenaPtr) -> Vec<String> {
+        let parser = QueryParser::default();
+        let parsed = parser.parse(query);
+        let effective = match &parsed.fuzzy_query {
+            FuzzyQuery::Text(t) => *t,
+            FuzzyQuery::Parts(parts) if !parts.is_empty() => parts[0],
+            _ => query,
+        };
+        let max_typos = (effective.len() as u16 / 4).clamp(2, 6);
+        let ctx = ScoringContext {
+            query: &parsed,
+            max_threads: 1,
+            max_typos,
+            current_file: None,
+            last_same_query_match: None,
+            project_path: None,
+            combo_boost_score_multiplier: 100,
+            min_combo_count: 3,
+            path_bigram: None,
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 100,
+            },
+        };
+        let (items, _scores, _) =
+            fuzzy_match_and_score_files(files, &ctx, files.len(), arena, arena);
+        items.iter().map(|f| f.relative_path(arena)).collect()
+    }
+
+    #[test]
+    fn exact_filename_beats_fuzzy_filename_beats_path_only() {
+        let (files, arena) = make(&[
+            ("src/username/handler.rs", 0), // path-only
+            ("src/username/username.rs", 0), // fuzzy/exact filename
+            ("other/username", 0),           // exact filename
+        ]);
+        let order = rank(&files, "username", arena);
+        assert_eq!(order[0], "other/username", "exact filename first");
+        assert!(
+            order.iter().position(|p| p == "src/username/username.rs")
+                < order.iter().position(|p| p == "src/username/handler.rs"),
+            "filename hit above path-only, got {order:?}"
+        );
+    }
+
+    #[test]
+    fn frecency_breaks_ties_at_equal_match_quality() {
+        let (files, arena) = make(&[
+            ("src/a/user_service.rs", 10),
+            ("src/b/user_service.rs", 90),
+        ]);
+        let order = rank(&files, "user_service", arena);
+        assert_eq!(order[0], "src/b/user_service.rs", "higher frecency first");
+    }
+
+    #[test]
+    fn special_entry_point_beats_ordinary_path_only() {
+        let (files, arena) = make(&[
+            ("src/deep/mod.rs", 0),
+            ("src/deep/helper_mod.rs", 0),
+        ]);
+        let order = rank(&files, "mod", arena);
+        assert_eq!(
+            order[0], "src/deep/mod.rs",
+            "special entry point above ordinary path hit, got {order:?}"
+        );
+    }
+}
