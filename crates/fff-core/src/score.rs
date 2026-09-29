@@ -295,7 +295,55 @@ fn match_fuzzy_parts(
         let p = crate::interseq_sw::SwParams::for_query(has_upper);
         let needle = valid_parts[0].as_bytes();
 
+        // Selectivity collapse: a common query (`score` hits 226k/227k)
+        // makes per-path SW useless — ranking is decided by filename +
+        // frecency anyway. Skip the interseq pass and score from match
+        // concentration (trim length) + filename presence. Only for large
+        // corpora: small fixtures always take the exact SW path.
+        let n_files = working_files.len().max(1);
+        let collapsed = n_files >= 10_000
+            && matches.len() >= 4096
+            && matches.len() * 100 >= n_files * 85
+            && needle.len() <= 8;
+
         let t_collect = std::time::Instant::now();
+        if collapsed {
+            for m in matches.iter_mut() {
+                let file = working_files.index(m.index as usize);
+                let hay_len = file.path.byte_len as usize;
+                let start_adj = m.score as usize;
+                let end_pos = m.end_col as usize;
+                let end_clamped = end_pos.min(hay_len);
+                let start_clamped = start_adj.min(end_clamped);
+                let win = end_clamped.saturating_sub(start_clamped).max(1);
+                let conc = ((64usize.saturating_sub(win.min(64))) as u16) * 2;
+                let fname_bonus = {
+                    let fname_off = file.path.filename_offset as usize;
+                    if start_clamped >= fname_off {
+                        40u16
+                    } else {
+                        0
+                    }
+                };
+                let exact = start_clamped == 0 && end_clamped == hay_len && {
+                    let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+                    let hay = file.path.read_to_buf(arena, &mut path_buf);
+                    needle.eq_ignore_ascii_case(hay.as_bytes())
+                };
+                let bonus = if exact { 8u16 } else { 0 };
+                m.score = conc.saturating_add(fname_bonus).saturating_add(bonus);
+                m.end_col = end_clamped.min(u16::MAX as usize) as u16;
+                m.exact = exact;
+            }
+            let collect_ms = t_collect.elapsed().as_secs_f64() * 1e3;
+            if std::env::var_os("FFF_PHASE_TIMING").is_some() {
+                eprintln!(
+                    "PHASE interseq prefilter_ms={prefilter_ms:.1} collapse_ms={collect_ms:.1} n={}",
+                    matches.len()
+                );
+            }
+            matches
+        } else {
         // Chunked scoring: process at most CHUNK matches of metadata at a
         // time so peak working set stays small (faults/RSS vs upstream).
         // 32k × ~16 B × a few arrays ≈ 1 MB peak, vs a full 227k-wide set.
@@ -562,7 +610,8 @@ fn match_fuzzy_parts(
                 matches.len()
             );
         }
-        matches
+            matches
+        }
     };
 
     if valid_parts.len() == 1 {
