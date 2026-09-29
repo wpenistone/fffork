@@ -1615,6 +1615,7 @@ fn match_and_score_in_arena<'a>(
         fn cmp(&self, other: &Self) -> std::cmp::Ordering {
             self.total
                 .cmp(&other.total)
+                .then_with(|| self.file.modified.cmp(&other.file.modified))
                 .then_with(|| self.stamp.cmp(&other.stamp))
         }
     }
@@ -1668,18 +1669,57 @@ fn match_and_score_in_arena<'a>(
                 consider(&mut heap, item);
             }
         } else {
-            let scored: Vec<_> = crate::parallelism::run_on_bg_pool(|| {
+            // Fold into per-worker heaps sized page_cap and reduce. Avoids
+            // materializing 226k Score structs (~10 MB of faults/RSS) just to
+            // keep the top 100. Ranking stays exact (same comparator).
+            type Heap<'a> = BinaryHeap<Reverse<Ranked<'a>>>;
+            let merge = |mut a: Heap<'a>, b: Heap<'a>| -> Heap<'a> {
+                for Reverse(r) in b {
+                    if a.len() < page_cap {
+                        a.push(Reverse(r));
+                    } else if a.peek().is_some_and(|Reverse(w)| r.total > w.total) {
+                        a.pop();
+                        a.push(Reverse(r));
+                    }
+                }
+                a
+            };
+            heap = crate::parallelism::run_on_bg_pool(|| {
                 path_matches
                     .par_iter()
                     .enumerate()
-                    .map_init(make_scratch, |scratch, (match_idx, path_match)| {
-                        score_one(scratch, match_idx, path_match)
-                    })
-                    .collect::<Vec<_>>()
+                    .fold(
+                        || (make_scratch(), Heap::new()),
+                        |(mut scratch, mut h), (match_idx, path_match)| {
+                            let item = score_one(&mut scratch, match_idx, path_match);
+                            if h.len() < page_cap {
+                                h.push(Reverse(Ranked {
+                                    total: item.1.total,
+                                    stamp: 0,
+                                    file: item.0,
+                                    score: item.1,
+                                }));
+                            } else if h
+                                .peek()
+                                .is_some_and(|Reverse(w)| item.1.total > w.total)
+                            {
+                                h.pop();
+                                h.push(Reverse(Ranked {
+                                    total: item.1.total,
+                                    stamp: 0,
+                                    file: item.0,
+                                    score: item.1,
+                                }));
+                            }
+                            (scratch, h)
+                        },
+                    )
+                    .reduce(
+                        || (make_scratch(), Heap::new()),
+                        |(_, a), (_, b)| (make_scratch(), merge(a, b)),
+                    )
+                    .1
             });
-            for item in scored {
-                consider(&mut heap, item);
-            }
         }
         let mut results: Vec<(&'a FileItem, Score)> = heap
             .into_iter()
