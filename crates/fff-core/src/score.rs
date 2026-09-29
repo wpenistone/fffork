@@ -1415,7 +1415,7 @@ fn match_and_score_in_arena<'a>(
             let base_score = path_match.score as i32;
             let frecency_boost = base_score.saturating_mul(file.total_frecency_score()) / 100;
 
-            let git_status_boost = if file.git_status.is_some_and(is_modified_status) {
+            let git_status_boost = if file.git_status().is_some_and(is_modified_status) {
                 base_score * 15 / 100
             } else {
                 0
@@ -1763,7 +1763,7 @@ fn score_filtered_by_frecency<'a>(
             + (file.modification_frecency_score as i32).saturating_mul(4);
 
         // Give modified/dirty files a boost even in frecency-only mode
-        let git_status_boost = if file.git_status.is_some_and(is_modified_status) {
+        let git_status_boost = if file.git_status().is_some_and(is_modified_status) {
             total_frecency_score * 15 / 100
         } else {
             0
@@ -2608,8 +2608,8 @@ mod constraint_only_query_tests {
             file.set_path(strings[i].clone());
                 file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
         }
-        files[0].git_status = Some(git2::Status::WT_MODIFIED);
-        files[1].git_status = Some(git2::Status::CURRENT);
+        files[0].set_git_status(Some(git2::Status::WT_MODIFIED));
+        files[1].set_git_status(Some(git2::Status::CURRENT));
         std::mem::forget(store);
 
         let parser = QueryParser::default();
@@ -2661,8 +2661,8 @@ mod constraint_only_query_tests {
             file.set_path(strings[i].clone());
                 file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
         }
-        files[0].git_status = Some(git2::Status::WT_MODIFIED);
-        files[1].git_status = Some(git2::Status::CURRENT);
+        files[0].set_git_status(Some(git2::Status::WT_MODIFIED));
+        files[1].set_git_status(Some(git2::Status::CURRENT));
         std::mem::forget(store);
 
         let parser = QueryParser::default();

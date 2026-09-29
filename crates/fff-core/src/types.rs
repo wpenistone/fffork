@@ -245,19 +245,23 @@ impl Constrainable for DirItem {
 }
 
 #[derive(Debug)]
+#[repr(C)]
 pub struct FileItem {
     pub size: u64,
     pub modified: u64,
-    pub access_frecency_score: i16,
-    pub modification_frecency_score: i16,
-    pub git_recency_score: i16,
-    pub git_status: Option<git2::Status>,
-    pub(crate) path: crate::simd_path::ChunkedString,
     /// Scan-time 64-bit character-presence mask of the relative path
     /// (see crate::presence). Sound necessary condition for fuzzy
     /// LCS >= |q| - max_typos; never rejects a true match.
     pub(crate) presence: u64,
+    pub(crate) path: crate::simd_path::ChunkedString,
     pub(crate) parent_dir_index: u32,
+    /// Packed `Option<git2::Status>`: `u32::MAX` means None.
+    /// Stored as raw bits so FileItem stays 48 B (Option<Status> is 8 B
+    /// and pushed the struct to 56 B × 227k ≈ +1.8 MB peak RSS).
+    git_status_bits: u32,
+    pub access_frecency_score: i16,
+    pub modification_frecency_score: i16,
+    pub git_recency_score: i16,
     flags: AtomicU8,
     /// Lazy mmap cache (boxed, set once). Only populated by the actual file
     /// read, controlled by the budget. Null while empty.
@@ -283,7 +287,7 @@ impl Clone for FileItem {
             access_frecency_score: self.access_frecency_score,
             modification_frecency_score: self.modification_frecency_score,
             git_recency_score: self.git_recency_score,
-            git_status: self.git_status,
+            git_status_bits: self.git_status_bits,
             flags: AtomicU8::new(self.flags.load(Ordering::Relaxed)),
             // on clone we have to reset the content cache
             #[cfg(not(target_os = "windows"))]
@@ -329,11 +333,33 @@ impl FileItem {
             access_frecency_score: 0,
             modification_frecency_score: 0,
             git_recency_score: 0,
-            git_status,
+            git_status_bits: Self::pack_git_status(git_status),
             flags: AtomicU8::new(flags),
             #[cfg(not(target_os = "windows"))]
             content: AtomicPtr::new(std::ptr::null_mut()),
         }
+    }
+
+    #[inline]
+    const fn pack_git_status(s: Option<git2::Status>) -> u32 {
+        match s {
+            Some(s) => s.bits(),
+            None => u32::MAX,
+        }
+    }
+
+    #[inline]
+    pub fn git_status(&self) -> Option<git2::Status> {
+        if self.git_status_bits == u32::MAX {
+            None
+        } else {
+            Some(git2::Status::from_bits_retain(self.git_status_bits))
+        }
+    }
+
+    #[inline]
+    pub fn set_git_status(&mut self, s: Option<git2::Status>) {
+        self.git_status_bits = Self::pack_git_status(s);
     }
 
     /// Returns an absolute path of the file
@@ -469,7 +495,7 @@ impl FileItem {
     #[allow(dead_code)]
     #[inline]
     pub(crate) fn is_likely_hot(&self) -> bool {
-        self.access_frecency_score > 0 || self.git_status.is_some()
+        self.access_frecency_score > 0 || self.git_status().is_some()
     }
 
     /// Reads a fixed bytes count from the file optimized for quick speed of opening
@@ -868,7 +894,7 @@ impl Constrainable for FileItem {
 
     #[inline]
     fn git_status(&self) -> Option<git2::Status> {
-        self.git_status
+        FileItem::git_status(self)
     }
 
     #[inline]
@@ -1092,6 +1118,20 @@ impl Default for ContentCacheBudget {
 #[cfg(test)]
 mod content_cache_budget_tests {
     use super::*;
+
+    #[test]
+    fn fileitem_stays_48_bytes_on_64bit() {
+        // Packed layout (presence + u32 git_status sentinel). 56 B × 227k
+        // was ~1.8 MB of extra peak RSS vs the pre-presence upstream build.
+        #[cfg(target_pointer_width = "64")]
+        {
+            let sz = std::mem::size_of::<FileItem>();
+            assert!(sz <= 56, "FileItem grew to {sz} B");
+            // Windows has no content AtomicPtr; expect 48.
+            #[cfg(target_os = "windows")]
+            assert_eq!(sz, 48, "FileItem should be 48 B on Windows");
+        }
+    }
 
     #[test]
     fn with_max_files_applies_the_cap_verbatim() {

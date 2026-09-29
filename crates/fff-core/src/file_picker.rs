@@ -541,7 +541,7 @@ impl FileItem {
         let abs = self.write_absolute_path(arena, base_path, &mut abs_buf);
         self.access_frecency_score = tracker.get_access_score(abs, mode) as i16;
         self.modification_frecency_score =
-            tracker.get_modification_score(self.modified, self.git_status, mode) as i16;
+            tracker.get_modification_score(self.modified, self.git_status(), mode) as i16;
 
         Ok(())
     }
@@ -557,7 +557,7 @@ impl FileItem {
         mode: FFFMode,
     ) {
         self.modification_frecency_score =
-            tracker.get_modification_score(self.modified, self.git_status, mode) as i16;
+            tracker.get_modification_score(self.modified, self.git_status(), mode) as i16;
     }
 }
 
@@ -1140,11 +1140,11 @@ impl FilePicker {
 
             let arena = self.arena_base_ptr();
             for file in self.sync_data.files.iter_mut() {
-                file.git_status = git_cache.lookup_status(file.write_absolute_path(
+                file.set_git_status(git_cache.lookup_status(file.write_absolute_path(
                     arena,
                     &self.base_path,
                     &mut path_buf,
-                ));
+                )));
             }
         }
 
@@ -1733,7 +1733,7 @@ impl FilePicker {
             .into_iter()
             .try_for_each(|(path, status)| -> Result<(), Error> {
                 if let Some((arena, file)) = self.get_mut_file_by_path(&path) {
-                    file.git_status = Some(status);
+                    file.set_git_status(Some(status));
                     if let Some(ref f) = *frecency {
                         file.update_frecency_scores(f, arena, &bp, mode)?;
                     }
@@ -1969,7 +1969,7 @@ impl FilePicker {
 
         file.set_deleted(true);
         file.invalidate_mmap(&self.cache_budget);
-        file.git_status = None;
+        file.set_git_status(None);
 
         // Only base-region files participate in the bigram overlay
         if index < self.sync_data.base_count
