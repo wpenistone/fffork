@@ -298,21 +298,65 @@ fn match_fuzzy_parts(
             valid_parts[0].as_bytes(),
             options.max_typos.unwrap_or(u16::MAX),
         );
+        // Index reject before frizbee: only resolve paths that pass
+        // length+presence. When that set is well under the corpus, frizbee
+        // never even visits the rejects (its loop is over `len`).
+        let mut cand: Vec<u32> = Vec::new();
+        if np.should_check() || np.min_path_len() > 1 {
+            cand.reserve(working_files.len() / 4);
+            for i in 0..working_files.len() {
+                let f = working_files.index(i);
+                if (f.path.byte_len as usize) < np.min_path_len() {
+                    continue;
+                }
+                let mask = f.presence_mask();
+                if mask != 0 && !np.allows(mask, valid_parts[0].as_bytes()) {
+                    continue;
+                }
+                cand.push(i as u32);
+            }
+        }
+        let use_cand = cand.len() * 2 < working_files.len() && !cand.is_empty();
         let mut matches = neo_frizbee::with_skip_sw(|| {
             with_cached_matcher(valid_parts[0], options, |matcher| {
-                matcher.match_range_parallel_resolved(
-                    working_files.len(),
-                    &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
-                        resolve_file_chunks_prefiltered(
-                            working_files.index(index as usize),
-                            arena,
-                            buf,
-                            &np,
-                            valid_parts[0].as_bytes(),
-                        )
-                    },
-                    threads,
-                )
+                if use_cand {
+                    let cand = cand.as_slice();
+                    let raw = matcher.match_range_parallel_resolved(
+                        cand.len(),
+                        &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+                            let fi = cand[index as usize] as usize;
+                            resolve_file_chunks_prefiltered(
+                                working_files.index(fi),
+                                arena,
+                                buf,
+                                &np,
+                                valid_parts[0].as_bytes(),
+                            )
+                        },
+                        threads,
+                    );
+                    // Remap subset index → corpus index.
+                    raw.into_iter()
+                        .map(|mut m| {
+                            m.index = cand[m.index as usize];
+                            m
+                        })
+                        .collect()
+                } else {
+                    matcher.match_range_parallel_resolved(
+                        working_files.len(),
+                        &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+                            resolve_file_chunks_prefiltered(
+                                working_files.index(index as usize),
+                                arena,
+                                buf,
+                                &np,
+                                valid_parts[0].as_bytes(),
+                            )
+                        },
+                        threads,
+                    )
+                }
             })
         });
         let prefilter_ms = t_prefilter.elapsed().as_secs_f64() * 1e3;
