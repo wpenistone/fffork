@@ -2261,7 +2261,11 @@ impl FileSync {
 
         // Walk files (the fast part, typically 2-3s even on huge repos).
         let is_git_repo = git_workdir.is_some();
-        let bg_threads = BACKGROUND_THREAD_POOL.current_num_threads();
+        // Limit walk parallelism: the ignore walker spawns its own workers and
+        // coexisting with the BG pool inflates scan peak RSS on flat corpora.
+        let bg_threads = BACKGROUND_THREAD_POOL
+            .current_num_threads()
+            .min(4);
 
         let WalkOutput {
             dirs: mut walked_dirs,
