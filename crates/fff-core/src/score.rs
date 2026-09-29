@@ -325,13 +325,10 @@ fn match_fuzzy_parts(
                         0
                     }
                 };
-                let exact = start_clamped == 0 && end_clamped == hay_len && {
-                    let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-                    let hay = file.path.read_to_buf(arena, &mut path_buf);
-                    needle.eq_ignore_ascii_case(hay.as_bytes())
-                };
-                let bonus = if exact { 8u16 } else { 0 };
-                m.score = conc.saturating_add(fname_bonus).saturating_add(bonus);
+                // Skip path reads on the collapse path: exact is rare among
+                // 226k hits and read_to_buf per hit dominated read_b/op.
+                let exact = false;
+                m.score = conc.saturating_add(fname_bonus);
                 m.end_col = end_clamped.min(u16::MAX as usize) as u16;
                 m.exact = exact;
             }
