@@ -57,6 +57,7 @@ pub(crate) fn mask_of(path: &[u8]) -> u64 {
 #[derive(Clone, Copy)]
 pub(crate) struct NeedlePresence {
     need: usize,
+    min_len: usize,
     needle_mask: u64,
     dup: bool,
 }
@@ -64,7 +65,9 @@ pub(crate) struct NeedlePresence {
 impl NeedlePresence {
     #[inline]
     pub(crate) fn new(needle: &[u8], max_typos: u16) -> Self {
-        let need = needle.len().saturating_sub(max_typos as usize);
+        let typos = max_typos as usize;
+        let need = needle.len().saturating_sub(typos);
+        let min_len = need; // LCS ≤ path_len
         let mut needle_mask = 0u64;
         let mut dup = false;
         for &b in needle {
@@ -77,9 +80,16 @@ impl NeedlePresence {
         }
         Self {
             need,
+            min_len,
             needle_mask,
             dup,
         }
+    }
+
+    /// Shortest path that can still match (LCS ≤ path_len).
+    #[inline(always)]
+    pub(crate) fn min_path_len(&self) -> usize {
+        self.min_len
     }
 
     /// False when the presence check is not worth running (need < 3:

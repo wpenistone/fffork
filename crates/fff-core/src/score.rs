@@ -84,10 +84,11 @@ fn resolve_file_chunks_prefiltered(
     np: &crate::presence::NeedlePresence,
     needle: &[u8],
 ) -> Option<(usize, u16)> {
+    // Sound length reject: LCS ≤ path_len, so shorter paths cannot match.
+    if (file.path.byte_len as usize) < np.min_path_len() {
+        return None;
+    }
     let mask = file.presence_mask();
-    // Gate on selectivity: short queries (need<=2) match almost every path,
-    // so the mask check is pure overhead. Live-narrow always applies the
-    // full check (smaller candidate set, higher value per reject).
     if mask != 0 && np.should_check() && !np.allows(mask, needle) {
         return None;
     }
