@@ -81,15 +81,14 @@ fn resolve_file_chunks_prefiltered(
     file: &FileItem,
     arena: ArenaPtr,
     buf: &mut [*const u8; MAX_PATH_CHUNKS],
+    np: &crate::presence::NeedlePresence,
     needle: &[u8],
-    max_typos: u16,
 ) -> Option<(usize, u16)> {
     let mask = file.presence_mask();
-    let need = needle.len().saturating_sub(max_typos as usize);
     // Gate on selectivity: short queries (need<=2) match almost every path,
     // so the mask check is pure overhead. Live-narrow always applies the
     // full check (smaller candidate set, higher value per reject).
-    if mask != 0 && need >= 3 && !crate::presence::allows(mask, needle, max_typos) {
+    if mask != 0 && np.should_check() && !np.allows(mask, needle) {
         return None;
     }
     resolve_file_chunks(file, arena, buf)
@@ -268,6 +267,10 @@ fn match_fuzzy_parts(
         let t_prefilter = std::time::Instant::now();
         // Phase 1: frizbee prefilter only (skip its SW). The skip_sw path
         // encodes (start_pos_adj, end_pos) in (score, end_col).
+        let np = crate::presence::NeedlePresence::new(
+            valid_parts[0].as_bytes(),
+            options.max_typos.unwrap_or(u16::MAX),
+        );
         let mut matches = neo_frizbee::with_skip_sw(|| {
             with_cached_matcher(valid_parts[0], options, |matcher| {
                 matcher.match_range_parallel_resolved(
@@ -277,8 +280,8 @@ fn match_fuzzy_parts(
                             working_files.index(index as usize),
                             arena,
                             buf,
+                            &np,
                             valid_parts[0].as_bytes(),
-                            options.max_typos.unwrap_or(u16::MAX),
                         )
                     },
                     threads,
@@ -575,6 +578,10 @@ fn match_fuzzy_parts(
                 max_threads,
             )
         };
+        let sub_np = crate::presence::NeedlePresence::new(
+            part.as_bytes(),
+            part_options.max_typos.unwrap_or(u16::MAX),
+        );
         let sub_matches = with_cached_matcher(part, &part_options, |matcher| {
             matcher.match_range_parallel_resolved(
                 survivors.len(),
@@ -584,8 +591,8 @@ fn match_fuzzy_parts(
                         file,
                         arena,
                         buf,
+                        &sub_np,
                         part.as_bytes(),
-                        part_options.max_typos.unwrap_or(u16::MAX),
                     )
                 },
                 sub_threads,

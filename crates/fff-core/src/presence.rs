@@ -52,6 +52,64 @@ pub(crate) fn mask_of(path: &[u8]) -> u64 {
     m
 }
 
+/// Precomputed per-query presence check. The needle fold is built once
+/// instead of per path (227k calls in the prefilter hot loop).
+#[derive(Clone, Copy)]
+pub(crate) struct NeedlePresence {
+    need: usize,
+    needle_mask: u64,
+    dup: bool,
+}
+
+impl NeedlePresence {
+    #[inline]
+    pub(crate) fn new(needle: &[u8], max_typos: u16) -> Self {
+        let need = needle.len().saturating_sub(max_typos as usize);
+        let mut needle_mask = 0u64;
+        let mut dup = false;
+        for &b in needle {
+            let bit = 1u64 << fold_bit(b);
+            if needle_mask & bit != 0 {
+                dup = true;
+                break;
+            }
+            needle_mask |= bit;
+        }
+        Self {
+            need,
+            needle_mask,
+            dup,
+        }
+    }
+
+    /// False when the presence check is not worth running (need < 3:
+    /// short queries match almost every path, so the check is overhead).
+    #[inline(always)]
+    pub(crate) fn should_check(&self) -> bool {
+        self.need >= 3
+    }
+
+    #[inline(always)]
+    pub(crate) fn allows(&self, path_mask: u64, needle: &[u8]) -> bool {
+        if self.need == 0 {
+            return true;
+        }
+        if !self.dup {
+            return (path_mask & self.needle_mask).count_ones() as usize >= self.need;
+        }
+        let mut hits = 0usize;
+        for &b in needle {
+            if path_mask & (1u64 << fold_bit(b)) != 0 {
+                hits += 1;
+                if hits >= self.need {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
 /// Sound necessary condition for `LCS(needle, path) >= |needle| - max_typos`.
 ///
 /// Counts needle bytes (with multiplicity) whose folded bit is set in the
@@ -61,36 +119,8 @@ pub(crate) fn mask_of(path: &[u8]) -> u64 {
 /// `need == 0` (typo budget covers the whole needle) accepts everything.
 #[inline]
 pub(crate) fn allows(path_mask: u64, needle: &[u8], max_typos: u16) -> bool {
-    let need = needle.len().saturating_sub(max_typos as usize);
-    if need == 0 {
-        return true;
-    }
-    // Fast path: all needle bytes fold to distinct bits, so the multiplicity
-    // count equals the popcount of the AND. One AND + popcount vs a loop.
-    let mut needle_mask = 0u64;
-    let mut dup = false;
-    for &b in needle {
-        let bit = 1u64 << fold_bit(b);
-        if needle_mask & bit != 0 {
-            dup = true;
-            break;
-        }
-        needle_mask |= bit;
-    }
-    if !dup {
-        return (path_mask & needle_mask).count_ones() as usize >= need;
-    }
-    // Slow path: needle has duplicate folded bits, multiplicity matters.
-    let mut hits = 0usize;
-    for &b in needle {
-        if path_mask & (1u64 << fold_bit(b)) != 0 {
-            hits += 1;
-            if hits >= need {
-                return true;
-            }
-        }
-    }
-    false
+    let np = NeedlePresence::new(needle, max_typos);
+    np.allows(path_mask, needle)
 }
 
 #[cfg(test)]
