@@ -261,6 +261,77 @@ fn main() {
         }
     }
 
+    // Keystroke wall with warmup: keys:<string> types the string one char at
+    // a time (live-narrow engaged across prefixes). The full prefix sequence
+    // is run `warmup` times before measurement, then `iters` timed rounds.
+    // Reports per-keystroke us_per_op (mean over rounds) — the wall for that
+    // keystroke, not a cumulative total.
+    if let Some(full) = query.strip_prefix("keys:") {
+        let warmup = std::env::var("FFF_KEYS_WARMUP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+        let iters = std::env::var("FFF_KEYS_ITERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+        eprintln!("SCENARIO keys={full} warmup={warmup} iters={iters}");
+        let prefixes: Vec<&str> = (1..=full.len()).map(|n| &full[..n]).collect();
+        let run_one = |q: &str| -> (f64, usize, usize) {
+            let p2 = parser.parse(q);
+            let t0 = Instant::now();
+            let (total_matched, items_len) = {
+                let guard = shared_picker.read().expect("picker lock");
+                let picker = guard.as_ref().expect("picker");
+                let r = picker.fuzzy_search(
+                    &p2,
+                    None,
+                    FuzzySearchOptions {
+                        max_threads: threads,
+                        current_file: None,
+                        project_path: Some(root_path),
+                        combo_boost_score_multiplier: 100,
+                        min_combo_count: 3,
+                        pagination: PaginationArgs { offset: 0, limit: 100 },
+                    },
+                );
+                (r.total_matched, r.items.len())
+            };
+            (t0.elapsed().as_secs_f64() * 1e6, total_matched, items_len)
+        };
+        // Warmup rounds: let caches, TLS scratch, and live-narrow state settle.
+        for _ in 0..warmup {
+            for q in &prefixes {
+                let _ = run_one(q);
+            }
+        }
+        let mut acc = vec![0.0f64; prefixes.len()];
+        let mut tms = vec![0usize; prefixes.len()];
+        let mut last_items = 0usize;
+        for _ in 0..iters {
+            for (i, q) in prefixes.iter().enumerate() {
+                let (us, tm, items) = run_one(q);
+                acc[i] += us;
+                tms[i] = tm;
+                last_items = items;
+            }
+        }
+        let n = iters as f64;
+        for (i, q) in prefixes.iter().enumerate() {
+            eprintln!(
+                "KEY q={:?} us_per_op={:.1} total_matched={} items={}",
+                q,
+                acc[i] / n,
+                tms[i],
+                last_items
+            );
+        }
+        // Full-query repeat (no live-narrow: same length, can_narrow requires growth).
+        let (repeat_us, _, _) = run_one(full);
+        eprintln!("KEY repeat_us={:.1}", repeat_us);
+        return;
+    }
+
     // Realistic typing scenario: type:<string> times one search per prefix
     // (s, sc, sco, ...) with no cross-prefix warmup — first keystroke after
     // open, then each next character.

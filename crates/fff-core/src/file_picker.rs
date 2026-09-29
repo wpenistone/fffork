@@ -1246,39 +1246,67 @@ impl FilePicker {
 
         // Typing live-narrow: when the query only extends the previous one and
         // max_typos is unchanged, Match(longer,T) ⊆ Match(shorter,T).
+        //
+        // Fast path holds the live lock only to filter the previous hit set
+        // into (file_index, &FileItem) pairs — no clone of the 226k u32
+        // candidate vector, and the kept indices stay aligned with the subset
+        // so hit mapping is exact even when the presence mask drops items.
         let mut hit_buf: Vec<u32> = Vec::new();
         let (items, scores, total_matched) = {
-            let can_narrow = {
+            enum NarrowPlan<'a> {
+                Full,
+                Narrow {
+                    subset: Vec<&'a FileItem>,
+                    orig: Vec<u32>,
+                },
+            }
+            let plan = {
                 let live = self.live.lock();
-                live.active
+                let can_narrow = live.active
                     && live.max_typos == max_typos
                     && context.effective_query().len() > live.query.len()
                     && context
                         .effective_query()
                         .starts_with(live.query.as_str())
-                    && live.generation == self.index_generation()
-            };
-            if can_narrow {
-                let (prev_q, prev_cand): (String, Vec<u32>) = {
-                    let live = self.live.lock();
-                    (live.query.clone(), live.candidates.clone())
-                };
-                // Presence-index prune of the previous hit set before the
-                // expensive matcher: a longer query only tightens the
-                // necessary condition, so mask rejects are sound here too.
-                let new_q = context.effective_query().as_bytes();
-                let subset: Vec<&FileItem> = prev_cand
-                    .iter()
-                    .filter_map(|&i| files.get(i as usize))
-                    .filter(|f| {
-                        let m = f.presence_mask();
-                        m == 0 || crate::presence::allows(m, new_q, max_typos)
-                    })
-                    .collect();
-                if cfg!(debug_assertions) || std::env::var_os("FFF_PHASE_TIMING").is_some() {
-                    eprintln!("LIVE_NARROW prev={} cand={} masked={}", prev_q, prev_cand.len(), subset.len());
+                    && live.generation == self.index_generation();
+                if can_narrow {
+                    // Presence-index prune of the previous hit set before the
+                    // expensive matcher: a longer query only tightens the
+                    // necessary condition, so mask rejects are sound here too.
+                    let new_q = context.effective_query().as_bytes();
+                    let mut subset: Vec<&FileItem> = Vec::with_capacity(live.candidates.len());
+                    let mut orig: Vec<u32> = Vec::with_capacity(live.candidates.len());
+                    for &i in live.candidates.iter() {
+                        if let Some(f) = files.get(i as usize) {
+                            let m = f.presence_mask();
+                            if m == 0 || crate::presence::allows(m, new_q, max_typos) {
+                                subset.push(f);
+                                orig.push(i);
+                            }
+                        }
+                    }
+                    if cfg!(debug_assertions) || std::env::var_os("FFF_PHASE_TIMING").is_some() {
+                        eprintln!(
+                            "LIVE_NARROW prev={} cand={} masked={}",
+                            live.query,
+                            live.candidates.len(),
+                            subset.len()
+                        );
+                    }
+                    // Narrowing a near-full candidate set is pure overhead:
+                    // the subset vec + Filtered indirection cost more than a
+                    // direct scan when the presence mask barely rejects.
+                    if subset.len() < live.candidates.len() && !subset.is_empty() {
+                        NarrowPlan::Narrow { subset, orig }
+                    } else {
+                        NarrowPlan::Full
+                    }
+                } else {
+                    NarrowPlan::Full
                 }
-                if !subset.is_empty() {
+            };
+            match plan {
+                NarrowPlan::Narrow { subset, orig } => {
                     let mut local_hits: Vec<u32> = Vec::new();
                     let out = crate::score::with_hit_capture(&mut local_hits, || {
                         crate::score::fuzzy_match_and_score_subset(
@@ -1289,15 +1317,18 @@ impl FilePicker {
                             overflow_arena,
                         )
                     });
-                    // local_hits are indices into the subset; map to file indices.
+                    // local_hits index the subset; `orig` carries the file
+                    // index each subset slot came from.
                     hit_buf.clear();
+                    hit_buf.reserve(local_hits.len());
                     for li in local_hits {
-                        if let Some(&orig) = prev_cand.get(li as usize) {
-                            hit_buf.push(orig);
+                        if let Some(&o) = orig.get(li as usize) {
+                            hit_buf.push(o);
                         }
                     }
                     out
-                } else {
+                }
+                NarrowPlan::Full => {
                     crate::score::with_hit_capture(&mut hit_buf, || {
                         fuzzy_match_and_score_files(
                             files,
@@ -1308,16 +1339,6 @@ impl FilePicker {
                         )
                     })
                 }
-            } else {
-                crate::score::with_hit_capture(&mut hit_buf, || {
-                    fuzzy_match_and_score_files(
-                        files,
-                        &context,
-                        self.sync_data.base_count,
-                        base_arena,
-                        overflow_arena,
-                    )
-                })
             }
         };
         {
@@ -1326,8 +1347,8 @@ impl FilePicker {
             live.query = context.effective_query().to_string();
             live.max_typos = max_typos;
             live.active = !hit_buf.is_empty();
-            live.candidates.clear();
-            live.candidates.extend_from_slice(&hit_buf);
+            // Move, don't copy — hit_buf is dead after this.
+            live.candidates = hit_buf;
         }
         let match_byte_offsets =
             fuzzy_match_byte_offsets_for_page(query, &items, max_typos, base_arena, overflow_arena);
