@@ -546,6 +546,11 @@ pub(crate) mod avx2 {
         let mut best_score_v = zero;
 
         for j in 0..n {
+            // All lanes saturated at u8::MAX: further columns cannot raise
+            // last_row_max. Score-identical early-out.
+            if _mm256_movemask_epi8(_mm256_cmpeq_epi8(last_row_max, ones)) == -1 {
+                break;
+            }
             // Load 32 bytes at position j
             let hay = _mm256_loadu_si256(soa.as_ptr().add(j * LANES8) as *const __m256i);
 
@@ -633,6 +638,204 @@ pub(crate) mod avx2 {
         }
 
         // Extract per-lane scores (u8 -> u16) and end_cols
+        let score_bytes: [u8; 32] = std::mem::transmute(last_row_max);
+        let ecol_bytes: [u8; 32] = std::mem::transmute(end_col_v);
+        for (i, (&s, &e)) in score_bytes.iter().zip(ecol_bytes.iter()).enumerate() {
+            if i < out.len() {
+                out[i] = s as u16;
+                end_cols[i] = e as u16;
+            }
+        }
+    }
+
+    /// Dispatch to a const-unrolled specialization for common needle lengths.
+    /// `M = 0` keeps the general runtime-m loop. Results are bit-identical.
+    #[inline]
+    pub(crate) unsafe fn score_batch_avx2_u8_dispatch(
+        needle: &[u8],
+        soa: &[u8],
+        max_len: usize,
+        p: &SwParams,
+        include_prefix_mask: u32,
+        out: &mut [u16],
+        end_cols: &mut [u16],
+    ) {
+        let m = needle.len().min(32);
+        match m {
+            5 => score_batch_avx2_u8_const::<5>(needle, soa, max_len, p, include_prefix_mask, out, end_cols),
+            8 => score_batch_avx2_u8_const::<8>(needle, soa, max_len, p, include_prefix_mask, out, end_cols),
+            12 => score_batch_avx2_u8_const::<12>(needle, soa, max_len, p, include_prefix_mask, out, end_cols),
+            16 => score_batch_avx2_u8_const::<16>(needle, soa, max_len, p, include_prefix_mask, out, end_cols),
+            24 => score_batch_avx2_u8_const::<24>(needle, soa, max_len, p, include_prefix_mask, out, end_cols),
+            32 => score_batch_avx2_u8_const::<32>(needle, soa, max_len, p, include_prefix_mask, out, end_cols),
+            _ => score_batch_avx2_u8(needle, soa, max_len, p, include_prefix_mask, out, end_cols),
+        }
+    }
+
+    /// Same as [`score_batch_avx2_u8`] but with a compile-time needle length so
+    /// the DP row loop is fully unrolled and the state arrays SROA to registers.
+    /// Bit-identical to the general loop (asserted in tests).
+    #[inline(always)]
+    unsafe fn score_batch_avx2_u8_const<const M: usize>(
+        needle: &[u8],
+        soa: &[u8],
+        max_len: usize,
+        p: &SwParams,
+        include_prefix_mask: u32,
+        out: &mut [u16],
+        end_cols: &mut [u16],
+    ) {
+        debug_assert_eq!(needle.len().min(32), M);
+        let m = M;
+        let n = max_len;
+        if m == 0 || n == 0 {
+            out.iter_mut().for_each(|s| *s = 0);
+            end_cols.iter_mut().for_each(|s| *s = 0);
+            return;
+        }
+
+        let set1 = |v: u8| _mm256_set1_epi8(v as i8);
+        let zero = _mm256_setzero_si256();
+        let ones = set1(u8::MAX);
+
+        let gap_open_v = set1(p.gap_open as u8);
+        let gap_ext_v = set1(p.gap_extend as u8);
+        let match_add_v = set1((p.match_score + p.mismatch_penalty) as u8);
+        let mismatch_v = set1(p.mismatch_penalty as u8);
+        let delim_v = set1(p.delimiter_bonus as u8);
+        let cap_v = set1(p.capitalization_bonus as u8);
+        let case_v = set1(p.matching_case_bonus as u8);
+        let prefix_v = set1(p.prefix_bonus as u8);
+        let a_lo = set1(b'A' - 1);
+        let z_hi = set1(b'Z' + 1);
+        let la_lo = set1(b'a' - 1);
+        let lz_hi = set1(b'z' + 1);
+        let d0_lo = set1(b'0' - 1);
+        let d9_hi = set1(b'9' + 1);
+        let hi80 = set1(0x80);
+        let need_case = p.capitalization_bonus != 0 || p.matching_case_bonus != 0;
+        let need_delim = p.delimiter_bonus != 0;
+
+        let prefix_lanes = {
+            let mut arr = [0u8; 32];
+            for (i, a) in arr.iter_mut().enumerate() {
+                *a = if include_prefix_mask & (1u32 << i) != 0 { u8::MAX } else { 0 };
+            }
+            _mm256_loadu_si256(arr.as_ptr() as *const __m256i)
+        };
+
+        // Fixed max arrays; the row loop below has a const trip count so LLVM
+        // unrolls 1..=M and can keep the hot state in registers.
+        let mut nc_v = [zero; 33];
+        let mut nf_v = [zero; 33];
+        for i in 0..m {
+            nc_v[i + 1] = set1(needle[i]);
+            nf_v[i + 1] = set1(flip_case(needle[i]));
+        }
+
+        let mut h = [[zero; 33]; 2];
+        let mut e = [[zero; 33]; 2];
+        let mut f = [[zero; 33]; 2];
+        let mut match_state = [[zero; 33]; 2];
+        let mut cur = 0usize;
+
+        let mut prev_lower = zero;
+        let mut prev_delim = zero;
+        let mut last_row_max = zero;
+        let mut end_col_v = zero;
+        let mut best_score_v = zero;
+
+        for j in 0..n {
+            let hay = _mm256_loadu_si256(soa.as_ptr().add(j * 32) as *const __m256i);
+
+            // All lanes saturated: no column can raise a u8 score further.
+            // Score-identical early-out.
+            if _mm256_movemask_epi8(_mm256_cmpeq_epi8(last_row_max, ones)) == -1 {
+                break;
+            }
+
+            let (is_lower, is_delim_unused, cap_bonus, delim_bonus) = if need_case || need_delim {
+                let ge_a = _mm256_cmpgt_epi8(hay, a_lo);
+                let le_z = _mm256_cmpgt_epi8(z_hi, hay);
+                let is_upper = _mm256_and_si256(ge_a, le_z);
+                let ge_la = _mm256_cmpgt_epi8(hay, la_lo);
+                let le_lz = _mm256_cmpgt_epi8(lz_hi, hay);
+                let is_lower = _mm256_and_si256(ge_la, le_lz);
+                let ge_0 = _mm256_cmpgt_epi8(hay, d0_lo);
+                let le_9 = _mm256_cmpgt_epi8(d9_hi, hay);
+                let is_digit = _mm256_and_si256(ge_0, le_9);
+                let is_letter = _mm256_or_si256(is_upper, is_lower);
+                let alnum = _mm256_or_si256(is_letter, is_digit);
+                let not_alnum = _mm256_andnot_si256(alnum, ones);
+                let high_bit = _mm256_and_si256(hay, hi80);
+                let lt_128 = _mm256_cmpeq_epi8(high_bit, zero);
+                let is_delim = _mm256_and_si256(not_alnum, lt_128);
+                let not_delim = _mm256_andnot_si256(is_delim, ones);
+                let cap_mask = _mm256_and_si256(is_upper, prev_lower);
+                let cap_bonus = _mm256_and_si256(cap_mask, cap_v);
+                let dm = _mm256_and_si256(prev_delim, not_delim);
+                let delim_bonus = _mm256_and_si256(dm, delim_v);
+                (is_lower, is_delim, cap_bonus, delim_bonus)
+            } else {
+                (zero, zero, zero, zero)
+            };
+            let prefix_bonus = if j == 0 {
+                _mm256_and_si256(prefix_v, prefix_lanes)
+            } else {
+                zero
+            };
+
+            let nxt = 1 - cur;
+            h[nxt][0] = zero;
+            e[nxt][0] = zero;
+            f[nxt][0] = zero;
+            match_state[nxt][0] = zero;
+
+            // Const trip count (M is a const generic): fully unrolled.
+            for i in 1..=M {
+                let eq_nc = _mm256_cmpeq_epi8(hay, nc_v[i]);
+                let eq_nf = _mm256_cmpeq_epi8(hay, nf_v[i]);
+                let mm = _mm256_or_si256(eq_nc, eq_nf);
+                match_state[nxt][i] = mm;
+
+                let masked_bonus = _mm256_and_si256(
+                    _mm256_add_epi8(
+                        _mm256_add_epi8(delim_bonus, cap_bonus),
+                        _mm256_add_epi8(prefix_bonus, match_add_v),
+                    ),
+                    mm,
+                );
+                let diag = _mm256_add_epi8(h[cur][i - 1], masked_bonus);
+                let diag = _mm256_subs_epu8(diag, mismatch_v);
+                let diag = _mm256_add_epi8(diag, _mm256_and_si256(eq_nc, case_v));
+
+                let e_pen = _mm256_blendv_epi8(gap_ext_v, gap_open_v, match_state[cur][i]);
+                let e_new = _mm256_subs_epu8(h[cur][i], e_pen);
+                let e_ext = _mm256_subs_epu8(e[cur][i], gap_ext_v);
+                e[nxt][i] = _mm256_max_epu8(e_new, e_ext);
+
+                let f_pen = _mm256_blendv_epi8(gap_ext_v, gap_open_v, match_state[nxt][i - 1]);
+                let f_new = _mm256_subs_epu8(h[nxt][i - 1], f_pen);
+                let f_ext = _mm256_subs_epu8(f[nxt][i - 1], gap_ext_v);
+                f[nxt][i] = _mm256_max_epu8(f_new, f_ext);
+
+                let h_val = _mm256_max_epu8(diag, e[nxt][i]);
+                let h_val = _mm256_max_epu8(h_val, f[nxt][i]);
+                h[nxt][i] = _mm256_max_epu8(h_val, zero);
+            }
+
+            let row_m = h[nxt][M];
+            let gt_best = _mm256_cmpgt_epi8(row_m, best_score_v);
+            let j_v = set1(j as u8);
+            end_col_v = _mm256_blendv_epi8(end_col_v, j_v, gt_best);
+            best_score_v = _mm256_max_epu8(best_score_v, row_m);
+            last_row_max = _mm256_max_epu8(last_row_max, row_m);
+
+            cur = nxt;
+            prev_lower = is_lower;
+            prev_delim = is_delim_unused;
+        }
+
         let score_bytes: [u8; 32] = std::mem::transmute(last_row_max);
         let ecol_bytes: [u8; 32] = std::mem::transmute(end_col_v);
         for (i, (&s, &e)) in score_bytes.iter().zip(ecol_bytes.iter()).enumerate() {
@@ -786,6 +989,42 @@ mod tests {
                     simd_ecol[k], scalar_ecol
                 );
             }
+        }
+    }
+
+    #[test]
+    fn avx2_u8_dispatch_matches_general_unrolled() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let p = params();
+        for &m in &[5usize, 8, 12, 16, 24, 32] {
+            let needle: Vec<u8> = (0..m).map(|i| b'a' + (i % 26) as u8).collect();
+            let batch: Vec<String> = (0..32)
+                .map(|i| {
+                    let len = 4 + (i * 3 + m) % 40;
+                    let bytes: Vec<u8> =
+                        (0..len).map(|j| b'a' + ((i + j) % 26) as u8).collect();
+                    String::from_utf8(bytes).unwrap()
+                })
+                .collect();
+            let max_len = batch.iter().map(|h| h.len()).max().unwrap();
+            let hays: Vec<&[u8]> = batch.iter().map(|h| h.as_bytes()).collect();
+            let soa = super::avx2::build_soa(&hays, max_len, 32);
+            let mut out_a = vec![0u16; 32];
+            let mut eco_a = vec![0u16; 32];
+            let mut out_b = vec![0u16; 32];
+            let mut eco_b = vec![0u16; 32];
+            unsafe {
+                super::avx2::score_batch_avx2_u8(
+                    &needle, &soa, max_len, &p, u32::MAX, &mut out_a, &mut eco_a,
+                );
+                super::avx2::score_batch_avx2_u8_dispatch(
+                    &needle, &soa, max_len, &p, u32::MAX, &mut out_b, &mut eco_b,
+                );
+            }
+            assert_eq!(out_a, out_b, "m={m} scores differ general vs unrolled");
+            assert_eq!(eco_a, eco_b, "m={m} end_cols differ general vs unrolled");
         }
     }
 
