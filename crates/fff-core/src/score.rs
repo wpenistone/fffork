@@ -1461,6 +1461,15 @@ fn match_and_score_in_arena<'a>(
         )
     };
 
+    // Collapse-aware rank: when the query hit ~every path, skip per-hit
+    // filename arena reads (filename_cow / special-entry).
+    let rank_collapsed = {
+        let n_files = working_files.len().max(1);
+        path_matches.len() >= 4096
+            && path_matches.len() * 100 >= n_files * 85
+            && main_needle_len <= 8
+    };
+
     let score_one = |scratch: &mut ScoreScratch,
                      match_idx: usize,
                      path_match: &neo_frizbee::Match|
@@ -1502,15 +1511,19 @@ fn match_and_score_in_arena<'a>(
             let is_filename_match = end_col_filename_match || simd_filename_match.is_some();
             let fname_len = file.path.byte_len as usize - file.path.filename_offset as usize;
 
-            let is_exact_filename = simd_filename_match.is_some_and(|(exact, _)| exact)
-                || (end_col_filename_match && main_needle_len as usize == fname_len && {
-                    // Borrowed filename when it fits one chunk — no String write.
-                    let fname = file.path.filename_cow(arena);
-                    main_needle.eq_ignore_ascii_case(fname.as_bytes())
-                });
+            let is_exact_filename = !rank_collapsed
+                && (simd_filename_match.is_some_and(|(exact, _)| exact)
+                    || (end_col_filename_match && main_needle_len as usize == fname_len && {
+                        let fname = file.path.filename_cow(arena);
+                        main_needle.eq_ignore_ascii_case(fname.as_bytes())
+                    }));
 
             let mut has_special_filename_bonus = false;
-            let filename_bonus = if is_exact_filename {
+            let filename_bonus = if rank_collapsed {
+                // Collapse path: MatchWindow already put a filename hit bonus
+                // into base_score. Avoid special-entry filename_cow here.
+                0
+            } else if is_exact_filename {
                 base_score / 5 * 2 // 40% bonus for exact filename match
             } else if is_filename_match {
                 // 16% bonus for fuzzy filename match that landed in the filename region.
