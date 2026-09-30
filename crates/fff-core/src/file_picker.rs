@@ -1236,7 +1236,6 @@ impl FilePicker {
             combo_boost_score_multiplier: options.combo_boost_score_multiplier,
             min_combo_count: options.min_combo_count,
             pagination: options.pagination,
-            path_bigram: self.sync_data.path_bigram_index.as_deref(),
         };
 
         let time = std::time::Instant::now();
@@ -1409,7 +1408,6 @@ impl FilePicker {
             combo_boost_score_multiplier: 0,
             min_combo_count: 0,
             pagination: options.pagination,
-            path_bigram: self.sync_data.path_bigram_index.as_deref(),
         };
 
         let arena = self.sync_data.arena_base_ptr();

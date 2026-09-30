@@ -257,7 +257,6 @@ fn match_fuzzy_parts(
     options: &neo_frizbee::Config,
     max_threads: usize,
     arena: ArenaPtr,
-    path_bigram: Option<&crate::index::BigramFilter>,
 ) -> Vec<neo_frizbee::Match> {
     let valid_parts: Vec<&str> = fuzzy_parts
         .iter()
@@ -1407,7 +1406,6 @@ fn match_and_score_in_arena<'a>(
                 &options,
                 context.max_threads,
                 arena,
-                context.path_bigram,
             );
             let matches_arc = Arc::new(matches);
             if let Some(((cache, _, _), key)) = raw_cache.zip(cache_key) {
@@ -2135,8 +2133,6 @@ mod tests {
             project_path: None,
             combo_boost_score_multiplier: 100,
             min_combo_count: 3,
-
-            path_bigram: None,
             pagination: PaginationArgs {
                 offset: 0,
                 limit: 0,
@@ -2188,8 +2184,6 @@ mod tests {
             project_path: None,
             combo_boost_score_multiplier: 100,
             min_combo_count: 3,
-
-            path_bigram: None,
             pagination: PaginationArgs {
                 offset: 0,
                 limit: 0,
@@ -2239,8 +2233,6 @@ mod tests {
             project_path: None,
             combo_boost_score_multiplier: 100,
             min_combo_count: 3,
-
-            path_bigram: None,
             pagination: PaginationArgs {
                 offset: 0,
                 limit: 0,
@@ -2330,8 +2322,6 @@ mod filename_bonus_tests {
             project_path: None,
             combo_boost_score_multiplier: 100,
             min_combo_count: 3,
-
-            path_bigram: None,
             pagination: PaginationArgs {
                 offset: 0,
                 limit: 100,
@@ -2575,7 +2565,6 @@ mod git_recency_scoring_tests {
             project_path: None,
             combo_boost_score_multiplier: 100,
             min_combo_count: 3,
-            path_bigram: None,
             pagination: PaginationArgs {
                 offset: 0,
                 limit: 100,
@@ -2666,7 +2655,6 @@ mod typo_resistance_tests {
             project_path: None,
             combo_boost_score_multiplier: 100,
             min_combo_count: 3,
-            path_bigram: None,
             pagination: PaginationArgs {
                 offset: 0,
                 limit: 100,
@@ -2776,7 +2764,6 @@ mod constraint_only_query_tests {
             project_path: None,
             combo_boost_score_multiplier: 100,
             min_combo_count: 3,
-            path_bigram: None,
             pagination: PaginationArgs {
                 offset: 0,
                 limit: 50,
@@ -2829,7 +2816,6 @@ mod constraint_only_query_tests {
             project_path: None,
             combo_boost_score_multiplier: 100,
             min_combo_count: 3,
-            path_bigram: None,
             pagination: PaginationArgs {
                 offset: 0,
                 limit: 50,
@@ -2898,7 +2884,6 @@ mod ranking_policy_tests {
             project_path: None,
             combo_boost_score_multiplier: 100,
             min_combo_count: 3,
-            path_bigram: None,
             pagination: PaginationArgs {
                 offset: 0,
                 limit: 100,
