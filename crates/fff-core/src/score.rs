@@ -352,8 +352,7 @@ fn match_fuzzy_parts(
                 m.exact = false;
             }
             if !exact_name_hits.is_empty() {
-                let pinned: std::collections::HashSet<u32> =
-                    exact_name_hits.iter().copied().collect();
+                let pinned = exact_name_hits.as_slice();
                 for m in matches.iter_mut() {
                     if pinned.contains(&m.index) {
                         m.score = m.score.max(200);
@@ -668,8 +667,7 @@ fn match_fuzzy_parts(
             );
         }
             if !exact_name_hits.is_empty() {
-                let pinned: std::collections::HashSet<u32> =
-                    exact_name_hits.iter().copied().collect();
+                let pinned = exact_name_hits.as_slice();
                 for m in matches.iter_mut() {
                     if pinned.contains(&m.index) {
                         m.score = m.score.max(200);
