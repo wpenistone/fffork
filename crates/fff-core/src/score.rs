@@ -304,18 +304,29 @@ fn match_fuzzy_parts(
         let mut cand: Vec<u32> = Vec::new();
         let try_cand = valid_parts[0].len() >= 6 && working_files.len() >= 8_192;
         if try_cand {
-            cand.reserve(working_files.len() / 4);
-            for i in 0..working_files.len() {
-                let f = working_files.index(i);
-                if (f.path.byte_len as usize) < np.min_path_len() {
-                    continue;
-                }
-                let mask = f.presence_mask();
-                if mask != 0 && !np.allows(mask, valid_parts[0].as_bytes()) {
-                    continue;
-                }
-                cand.push(i as u32);
-            }
+            // Parallel presence/length reject: sequential 227k scan was ~ms
+            // of the prefilter; servers with more cores get this for free.
+            use rayon::prelude::*;
+            let needle_b = valid_parts[0].as_bytes();
+            let min_len = np.min_path_len();
+            let mut local: Vec<u32> = crate::parallelism::run_on_bg_pool(|| {
+                (0..working_files.len())
+                    .into_par_iter()
+                    .filter_map(|i| {
+                        let f = working_files.index(i);
+                        if (f.path.byte_len as usize) < min_len {
+                            return None;
+                        }
+                        let mask = f.presence_mask();
+                        if mask != 0 && !np.allows(mask, needle_b) {
+                            return None;
+                        }
+                        Some(i as u32)
+                    })
+                    .collect()
+            });
+            local.shrink_to_fit();
+            cand = local;
         }
         let use_cand = try_cand && cand.len() * 2 < working_files.len() && !cand.is_empty();
         let mut matches = neo_frizbee::with_skip_sw(|| {
