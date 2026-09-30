@@ -426,9 +426,26 @@ fn match_fuzzy_parts(
         const MIN_OVERLAP: f32 = 0.75;
         let mut collapsed = false;
         if matches.len() >= 512 && n_files >= 4_096 {
-            let mut order: Vec<usize> = (0..wins.len()).collect();
-            order.sort_by_key(|&i| std::cmp::Reverse(cheap_of(&wins[i], working_files)));
-            let mut sample: Vec<usize> = order.iter().copied().take(TOP_K * 2).collect();
+            // Top-K by cheap score without sorting the full 226k hit set.
+            let mut top: Vec<(u16, usize)> = Vec::with_capacity(TOP_K * 2);
+            for i in 0..wins.len() {
+                let c = cheap_of(&wins[i], working_files);
+                if top.len() < TOP_K * 2 {
+                    top.push((c, i));
+                    if top.len() == TOP_K * 2 {
+                        top.sort_unstable_by_key(|&(c, _)| std::cmp::Reverse(c));
+                    }
+                } else if c > top.last().unwrap().0 {
+                    top.pop();
+                    let mut p = top.len();
+                    top.push((c, i));
+                    while p > 0 && top[p - 1].0 < top[p].0 {
+                        top.swap(p - 1, p);
+                        p -= 1;
+                    }
+                }
+            }
+            let mut sample: Vec<usize> = top.iter().map(|&(_, i)| i).collect();
             let stride = (wins.len() / SAMPLE_CAP).max(1);
             let mut seen: std::collections::HashSet<usize> = sample.iter().copied().collect();
             for i in (0..wins.len()).step_by(stride) {
@@ -466,7 +483,8 @@ fn match_fuzzy_parts(
             by_sw.sort_by_key(|&k| std::cmp::Reverse(sw_scores[k]));
             let sw_top: std::collections::HashSet<usize> =
                 by_sw.iter().take(TOP_K).map(|&k| sample[k]).collect();
-            let cheap_top: std::collections::HashSet<usize> = order.iter().take(TOP_K).copied().collect();
+            let cheap_top: std::collections::HashSet<usize> =
+                top.iter().take(TOP_K).map(|&(_, i)| i).collect();
             let inter = sw_top.intersection(&cheap_top).count();
             collapsed = (inter as f32 / TOP_K as f32) >= MIN_OVERLAP;
         }
