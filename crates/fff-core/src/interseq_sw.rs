@@ -544,9 +544,11 @@ pub(crate) mod avx2 {
         let mut best_score_v = zero;
 
         for j in 0..n {
-            // All lanes saturated at u8::MAX: further columns cannot raise
-            // last_row_max. Score-identical early-out.
-            if _mm256_movemask_epi8(_mm256_cmpeq_epi8(last_row_max, ones)) == -1 {
+            // Saturation check every 4th column (result-identical; last_row_max
+            // only grows, so skipping columns is safe).
+            if j & 3 == 0
+                && _mm256_movemask_epi8(_mm256_cmpeq_epi8(last_row_max, ones)) == -1
+            {
                 break;
             }
             // Load 32 bytes at position j
@@ -762,9 +764,9 @@ pub(crate) mod avx2 {
                 }
             }
 
-            // All lanes saturated: no column can raise a u8 score further.
-            // Score-identical early-out.
-            if _mm256_movemask_epi8(_mm256_cmpeq_epi8(last_row_max, ones)) == -1 {
+            if j & 3 == 0
+                && _mm256_movemask_epi8(_mm256_cmpeq_epi8(last_row_max, ones)) == -1
+            {
                 break;
             }
 

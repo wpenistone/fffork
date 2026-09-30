@@ -430,8 +430,19 @@ fn match_fuzzy_parts(
             let mut trims = TRIMS.with(|c| take_tls(c, n_matches));
             trims.clear();
             {
-                for m in matches_chunk.iter() {
+                for (mi, m) in matches_chunk.iter().enumerate() {
                     let file = working_files.index(m.index as usize);
+                    // Prefetch next FileItem (sequential over this chunk).
+                    #[cfg(target_arch = "x86_64")]
+                    if mi + 1 < n_matches {
+                        let nf = working_files.index(matches_chunk[mi + 1].index as usize);
+                        unsafe {
+                            std::arch::x86_64::_mm_prefetch(
+                                (nf as *const crate::types::FileItem).cast::<i8>(),
+                                std::arch::x86_64::_MM_HINT_T0,
+                            );
+                        }
+                    }
                     let w = decode_match_window(m, file.path.byte_len as usize);
                     trims.push((
                         w.file_idx,
@@ -1568,27 +1579,27 @@ fn match_and_score_in_arena<'a>(
 
             let is_filename_match = end_col_filename_match || simd_filename_match.is_some();
             let fname_len = file.path.byte_len as usize - file.path.filename_offset as usize;
+            // Hoist filename once (was up to 3× filename_cow per hit).
+            let fname = if rank_collapsed {
+                None
+            } else {
+                Some(file.path.filename_cow(arena))
+            };
 
             let is_exact_filename = !rank_collapsed
                 && (simd_filename_match.is_some_and(|(exact, _)| exact)
-                    || (end_col_filename_match && main_needle_len as usize == fname_len && {
-                        let fname = file.path.filename_cow(arena);
-                        main_needle.eq_ignore_ascii_case(fname.as_bytes())
-                    }));
+                    || (end_col_filename_match
+                        && main_needle_len as usize == fname_len
+                        && main_needle.eq_ignore_ascii_case(
+                            fname.as_ref().unwrap().as_bytes(),
+                        )));
 
             let mut has_special_filename_bonus = false;
             let filename_bonus = if rank_collapsed {
-                // Collapse path: MatchWindow already put a filename hit bonus
-                // into base_score. Avoid special-entry filename_cow here.
                 0
             } else if is_exact_filename {
                 base_score / 5 * 2 // 40% bonus for exact filename match
             } else if is_filename_match {
-                // 16% bonus for fuzzy filename match that landed in the filename region.
-                // For fallback matches (where the path match landed in a directory segment),
-                // scale the bonus by the quality of the filename match — a contiguous match
-                // like "rename" in "rename.ts" gets the full bonus, while a scattered
-                // subsequence like r-e-n-a-m-e in "generateSessionName.ts" gets much less.
                 let max_bonus = (base_score / 6).min(30);
                 if let Some((_, fm_score)) = simd_filename_match {
                     let max_possible = main_needle_len as i32 * 16;
@@ -1598,10 +1609,7 @@ fn match_and_score_in_arena<'a>(
                     max_bonus
                 }
             } else if !is_filename_match && (5..=11).contains(&fname_len) {
-                let fname = file.path.filename_cow(arena);
-                // 5% bonus for special file but not as much as file name to avoid situations
-                // when you have /user_service/server.rs and /user_service/server/mod.rs
-                if is_special_entry_point_bytes(fname.as_bytes()) {
+                if is_special_entry_point_bytes(fname.as_ref().unwrap().as_bytes()) {
                     has_special_filename_bonus = true;
                     base_score * 5 / 100
                 } else {
@@ -1669,22 +1677,21 @@ fn match_and_score_in_arena<'a>(
             let evidence_bonus = if rank_collapsed {
                 0
             } else {
-                let fname = file.path.filename_cow(arena);
-                // Path walk only when intent/context can use it.
+                let fname_ref = fname.as_ref().unwrap();
                 let need_path = query_intent == crate::intent::QueryIntent::Path
                     || context.current_file.is_some();
                 let ev = if need_path {
                     let rel = file.path.read_to_buf(arena, path_buf);
                     crate::intent::evidence_for(
                         rel.as_ref(),
-                        fname.as_ref(),
+                        fname_ref.as_ref(),
                         main_needle_as_str,
                         query_intent,
                         context.current_file,
                     )
                 } else {
                     crate::intent::evidence_filename_only(
-                        fname.as_ref(),
+                        fname_ref.as_ref(),
                         main_needle_as_str,
                         query_intent,
                     )
