@@ -509,7 +509,11 @@ fn match_fuzzy_parts(
                             std::mem::take(&mut *b)
                         });
                         stage.truncate(buf_len);
-                        stage[..buf_len].fill(0);
+                        // Zero only padding (was fill(0) of the whole buffer,
+                        // then overwrite every window — double-touch).
+                        for k in n..batch_sz {
+                            stage[k * rows..(k + 1) * rows].fill(0);
+                        }
 
                         let mut prefix_mask: u32 = 0;
                         let mut next_ptrs = [std::ptr::null::<u8>(); MAX_PATH_CHUNKS];
@@ -529,8 +533,11 @@ fn match_fuzzy_parts(
                                     }
                                 }
                             }
-                            let dst = &mut stage[k * rows..k * rows + (e - s) as usize];
+                            let wlen = (e - s) as usize;
+                            let dst = &mut stage[k * rows..k * rows + wlen];
                             file.path.copy_window_to(arena, s, e, dst);
+                            // Pad the rest of this lane to zeros (SoA expects it).
+                            stage[k * rows + wlen..(k + 1) * rows].fill(0);
                             if inc_prefix {
                                 prefix_mask |= 1u32 << k;
                             }
