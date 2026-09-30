@@ -247,128 +247,16 @@ fn match_fuzzy_parts(
             }
         }
 
-        // Adaptive collapse: when the cheap ranker (trim concentration +
-        // filename) agrees with SW on a sample, skip full SW. Quality is
-        // measured, not assumed from needle length / magic percentages.
-        let n_files = working_files.len().max(1);
+        // SW scoring (collapse removed: cheap rank disagreed with SW
+        // on real corpora; reordering would be a UX regression).
         let t_collect = std::time::Instant::now();
-        // No full-set MatchWindow vec: collapse is off for UX parity; windows
-        // are decoded per chunk in the SW path (was +1.2ms and 3.6MB).
-        let _ = n_files;
-        let wins: Vec<MatchWindow> = Vec::new();
         let wins_ms = 0.0f64;
-
-        let cheap_of = |w: &MatchWindow, working_files: &FileItems<'_>| -> u16 {
-            let win = w.end.saturating_sub(w.start).max(1) as usize;
-            let conc = ((64usize.saturating_sub(win.min(64))) as u16) * 2;
-            let fname_off = working_files.index(w.file_idx as usize).path.filename_offset as usize;
-            let fname_bonus = if (w.start as usize) >= fname_off { 40u16 } else { 0 };
-            conc.saturating_add(fname_bonus)
-        };
-
-        // Collapse disabled: cheap rank vs SW top-32 overlap is 0.06–0.16 on
-        // real corpora; reordering would be a UX regression vs upstream.
-        // Always take the full SW path. (Sample machinery kept for research.)
-        let mut collapsed = false;
-        const SAMPLE_CAP: usize = 256;
-        const TOP_K: usize = 32;
-        const MIN_OVERLAP: f32 = 1.0;
-        if false && matches.len() >= 32_000 && n_files >= 4_096 {
-            // Top-K by cheap score without sorting the full 226k hit set.
-            let mut top: Vec<(u16, usize)> = Vec::with_capacity(TOP_K * 2);
-            for i in 0..wins.len() {
-                let c = cheap_of(&wins[i], working_files);
-                if top.len() < TOP_K * 2 {
-                    top.push((c, i));
-                    if top.len() == TOP_K * 2 {
-                        top.sort_unstable_by_key(|&(c, _)| std::cmp::Reverse(c));
-                    }
-                } else if c > top.last().unwrap().0 {
-                    top.pop();
-                    let mut p = top.len();
-                    top.push((c, i));
-                    while p > 0 && top[p - 1].0 < top[p].0 {
-                        top.swap(p - 1, p);
-                        p -= 1;
-                    }
-                }
-            }
-            let mut sample: Vec<usize> = top.iter().map(|&(_, i)| i).collect();
-            let stride = (wins.len() / SAMPLE_CAP).max(1);
-            let mut seen: std::collections::HashSet<usize> = sample.iter().copied().collect();
-            for i in (0..wins.len()).step_by(stride) {
-                if sample.len() >= SAMPLE_CAP {
-                    break;
-                }
-                if seen.insert(i) {
-                    sample.push(i);
-                }
-            }
-            let mut sw_scores = vec![0u16; sample.len()];
-            {
-                let max_len = sample
-                    .iter()
-                    .map(|&i| (wins[i].end - wins[i].start) as usize)
-                    .max()
-                    .unwrap_or(1);
-                let rows = max_len.div_ceil(8) * 8;
-                let mut stage = vec![0u8; rows * sample.len().max(1)];
-                for (k, &i) in sample.iter().enumerate() {
-                    let w = wins[i];
-                    let file = working_files.index(w.file_idx as usize);
-                    let dst = &mut stage[k * rows..k * rows + (w.end - w.start) as usize];
-                    file.path.copy_window_to(arena, w.start, w.end, dst);
-                }
-                for (k, &i) in sample.iter().enumerate() {
-                    let w = wins[i];
-                    let src = &stage[k * rows..k * rows + (w.end - w.start) as usize];
-                    let (sc, _) =
-                        crate::interseq_sw::score_one_scalar_full(needle, src, &p, w.include_prefix);
-                    sw_scores[k] = sc;
-                }
-            }
-            let mut by_sw: Vec<usize> = (0..sample.len()).collect();
-            by_sw.sort_by_key(|&k| std::cmp::Reverse(sw_scores[k]));
-            let sw_top: std::collections::HashSet<usize> =
-                by_sw.iter().take(TOP_K).map(|&k| sample[k]).collect();
-            let cheap_top: std::collections::HashSet<usize> =
-                top.iter().take(TOP_K).map(|&(_, i)| i).collect();
-            let inter = sw_top.intersection(&cheap_top).count();
-            let overlap = inter as f32 / TOP_K as f32;
-            if std::env::var_os("FFF_PHASE_TIMING").is_some() {
-                eprintln!("PHASE overlap={overlap:.2} collapsed_would_be={}", overlap >= MIN_OVERLAP);
-            }
-            collapsed = overlap >= MIN_OVERLAP;
-        }
         let samp_ms = 0.0f64;
         if std::env::var_os("FFF_PHASE_TIMING").is_some() {
-            eprintln!("PHASE cand_ms={cand_ms:.1} wins_ms={wins_ms:.1} samp_ms={samp_ms:.1} collapsed={collapsed} n={}", matches.len());
+            eprintln!("PHASE cand_ms={cand_ms:.1} wins_ms={wins_ms:.1} samp_ms={samp_ms:.1} collapsed=false n={}", matches.len());
         }
+        {
 
-        if collapsed {
-            for (m, w) in matches.iter_mut().zip(wins.iter()) {
-                m.score = cheap_of(w, working_files);
-                m.end_col = w.end.min(u16::MAX as u32) as u16;
-                m.exact = false;
-            }
-            if !exact_name_hits.is_empty() {
-                let pinned = exact_name_hits.as_slice();
-                for m in matches.iter_mut() {
-                    if pinned.contains(&m.index) {
-                        m.score = m.score.max(200);
-                        m.exact = true;
-                    }
-                }
-            }
-            let collect_ms = t_collect.elapsed().as_secs_f64() * 1e3;
-            if std::env::var_os("FFF_PHASE_TIMING").is_some() {
-                eprintln!(
-                    "PHASE interseq prefilter_ms={prefilter_ms:.1} collapse_ms={collect_ms:.1} n={}",
-                    matches.len()
-                );
-            }
-            matches
-        } else {
         // Chunked scoring: process at most CHUNK matches of metadata at a
         // time so peak working set stays small (faults/RSS vs upstream).
         // 32k × ~16 B × a few arrays ≈ 1 MB peak, vs a full 227k-wide set.
