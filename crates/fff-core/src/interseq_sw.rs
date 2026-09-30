@@ -553,6 +553,15 @@ pub(crate) mod avx2 {
             }
             // Load 32 bytes at position j
             let hay = _mm256_loadu_si256(soa.as_ptr().add(j * LANES8) as *const __m256i);
+            // Prefetch the next column (position-major SoA is sequential).
+            if j + 2 < n {
+                unsafe {
+                    std::arch::x86_64::_mm_prefetch(
+                        soa.as_ptr().add((j + 2) * LANES8) as *const i8,
+                        std::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+            }
 
             // Character class masks — skip entirely when case/delim bonuses are 0
             // (typical lowercase query). Saves ~10 SIMD ops per column.
@@ -747,6 +756,14 @@ pub(crate) mod avx2 {
 
         for j in 0..n {
             let hay = _mm256_loadu_si256(soa.as_ptr().add(j * 32) as *const __m256i);
+            if j + 2 < n {
+                unsafe {
+                    std::arch::x86_64::_mm_prefetch(
+                        soa.as_ptr().add((j + 2) * 32) as *const i8,
+                        std::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+            }
 
             // All lanes saturated: no column can raise a u8 score further.
             // Score-identical early-out.
