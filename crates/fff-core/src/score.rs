@@ -125,32 +125,50 @@ fn match_fuzzy_parts(
         // actually reject (longer / typed letters). Common short queries
         // match almost everything — skip so we don't scan twice.
         let mut cand: Vec<u32> = Vec::new();
+        let t_cand = std::time::Instant::now();
         let try_cand = valid_parts[0].len() >= 6 && working_files.len() >= 8_192;
         if try_cand {
-            // Parallel presence/length reject: sequential 227k scan was ~ms
-            // of the prefilter; servers with more cores get this for free.
-            use rayon::prelude::*;
+            // Probe presence selectivity on a small sample first. A full
+            // 227k scan is wasted when the needle is too common to reject.
+            let n_probe = working_files.len().min(4_096);
+            let stride = (working_files.len() / n_probe).max(1);
+            let mut pass = 0usize;
+            let mut probed = 0usize;
             let needle_b = valid_parts[0].as_bytes();
-            let min_len = np.min_path_len();
-            let mut local: Vec<u32> = crate::parallelism::run_on_bg_pool(|| {
-                (0..working_files.len())
-                    .into_par_iter()
-                    .filter_map(|i| {
-                        let f = working_files.index(i);
-                        if (f.path.byte_len as usize) < min_len {
-                            return None;
-                        }
-                        let mask = f.presence_mask();
-                        if mask != 0 && !np.allows(mask, needle_b) {
-                            return None;
-                        }
-                        Some(i as u32)
-                    })
-                    .collect()
-            });
-            local.shrink_to_fit();
-            cand = local;
+            for i in (0..working_files.len()).step_by(stride) {
+                let f = working_files.index(i);
+                let mask = f.presence_mask();
+                let ok = (f.path.byte_len as usize) >= np.min_path_len()
+                    && (mask == 0 || np.allows(mask, needle_b));
+                pass += ok as usize;
+                probed += 1;
+                if probed >= n_probe {
+                    break;
+                }
+            }
+            // Need the probe to eliminate at least half the corpus.
+            if probed > 0 && pass * 2 <= probed {
+                use rayon::prelude::*;
+                let min_len = np.min_path_len();
+                cand = crate::parallelism::run_on_bg_pool(|| {
+                    (0..working_files.len())
+                        .into_par_iter()
+                        .filter_map(|i| {
+                            let f = working_files.index(i);
+                            if (f.path.byte_len as usize) < min_len {
+                                return None;
+                            }
+                            let mask = f.presence_mask();
+                            if mask != 0 && !np.allows(mask, needle_b) {
+                                return None;
+                            }
+                            Some(i as u32)
+                        })
+                        .collect()
+                });
+            }
         }
+        let cand_ms = t_cand.elapsed().as_secs_f64() * 1e3;
         let use_cand = try_cand && cand.len() * 2 < working_files.len() && !cand.is_empty();
         let mut matches = neo_frizbee::with_skip_sw(|| {
             with_cached_matcher(valid_parts[0], options, |matcher| {
@@ -251,7 +269,9 @@ fn match_fuzzy_parts(
         const TOP_K: usize = 32;
         const MIN_OVERLAP: f32 = 0.75;
         let mut collapsed = false;
-        if matches.len() >= 512 && n_files >= 4_096 {
+        // Only sample-check when full SW would dominate. Below this, just
+        // score every hit (8k x SW is <1ms; the sample pass costs more).
+        if matches.len() >= 32_000 && n_files >= 4_096 {
             // Top-K by cheap score without sorting the full 226k hit set.
             let mut top: Vec<(u16, usize)> = Vec::with_capacity(TOP_K * 2);
             for i in 0..wins.len() {
@@ -316,7 +336,7 @@ fn match_fuzzy_parts(
         }
         let samp_ms = t_samp.elapsed().as_secs_f64() * 1e3;
         if std::env::var_os("FFF_PHASE_TIMING").is_some() {
-            eprintln!("PHASE wins_ms={wins_ms:.1} samp_ms={samp_ms:.1} collapsed={collapsed} n={}", matches.len());
+            eprintln!("PHASE cand_ms={cand_ms:.1} wins_ms={wins_ms:.1} samp_ms={samp_ms:.1} collapsed={collapsed} n={}", matches.len());
         }
 
         if collapsed {
