@@ -1210,7 +1210,7 @@ impl FilePicker {
         );
 
         // small queries with a large number of results can match absolutely everything
-        let max_typos = (effective_query.len() as u16 / 4).clamp(2, 6);
+        let max_typos = (effective_query.len() as u16 / 6).clamp(2, 6);
         // Look up the last file selected for this query (combo-boost scoring)
         let last_same_query_entry =
             query_tracker
@@ -1396,7 +1396,7 @@ impl FilePicker {
             _ => query.raw_query.trim(),
         };
 
-        let max_typos = (effective_query.len() as u16 / 4).clamp(2, 6);
+        let max_typos = (effective_query.len() as u16 / 6).clamp(2, 6);
 
         let context = ScoringContext {
             query,
