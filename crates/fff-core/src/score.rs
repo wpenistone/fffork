@@ -219,22 +219,23 @@ fn match_fuzzy_parts(
         let p = crate::interseq_sw::SwParams::for_query(has_upper);
         let needle = valid_parts[0].as_bytes();
 
-        // Query intent: `name.ext` (has dot, no slash) — pin exact filename
-        // hits so a typed filename always wins without waiting on fuzzy rank.
+        // Query intent: `name.ext` — pin exact filename hits among the match
+        // set (not a full-corpus walk; score_one already ranks exact names).
         let looks_like_filename = {
             let q = valid_parts[0];
             q.len() >= 4 && q.contains('.') && !q.contains('/')
         };
         let mut exact_name_hits: Vec<u32> = Vec::new();
         if looks_like_filename {
-            let q = valid_parts[0].as_bytes();
-            for i in 0..working_files.len() {
-                let f = working_files.index(i);
+            let q = valid_parts[0];
+            let qb = q.as_bytes();
+            for m in matches.iter() {
+                let f = working_files.index(m.index as usize);
                 let flen = f.path.byte_len as usize - f.path.filename_offset as usize;
-                if flen == q.len() {
+                if flen == qb.len() {
                     let fname = f.path.filename_cow(arena);
-                    if fname.eq_ignore_ascii_case(valid_parts[0]) {
-                        exact_name_hits.push(i as u32);
+                    if fname.eq_ignore_ascii_case(q) {
+                        exact_name_hits.push(m.index);
                     }
                 }
             }
