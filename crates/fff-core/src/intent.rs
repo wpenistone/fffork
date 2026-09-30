@@ -404,6 +404,19 @@ pub fn evidence_for(
 ) -> Evidence {
     let mut ev = Evidence::default();
     let q = query.trim();
+    if q.is_empty() && intent != QueryIntent::WorkingSet {
+        return ev;
+    }
+
+    // Proximity / related work even with no query text (working set).
+    if let Some(cur) = current_file {
+        let sep = if relative_path.contains('\\') { '\\' } else { '/' };
+        let cur_dir = cur.rsplit_once(sep).map(|(d, _)| d).unwrap_or("");
+        let hit_dir = relative_path.rsplit_once(sep).map(|(d, _)| d).unwrap_or("");
+        ev.same_dir = !cur_dir.is_empty() && cur_dir.eq_ignore_ascii_case(hit_dir);
+        let cur_fname = cur.rsplit(['/', '\\']).next().unwrap_or(cur);
+        ev.related = is_related_filename(filename, cur_fname);
+    }
     if q.is_empty() {
         return ev;
     }
@@ -439,14 +452,6 @@ pub fn evidence_for(
     // Words / camel
     ev.word_coverage = word_coverage(filename, q);
 
-    // Proximity
-    if let Some(cur) = current_file {
-        let sep = if relative_path.contains('\\') { '\\' } else { '/' };
-        let cur_dir = cur.rsplit_once(sep).map(|(d, _)| d).unwrap_or("");
-        let hit_dir = relative_path.rsplit_once(sep).map(|(d, _)| d).unwrap_or("");
-        ev.same_dir = !cur_dir.is_empty() && cur_dir.eq_ignore_ascii_case(hit_dir);
-    }
-
     // Role
     let role = role_of_filename(filename);
     if let Some(want) = implied_role_from_query(q) {
@@ -455,11 +460,6 @@ pub fn evidence_for(
         ev.role_match = false;
     } else {
         ev.role_match = false;
-    }
-
-    // Related names (foo.ts ↔ foo.test.ts / foo.module.css)
-    if let Some(cur) = current_file {
-        ev.related = is_related_filename(filename, cur.rsplit(['/', '\\']).next().unwrap_or(cur));
     }
 
     ev

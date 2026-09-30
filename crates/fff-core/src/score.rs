@@ -1935,9 +1935,32 @@ fn score_filtered_by_frecency<'a>(
 
         let current_file_penalty =
             calculate_current_file_penalty(file, total_frecency_score, context, arena);
+
+        // Working set: same dir / related siblings of the current file.
+        let mut evidence_bonus = 0i32;
+        if let Some(cur) = context.current_file {
+            let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+            let rel = file.path.read_to_buf(arena, &mut path_buf);
+            let fname = file.path.filename_cow(arena);
+            let ev = crate::intent::evidence_for(
+                rel.as_ref(),
+                fname.as_ref(),
+                "",
+                crate::intent::QueryIntent::WorkingSet,
+                Some(cur),
+            );
+            let base = total_frecency_score.max(8);
+            evidence_bonus = crate::intent::evidence_bonus(
+                crate::intent::QueryIntent::WorkingSet,
+                &ev,
+                base,
+            );
+        }
+
         let total = total_frecency_score
             .saturating_add(git_status_boost)
             .saturating_add(git_recency_boost)
+            .saturating_add(evidence_bonus)
             .saturating_add(current_file_penalty);
 
         let score = Score {
@@ -1948,7 +1971,7 @@ fn score_filtered_by_frecency<'a>(
             special_filename_bonus: 0,
             combo_match_boost: 0,
             path_alignment_bonus: 0,
-                evidence_bonus: 0,
+            evidence_bonus,
             current_file_penalty,
             frecency_boost: total_frecency_score,
             git_status_boost,
