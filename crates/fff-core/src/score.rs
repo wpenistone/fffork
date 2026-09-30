@@ -750,28 +750,23 @@ fn match_fuzzy_parts(
     matches
 }
 
-/// Score only `subset` (refs into the full file slice) — used for typing
-/// live-narrow. `total_matched` is the subset hit count (a superset of the
-/// true hit set when narrowing is sound).
+/// Score only `idx` (indices into `base`) — used for typing live-narrow.
+/// `total_matched` is the subset hit count.
 pub(crate) fn fuzzy_match_and_score_subset<'a>(
-    subset: Vec<&'a FileItem>,
+    base: &'a [FileItem],
+    idx: Vec<u32>,
     context: &ScoringContext,
-    base_count: usize,
-    base_arena: ArenaPtr,
-    overflow_arena: ArenaPtr,
+    _base_count: usize,
+    _base_arena: ArenaPtr,
+    _overflow_arena: ArenaPtr,
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
-    let n = subset.len();
     let (results, total) = match_and_score_in_arena(
-        FileItems::Filtered(subset),
+        FileItems::Filtered { base, idx },
         context,
-        base_arena,
+        _base_arena,
         None,
     );
-    let _ = base_count;
-    let _ = overflow_arena;
     let mut out = sort_and_paginate(results, context, total);
-    // total_matched here is hits among the subset only.
-    let _ = n;
     out.2 = total;
     out
 }
@@ -1347,7 +1342,20 @@ fn match_and_score_in_arena<'a>(
         match files {
             FileItems::All(all) => {
                 match apply_constraints(all, &parsed.constraints, arena, arena) {
-                    Some(filtered) if !filtered.is_empty() => FileItems::Filtered(filtered),
+                    Some(filtered) if !filtered.is_empty() => {
+                        // Map refs back to indices into `all` (same allocation).
+                        let idx: Vec<u32> = filtered
+                            .iter()
+                            .map(|f| {
+                                let off = unsafe {
+                                    (*f as *const FileItem).offset_from(all.as_ptr())
+                                };
+                                debug_assert!(off >= 0);
+                                off as u32
+                            })
+                            .collect();
+                        FileItems::Filtered { base: all, idx }
+                    }
                     Some(_) => {
                         return (vec![], 0);
                     }
@@ -2026,9 +2034,10 @@ fn score_filtered_by_frecency<'a>(
                 live.then_some(score_file(f))
             })
             .collect(),
-        FileItems::Filtered(v) => v
-            .iter()
-            .filter_map(|f| {
+        FileItems::Filtered { base, idx } => idx
+            .par_iter()
+            .filter_map(|&i| {
+                let f = &base[i as usize];
                 let live = !f.is_deleted();
                 live.then_some(score_file(f))
             })

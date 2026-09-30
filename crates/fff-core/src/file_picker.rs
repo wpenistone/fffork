@@ -1252,12 +1252,9 @@ impl FilePicker {
         // so hit mapping is exact even when the presence mask drops items.
         let mut hit_buf: Vec<u32> = Vec::new();
         let (items, scores, total_matched) = {
-            enum NarrowPlan<'a> {
+            enum NarrowPlan {
                 Full,
-                Narrow {
-                    subset: Vec<&'a FileItem>,
-                    orig: Vec<u32>,
-                },
+                Narrow { orig: Vec<u32> },
             }
             let plan = {
                 let live = self.live.lock();
@@ -1273,13 +1270,11 @@ impl FilePicker {
                     // expensive matcher: a longer query only tightens the
                     // necessary condition, so mask rejects are sound here too.
                     let new_q = context.effective_query().as_bytes();
-                    let mut subset: Vec<&FileItem> = Vec::with_capacity(live.candidates.len());
                     let mut orig: Vec<u32> = Vec::with_capacity(live.candidates.len());
                     for &i in live.candidates.iter() {
                         if let Some(f) = files.get(i as usize) {
                             let m = f.presence_mask();
                             if m == 0 || crate::presence::allows(m, new_q, max_typos) {
-                                subset.push(f);
                                 orig.push(i);
                             }
                         }
@@ -1289,14 +1284,11 @@ impl FilePicker {
                             "LIVE_NARROW prev={} cand={} masked={}",
                             live.query,
                             live.candidates.len(),
-                            subset.len()
+                            orig.len()
                         );
                     }
-                    // Narrowing a near-full candidate set is pure overhead:
-                    // the subset vec + Filtered indirection cost more than a
-                    // direct scan when the presence mask barely rejects.
-                    if subset.len() < live.candidates.len() && !subset.is_empty() {
-                        NarrowPlan::Narrow { subset, orig }
+                    if orig.len() < live.candidates.len() && !orig.is_empty() {
+                        NarrowPlan::Narrow { orig }
                     } else {
                         NarrowPlan::Full
                     }
@@ -1305,11 +1297,12 @@ impl FilePicker {
                 }
             };
             match plan {
-                NarrowPlan::Narrow { subset, orig } => {
+                NarrowPlan::Narrow { orig } => {
                     let mut local_hits: Vec<u32> = Vec::new();
                     let out = crate::score::with_hit_capture(&mut local_hits, || {
                         crate::score::fuzzy_match_and_score_subset(
-                            subset,
+                            files,
+                            orig.clone(),
                             &context,
                             self.sync_data.base_count,
                             base_arena,

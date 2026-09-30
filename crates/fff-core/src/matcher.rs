@@ -92,7 +92,12 @@ pub(crate) fn with_hit_capture<T>(sink: &mut Vec<u32>, f: impl FnOnce() -> T) ->
 
 pub(crate) enum FileItems<'a> {
     All(&'a [FileItem]),
-    Filtered(Vec<&'a FileItem>),
+    /// Compact candidate list over a base slice — indices avoid a
+    /// `Vec<&FileItem>` pointer-chase on the live-narrow typing path.
+    Filtered {
+        base: &'a [FileItem],
+        idx: Vec<u32>,
+    },
 }
 
 impl<'a> FileItems<'a> {
@@ -100,7 +105,7 @@ impl<'a> FileItems<'a> {
     pub(crate) fn len(&self) -> usize {
         match self {
             FileItems::All(s) => s.len(),
-            FileItems::Filtered(v) => v.len(),
+            FileItems::Filtered { idx, .. } => idx.len(),
         }
     }
 
@@ -113,9 +118,9 @@ impl<'a> FileItems<'a> {
                     m = m.max(f.path.byte_len as usize);
                 }
             }
-            FileItems::Filtered(v) => {
-                for f in v.iter() {
-                    m = m.max(f.path.byte_len as usize);
+            FileItems::Filtered { base, idx } => {
+                for &i in idx.iter() {
+                    m = m.max(base[i as usize].path.byte_len as usize);
                 }
             }
         }
@@ -126,7 +131,7 @@ impl<'a> FileItems<'a> {
     pub(crate) fn index(&self, index: usize) -> &'a FileItem {
         match self {
             FileItems::All(s) => &s[index],
-            FileItems::Filtered(v) => v[index],
+            FileItems::Filtered { base, idx } => &base[idx[index] as usize],
         }
     }
 }
