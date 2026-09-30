@@ -2947,4 +2947,55 @@ mod ranking_policy_tests {
             "special entry point above ordinary path hit, got {order:?}"
         );
     }
+
+    /// Job: "I know the name + ext" — exact stem+ext wins over wrong ext.
+    #[test]
+    fn filename_intent_prefers_matching_extension() {
+        let (files, arena) = make(&[
+            ("src/user_service.py", 0),
+            ("src/user_service.rs", 0),
+            ("src/other.rs", 0),
+        ]);
+        let order = rank(&files, "user_service.rs", arena);
+        assert_eq!(order[0], "src/user_service.rs", "matching ext first, got {order:?}");
+    }
+
+    /// Job: "I know the path" — segment hits beat scattered letters.
+    #[test]
+    fn path_intent_prefers_segment_sequence() {
+        let (files, arena) = make(&[
+            ("xsrc/xauth/xlogin.rs", 0),
+            ("src/auth/login.rs", 0),
+        ]);
+        let order = rank(&files, "src/auth", arena);
+        assert_eq!(
+            order[0], "src/auth/login.rs",
+            "clean segment sequence first, got {order:?}"
+        );
+    }
+
+    /// Job: "I know the concept" — filename words beat path-only scatter.
+    #[test]
+    fn concept_intent_prefers_filename_words() {
+        let (files, arena) = make(&[
+            ("src/hidden/handler_util.rs", 0),
+            ("src/api/handler.rs", 0),
+        ]);
+        let order = rank(&files, "handler", arena);
+        assert_eq!(order[0], "src/api/handler.rs", "filename word hit first, got {order:?}");
+    }
+
+    /// Job: "I want the test for this role" — role keyword ranks test files up.
+    #[test]
+    fn concept_test_role_ranks_test_files() {
+        let (files, arena) = make(&[
+            ("src/user.rs", 0),
+            ("src/user_test.rs", 0),
+        ]);
+        let order = rank(&files, "test", arena);
+        assert_eq!(
+            order[0], "src/user_test.rs",
+            "role=test should prefer test file, got {order:?}"
+        );
+    }
 }

@@ -362,6 +362,9 @@ pub fn evidence_bonus(intent: QueryIntent, ev: &Evidence, base: i32) -> i32 {
             }
         }
         QueryIntent::Concept | QueryIntent::Typo => {
+            if ev.exact_filename {
+                x += b / 2;
+            }
             x += (ev.word_coverage as i32 * b) / 250;
             if ev.role_match {
                 x += b / 4;
@@ -418,7 +421,9 @@ pub fn evidence_for(
             .to_ascii_lowercase()
             .contains(&ne.stem.to_ascii_lowercase());
     } else {
-        ev.exact_filename = filename.eq_ignore_ascii_case(q);
+        // Bare name query: stem equality is "this is the file", not just contains.
+        let stem = filename_stem(filename);
+        ev.exact_filename = filename.eq_ignore_ascii_case(q) || stem.eq_ignore_ascii_case(q);
         ev.filename_substring = filename.to_ascii_lowercase().contains(&q.to_ascii_lowercase());
     }
 
