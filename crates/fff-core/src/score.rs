@@ -399,27 +399,84 @@ fn match_fuzzy_parts(
             }
         }
 
-        // Selectivity collapse: a common query (`score` hits 226k/227k)
-        // makes per-path SW useless — ranking is decided by filename +
-        // frecency anyway. Skip the interseq pass and score from match
-        // concentration (trim length) + filename presence. Only for large
-        // corpora: small fixtures always take the exact SW path.
+        // Adaptive collapse: when the cheap ranker (trim concentration +
+        // filename) agrees with SW on a sample, skip full SW. Quality is
+        // measured, not assumed from needle length / magic percentages.
         let n_files = working_files.len().max(1);
-        let collapsed = n_files >= 10_000
-            && matches.len() >= 4096
-            && matches.len() * 100 >= n_files * 85
-            && needle.len() <= 8;
-
         let t_collect = std::time::Instant::now();
+
+        // Cheap scores for every hit (no path-byte reads).
+        let mut cheap: Vec<(u16, u32, MatchWindow)> = Vec::with_capacity(matches.len());
+        for m in matches.iter() {
+            let file = working_files.index(m.index as usize);
+            let w = decode_match_window(m, file.path.byte_len as usize);
+            let win = w.end.saturating_sub(w.start).max(1) as usize;
+            let conc = ((64usize.saturating_sub(win.min(64))) as u16) * 2;
+            let fname_off = file.path.filename_offset as usize;
+            let fname_bonus = if (w.start as usize) >= fname_off { 40u16 } else { 0 };
+            cheap.push((conc.saturating_add(fname_bonus), w.file_idx, w));
+        }
+
+        // Sample SW check: top by cheap + a stride through the rest.
+        const SAMPLE_CAP: usize = 256;
+        const TOP_K: usize = 32;
+        const MIN_OVERLAP: f32 = 0.75;
+        let mut collapsed = false;
+        if matches.len() >= 512 && n_files >= 4_096 {
+            let mut order: Vec<usize> = (0..cheap.len()).collect();
+            order.sort_by_key(|&i| std::cmp::Reverse(cheap[i].0));
+            let mut sample: Vec<usize> = order.iter().copied().take(TOP_K * 2).collect();
+            let stride = (cheap.len() / SAMPLE_CAP).max(1);
+            for i in (0..cheap.len()).step_by(stride).take(SAMPLE_CAP - sample.len()) {
+                if !sample.contains(&i) {
+                    sample.push(i);
+                }
+            }
+            // SW-score the sample on their real windows.
+            let mut sw_scores = vec![0u16; sample.len()];
+            let mut sw_ecols = vec![0u16; sample.len()];
+            {
+                let mut soa_rows = Vec::new();
+                let max_len = sample
+                    .iter()
+                    .map(|&i| {
+                        let w = cheap[i].2;
+                        (w.end - w.start) as usize
+                    })
+                    .max()
+                    .unwrap_or(1);
+                let rows = max_len.div_ceil(8) * 8;
+                let mut stage = vec![0u8; rows * sample.len().max(1)];
+                for (k, &i) in sample.iter().enumerate() {
+                    let w = cheap[i].2;
+                    let file = working_files.index(w.file_idx as usize);
+                    let dst = &mut stage[k * rows..k * rows + (w.end - w.start) as usize];
+                    file.path.copy_window_to(arena, w.start, w.end, dst);
+                }
+                // Serial scalar SW on the sample — tiny, and bit-exact vs batch.
+                for (k, &i) in sample.iter().enumerate() {
+                    let w = cheap[i].2;
+                    let src = &stage[k * rows..k * rows + (w.end - w.start) as usize];
+                    let (sc, ec) =
+                        crate::interseq_sw::score_one_scalar_full(needle, src, &p, w.include_prefix);
+                    sw_scores[k] = sc;
+                    sw_ecols[k] = ec;
+                    soa_rows.push(i);
+                }
+            }
+            // Overlap of top-TOP_K by cheap vs by SW within the sample.
+            let mut by_sw: Vec<usize> = (0..sample.len()).collect();
+            by_sw.sort_by_key(|&k| std::cmp::Reverse(sw_scores[k]));
+            let sw_top: std::collections::HashSet<usize> =
+                by_sw.iter().take(TOP_K).map(|&k| sample[k]).collect();
+            let cheap_top: std::collections::HashSet<usize> = order.iter().take(TOP_K).copied().collect();
+            let inter = sw_top.intersection(&cheap_top).count();
+            collapsed = (inter as f32 / TOP_K as f32) >= MIN_OVERLAP;
+        }
+
         if collapsed {
-            for m in matches.iter_mut() {
-                let file = working_files.index(m.index as usize);
-                let w = decode_match_window(m, file.path.byte_len as usize);
-                let win = w.end.saturating_sub(w.start).max(1) as usize;
-                let conc = ((64usize.saturating_sub(win.min(64))) as u16) * 2;
-                let fname_off = file.path.filename_offset as usize;
-                let fname_bonus = if (w.start as usize) >= fname_off { 40u16 } else { 0 };
-                m.score = conc.saturating_add(fname_bonus);
+            for (m, (sc, _, w)) in matches.iter_mut().zip(cheap.iter()) {
+                m.score = *sc;
                 m.end_col = w.end.min(u16::MAX as u32) as u16;
                 m.exact = false;
             }
