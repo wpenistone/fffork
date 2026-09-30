@@ -180,22 +180,18 @@ fn match_fuzzy_parts(
         // Emits the same skip_sw Match encoding the pipeline already decodes.
         let mut matches = if use_cand {
             let cand = cand.as_slice();
-            let mut raw = crate::gate::gate_match_range(
+            crate::gate::gate_match_range(
                 valid_parts[0].as_bytes(),
                 cand.len(),
                 options.max_typos.unwrap_or(u16::MAX),
                 threads,
                 |i| cand[i as usize],
                 |i| working_files.index(cand[i as usize] as usize).path.byte_len as usize,
-                |i, buf: &mut [u8]| {
+                |i, cb| {
                     let f = working_files.index(cand[i as usize] as usize);
-                    f.path.read_to_buf(arena, buf).len()
+                    f.path.for_each_chunk(arena, cb);
                 },
-            );
-            for m in &mut raw {
-                // index already remapped via file_index
-            }
-            raw
+            )
         } else {
             crate::gate::gate_match_range(
                 valid_parts[0].as_bytes(),
@@ -204,9 +200,9 @@ fn match_fuzzy_parts(
                 threads,
                 |i| i,
                 |i| working_files.index(i as usize).path.byte_len as usize,
-                |i, buf: &mut [u8]| {
+                |i, cb| {
                     let f = working_files.index(i as usize);
-                    f.path.read_to_buf(arena, buf).len()
+                    f.path.for_each_chunk(arena, cb);
                 },
             )
         };

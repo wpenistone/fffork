@@ -223,36 +223,104 @@ pub fn gate_file(
 }
 
 
+
+/// Scan one path via 16-byte chunks into a growable span buffer only when
+/// needed. Returns gate hit without a PATH_BUF_SIZE truncation.
+pub fn gate_path_chunks(
+    needle: &[u8],
+    byte_len: usize,
+    max_typos: u16,
+    mut visit: impl FnMut(&mut dyn FnMut(usize, &[u8])),
+) -> Option<GateHit> {
+    let m = needle.len();
+    if m == 0 || byte_len == 0 {
+        return None;
+    }
+    let typos = max_typos as usize;
+    let need = m.saturating_sub(typos);
+    if need == 0 {
+        return Some(GateHit {
+            start: 0,
+            end: byte_len.min(u16::MAX as usize) as u32,
+            include_prefix: true,
+        });
+    }
+    let mask = NeedleMask::new(needle);
+    let mut first = None;
+    let mut last = 0usize;
+    let mut n = 0usize;
+    visit(&mut |_off, chunk| {
+        for (i, &b) in chunk.iter().enumerate() {
+            if mask.contains(b) {
+                if first.is_none() {
+                    first = Some(_off + i);
+                }
+                last = _off + i;
+                n += 1;
+            }
+        }
+    });
+    if n < need {
+        return None;
+    }
+    let first = first.unwrap();
+    let hi = (last + 1).min(byte_len);
+    if hi.saturating_sub(first) < need {
+        return None;
+    }
+    // Copy only the span (not the whole path) for exact skip-DP.
+    let span = hi - first;
+    let mut buf = vec![0u8; span];
+    visit(&mut |_off, chunk| {
+        let a = _off.max(first);
+        let b = (_off + chunk.len()).min(hi);
+        if a < b {
+            let dst = a - first;
+            let src = a - _off;
+            let ncp = b - a;
+            if dst + ncp <= buf.len() {
+                buf[dst..dst + ncp].copy_from_slice(&chunk[src..src + ncp]);
+            }
+        }
+    });
+    if !skip_dp_accept(needle, &buf, 0, span, typos.min(MAX_SKIPS)) {
+        return None;
+    }
+    Some(GateHit {
+        start: first as u32,
+        end: hi as u32,
+        include_prefix: first == 0,
+    })
+}
+
+
 /// Parallel match-set over FileItems. Emits frizbee-compatible
 /// `Match { score: start, end_col: end }` (skip_sw encoding).
-/// Walks 16-byte chunks; copies only the needle-byte span for skip-DP.
-pub fn gate_match_range<F>(
+/// `resolve_chunks` visits every 16-byte path chunk (no truncation).
+pub fn gate_match_range<F, R>(
     needle: &[u8],
     n: usize,
     max_typos: u16,
     _threads: usize,
     file_index: F,
-    resolve_len: impl Fn(u32) -> usize + Sync,
-    resolve_bytes: impl Fn(u32, &mut [u8]) -> usize + Sync,
+    resolve_len: R,
+    resolve_chunks: impl Fn(u32, &mut dyn FnMut(usize, &[u8])) + Sync,
 ) -> Vec<neo_frizbee::Match>
 where
     F: Fn(u32) -> u32 + Sync,
+    R: Fn(u32) -> usize + Sync,
 {
     use rayon::prelude::*;
-    let _ = resolve_len;
     (0..n as u32)
         .into_par_iter()
         .filter_map(|i| {
             let hay_len = resolve_len(i);
-            if hay_len == 0 || hay_len > crate::simd_path::PATH_BUF_SIZE {
+            if hay_len == 0 {
                 return None;
             }
-            let mut buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-            let got = resolve_bytes(i, &mut buf);
-            if got == 0 {
-                return None;
-            }
-            let hit = gate_hit(needle, &buf[..got], max_typos)?;
+            let hit = gate_path_chunks(needle, hay_len, max_typos, |cb| {
+                resolve_chunks(i, cb);
+            })?;
             Some(neo_frizbee::Match {
                 score: hit.start as u16,
                 index: file_index(i),

@@ -124,6 +124,29 @@ impl ChunkedString {
         &buf[..count]
     }
 
+    /// Visit each 16-byte chunk of this path in order (no full-path copy).
+    /// `f(global_offset, chunk_slice)` — slice may be shorter than 16 at the end.
+    #[inline]
+    pub fn for_each_chunk(&self, arena: ArenaPtr, mut f: impl FnMut(usize, &[u8])) {
+        let total = self.byte_len as usize;
+        if total == 0 {
+            return;
+        }
+        let indices = self.indices(arena);
+        let mut off = 0usize;
+        for &idx in indices.iter() {
+            if off >= total {
+                break;
+            }
+            let take = SIMD_CHUNK_BYTES.min(total - off);
+            let chunk = unsafe {
+                core::slice::from_raw_parts(arena.chunk_ptr(idx), take)
+            };
+            f(off, chunk);
+            off += take;
+        }
+    }
+
     #[inline]
     fn write_slice_to_vec(
         indices: &[u32],
