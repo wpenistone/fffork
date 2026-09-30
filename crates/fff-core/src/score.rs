@@ -2953,4 +2953,27 @@ mod ranking_policy_tests {
             "role=test should prefer test file, got {order:?}"
         );
     }
+    /// MRR-style: first result must be the intended file for each job.
+    #[test]
+    fn mrr_jobs_first_result_is_intended() {
+        let (files, arena) = make(&[
+            ("src/api/user_service.rs", 0),
+            ("src/api/user_service.py", 0),
+            ("src/api/handler.rs", 0),
+            ("src/auth/login.rs", 0),
+            ("src/auth/login_test.rs", 0),
+            ("tests/unit/login_test.rs", 0),
+            ("mod.rs", 0),
+            ("src/models/mod.rs", 0),
+        ]);
+        let o = rank(&files, "user_service.rs", arena);
+        assert_eq!(o[0], "src/api/user_service.rs", "name.ext {o:?}");
+        let o = rank(&files, "handler", arena);
+        assert_eq!(o[0], "src/api/handler.rs", "concept {o:?}");
+        let o = rank(&files, "src/auth", arena);
+        assert_eq!(o[0], "src/auth/login.rs", "path {o:?}");
+        let o = rank(&files, "test", arena);
+        assert!(o[0].contains("test"), "role=test {o:?}");
+    }
+
 }
