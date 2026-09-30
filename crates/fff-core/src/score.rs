@@ -252,16 +252,11 @@ fn match_fuzzy_parts(
         // measured, not assumed from needle length / magic percentages.
         let n_files = working_files.len().max(1);
         let t_collect = std::time::Instant::now();
-        let t_wins = std::time::Instant::now();
-        // Decode windows once — both the cheap rank and the SW path use them.
-        let mut wins: Vec<MatchWindow> = Vec::with_capacity(matches.len());
-        for m in matches.iter() {
-            let file = working_files.index(m.index as usize);
-            wins.push(decode_match_window(m, file.path.byte_len as usize));
-        }
-        let wins_ms = t_wins.elapsed().as_secs_f64() * 1e3;
-
-        let t_samp = std::time::Instant::now();
+        // No full-set MatchWindow vec: collapse is off for UX parity; windows
+        // are decoded per chunk in the SW path (was +1.2ms and 3.6MB).
+        let _ = n_files;
+        let wins: Vec<MatchWindow> = Vec::new();
+        let wins_ms = 0.0f64;
 
         let cheap_of = |w: &MatchWindow, working_files: &FileItems<'_>| -> u16 {
             let win = w.end.saturating_sub(w.start).max(1) as usize;
@@ -345,7 +340,7 @@ fn match_fuzzy_parts(
             }
             collapsed = overlap >= MIN_OVERLAP;
         }
-        let samp_ms = t_samp.elapsed().as_secs_f64() * 1e3;
+        let samp_ms = 0.0f64;
         if std::env::var_os("FFF_PHASE_TIMING").is_some() {
             eprintln!("PHASE cand_ms={cand_ms:.1} wins_ms={wins_ms:.1} samp_ms={samp_ms:.1} collapsed={collapsed} n={}", matches.len());
         }
@@ -429,16 +424,15 @@ fn match_fuzzy_parts(
         let mut assemble_ms = 0.0f64;
         let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
 
-        for (wins_chunk, matches_chunk) in wins
-            .chunks(CHUNK)
-            .zip(matches.chunks_mut(CHUNK))
-        {
+        for matches_chunk in matches.chunks_mut(CHUNK) {
             let t_chunk = std::time::Instant::now();
             let n_matches = matches_chunk.len();
             let mut trims = TRIMS.with(|c| take_tls(c, n_matches));
             trims.clear();
             {
-                for w in wins_chunk.iter() {
+                for m in matches_chunk.iter() {
+                    let file = working_files.index(m.index as usize);
+                    let w = decode_match_window(m, file.path.byte_len as usize);
                     trims.push((
                         w.file_idx,
                         w.start,
