@@ -299,10 +299,12 @@ fn match_fuzzy_parts(
             options.max_typos.unwrap_or(u16::MAX),
         );
         // Index reject before frizbee: only resolve paths that pass
-        // length+presence. When that set is well under the corpus, frizbee
-        // never even visits the rejects (its loop is over `len`).
+        // length+presence. Only worth the extra scan when the needle can
+        // actually reject (longer / typed letters). Common short queries
+        // match almost everything — skip so we don't scan twice.
         let mut cand: Vec<u32> = Vec::new();
-        if np.should_check() || np.min_path_len() > 1 {
+        let try_cand = valid_parts[0].len() >= 6 && working_files.len() >= 8_192;
+        if try_cand {
             cand.reserve(working_files.len() / 4);
             for i in 0..working_files.len() {
                 let f = working_files.index(i);
@@ -316,7 +318,7 @@ fn match_fuzzy_parts(
                 cand.push(i as u32);
             }
         }
-        let use_cand = cand.len() * 2 < working_files.len() && !cand.is_empty();
+        let use_cand = try_cand && cand.len() * 2 < working_files.len() && !cand.is_empty();
         let mut matches = neo_frizbee::with_skip_sw(|| {
             with_cached_matcher(valid_parts[0], options, |matcher| {
                 if use_cand {
