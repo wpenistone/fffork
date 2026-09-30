@@ -584,6 +584,28 @@ mod tests {
     }
 
     #[test]
+    fn working_set_related_and_same_dir() {
+        let ev = evidence_for(
+            "src/api/user.test.ts",
+            "user.test.ts",
+            "",
+            QueryIntent::WorkingSet,
+            Some("src/api/user.ts"),
+        );
+        assert!(ev.related);
+        assert!(ev.same_dir);
+        let ev2 = evidence_for(
+            "other/user.test.ts",
+            "user.test.ts",
+            "",
+            QueryIntent::WorkingSet,
+            Some("src/api/user.ts"),
+        );
+        assert!(ev2.related);
+        assert!(!ev2.same_dir);
+    }
+
+    #[test]
     fn segment_evidence() {
         let q = split_path_tokens("src/auth");
         let (last, pct, seq) = segment_boundary_evidence("src/auth/login.rs", &q);
