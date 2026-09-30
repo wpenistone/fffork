@@ -274,7 +274,7 @@ fn match_fuzzy_parts(
         // Sample SW check first — only score the whole set if we will collapse.
         const SAMPLE_CAP: usize = 256;
         const TOP_K: usize = 32;
-        const MIN_OVERLAP: f32 = 0.75;
+        const MIN_OVERLAP: f32 = 1.0; // never reorder unless sample top-k is identical
         let mut collapsed = false;
         // Only sample-check when full SW would dominate. Below this, just
         // score every hit (8k x SW is <1ms; the sample pass costs more).
@@ -2349,7 +2349,7 @@ mod filename_bonus_tests {
             FuzzyQuery::Parts(parts) if !parts.is_empty() => parts[0],
             _ => query,
         };
-        let max_typos = (effective_query.len() as u16 / 6).clamp(2, 6);
+        let max_typos = (effective_query.len() as u16 / 4).clamp(2, 6);
 
         let ctx = ScoringContext {
             query: &parsed,
@@ -2912,7 +2912,7 @@ mod ranking_policy_tests {
             FuzzyQuery::Parts(parts) if !parts.is_empty() => parts[0],
             _ => query,
         };
-        let max_typos = (effective.len() as u16 / 6).clamp(2, 6);
+        let max_typos = (effective.len() as u16 / 4).clamp(2, 6);
         let ctx = ScoringContext {
             query: &parsed,
             max_threads: 1,
