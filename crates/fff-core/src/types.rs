@@ -916,6 +916,8 @@ pub struct Score {
     pub current_file_penalty: i32,
     pub combo_match_boost: i32,
     pub path_alignment_bonus: i32,
+    /// Intent-evidence mix (filename/ext/segments/role/proximity).
+    pub evidence_bonus: i32,
     pub exact_match: bool,
     pub match_type: &'static str,
 }

@@ -1218,6 +1218,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
                 current_file_penalty: 0,
                 combo_match_boost: 0,
                 path_alignment_bonus: 0,
+                evidence_bonus: 0,
                 exact_match: is_exact_dirname || path_match.exact,
                 match_type: if is_exact_dirname {
                     "exact_dirname"
@@ -1501,6 +1502,12 @@ fn match_and_score_in_arena<'a>(
             && path_matches.len() * 100 >= n_files * 85
             && main_needle_len <= 8
     };
+    let query_intent = crate::intent::detect_intent(
+        context.effective_query(),
+        context.current_file,
+        true,
+    );
+    let main_needle_as_str = context.effective_query();
 
     let score_one = |scratch: &mut ScoreScratch,
                      match_idx: usize,
@@ -1639,12 +1646,29 @@ fn match_and_score_in_arena<'a>(
                 0
             };
 
+            // Intent evidence: filename/ext/segments/role mixed per job.
+            let evidence_bonus = if rank_collapsed {
+                0
+            } else {
+                let fname = file.path.filename_cow(arena);
+                let rel = file.path.read_to_buf(arena, path_buf);
+                let ev = crate::intent::evidence_for(
+                    rel.as_ref(),
+                    fname.as_ref(),
+                    main_needle_as_str,
+                    query_intent,
+                    context.current_file,
+                );
+                crate::intent::evidence_bonus(query_intent, &ev, base_score)
+            };
+
             let total = base_score
                 .saturating_add(frecency_boost)
                 .saturating_add(git_status_boost)
                 .saturating_add(git_recency_boost)
                 .saturating_add(distance_penalty)
                 .saturating_add(filename_bonus)
+                .saturating_add(evidence_bonus)
                 .saturating_add(current_file_penalty)
                 .saturating_add(combo_match_boost)
                 .saturating_add(path_alignment_bonus);
@@ -1665,6 +1689,7 @@ fn match_and_score_in_arena<'a>(
                 distance_penalty,
                 combo_match_boost,
                 path_alignment_bonus,
+                evidence_bonus,
                 exact_match: is_exact_filename || path_match.exact,
                 match_type: if is_exact_filename {
                     "exact_filename"
@@ -1923,6 +1948,7 @@ fn score_filtered_by_frecency<'a>(
             special_filename_bonus: 0,
             combo_match_boost: 0,
             path_alignment_bonus: 0,
+                evidence_bonus: 0,
             current_file_penalty,
             frecency_boost: total_frecency_score,
             git_status_boost,
@@ -2079,6 +2105,7 @@ mod tests {
                     match_type: "test",
                     combo_match_boost: 0,
                     path_alignment_bonus: 0,
+                evidence_bonus: 0,
                 };
                 (file, score_obj)
             })
