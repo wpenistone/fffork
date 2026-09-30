@@ -1,0 +1,178 @@
+//! Match-set plumbing: windows from frizbee skip_sw, path resolve,
+//! candidate gates, and thread dispatch. Score/rank lives in `score`.
+
+use neo_frizbee::Matcher;
+use crate::types::FileItem;
+use crate::simd_path::{ArenaPtr, MAX_PATH_CHUNKS};
+
+#[derive(Clone, Copy)]
+pub(crate) struct MatchWindow {
+    pub(crate) file_idx: u32,
+    pub(crate) start: u32,
+    pub(crate) end: u32,
+    pub(crate) include_prefix: bool,
+    pub(crate) include_exact: bool,
+}
+
+#[inline]
+pub(crate) fn decode_match_window(m: &neo_frizbee::Match, hay_len: usize) -> MatchWindow {
+    // skip_sw packs (start_pos_adj, end_pos) into (score, end_col).
+    let start_adj = m.score as usize;
+    let end_pos = m.end_col as usize;
+    let end = end_pos.min(hay_len);
+    let start = start_adj.min(end);
+    MatchWindow {
+        file_idx: m.index,
+        start: start as u32,
+        end: end as u32,
+        include_prefix: start == 0,
+        include_exact: start == 0 && end == hay_len,
+    }
+}
+
+pub(crate) fn resolve_file_chunks_prefiltered(
+    file: &FileItem,
+    arena: ArenaPtr,
+    buf: &mut [*const u8; MAX_PATH_CHUNKS],
+    np: &crate::presence::NeedlePresence,
+    needle: &[u8],
+) -> Option<(usize, u16)> {
+    // Sound length reject: LCS ≤ path_len, so shorter paths cannot match.
+    if (file.path.byte_len as usize) < np.min_path_len() {
+        return None;
+    }
+    let mask = file.presence_mask();
+    if mask != 0 && np.should_check() && !np.allows(mask, needle) {
+        return None;
+    }
+    resolve_file_chunks(file, arena, buf)
+}
+
+/// Build a frizbee `Matcher` for one search. Construction is not free
+/// (prefilter + SW kernels); a thread-local cache would be a typing win but
+/// 0.13.3 matcher reuse changed `total_matched` on linux `score` (checksum
+/// gate). Keep fresh construction until reuse is proven result-identical.
+#[inline]
+pub(crate) fn with_cached_matcher<R>(
+    needle: &str,
+    options: &neo_frizbee::Config,
+    run: impl FnOnce(&mut Matcher) -> R,
+) -> R {
+    let mut matcher = Matcher::new(needle, options);
+    run(&mut matcher)
+}
+
+thread_local! {
+    static HIT_CAPTURE: std::cell::RefCell<Option<Vec<u32>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Collect match indices from the next `fuzzy_search` (typing live-narrow).
+pub(crate) fn capture_hit_indices(iter: impl Iterator<Item = u32>) {
+    HIT_CAPTURE.with(|c| {
+        if let Some(v) = c.borrow_mut().as_mut() {
+            v.clear();
+            v.extend(iter);
+        }
+    });
+}
+
+pub(crate) fn with_hit_capture<T>(sink: &mut Vec<u32>, f: impl FnOnce() -> T) -> T {
+    HIT_CAPTURE.with(|c| {
+        *c.borrow_mut() = Some(std::mem::take(sink));
+    });
+    let t = f();
+    HIT_CAPTURE.with(|c| {
+        if let Some(v) = c.borrow_mut().take() {
+            *sink = v;
+        }
+    });
+    t
+}
+
+pub(crate) enum FileItems<'a> {
+    All(&'a [FileItem]),
+    Filtered(Vec<&'a FileItem>),
+}
+
+impl<'a> FileItems<'a> {
+    #[inline]
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            FileItems::All(s) => s.len(),
+            FileItems::Filtered(v) => v.len(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn max_path_len(&self) -> usize {
+        let mut m = 0usize;
+        match self {
+            FileItems::All(s) => {
+                for f in s.iter() {
+                    m = m.max(f.path.byte_len as usize);
+                }
+            }
+            FileItems::Filtered(v) => {
+                for f in v.iter() {
+                    m = m.max(f.path.byte_len as usize);
+                }
+            }
+        }
+        m
+    }
+
+    #[inline]
+    pub(crate) fn index(&self, index: usize) -> &'a FileItem {
+        match self {
+            FileItems::All(s) => &s[index],
+            FileItems::Filtered(v) => v[index],
+        }
+    }
+}
+
+/// Resolve a FileItem's chunked path into frizbee's pointer buffer.
+/// Returns `Some((chunk_count, byte_len))` or `None` for deleted files.
+#[inline]
+pub(crate) fn resolve_file_chunks(
+    file: &FileItem,
+    arena: ArenaPtr,
+    buf: &mut [*const u8; MAX_PATH_CHUNKS],
+) -> Option<(usize, u16)> {
+    if file.is_deleted() {
+        return None;
+    }
+    let ptrs = file.path.resolve_ptrs(arena, buf);
+    Some((ptrs.len(), file.path.byte_len))
+}
+
+/// Thread dispatch only pays off past ~1k candidates; below that it adds
+/// latency. Scale by estimated DP work so 1T stays 1T and 4T is used when
+/// the corpus is large enough (keeps 4T efficiency honest).
+pub(crate) const MATCH_WORK_PER_THREAD: usize = 200_000;
+
+pub(crate) fn effective_match_threads(
+    item_count: usize,
+    needle_len: usize,
+    max_haystack_len: usize,
+    max_typos: Option<u16>,
+    max_threads: usize,
+) -> usize {
+    if item_count < 1024 {
+        return 1;
+    }
+    if max_threads <= 1 {
+        return 1;
+    }
+    let selectivity = match max_typos {
+        Some(t) if t >= 3 => 25,
+        Some(_) => 50,
+        None => 100,
+    };
+    let work = (item_count as u64)
+        .saturating_mul(needle_len.max(1) as u64)
+        .saturating_mul(max_haystack_len.min(512).div_ceil(16).max(1) as u64)
+        .saturating_mul(selectivity)
+        / 100;
+    (work.div_ceil(MATCH_WORK_PER_THREAD as u64) as usize).clamp(1, max_threads.max(1))
+}

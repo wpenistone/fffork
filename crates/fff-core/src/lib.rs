@@ -156,6 +156,7 @@ mod error;
 mod git_status_worker;
 mod ignore;
 mod scan;
+mod matcher;
 mod score;
 mod sort_buffer;
 pub(crate) mod interseq_sw;
