@@ -1448,10 +1448,12 @@ fn match_and_score_in_arena<'a>(
         working_files.len()
     ));
 
-    // Expose raw match indices for typing live-narrow (Match(longer,T) ⊆
+    // Expose file indices for typing live-narrow (Match(longer,T) ⊆
     // Match(shorter,T) when T is unchanged).
     crate::score::capture_hit_indices(
-        path_matches.iter().map(|m| m.index),
+        path_matches
+            .iter()
+            .map(|m| working_files.file_index(m.index as usize)),
     );
 
     let main_needle = fuzzy_parts[0].as_bytes(); // safe

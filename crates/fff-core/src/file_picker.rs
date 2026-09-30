@@ -1302,22 +1302,15 @@ impl FilePicker {
                     let out = crate::score::with_hit_capture(&mut local_hits, || {
                         crate::score::fuzzy_match_and_score_subset(
                             files,
-                            orig.clone(),
+                            orig,
                             &context,
                             self.sync_data.base_count,
                             base_arena,
                             overflow_arena,
                         )
                     });
-                    // local_hits index the subset; `orig` carries the file
-                    // index each subset slot came from.
                     hit_buf.clear();
-                    hit_buf.reserve(local_hits.len());
-                    for li in local_hits {
-                        if let Some(&o) = orig.get(li as usize) {
-                            hit_buf.push(o);
-                        }
-                    }
+                    hit_buf.extend_from_slice(&local_hits);
                     out
                 }
                 NarrowPlan::Full => {

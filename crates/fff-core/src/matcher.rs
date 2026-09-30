@@ -94,6 +94,7 @@ pub(crate) enum FileItems<'a> {
     All(&'a [FileItem]),
     /// Compact candidate list over a base slice — indices avoid a
     /// `Vec<&FileItem>` pointer-chase on the live-narrow typing path.
+    /// `idx` is owned so it can carry candidates without borrowing the caller.
     Filtered {
         base: &'a [FileItem],
         idx: Vec<u32>,
@@ -132,6 +133,15 @@ impl<'a> FileItems<'a> {
         match self {
             FileItems::All(s) => &s[index],
             FileItems::Filtered { base, idx } => &base[idx[index] as usize],
+        }
+    }
+
+    /// Corpus/file index for a working-set position (live-narrow hits).
+    #[inline]
+    pub(crate) fn file_index(&self, index: usize) -> u32 {
+        match self {
+            FileItems::All(_) => index as u32,
+            FileItems::Filtered { idx, .. } => idx[index],
         }
     }
 }
