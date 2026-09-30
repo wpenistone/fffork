@@ -227,13 +227,16 @@ fn match_fuzzy_parts(
         // measured, not assumed from needle length / magic percentages.
         let n_files = working_files.len().max(1);
         let t_collect = std::time::Instant::now();
-
+        let t_wins = std::time::Instant::now();
         // Decode windows once — both the cheap rank and the SW path use them.
         let mut wins: Vec<MatchWindow> = Vec::with_capacity(matches.len());
         for m in matches.iter() {
             let file = working_files.index(m.index as usize);
             wins.push(decode_match_window(m, file.path.byte_len as usize));
         }
+        let wins_ms = t_wins.elapsed().as_secs_f64() * 1e3;
+
+        let t_samp = std::time::Instant::now();
 
         let cheap_of = |w: &MatchWindow, working_files: &FileItems<'_>| -> u16 {
             let win = w.end.saturating_sub(w.start).max(1) as usize;
@@ -310,6 +313,10 @@ fn match_fuzzy_parts(
                 top.iter().take(TOP_K).map(|&(_, i)| i).collect();
             let inter = sw_top.intersection(&cheap_top).count();
             collapsed = (inter as f32 / TOP_K as f32) >= MIN_OVERLAP;
+        }
+        let samp_ms = t_samp.elapsed().as_secs_f64() * 1e3;
+        if std::env::var_os("FFF_PHASE_TIMING").is_some() {
+            eprintln!("PHASE wins_ms={wins_ms:.1} samp_ms={samp_ms:.1} collapsed={collapsed} n={}", matches.len());
         }
 
         if collapsed {
