@@ -1847,43 +1847,12 @@ fn match_and_score_in_arena<'a>(
                 path_matches
                     .par_iter()
                     .enumerate()
+                    .map_init(make_scratch, |scratch, (match_idx, path_match)| {
+                        score_one(scratch, match_idx, path_match)
+                    })
                     .fold(
                         || Heap::new(),
-                        |mut h, (match_idx, path_match)| {
-                            // Local top-k prune: worse than this partition's
-                            // kth cannot enter global top-k. Sound.
-                            if prunable && h.len() >= page_cap {
-                                let file = working_files.index(path_match.index as usize);
-                                let base = path_match.score as i32;
-                                let freq = file.total_frecency_score().max(0);
-                                let ub = base
-                                    .saturating_add(base.saturating_mul(freq) / 100)
-                                    .saturating_add(base * 2 / 5)
-                                    .saturating_add(base * 15 / 100)
-                                    .saturating_add(file.git_recency_score.max(0) as i32);
-                                if h
-                                    .peek()
-                                    .is_some_and(|Reverse(w)| ub < w.total)
-                                {
-                                    return h;
-                                }
-                            }
-                            let item = {
-                                thread_local! {
-                                    static SC: std::cell::RefCell<ScoreScratch> =
-                                        std::cell::RefCell::new((
-                                            String::new(),
-                                            [0u8; crate::simd_path::PATH_BUF_SIZE],
-                                        ));
-                                }
-                                SC.with(|c| {
-                                    let mut b = c.borrow_mut();
-                                    if b.0.capacity() < 64 {
-                                        b.0.reserve(64);
-                                    }
-                                    score_one(&mut b, match_idx, path_match)
-                                })
-                            };
+                        |mut h, item| {
                             let entry = Ranked {
                                 total: item.1.total,
                                 stamp: 0,
