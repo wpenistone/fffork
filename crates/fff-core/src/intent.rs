@@ -151,6 +151,12 @@ pub fn split_path_tokens(q: &str) -> PathTokens<'_> {
 /// → ["user","service"].
 pub fn filename_words(name: &str) -> Vec<&str> {
     let mut out = Vec::new();
+    for_each_word(name, |w| out.push(w));
+    out
+}
+
+/// Visit word tokens without allocating.
+pub fn for_each_word<'a>(name: &'a str, mut f: impl FnMut(&'a str)) {
     let mut start = 0usize;
     let bytes = name.as_bytes();
     let mut prev_lower_or_digit = false;
@@ -159,16 +165,20 @@ pub fn filename_words(name: &str) -> Vec<&str> {
         let is_sep = b == b'_' || b == b'-' || b == b'.' || b == b' ';
         let is_upper = b.is_ascii_uppercase();
         let is_lower_or_digit = b.is_ascii_lowercase() || b.is_ascii_digit();
-        // Break on separator, or camelCase boundary (lower→Upper).
         let camel_break = prev_lower_or_digit && is_upper;
-        let acronym_break = prev_upper && is_upper && i + 1 < bytes.len() && bytes[i + 1].is_ascii_lowercase();
+        let acronym_break = prev_upper
+            && is_upper
+            && i + 1 < bytes.len()
+            && bytes[i + 1].is_ascii_lowercase();
         if i > start && (is_sep || camel_break || acronym_break) {
             if !is_sep {
-                out.push(&name[start..i]);
+                if i > start {
+                    f(&name[start..i]);
+                }
                 start = i;
             } else {
                 if i > start {
-                    out.push(&name[start..i]);
+                    f(&name[start..i]);
                 }
                 start = i + 1;
             }
@@ -182,9 +192,8 @@ pub fn filename_words(name: &str) -> Vec<&str> {
         }
     }
     if start < name.len() {
-        out.push(&name[start..]);
+        f(&name[start..]);
     }
-    out.into_iter().filter(|s| !s.is_empty()).collect()
 }
 
 /// Cheap typo proxy: long identifier, mixed case noise, or uncommon bigrams.
@@ -311,22 +320,45 @@ pub fn segment_boundary_evidence(path: &str, q: &PathTokens<'_>) -> (bool, u8, b
 }
 
 /// Word coverage: percent of query tokens found in filename words.
+/// No heap allocs — query tokens fit a small stack array.
 pub fn word_coverage(fname: &str, query: &str) -> u8 {
-    let fwords = filename_words(fname);
-    let qwords = filename_words(query);
-    if qwords.is_empty() {
+    let mut qwords: [&str; 12] = [""; 12];
+    let mut qn = 0usize;
+    for_each_word(query, |w| {
+        if qn < qwords.len() {
+            qwords[qn] = w;
+            qn += 1;
+        }
+    });
+    if qn == 0 {
         return 0;
     }
     let mut hits = 0usize;
-    for qw in &qwords {
-        if fwords
-            .iter()
-            .any(|fw| fw.eq_ignore_ascii_case(qw) || fw.to_ascii_lowercase().starts_with(&qw.to_ascii_lowercase()))
-        {
+    for qw in qwords[..qn].iter() {
+        let mut found = false;
+        for_each_word(fname, |fw| {
+            if found {
+                return;
+            }
+            if fw.eq_ignore_ascii_case(qw) || starts_with_ignore_ascii(fw, qw) {
+                found = true;
+            }
+        });
+        if found {
             hits += 1;
         }
     }
-    (hits * 100 / qwords.len()).min(100) as u8
+    (hits * 100 / qn).min(100) as u8
+}
+
+/// Case-insensitive prefix test without allocating.
+fn starts_with_ignore_ascii(hay: &str, prefix: &str) -> bool {
+    let h = hay.as_bytes();
+    let p = prefix.as_bytes();
+    if p.len() > h.len() {
+        return false;
+    }
+    h[..p.len()].eq_ignore_ascii_case(p)
 }
 
 /// Mix evidence into a score delta for a given intent. `base` is the SW
