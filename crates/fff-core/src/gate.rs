@@ -107,6 +107,9 @@ fn skip_dp_accept(
     if hay.len() < need {
         return false;
     }
+    if t == 0 {
+        return is_subseq_fold(needle, hay);
+    }
     const INF: usize = usize::MAX;
     let mut best = [INF; MAX_SKIPS + 1];
     let mut nxt = [INF; MAX_SKIPS + 1];
@@ -138,12 +141,29 @@ fn skip_dp_accept(
 #[inline]
 fn find_byte_fold(hay: &[u8], from: usize, needle_b: u8) -> Option<usize> {
     let target = fold_byte(needle_b);
-    for (i, &b) in hay.iter().enumerate().skip(from) {
+    let slice = &hay[from..];
+    // Fast path: needle already lowercase (or hay) — memchr.
+    if target == needle_b {
+        return memchr::memchr(needle_b, slice).map(|i| from + i);
+    }
+    for (i, &b) in slice.iter().enumerate() {
         if fold_byte(b) == target {
-            return Some(i);
+            return Some(from + i);
         }
     }
     None
+}
+
+/// Exact subsequence (T=0) — faster than skip-DP.
+fn is_subseq_fold(needle: &[u8], hay: &[u8]) -> bool {
+    let mut hi = 0usize;
+    for &nb in needle {
+        match find_byte_fold(hay, hi, nb) {
+            Some(p) => hi = p + 1,
+            None => return false,
+        }
+    }
+    true
 }
 
 /// Single-haystack gate. `None` = not a match under the typo model.
@@ -202,15 +222,15 @@ pub fn gate_file(
     gate_hit(needle, hay.as_ref(), max_typos)
 }
 
+
 /// Parallel match-set over FileItems. Emits frizbee-compatible
-/// `Match { score: start, end_col: end }` (skip_sw encoding) so the rest
-/// of the pipeline is unchanged. `file_index` maps working-set position →
-/// corpus index.
+/// `Match { score: start, end_col: end }` (skip_sw encoding).
+/// Walks 16-byte chunks; copies only the needle-byte span for skip-DP.
 pub fn gate_match_range<F>(
     needle: &[u8],
     n: usize,
     max_typos: u16,
-    threads: usize,
+    _threads: usize,
     file_index: F,
     resolve_len: impl Fn(u32) -> usize + Sync,
     resolve_bytes: impl Fn(u32, &mut [u8]) -> usize + Sync,
@@ -219,20 +239,15 @@ where
     F: Fn(u32) -> u32 + Sync,
 {
     use rayon::prelude::*;
-    let _ = threads; // rayon pool sizes itself
     let _ = resolve_len;
     (0..n as u32)
         .into_par_iter()
         .filter_map(|i| {
-            // Cheap length reject first via resolve_len.
             let hay_len = resolve_len(i);
-            if hay_len == 0 {
+            if hay_len == 0 || hay_len > crate::simd_path::PATH_BUF_SIZE {
                 return None;
             }
             let mut buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-            if hay_len > buf.len() {
-                return None;
-            }
             let got = resolve_bytes(i, &mut buf);
             if got == 0 {
                 return None;
