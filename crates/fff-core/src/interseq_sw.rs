@@ -407,6 +407,10 @@ pub(crate) mod avx2 {
             } else {
                 zero
             };
+            let bonus_base = _mm256_add_epi16(
+                _mm256_add_epi16(delim_bonus, cap_bonus),
+                _mm256_add_epi16(prefix_bonus, match_add_v),
+            );
 
             let nxt = 1 - cur;
             h[nxt][0] = zero;
@@ -420,13 +424,7 @@ pub(crate) mod avx2 {
                 let mm = _mm256_or_si256(eq_nc, eq_nf);
                 match_state[nxt][i] = mm;
 
-                let masked_bonus = _mm256_and_si256(
-                    _mm256_add_epi16(
-                        _mm256_add_epi16(delim_bonus, cap_bonus),
-                        _mm256_add_epi16(prefix_bonus, match_add_v),
-                    ),
-                    mm,
-                );
+                let masked_bonus = _mm256_and_si256(bonus_base, mm);
                 let diag = _mm256_add_epi16(h[cur][i - 1], masked_bonus);
                 let diag = _mm256_subs_epu16(diag, mismatch_v);
                 let diag = _mm256_add_epi16(diag, _mm256_and_si256(eq_nc, case_v));
@@ -595,6 +593,11 @@ pub(crate) mod avx2 {
             } else {
                 zero
             };
+            // Column-invariant bonus pack (was inside the row loop).
+            let bonus_base = _mm256_add_epi8(
+                _mm256_add_epi8(delim_bonus, cap_bonus),
+                _mm256_add_epi8(prefix_bonus, match_add_v),
+            );
 
             let nxt = 1 - cur;
             h[nxt][0] = zero;
@@ -608,13 +611,7 @@ pub(crate) mod avx2 {
                 let mm = _mm256_or_si256(eq_nc, eq_nf);
                 match_state[nxt][i] = mm;
 
-                let masked_bonus = _mm256_and_si256(
-                    _mm256_add_epi8(
-                        _mm256_add_epi8(delim_bonus, cap_bonus),
-                        _mm256_add_epi8(prefix_bonus, match_add_v),
-                    ),
-                    mm,
-                );
+                let masked_bonus = _mm256_and_si256(bonus_base, mm);
                 let diag = _mm256_add_epi8(h[cur][i - 1], masked_bonus);
                 let diag = _mm256_subs_epu8(diag, mismatch_v);
                 let diag = _mm256_add_epi8(diag, _mm256_and_si256(eq_nc, case_v));
