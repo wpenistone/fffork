@@ -367,6 +367,27 @@ fn match_fuzzy_parts(
         let p = crate::interseq_sw::SwParams::for_query(has_upper);
         let needle = valid_parts[0].as_bytes();
 
+        // Query intent: `name.ext` (has dot, no slash) — pin exact filename
+        // hits so a typed filename always wins without waiting on fuzzy rank.
+        let looks_like_filename = {
+            let q = valid_parts[0];
+            q.len() >= 4 && q.contains('.') && !q.contains('/')
+        };
+        let mut exact_name_hits: Vec<u32> = Vec::new();
+        if looks_like_filename {
+            let q = valid_parts[0].as_bytes();
+            for i in 0..working_files.len() {
+                let f = working_files.index(i);
+                let flen = f.path.byte_len as usize - f.path.filename_offset as usize;
+                if flen == q.len() {
+                    let fname = f.path.filename_cow(arena);
+                    if fname.eq_ignore_ascii_case(valid_parts[0]) {
+                        exact_name_hits.push(i as u32);
+                    }
+                }
+            }
+        }
+
         // Selectivity collapse: a common query (`score` hits 226k/227k)
         // makes per-path SW useless — ranking is decided by filename +
         // frecency anyway. Skip the interseq pass and score from match
@@ -390,6 +411,16 @@ fn match_fuzzy_parts(
                 m.score = conc.saturating_add(fname_bonus);
                 m.end_col = w.end.min(u16::MAX as u32) as u16;
                 m.exact = false;
+            }
+            if !exact_name_hits.is_empty() {
+                let pinned: std::collections::HashSet<u32> =
+                    exact_name_hits.iter().copied().collect();
+                for m in matches.iter_mut() {
+                    if pinned.contains(&m.index) {
+                        m.score = m.score.max(200);
+                        m.exact = true;
+                    }
+                }
             }
             let collect_ms = t_collect.elapsed().as_secs_f64() * 1e3;
             if std::env::var_os("FFF_PHASE_TIMING").is_some() {
@@ -663,6 +694,16 @@ fn match_fuzzy_parts(
                 matches.len()
             );
         }
+            if !exact_name_hits.is_empty() {
+                let pinned: std::collections::HashSet<u32> =
+                    exact_name_hits.iter().copied().collect();
+                for m in matches.iter_mut() {
+                    if pinned.contains(&m.index) {
+                        m.score = m.score.max(200);
+                        m.exact = true;
+                    }
+                }
+            }
             matches
         }
     };
