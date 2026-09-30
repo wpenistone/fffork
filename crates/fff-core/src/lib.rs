@@ -158,6 +158,8 @@ mod ignore;
 mod scan;
 mod intent;
 pub use intent::{QueryIntent, detect_intent, evidence_for, split_name_ext, split_path_tokens, filename_words, role_of_filename, FileRole, Evidence};
+mod gate;
+pub use gate::{gate_hit, GateHit};
 mod matcher;
 mod score;
 mod sort_buffer;

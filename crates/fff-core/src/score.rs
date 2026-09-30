@@ -176,48 +176,40 @@ fn match_fuzzy_parts(
         }
         let cand_ms = t_cand.elapsed().as_secs_f64() * 1e3;
         let use_cand = try_cand && cand.len() * 2 < working_files.len() && !cand.is_empty();
-        let mut matches = neo_frizbee::with_skip_sw(|| {
-            with_cached_matcher(valid_parts[0], options, |matcher| {
-                if use_cand {
-                    let cand = cand.as_slice();
-                    let raw = matcher.match_range_parallel_resolved(
-                        cand.len(),
-                        &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
-                            let fi = cand[index as usize] as usize;
-                            resolve_file_chunks_prefiltered(
-                                working_files.index(fi),
-                                arena,
-                                buf,
-                                &np,
-                                valid_parts[0].as_bytes(),
-                            )
-                        },
-                        threads,
-                    );
-                    // Remap subset index → corpus index.
-                    raw.into_iter()
-                        .map(|mut m| {
-                            m.index = cand[m.index as usize];
-                            m
-                        })
-                        .collect()
-                } else {
-                    matcher.match_range_parallel_resolved(
-                        working_files.len(),
-                        &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
-                            resolve_file_chunks_prefiltered(
-                                working_files.index(index as usize),
-                                arena,
-                                buf,
-                                &np,
-                                valid_parts[0].as_bytes(),
-                            )
-                        },
-                        threads,
-                    )
-                }
-            })
-        });
+        // TISG gate (span + skip-DP) — match-set + window without frizbee.
+        // Emits the same skip_sw Match encoding the pipeline already decodes.
+        let mut matches = if use_cand {
+            let cand = cand.as_slice();
+            let mut raw = crate::gate::gate_match_range(
+                valid_parts[0].as_bytes(),
+                cand.len(),
+                options.max_typos.unwrap_or(u16::MAX),
+                threads,
+                |i| cand[i as usize],
+                |i| working_files.index(cand[i as usize] as usize).path.byte_len as usize,
+                |i, buf: &mut [u8]| {
+                    let f = working_files.index(cand[i as usize] as usize);
+                    f.path.read_to_buf(arena, buf).len()
+                },
+            );
+            for m in &mut raw {
+                // index already remapped via file_index
+            }
+            raw
+        } else {
+            crate::gate::gate_match_range(
+                valid_parts[0].as_bytes(),
+                working_files.len(),
+                options.max_typos.unwrap_or(u16::MAX),
+                threads,
+                |i| i,
+                |i| working_files.index(i as usize).path.byte_len as usize,
+                |i, buf: &mut [u8]| {
+                    let f = working_files.index(i as usize);
+                    f.path.read_to_buf(arena, buf).len()
+                },
+            )
+        };
         let prefilter_ms = t_prefilter.elapsed().as_secs_f64() * 1e3;
 
         // Phase 2: re-score with inter-sequence SW on trimmed windows.
