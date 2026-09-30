@@ -1010,12 +1010,16 @@ fn match_fuzzy_parts_dirs(
         return vec![];
     }
 
+    let scan_cap = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .min(8);
     let dir_threads = effective_match_threads(
         working_dirs.len(),
         valid_parts[0].len(),
         256,
         options.max_typos,
-        max_threads,
+        scan_cap.max(max_threads),
     );
     let first_part_matches = with_cached_matcher(valid_parts[0], options, |matcher| {
         matcher.match_range_parallel_resolved(
@@ -1045,7 +1049,7 @@ fn match_fuzzy_parts_dirs(
             part.len(),
             256,
             part_options.max_typos,
-            max_threads,
+            scan_cap.max(max_threads),
         );
         let sub_matches = with_cached_matcher(part, &part_options, |matcher| {
             matcher.match_range_parallel_resolved(
