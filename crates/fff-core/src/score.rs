@@ -554,7 +554,7 @@ fn match_fuzzy_parts(
                                     &mut soa,
                                 );
                                 if use_u8 {
-                                    crate::interseq_sw::avx2::score_batch_avx2_u8_dispatch(
+                                    crate::interseq_sw::avx2::score_batch_avx2_u8(
                                         needle,
                                         &soa,
                                         max_len,
