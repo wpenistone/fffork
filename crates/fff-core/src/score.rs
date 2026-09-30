@@ -271,14 +271,14 @@ fn match_fuzzy_parts(
             conc.saturating_add(fname_bonus)
         };
 
-        // Sample SW check first — only score the whole set if we will collapse.
+        // Collapse disabled: cheap rank vs SW top-32 overlap is 0.06–0.16 on
+        // real corpora; reordering would be a UX regression vs upstream.
+        // Always take the full SW path. (Sample machinery kept for research.)
+        let mut collapsed = false;
         const SAMPLE_CAP: usize = 256;
         const TOP_K: usize = 32;
-        const MIN_OVERLAP: f32 = 1.0; // never reorder unless sample top-k is identical
-        let mut collapsed = false;
-        // Only sample-check when full SW would dominate. Below this, just
-        // score every hit (8k x SW is <1ms; the sample pass costs more).
-        if matches.len() >= 32_000 && n_files >= 4_096 {
+        const MIN_OVERLAP: f32 = 1.0;
+        if false && matches.len() >= 32_000 && n_files >= 4_096 {
             // Top-K by cheap score without sorting the full 226k hit set.
             let mut top: Vec<(u16, usize)> = Vec::with_capacity(TOP_K * 2);
             for i in 0..wins.len() {
