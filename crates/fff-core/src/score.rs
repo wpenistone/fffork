@@ -333,7 +333,11 @@ fn match_fuzzy_parts(
             let cheap_top: std::collections::HashSet<usize> =
                 top.iter().take(TOP_K).map(|&(_, i)| i).collect();
             let inter = sw_top.intersection(&cheap_top).count();
-            collapsed = (inter as f32 / TOP_K as f32) >= MIN_OVERLAP;
+            let overlap = inter as f32 / TOP_K as f32;
+            if std::env::var_os("FFF_PHASE_TIMING").is_some() {
+                eprintln!("PHASE overlap={overlap:.2} collapsed_would_be={}", overlap >= MIN_OVERLAP);
+            }
+            collapsed = overlap >= MIN_OVERLAP;
         }
         let samp_ms = t_samp.elapsed().as_secs_f64() * 1e3;
         if std::env::var_os("FFF_PHASE_TIMING").is_some() {
