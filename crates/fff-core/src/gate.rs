@@ -270,7 +270,8 @@ pub fn gate_path_chunks(
     }
     // Copy only the span (not the whole path) for exact skip-DP.
     let span = hi - first;
-    let mut buf = vec![0u8; span];
+    thread_local! { static SPAN_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) }; }
+    let mut buf = SPAN_BUF.with(|c| { let mut b = c.borrow_mut(); b.clear(); b.resize(span, 0); std::mem::take(&mut *b) });
     visit(&mut |_off, chunk| {
         let a = _off.max(first);
         let b = (_off + chunk.len()).min(hi);
@@ -394,4 +395,118 @@ mod tests {
             assert_eq!(gate, expect, "n={needle:?} h={hay:?} t={t} lcs={lcs}");
         }
     }
+    #[test]
+    fn differential_vs_frizbee_on_random() {
+        let mut state = 0xC0FFEEu32;
+        let mut next = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 16) as u16
+        };
+        let mut gate_only = 0;
+        let mut friz_only = 0;
+        let mut both = 0;
+        let mut neither = 0;
+        let mut friz_wrong = 0;
+        let mut gate_wrong = 0;
+        for _ in 0..3000 {
+            let nl = 3 + (next() % 8) as usize;
+            let hl = 2 + (next() % 20) as usize;
+            let needle: String = (0..nl).map(|_| (b'a' + (next() % 6) as u8) as char).collect();
+            let hay: String = (0..hl).map(|_| (b'a' + (next() % 6) as u8) as char).collect();
+            let t = (next() % 3) as u16;
+            let need = nl as i32 - t as i32;
+            // LCS
+            let nbs = needle.as_bytes();
+            let hbs = hay.as_bytes();
+            let mut dp = vec![0i32; hl + 1];
+            for &nc in nbs {
+                let mut prev = 0i32;
+                for j in 1..=hl {
+                    let tmp = dp[j];
+                    dp[j] = if fold_byte(nc) == fold_byte(hbs[j - 1]) {
+                        prev + 1
+                    } else {
+                        dp[j].max(dp[j - 1])
+                    };
+                    prev = tmp;
+                }
+            }
+            let lcs = dp[hl];
+            let expect = lcs >= need.max(0);
+            let g = gate_hit(nbs, hbs, t).is_some();
+            let f = {
+                let cfg = neo_frizbee::Config {
+                    max_typos: Some(t),
+                    sort: neo_frizbee::SortStrategy::Unsorted,
+                    ..Default::default()
+                };
+                let mut m = neo_frizbee::Matcher::new(needle.as_str(), &cfg);
+                !m.match_list(&[hay.as_str()]).is_empty()
+            };
+            if g && f {
+                both += 1;
+            } else if g {
+                gate_only += 1;
+            } else if f {
+                friz_only += 1;
+                if !expect {
+                    friz_wrong += 1;
+                }
+            } else {
+                neither += 1;
+            }
+            if g != expect {
+                gate_wrong += 1;
+            }
+        }
+        eprintln!(
+            "DIFF both={both} gate_only={gate_only} friz_only={friz_only} neither={neither} gate_wrong={gate_wrong} friz_wrong={friz_wrong}"
+        );
+        assert_eq!(gate_wrong, 0, "gate must equal LCS");
+    }
+
+    #[test]
+    fn differential_long_and_high_bytes() {
+        let mut disagree = 0;
+        for seed in 0..500u32 {
+            let mut state = seed.wrapping_mul(0x9E3779B1);
+            let mut next = move || {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                (state >> 16) as u16
+            };
+            let nl = 4 + (next() % 10) as usize;
+            let hl = 100 + (next() % 400) as usize;
+            let needle: Vec<u8> = (0..nl).map(|_| b'a' + (next() % 8) as u8).collect();
+            let hay: Vec<u8> = (0..hl)
+                .map(|_| {
+                    let r = next() % 10;
+                    if r < 8 {
+                        b'a' + r as u8
+                    } else if r == 8 {
+                        0xC3
+                    } else {
+                        0xE9
+                    }
+                })
+                .collect();
+            let t = (next() % 4) as u16;
+            let g = gate_hit(&needle, &hay, t).is_some();
+            let nls = String::from_utf8_lossy(&needle).to_string();
+            let hls = String::from_utf8_lossy(&hay).to_string();
+            let f = {
+                let cfg = neo_frizbee::Config {
+                    max_typos: Some(t),
+                    sort: neo_frizbee::SortStrategy::Unsorted,
+                    ..Default::default()
+                };
+                let mut m = neo_frizbee::Matcher::new(nls.as_str(), &cfg);
+                !m.match_list(&[hls.as_str()]).is_empty()
+            };
+            if g != f {
+                disagree += 1;
+            }
+        }
+        eprintln!("LONG disagree={disagree}");
+    }
+
 }
