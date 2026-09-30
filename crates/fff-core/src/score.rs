@@ -374,7 +374,7 @@ fn match_fuzzy_parts(
         // 32k × ~16 B × a few arrays ≈ 1 MB peak, vs a full 227k-wide set.
         const CHUNK: usize = 32 * 1024;
         thread_local! {
-            static TRIMS: std::cell::RefCell<Vec<(u32, u32, u32, bool, bool)>> =
+            static TRIMS: std::cell::RefCell<Vec<crate::matcher::Trim>> =
                 const { std::cell::RefCell::new(Vec::new()) };
             static SCORES: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
             static ECOLS: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -443,13 +443,7 @@ fn match_fuzzy_parts(
                         }
                     }
                     let w = decode_match_window(m, file.path.byte_len as usize);
-                    trims.push((
-                        w.file_idx,
-                        w.start,
-                        w.end,
-                        w.include_prefix,
-                        w.include_exact,
-                    ));
+                    trims.push(crate::matcher::Trim::from_window(w));
                 }
             }
             collect_ms += t_chunk.elapsed().as_secs_f64() * 1e3;
@@ -474,7 +468,7 @@ fn match_fuzzy_parts(
             {
                 let mut cnt = [0u32; 129];
                 for i in 0..n_matches {
-                    let (_, s, e, _, _) = trims[i];
+                    let (s, e) = (trims[i].start, trims[i].end);
                     let l = (e - s).min(128) as usize;
                     cnt[l] += 1;
                 }
@@ -486,7 +480,7 @@ fn match_fuzzy_parts(
                 }
                 order.resize(n_matches, 0);
                 for i in 0..n_matches {
-                    let (_, s, e, _, _) = trims[i];
+                    let (s, e) = (trims[i].start, trims[i].end);
                     let l = (e - s).min(128) as usize;
                     order[start[l] as usize] = i as u32;
                     start[l] += 1;
@@ -517,7 +511,7 @@ fn match_fuzzy_parts(
                         let n = ord.len();
                         let mut max_len = 0usize;
                         for &oi in ord.iter() {
-                            let (_, s, e, _, _) = trims[oi as usize];
+                            let (s, e) = (trims[oi as usize].start, trims[oi as usize].end);
                             max_len = max_len.max((e - s) as usize);
                         }
                         if max_len == 0 {
@@ -546,11 +540,14 @@ fn match_fuzzy_parts(
                         let mut prefix_mask: u32 = 0;
                         let mut next_ptrs = [std::ptr::null::<u8>(); MAX_PATH_CHUNKS];
                         for (k, &oi) in ord.iter().enumerate() {
-                            let (fi, s, e, inc_prefix, _) = trims[oi as usize];
+                            let t = trims[oi as usize];
+                            let (fi, s, e, inc_prefix) = (t.file_idx, t.start, t.end, t.include_prefix());
                             let file = working_files.index(fi as usize);
                             #[cfg(target_arch = "x86_64")]
                             if k + 1 < n {
-                                let nf = working_files.index(trims[ord[k + 1] as usize].0 as usize);
+                                let nf = working_files.index(
+                                    trims[ord[k + 1] as usize].file_idx as usize,
+                                );
                                 let nptrs = nf.path.resolve_ptrs(arena, &mut next_ptrs);
                                 for &p in nptrs.iter().take(4) {
                                     unsafe {
@@ -563,7 +560,7 @@ fn match_fuzzy_parts(
                             }
                             let wlen = (e - s) as usize;
                             let dst = &mut stage[k * rows..k * rows + wlen];
-                            file.path.copy_window_to(arena, s, e, dst);
+                            file.path.copy_window_to(arena, s as u32, e as u32, dst);
                             // Pad the rest of this lane to zeros (SoA expects it).
                             stage[k * rows + wlen..(k + 1) * rows].fill(0);
                             if inc_prefix {
@@ -615,7 +612,7 @@ fn match_fuzzy_parts(
                             return;
                         }
                         for (k, &oi) in ord.iter().enumerate() {
-                            let (_, s, e, inc_prefix, _) = trims[oi as usize];
+                            let tw = trims[oi as usize]; let (s, e, inc_prefix) = (tw.start, tw.end, tw.include_prefix());
                             let src = &stage[k * rows..k * rows + (e - s) as usize];
                             let (sc, ec) =
                                 crate::interseq_sw::score_one_scalar_full(needle, src, &p, inc_prefix);
@@ -637,7 +634,8 @@ fn match_fuzzy_parts(
             // Assemble this chunk into the match structs (no full-size hold).
             let t_asm = std::time::Instant::now();
             for (i, m) in matches_chunk.iter_mut().enumerate() {
-                let (fi, start_adj, end_pos, _, include_exact) = trims[i];
+                let t = trims[i];
+                let (fi, start_adj, end_pos, include_exact) = (t.file_idx, t.start as u32, t.end as u32, t.include_exact());
                 let exact = include_exact && {
                     let file = working_files.index(fi as usize);
                     let hay = file.path.read_to_buf(arena, &mut path_buf);

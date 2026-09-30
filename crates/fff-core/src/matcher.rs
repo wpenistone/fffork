@@ -14,7 +14,36 @@ pub(crate) struct MatchWindow {
     pub(crate) include_exact: bool,
 }
 
-#[inline]
+/// Packed trim window: 12 B vs 16 B tuple. Paths fit u16 (ChunkedString).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Trim {
+    pub file_idx: u32,
+    pub start: u16,
+    pub end: u16,
+    /// bit0 = include_prefix, bit1 = include_exact
+    pub flags: u8,
+}
+
+impl Trim {
+    #[inline]
+    pub(crate) fn from_window(w: MatchWindow) -> Self {
+        Self {
+            file_idx: w.file_idx,
+            start: w.start.min(u16::MAX as u32) as u16,
+            end: w.end.min(u16::MAX as u32) as u16,
+            flags: (w.include_prefix as u8) | ((w.include_exact as u8) << 1),
+        }
+    }
+    #[inline]
+    pub(crate) fn include_prefix(&self) -> bool {
+        self.flags & 1 != 0
+    }
+    #[inline]
+    pub(crate) fn include_exact(&self) -> bool {
+        self.flags & 2 != 0
+    }
+}
+
 pub(crate) fn decode_match_window(m: &neo_frizbee::Match, hay_len: usize) -> MatchWindow {
     // skip_sw packs (start_pos_adj, end_pos) into (score, end_col).
     let start_adj = m.score as usize;
