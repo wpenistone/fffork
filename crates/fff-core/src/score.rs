@@ -1652,14 +1652,25 @@ fn match_and_score_in_arena<'a>(
                 0
             } else {
                 let fname = file.path.filename_cow(arena);
-                let rel = file.path.read_to_buf(arena, path_buf);
-                let ev = crate::intent::evidence_for(
-                    rel.as_ref(),
-                    fname.as_ref(),
-                    main_needle_as_str,
-                    query_intent,
-                    context.current_file,
-                );
+                // Path walk only when intent/context can use it.
+                let need_path = query_intent == crate::intent::QueryIntent::Path
+                    || context.current_file.is_some();
+                let ev = if need_path {
+                    let rel = file.path.read_to_buf(arena, path_buf);
+                    crate::intent::evidence_for(
+                        rel.as_ref(),
+                        fname.as_ref(),
+                        main_needle_as_str,
+                        query_intent,
+                        context.current_file,
+                    )
+                } else {
+                    crate::intent::evidence_filename_only(
+                        fname.as_ref(),
+                        main_needle_as_str,
+                        query_intent,
+                    )
+                };
                 crate::intent::evidence_bonus(query_intent, &ev, base_score)
             };
 

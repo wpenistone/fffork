@@ -394,6 +394,16 @@ pub fn evidence_bonus(intent: QueryIntent, ev: &Evidence, base: i32) -> i32 {
     x
 }
 
+/// Filename-only evidence (no relative path walk). Same as `evidence_for`
+/// for fields that don't need the path; path/segment/same_dir stay default.
+pub fn evidence_filename_only(
+    filename: &str,
+    query: &str,
+    intent: QueryIntent,
+) -> Evidence {
+    evidence_for("", filename, query, intent, None)
+}
+
 /// Full evidence bundle for one file vs one query + intent.
 pub fn evidence_for(
     relative_path: &str,
