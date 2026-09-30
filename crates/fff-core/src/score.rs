@@ -95,7 +95,13 @@ fn match_fuzzy_parts(
     // max_path_len is O(n) over every FileItem; only worth it when it can
     // change the thread count (1T and tiny sets always stay serial).
     let mut cached_max_path: Option<usize> = None;
-    let threads = if max_threads <= 1 || working_files.len() < 1024 {
+    // Prefilter is an internal scan — parallelize even when the *search*
+    // is 1 thread (one query). Interseq SW already uses the bg pool this way.
+    let scan_cap = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .min(8);
+    let threads = if working_files.len() < 1024 {
         1
     } else {
         let max_path = working_files.max_path_len();
@@ -105,7 +111,7 @@ fn match_fuzzy_parts(
             valid_parts[0].len(),
             max_path,
             options.max_typos,
-            max_threads,
+            scan_cap.max(max_threads),
         )
     };
 
@@ -658,7 +664,7 @@ fn match_fuzzy_parts(
         // Match only the files that survived the previous round, addressed
         // through the previous matches without collecting a subset.
         let survivors = &matches;
-        let sub_threads = if max_threads <= 1 || survivors.len() < 1024 {
+        let sub_threads = if survivors.len() < 1024 {
             1
         } else {
             let max_path = cached_max_path.unwrap_or_else(|| working_files.max_path_len());
@@ -667,7 +673,7 @@ fn match_fuzzy_parts(
                 part.len(),
                 max_path,
                 part_options.max_typos,
-                max_threads,
+                scan_cap.max(max_threads),
             )
         };
         let sub_np = crate::presence::NeedlePresence::new(
