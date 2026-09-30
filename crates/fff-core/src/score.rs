@@ -459,11 +459,29 @@ fn match_fuzzy_parts(
             // stays close to the lanes' own lengths.
             let mut order = ORDER.with(|c| take_tls(c, n_matches));
             order.clear();
-            order.extend(0..n_matches as u32);
-            order.sort_by_key(|&oi| {
-                let (_, s, e, _, _) = trims[oi as usize];
-                e - s
-            });
+            // Counting sort by trim length (stable, O(n)). Batch grouping only
+            // affects SIMD max_len, not per-match scores.
+            {
+                let mut cnt = [0u32; 129];
+                for i in 0..n_matches {
+                    let (_, s, e, _, _) = trims[i];
+                    let l = (e - s).min(128) as usize;
+                    cnt[l] += 1;
+                }
+                let mut start = [0u32; 129];
+                let mut acc = 0u32;
+                for l in 0..129 {
+                    start[l] = acc;
+                    acc += cnt[l];
+                }
+                order.resize(n_matches, 0);
+                for i in 0..n_matches {
+                    let (_, s, e, _, _) = trims[i];
+                    let l = (e - s).min(128) as usize;
+                    order[start[l] as usize] = i as u32;
+                    start[l] += 1;
+                }
+            }
             let mut perm_scores = PERM_SCORES.with(|c| take_tls(c, n_matches + 32));
             perm_scores.clear();
             perm_scores.resize(n_matches + 32, 0);
