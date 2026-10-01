@@ -252,8 +252,12 @@ pub fn gate_path_chunks(
     }
     let mut hay = HAY.with(|c| {
         let mut b = c.borrow_mut();
-        b.clear();
-        b.resize(byte_len, 0);
+        if b.len() < byte_len {
+            b.resize(byte_len, 0);
+        } else {
+            // Overwrite without zeroing — chunks fill every byte we read.
+            unsafe { b.set_len(byte_len) };
+        }
         std::mem::take(&mut *b)
     });
     let mut first = None;
@@ -284,7 +288,7 @@ pub fn gate_path_chunks(
         HAY.with(|c| *c.borrow_mut() = hay);
         return None;
     }
-    let ok = skip_dp_accept(needle, &hay, first, hi, typos.min(MAX_SKIPS));
+    let ok = skip_dp_accept(needle, &hay[..byte_len], first, hi, typos.min(MAX_SKIPS));
     HAY.with(|c| *c.borrow_mut() = hay);
     if !ok {
         return None;
