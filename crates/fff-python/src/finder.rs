@@ -256,6 +256,7 @@ impl FileFinder {
                     enable_fs_root_scanning,
                     enable_home_dir_scanning,
                     git_recency: Default::default(),
+                    skip_git: false,
                 },
             )
             .map_err(py_err)
@@ -878,6 +879,7 @@ impl FileFinder {
                     enable_fs_root_scanning: fs_root,
                     enable_home_dir_scanning: home_dir,
                     git_recency,
+                    skip_git: false,
                 },
             )
             .map_err(py_err)

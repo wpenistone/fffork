@@ -536,7 +536,7 @@ impl FffServer {
             lines.push(format!(
                 "{}{}",
                 item.relative_path(picker),
-                file_suffix(item.git_status, item.total_frecency_score())
+                file_suffix(item.git_status(), item.total_frecency_score())
             ));
         }
 

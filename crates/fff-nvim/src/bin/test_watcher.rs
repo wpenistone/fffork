@@ -70,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "  {}. {} ({})",
                     i + 1,
                     file.relative_path(picker),
-                    format_git_status(file.git_status)
+                    format_git_status(file.git_status())
                 );
             }
             if files.len() > 5 {
@@ -137,7 +137,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             git_stats.clear();
             for file in current_files {
-                let status = format_git_status(file.git_status);
+                let status = format_git_status(file.git_status());
                 *git_stats.entry(status).or_insert(0) += 1;
             }
 

@@ -85,15 +85,10 @@ fn needle_span(mask: &NeedleMask, hay: &[u8], need: usize) -> Option<(usize, usi
     Some((first.unwrap(), last))
 }
 
-/// Exact skip-DP over `[lo, hi)` of `hay` (or the whole slice).
-/// Returns true iff LCS(needle, hay[lo..=hi]) >= needle.len() - max_typos.
-fn skip_dp_accept(
-    needle: &[u8],
-    hay: &[u8],
-    lo: usize,
-    hi: usize,
-    max_typos: usize,
-) -> bool {
+/// Exact skip-DP over the whole hay: true iff
+/// `LCS(needle, hay) >= needle.len() - max_typos`.
+/// Fallback for needles longer than one 64-bit word.
+fn skip_dp_accept_slow(needle: &[u8], hay: &[u8], max_typos: usize) -> bool {
     let m = needle.len();
     if m == 0 {
         return false;
@@ -102,15 +97,11 @@ fn skip_dp_accept(
     if need == 0 {
         return true;
     }
-    let t = max_typos.min(MAX_SKIPS);
-    let hay = &hay[lo..hi];
     if hay.len() < need {
         return false;
     }
-    if t == 0 {
-        return is_subseq_fold(needle, hay);
-    }
     const INF: usize = usize::MAX;
+    let t = max_typos;
     let mut best = [INF; MAX_SKIPS + 1];
     let mut nxt = [INF; MAX_SKIPS + 1];
     best[0] = 0;
@@ -136,6 +127,20 @@ fn skip_dp_accept(
         best = nxt;
     }
     best[..=t].iter().any(|&p| p != INF)
+}
+
+/// Hyyrö bit-parallel LCS length: one linear pass, no per-needle rescans.
+/// `pm[c]` must hold the folded-byte position masks and `len_mask` the
+/// low `needle.len()` bits. Exact for `needle.len() <= 64`.
+#[inline]
+fn lcs_len_bitparallel(pm: &[u64; 256], len_mask: u64, hay: &[u8]) -> usize {
+    let mut s = 0u64;
+    for &b in hay {
+        let x = s | pm[fold_byte(b) as usize];
+        let y = (s << 1) | 1;
+        s = x & (x ^ x.wrapping_sub(y));
+    }
+    (s & len_mask).count_ones() as usize
 }
 
 #[inline]
@@ -166,45 +171,165 @@ fn is_subseq_fold(needle: &[u8], hay: &[u8]) -> bool {
     true
 }
 
+/// Per-query gate state: span mask + bit-parallel LCS position masks.
+/// Built once per search so per-path work is a single linear pass.
+pub struct GateNeedle {
+    needle: Box<[u8]>,
+    /// Typo budget actually used (capped at `MAX_SKIPS`).
+    typos: usize,
+    /// `needle.len() - typos`.
+    need: usize,
+    span: NeedleMask,
+    /// `pm[c]` = bitmask of needle positions holding folded byte `c`.
+    pm: Box<[u64; 256]>,
+    len_mask: u64,
+}
+
+impl GateNeedle {
+    pub fn new(needle: &[u8], max_typos: u16) -> Self {
+        let typos = (max_typos as usize).min(MAX_SKIPS);
+        let m = needle.len();
+        let mut pm = Box::new([0u64; 256]);
+        for (i, &b) in needle.iter().enumerate().take(64) {
+            pm[fold_byte(b) as usize] |= 1u64 << i;
+        }
+        Self {
+            span: NeedleMask::new(needle),
+            len_mask: if m >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << m) - 1
+            },
+            needle: needle.to_vec().into_boxed_slice(),
+            typos,
+            need: m.saturating_sub(typos),
+            pm,
+        }
+    }
+
+    /// Exact accept test: `LCS(needle, hay) >= need`.
+    #[inline]
+    fn decide(&self, hay: &[u8]) -> bool {
+        if self.needle.is_empty() {
+            return false;
+        }
+        if self.need == 0 {
+            return true;
+        }
+        if hay.len() < self.need {
+            return false;
+        }
+        if self.typos == 0 {
+            return is_subseq_fold(&self.needle, hay);
+        }
+        if self.needle.len() > 64 {
+            return skip_dp_accept_slow(&self.needle, hay, self.typos);
+        }
+        lcs_len_bitparallel(&self.pm, self.len_mask, hay) >= self.need
+    }
+
+    /// Gate one contiguous hay slice.
+    pub fn hit(&self, hay: &[u8]) -> Option<GateHit> {
+        if self.needle.is_empty() || hay.is_empty() {
+            return None;
+        }
+        if self.need == 0 {
+            return Some(GateHit {
+                start: 0,
+                end: hay.len().min(u16::MAX as usize) as u32,
+                include_prefix: true,
+            });
+        }
+        let (first, last) = needle_span(&self.span, hay, self.need)?;
+        let hi = (last + 1).min(hay.len());
+        if !self.decide(&hay[first..hi]) {
+            return None;
+        }
+        Some(GateHit {
+            start: first as u32,
+            end: hi as u32,
+            include_prefix: first == 0,
+        })
+    }
+
+    /// Gate a path visited in 16-byte chunks (no caller buffer, no truncation).
+    pub fn hit_chunks(
+        &self,
+        byte_len: usize,
+        mut visit: impl FnMut(&mut dyn FnMut(usize, &[u8])),
+    ) -> Option<GateHit> {
+        if self.needle.is_empty() || byte_len == 0 {
+            return None;
+        }
+        if self.need == 0 {
+            return Some(GateHit {
+                start: 0,
+                end: byte_len.min(u16::MAX as usize) as u32,
+                include_prefix: true,
+            });
+        }
+        thread_local! {
+            static HAY: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let mut hay = HAY.with(|c| {
+            let mut b = c.borrow_mut();
+            if b.len() < byte_len {
+                b.resize(byte_len, 0);
+            } else {
+                // Overwrite without zeroing — chunks fill every byte we read.
+                unsafe { b.set_len(byte_len) };
+            }
+            std::mem::take(&mut *b)
+        });
+        let mut first = 0usize;
+        let mut last = 0usize;
+        let mut n = 0usize;
+        visit(&mut |off, chunk| {
+            let end = (off + chunk.len()).min(byte_len);
+            if off < end {
+                hay[off..end].copy_from_slice(&chunk[..end - off]);
+            }
+            for (i, &b) in chunk.iter().enumerate() {
+                if self.span.contains(b) {
+                    if n == 0 {
+                        first = off + i;
+                    }
+                    last = off + i;
+                    n += 1;
+                }
+            }
+        });
+        let ok = if n < self.need {
+            false
+        } else {
+            let hi = (last + 1).min(byte_len);
+            hi.saturating_sub(first) >= self.need && self.decide(&hay[first..hi])
+        };
+        HAY.with(|c| *c.borrow_mut() = hay);
+        if !ok {
+            return None;
+        }
+        Some(GateHit {
+            start: first as u32,
+            end: (last + 1).min(byte_len) as u32,
+            include_prefix: first == 0,
+        })
+    }
+}
+
 /// Single-haystack gate. `None` = not a match under the typo model.
 pub fn gate_hit(needle: &[u8], hay: &[u8], max_typos: u16) -> Option<GateHit> {
-    let m = needle.len();
-    if m == 0 || hay.is_empty() {
-        return None;
-    }
-    let typos = max_typos as usize;
-    let need = m.saturating_sub(typos);
-    if need == 0 {
-        return Some(GateHit {
-            start: 0,
-            end: hay.len().min(u16::MAX as usize) as u32,
-            include_prefix: true,
-        });
-    }
-    let mask = NeedleMask::new(needle);
-    let (first, last) = needle_span(&mask, hay, need)?;
-    // Span must hold at least `need` matched bytes (already n>=need) and
-    // the skip-DP must succeed inside the span (plus one byte of margin).
-    let lo = first;
-    let hi = (last + 1).min(hay.len());
-    if !skip_dp_accept(needle, hay, lo, hi, typos.min(MAX_SKIPS)) {
-        return None;
-    }
-    Some(GateHit {
-        start: lo as u32,
-        end: hi as u32,
-        include_prefix: lo == 0,
-    })
+    GateNeedle::new(needle, max_typos).hit(hay)
 }
 
 /// Batch gate over paths (same needle). Indices of hits are pushed to `out`.
-/// `windows` parallel to hits.
 pub fn gate_batch<'a, I>(needle: &[u8], hays: I, max_typos: u16, out: &mut Vec<(u32, GateHit)>)
 where
     I: IntoIterator<Item = (u32, &'a [u8])>,
 {
+    let n = GateNeedle::new(needle, max_typos);
     for (idx, hay) in hays {
-        if let Some(hit) = gate_hit(needle, hay, max_typos) {
+        if let Some(hit) = n.hit(hay) {
             out.push((idx, hit));
         }
     }
@@ -219,86 +344,21 @@ pub fn gate_file(
     buf: &mut [u8],
 ) -> Option<GateHit> {
     let hay = file.path.read_to_buf(arena, buf);
-    gate_hit(needle, hay.as_ref(), max_typos)
+    GateNeedle::new(needle, max_typos).hit(hay.as_ref())
 }
 
-
-
-/// Scan one path via 16-byte chunks into a growable span buffer only when
-/// needed. Returns gate hit without a PATH_BUF_SIZE truncation.
+/// Scan one path via 16-byte chunks. Returns gate hit without a
+/// PATH_BUF_SIZE truncation.
 pub fn gate_path_chunks(
     needle: &[u8],
     byte_len: usize,
     max_typos: u16,
-    mut visit: impl FnMut(&mut dyn FnMut(usize, &[u8])),
+    visit: impl FnMut(&mut dyn FnMut(usize, &[u8])),
 ) -> Option<GateHit> {
-    let m = needle.len();
-    if m == 0 || byte_len == 0 {
-        return None;
-    }
-    let typos = max_typos as usize;
-    let need = m.saturating_sub(typos);
-    if need == 0 {
-        return Some(GateHit {
-            start: 0,
-            end: byte_len.min(u16::MAX as usize) as u32,
-            include_prefix: true,
-        });
-    }
-    let mask = NeedleMask::new(needle);
-    // One visit: copy path into TLS buffer while tracking needle-byte span.
-    thread_local! {
-        static HAY: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-    }
-    let mut hay = HAY.with(|c| {
-        let mut b = c.borrow_mut();
-        if b.len() < byte_len {
-            b.resize(byte_len, 0);
-        } else {
-            // Overwrite without zeroing — chunks fill every byte we read.
-            unsafe { b.set_len(byte_len) };
-        }
-        std::mem::take(&mut *b)
-    });
-    let mut first = None;
-    let mut last = 0usize;
-    let mut n = 0usize;
-    visit(&mut |_off, chunk| {
-        let end = (_off + chunk.len()).min(byte_len);
-        if _off < end {
-            hay[_off..end].copy_from_slice(&chunk[..end - _off]);
-        }
-        for (i, &b) in chunk.iter().enumerate() {
-            if mask.contains(b) {
-                if first.is_none() {
-                    first = Some(_off + i);
-                }
-                last = _off + i;
-                n += 1;
-            }
-        }
-    });
-    if n < need {
-        HAY.with(|c| *c.borrow_mut() = hay);
-        return None;
-    }
-    let first = first.unwrap();
-    let hi = (last + 1).min(byte_len);
-    if hi.saturating_sub(first) < need {
-        HAY.with(|c| *c.borrow_mut() = hay);
-        return None;
-    }
-    let ok = skip_dp_accept(needle, &hay[..byte_len], first, hi, typos.min(MAX_SKIPS));
-    HAY.with(|c| *c.borrow_mut() = hay);
-    if !ok {
-        return None;
-    }
-    Some(GateHit {
-        start: first as u32,
-        end: hi as u32,
-        include_prefix: first == 0,
-    })
+    GateNeedle::new(needle, max_typos).hit_chunks(byte_len, visit)
 }
+
+
 
 /// Parallel match-set over FileItems. Emits frizbee-compatible
 /// `Match { score: start, end_col: end }` (skip_sw encoding).
@@ -307,7 +367,7 @@ pub fn gate_match_range<F, R>(
     needle: &[u8],
     n: usize,
     max_typos: u16,
-    _threads: usize,
+    threads: usize,
     file_index: F,
     resolve_len: R,
     resolve_chunks: impl Fn(u32, &mut dyn FnMut(usize, &[u8])) + Sync,
@@ -316,25 +376,31 @@ where
     F: Fn(u32) -> u32 + Sync,
     R: Fn(u32) -> usize + Sync,
 {
-    use rayon::prelude::*;
-    (0..n as u32)
-        .into_par_iter()
-        .filter_map(|i| {
-            let hay_len = resolve_len(i);
-            if hay_len == 0 {
-                return None;
-            }
-            let hit = gate_path_chunks(needle, hay_len, max_typos, |cb| {
-                resolve_chunks(i, cb);
-            })?;
-            Some(neo_frizbee::Match {
-                score: hit.start as u16,
-                index: file_index(i),
-                exact: false,
-                end_col: hit.end as u16,
-            })
+    // Needle state (span mask + bit-parallel position masks) is per query, so
+    // it is built once and shared by every path instead of per path.
+    let state = GateNeedle::new(needle, max_typos);
+    let scan = |i: u32| -> Option<neo_frizbee::Match> {
+        let hay_len = resolve_len(i);
+        if hay_len == 0 {
+            return None;
+        }
+        let hit = state.hit_chunks(hay_len, |cb| {
+            resolve_chunks(i, cb);
+        })?;
+        Some(neo_frizbee::Match {
+            score: hit.start as u16,
+            index: file_index(i),
+            exact: false,
+            end_col: hit.end as u16,
         })
-        .collect()
+    };
+    // Honor the dispatch decision: below ~1k paths (or an explicit 1T search)
+    // the rayon pool wakeup costs more than the gate itself.
+    if threads <= 1 || n < 1024 {
+        return (0..n as u32).filter_map(scan).collect();
+    }
+    use rayon::prelude::*;
+    (0..n as u32).into_par_iter().filter_map(scan).collect()
 }
 
 #[cfg(test)]

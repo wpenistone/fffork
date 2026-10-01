@@ -74,7 +74,7 @@ fn file_item_into_lua(item: &FileItem, lua: &Lua, picker: &FilePicker) -> LuaRes
         item.modification_frecency_score,
     )?;
     table.set("total_frecency_score", item.total_frecency_score())?;
-    table.set("git_status", format_git_status(item.git_status))?;
+    table.set("git_status", format_git_status(item.git_status()))?;
     table.set("git_recency_score", item.git_recency_score)?;
     table.set("is_binary", item.is_binary())?;
     Ok(LuaValue::Table(table))
@@ -247,7 +247,7 @@ impl IntoLua for GrepResultLua<'_> {
             item.set("relative_path", file.relative_path(self.picker))?;
             item.set("name", file.file_name(self.picker))?;
             item.set("is_binary", file.is_binary())?;
-            item.set("git_status", format_git_status(file.git_status))?;
+            item.set("git_status", format_git_status(file.git_status()))?;
             item.set("size", file.size)?;
             item.set("modified", file.modified)?;
             item.set("total_frecency_score", file.total_frecency_score())?;

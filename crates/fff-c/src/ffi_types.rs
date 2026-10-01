@@ -148,7 +148,7 @@ impl FffFileItem {
         FffFileItem {
             relative_path: cstring_new(&item.relative_path(picker)),
             file_name: cstring_new(&item.file_name(picker)),
-            git_status: cstring_new(format_git_status(item.git_status)),
+            git_status: cstring_new(format_git_status(item.git_status())),
             size: item.size,
             modified: item.modified,
             access_frecency_score: item.access_frecency_score as i64,
@@ -374,7 +374,7 @@ impl FffGrepMatch {
         FffGrepMatch {
             relative_path: cstring_new(&file.relative_path(picker)),
             file_name: cstring_new(&file.file_name(picker)),
-            git_status: cstring_new(format_git_status(file.git_status)),
+            git_status: cstring_new(format_git_status(file.git_status())),
             line_content: cstring_new(&m.line_content),
             match_ranges,
             context_before,
@@ -669,7 +669,7 @@ impl FffMixedItem {
                 item_type: 0,
                 relative_path: cstring_new(&file.relative_path(picker)),
                 display_name: cstring_new(&file.file_name(picker)),
-                git_status: cstring_new(format_git_status(file.git_status)),
+                git_status: cstring_new(format_git_status(file.git_status())),
                 size: file.size,
                 modified: file.modified,
                 access_frecency_score: file.access_frecency_score as i64,

@@ -380,6 +380,8 @@ mod tests {
             special_filename_bonus: 20, // informational only
             frecency_boost: 10,
             git_status_boost: 5,
+            git_recency_boost: 0,
+            evidence_bonus: 0,
             distance_penalty: -3,
             current_file_penalty: 0,
             combo_match_boost: 7,
@@ -416,6 +418,10 @@ pub struct ScoreBreakdown {
     pub special_filename_bonus: i32,
     pub frecency_boost: i32,
     pub git_status_boost: i32,
+    #[serde(default)]
+    pub git_recency_boost: i32,
+    #[serde(default)]
+    pub evidence_bonus: i32,
     pub distance_penalty: i32,
     pub current_file_penalty: i32,
     pub combo_match_boost: i32,
@@ -433,6 +439,8 @@ impl From<&fff::Score> for ScoreBreakdown {
             special_filename_bonus: s.special_filename_bonus,
             frecency_boost: s.frecency_boost,
             git_status_boost: s.git_status_boost,
+            git_recency_boost: s.git_recency_boost,
+            evidence_bonus: s.evidence_bonus,
             distance_penalty: s.distance_penalty,
             current_file_penalty: s.current_file_penalty,
             combo_match_boost: s.combo_match_boost,
@@ -458,11 +466,13 @@ pub fn score_components_sum(s: &ScoreBreakdown) -> i32 {
     s.base_score
         .saturating_add(s.frecency_boost)
         .saturating_add(s.git_status_boost)
+        .saturating_add(s.git_recency_boost)
         .saturating_add(s.distance_penalty)
         .saturating_add(s.filename_bonus)
         .saturating_add(s.current_file_penalty)
         .saturating_add(s.combo_match_boost)
         .saturating_add(s.path_alignment_bonus)
+        .saturating_add(s.evidence_bonus)
 }
 
 /// Composition check when breakdown is populated.

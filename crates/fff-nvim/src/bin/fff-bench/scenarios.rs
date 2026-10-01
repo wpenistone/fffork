@@ -147,6 +147,11 @@ pub fn expand_suite(suite: &str, repo_id: &str) -> Vec<Cell> {
     // Canonical pack names + aliases (FFF_REFERENCE_PACK / OPERATIONS).
     match suite {
         "ci-gates" | "gates" => family_gates(repo_id),
+        // Quality floor: labeled queries whose top-1 must be the intended file.
+        "ranking-gates" | "intent-gates" | "quality" => family_ranking_intent(repo_id),
+        // Latency floor probe: same queries across thread counts so a
+        // per-query overhead regression on small corpora becomes visible.
+        "size-sweep" | "sweep" => family_size_sweep(repo_id),
         "public-v1" | "fixture-gates" => compose_public_fixture(repo_id),
         // Fast rejection: critical gates + representative search + one grep family.
         "agent-screen" | "agent-loop" | "screen" => compose_agent_screen(repo_id),
@@ -426,6 +431,87 @@ fn family_gates(repo_id: &str) -> Vec<Cell> {
             )
         })
         .collect()
+/// Quality floor: labeled user queries, each pinned to the file the user
+/// actually wants at rank 0 — the regressions that matter when typing a
+/// filename, because fuzzy scoring alone buries them under test fixtures
+/// and vendored copies. Expectations are substrings so corpus copies of
+/// the same file cannot break them.
+fn family_ranking_intent(repo_id: &str) -> Vec<Cell> {
+    let cases = [
+        ("score.rs", "fff-core/src/score.rs"),
+        ("file_picker", "fff-core/src/file_picker.rs"),
+        ("lua_types", "nvim/src/lua_types.rs"),
+        ("picker_ui", "picker_ui/picker_ui.lua"),
+        ("frecncy", "dbs/frecency.rs"),
+        ("src/dbs", "dbs/mod.rs"),
+        ("fuzzy_search_bench", "benches/fuzzy_search_bench.rs"),
+        ("conf", "lua/fff/conf.lua"),
+        ("README", "README.md"),
+        ("path_utils", "path_utils.rs"),
+    ];
+    cases
+        .into_iter()
+        .map(|(query, expect)| {
+            let axes = json!({
+                "query": query, "limit": 50, "offset": 0, "threads": 4, "expect": expect,
+            });
+            cell(
+                "gate.ranking",
+                repo_id,
+                "quality",
+                CellKind::GateGolden,
+                axes,
+                Some(SearchCell {
+                    query: query.into(),
+                    limit: 50,
+                    offset: 0,
+                    threads: 4,
+                    expect_path_contains: Some(expect.into()),
+                    burst: 0,
+                    clients: 1,
+                    pages: 1,
+                    call_kind: None,
+                    stream: vec![],
+                }),
+                &["quality", "gate", "must_hit", "ranking"],
+            )
+        })
+        .collect()
+}
+
+/// Latency floor probe: representative queries at every thread count the
+/// picker can be asked for. Reported, not gated — a per-query overhead
+/// regression on small corpora shows up here before it reaches the gates.
+fn family_size_sweep(repo_id: &str) -> Vec<Cell> {
+    let mut cells = Vec::new();
+    for threads in [1usize, 4] {
+        for query in ["score", "file_picker", "readme", "mod"] {
+            let axes = json!({
+                "query": query, "limit": 100, "offset": 0, "threads": threads,
+            });
+            cells.push(cell(
+                "sweep.search",
+                repo_id,
+                "sweep",
+                CellKind::Search,
+                axes,
+                Some(SearchCell {
+                    query: query.into(),
+                    limit: 100,
+                    offset: 0,
+                    threads,
+                    burst: 0,
+                    clients: 1,
+                    pages: 1,
+                    call_kind: Some("file".into()),
+                    stream: vec![],
+                }),
+                &["sweep", "latency"],
+            ));
+        }
+    }
+    cells
+}
 }
 
 // ─── Core search matrix (selectivity × threads) ────────────────────────────
@@ -1775,6 +1861,8 @@ pub fn list_scenarios() -> Vec<(&'static str, &'static str)> {
         ("profile.stability.*", "repeat identical for variance"),
         ("profile.stress.*", "pathological fanout/burst/thrash"),
         ("ci-gates", "suite: required public gates only"),
+        ("ranking-gates", "suite: labeled ranking goldens (top-1 quality floor)"),
+        ("size-sweep", "suite: latency floor probe across thread counts"),
         ("public-v1", "suite: content-addressed fixture query bank"),
         ("agent-screen", "suite: gates + representative search/grep (fast reject)"),
         ("agent-confirm", "suite: decision-grade + mutation gate phase"),

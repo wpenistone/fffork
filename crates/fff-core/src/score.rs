@@ -186,9 +186,19 @@ fn match_fuzzy_parts(
                 options.max_typos.unwrap_or(u16::MAX),
                 threads,
                 |i| cand[i as usize],
-                |i| working_files.index(cand[i as usize] as usize).path.byte_len as usize,
+                |i| {
+                    let f = working_files.index(cand[i as usize] as usize);
+                    if f.is_deleted() {
+                        0
+                    } else {
+                        f.path.byte_len as usize
+                    }
+                },
                 |i, cb| {
                     let f = working_files.index(cand[i as usize] as usize);
+                    if f.is_deleted() {
+                        return;
+                    }
                     f.path.for_each_chunk(arena, cb);
                 },
             )
@@ -199,9 +209,19 @@ fn match_fuzzy_parts(
                 options.max_typos.unwrap_or(u16::MAX),
                 threads,
                 |i| i,
-                |i| working_files.index(i as usize).path.byte_len as usize,
+                |i| {
+                    let f = working_files.index(i as usize);
+                    if f.is_deleted() {
+                        0
+                    } else {
+                        f.path.byte_len as usize
+                    }
+                },
                 |i, cb| {
                     let f = working_files.index(i as usize);
+                    if f.is_deleted() {
+                        return;
+                    }
                     f.path.for_each_chunk(arena, cb);
                 },
             )
@@ -1903,15 +1923,24 @@ fn score_filtered_by_frecency<'a>(
     };
 
     match files {
-        FileItems::All(s) => s
+        // Small indexes cannot amortize Rayon scheduling for this cheap pass
+        // (upstream parity: stay serial under 32k or an explicit 1T search).
+        FileItems::All(s) if s.len() >= 32_768 && context.max_threads > 1 => s
             .par_iter()
             .filter_map(|f| {
                 let live = !f.is_deleted();
                 live.then_some(score_file(f))
             })
             .collect(),
+        FileItems::All(s) => s
+            .iter()
+            .filter_map(|f| {
+                let live = !f.is_deleted();
+                live.then_some(score_file(f))
+            })
+            .collect(),
         FileItems::Filtered { base, idx } => idx
-            .par_iter()
+            .iter()
             .filter_map(|&i| {
                 let f = &base[i as usize];
                 let live = !f.is_deleted();
