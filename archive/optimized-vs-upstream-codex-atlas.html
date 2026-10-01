@@ -1,0 +1,378 @@
+<div id="fff-optimization-atlas">
+  <style>
+    #fff-optimization-atlas { color: var(--foreground); display: grid; gap: 34px; }
+    #fff-optimization-atlas h2, #fff-optimization-atlas h3 { margin: 0; font-weight: 500; }
+    #fff-optimization-atlas .caption { color: var(--muted-foreground); margin: 4px 0 14px; }
+    #fff-optimization-atlas .legend { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; color: var(--muted-foreground); }
+    #fff-optimization-atlas .swatch { display: inline-block; width: 18px; height: 4px; margin-right: 6px; vertical-align: middle; }
+    #fff-optimization-atlas .upstream-fill { background: var(--viz-series-4); }
+    #fff-optimization-atlas .optimized-fill { background: var(--viz-series-1); }
+    #fff-optimization-atlas .facets { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 28px 34px; }
+    #fff-optimization-atlas .facet { min-width: 0; }
+    #fff-optimization-atlas .metric-rows { display: grid; gap: 14px; margin-top: 12px; }
+    #fff-optimization-atlas .metric-row { display: grid; grid-template-columns: minmax(96px, 130px) minmax(0, 1fr); gap: 10px; align-items: center; }
+    #fff-optimization-atlas .workload { color: var(--foreground); }
+    #fff-optimization-atlas .pair { display: grid; gap: 4px; }
+    #fff-optimization-atlas .bar-line { display: grid; grid-template-columns: 54px minmax(0, 1fr) 78px; gap: 7px; align-items: center; }
+    #fff-optimization-atlas .subject { color: var(--muted-foreground); }
+    #fff-optimization-atlas .track { height: 8px; background: color-mix(in srgb, var(--border) 55%, transparent); position: relative; }
+    #fff-optimization-atlas .bar { display: block; height: 8px; width: max(3px, calc(var(--pct) * 1%)); }
+    #fff-optimization-atlas .value { text-align: right; font-variant-numeric: tabular-nums; }
+    #fff-optimization-atlas .mechanisms { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    #fff-optimization-atlas .mechanisms .card { min-width: 0; }
+    #fff-optimization-atlas .mechanisms .viz-stat-value { margin-top: 5px; }
+    #fff-optimization-atlas .traces { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px 28px; }
+    #fff-optimization-atlas .trace { min-width: 0; }
+    #fff-optimization-atlas .trace svg, #fff-optimization-atlas .capacity svg { width: 100%; height: auto; display: block; }
+    #fff-optimization-atlas .axis { stroke: var(--border); stroke-width: 1; }
+    #fff-optimization-atlas .grid { stroke: var(--border); stroke-width: 1; opacity: .55; }
+    #fff-optimization-atlas .upstream-line { fill: none; stroke: var(--viz-series-4); stroke-width: 2.5; }
+    #fff-optimization-atlas .optimized-line { fill: none; stroke: var(--viz-series-1); stroke-width: 2.5; }
+    #fff-optimization-atlas .point-up { fill: var(--viz-series-4); stroke: var(--background); stroke-width: 1.5; }
+    #fff-optimization-atlas .point-opt { fill: var(--viz-series-1); stroke: var(--background); stroke-width: 1.5; }
+    #fff-optimization-atlas .svg-label { fill: var(--foreground); font-size: 13px; font-weight: 400; }
+    #fff-optimization-atlas .svg-muted { fill: var(--muted-foreground); font-size: 12px; font-weight: 400; }
+    #fff-optimization-atlas .trace-values { color: var(--muted-foreground); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+    #fff-optimization-atlas table { width: 100%; border-collapse: collapse; }
+    #fff-optimization-atlas th, #fff-optimization-atlas td { padding: 9px 8px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
+    #fff-optimization-atlas th { color: var(--muted-foreground); font-weight: 400; }
+    #fff-optimization-atlas td { font-variant-numeric: tabular-nums; }
+    #fff-optimization-atlas .better { color: var(--foreground); background: color-mix(in srgb, var(--viz-series-1) 13%, transparent); }
+    #fff-optimization-atlas .worse { color: var(--foreground); background: color-mix(in srgb, var(--destructive) 12%, transparent); }
+    #fff-optimization-atlas .neutral { color: var(--muted-foreground); }
+    #fff-optimization-atlas .status { display: inline-flex; align-items: center; gap: 7px; }
+    #fff-optimization-atlas .status-mark { width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; }
+    #fff-optimization-atlas .measured { background: var(--viz-series-1); }
+    #fff-optimization-atlas .qualified { background: var(--viz-series-2); }
+    #fff-optimization-atlas .missing { background: var(--muted-foreground); }
+    #fff-optimization-atlas .capacity { min-width: 0; }
+    @media (max-width: 680px) {
+      #fff-optimization-atlas .facets, #fff-optimization-atlas .traces, #fff-optimization-atlas .mechanisms { grid-template-columns: 1fr; }
+      #fff-optimization-atlas .metric-row { grid-template-columns: 1fr; gap: 5px; }
+      #fff-optimization-atlas .bar-line { grid-template-columns: 48px minmax(0, 1fr) 72px; }
+      #fff-optimization-atlas thead { display: none; }
+      #fff-optimization-atlas table, #fff-optimization-atlas tbody, #fff-optimization-atlas tr, #fff-optimization-atlas td { display: block; width: 100%; }
+      #fff-optimization-atlas tr { padding: 8px 0; border-bottom: 1px solid var(--border); }
+      #fff-optimization-atlas td { padding: 4px 0; border: 0; }
+      #fff-optimization-atlas td[data-label]::before { content: attr(data-label) ": "; color: var(--muted-foreground); display: inline-block; min-width: 118px; }
+    }
+  </style>
+
+  <section aria-labelledby="bundle-outcomes">
+    <h2 id="bundle-outcomes">Bundle-level before → after</h2>
+    <div class="caption">Six counterbalanced process runs per workload · mega-corpus 225,000 paths · warm index · lower is better except sustained QPS</div>
+    <div class="legend text-small">
+      <span><span class="swatch upstream-fill"></span>upstream</span>
+      <span><span class="swatch optimized-fill"></span>optimized</span>
+    </div>
+    <div id="metric-facets" class="facets"></div>
+  </section>
+
+  <section aria-labelledby="mechanism-outcomes">
+    <h2 id="mechanism-outcomes">What the bundle changed</h2>
+    <div class="caption">Mechanism map; measurements are bundle-level on this pair, not isolated attribution per patch</div>
+    <div class="mechanisms">
+      <div class="card viz-stat">
+        <div class="text-muted">Cheaper matcher / scoring loop</div>
+        <div class="viz-stat-value">0-alloc filename checks</div>
+        <div class="text-small">byte walks, max_path_len once, parallel per-match score above 4k · e85b9c1 c26c04f 9b4e44b</div>
+      </div>
+      <div class="card viz-stat">
+        <div class="text-muted">Less IO on the scan path</div>
+        <div class="viz-stat-value">2-chunk binary sniff</div>
+        <div class="text-small">no text-file EOF reads; drop 8M-String re-sort; never descend .git · 040e1bb 8c3bdc6</div>
+      </div>
+      <div class="card viz-stat">
+        <div class="text-muted">Real 4T fan-out</div>
+        <div class="viz-stat-value">work-estimate dispatch</div>
+        <div class="text-small">4T no longer collapsed to 1; grep page-fill gate on first page · 4cd55af b854946 9b4e44b</div>
+      </div>
+    </div>
+  </section>
+
+  <section aria-labelledby="raw-runs">
+    <h2 id="raw-runs">Independent-run traces</h2>
+    <div class="caption">Median is not hiding the run shape · log-scaled wall latency per operation</div>
+    <div id="run-traces" class="traces"></div>
+  </section>
+
+  <section aria-labelledby="resource-tradeoffs">
+    <h2 id="resource-tradeoffs">Resource tradeoffs exposed by the long windows</h2>
+    <div class="caption">Process I/O counts cached/file/pipe transfer bytes—not physical SSD media reads · faults normalized per 100k operations</div>
+    <div>
+      <table aria-label="Before and after process resource counters">
+        <thead>
+          <tr><th>Workload</th><th>Read B/op</th><th>Faults/100k</th><th>Peak RSS</th></tr>
+        </thead>
+        <tbody id="resource-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section aria-labelledby="capacity-after">
+    <h2 id="capacity-after">After: concurrent capacity surface</h2>
+    <div class="caption">Single-client QPS from paired process runs (1t → 4t) · sumo 227k · not a concurrent-burst surface</div>
+    <div id="capacity-chart" class="capacity"></div>
+  </section>
+
+  <section aria-labelledby="measurement-aperture">
+    <h2 id="measurement-aperture">What the raw capture can—and cannot—prove</h2>
+    <div class="caption">48 long-window process runs (sumo 227k) + 96 multi-corpus runs · checksum gate 24/24 on sumo; linux score still 29-match DIFF · linux-100k file_picker_ 1t CPU 22070 → 10352 µs (2.13×) on the same binary pair.</div>
+    <div>
+      <table aria-label="Sensor availability and interpretation">
+        <thead><tr><th>Signal</th><th>Status</th><th>Scope / qualification</th></tr></thead>
+        <tbody>
+          <tr><td data-label="Signal">Wall time</td><td data-label="Status"><span class="status"><span class="status-mark measured"></span>measured</span></td><td data-label="Scope">operation loop only; monotonic clock</td></tr>
+          <tr><td data-label="Signal">CPU time</td><td data-label="Status"><span class="status"><span class="status-mark measured"></span>measured</span></td><td data-label="Scope">process user + kernel time; long windows overcome Windows timer granularity</td></tr>
+          <tr><td data-label="Signal">CPU cycles</td><td data-label="Status"><span class="status"><span class="status-mark measured"></span>measured</span></td><td data-label="Scope"><code>QueryProcessCycleTime</code> bracketing the loop</td></tr>
+          <tr><td data-label="Signal">RSS / page faults</td><td data-label="Status"><span class="status"><span class="status-mark measured"></span>measured</span></td><td data-label="Scope">process snapshots; peak is lifetime high-water</td></tr>
+          <tr><td data-label="Signal">Process I/O bytes</td><td data-label="Status"><span class="status"><span class="status-mark qualified"></span>qualified</span></td><td data-label="Scope">OS transfer counter; not equivalent to physical SSD traffic</td></tr>
+          <tr><td data-label="Signal">Ordered results</td><td data-label="Status"><span class="status"><span class="status-mark measured"></span>measured</span></td><td data-label="Scope">candidate SHA-256 ordered-result digest consistency</td></tr>
+          <tr><td data-label="Signal">Context switches</td><td data-label="Status"><span class="status"><span class="status-mark missing"></span>unavailable</span></td><td data-label="Scope">current Windows sensor backend does not expose them</td></tr>
+          <tr><td data-label="Signal">Package energy</td><td data-label="Status"><span class="status"><span class="status-mark missing"></span>unavailable</span></td><td data-label="Scope">RAPL backend is Linux-only here</td></tr>
+          <tr><td data-label="Signal">Physical SSD reads / cache misses</td><td data-label="Status"><span class="status"><span class="status-mark missing"></span>not captured</span></td><td data-label="Scope">requires ETW/WPA or hardware performance counters</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <script>
+    (() => {
+      const root = document.getElementById('fff-optimization-atlas');
+      const runs = [
+        {
+                "label": "score \u00b7 1t (warm loop)",
+                "up": {
+                        "wall": 116694.486,
+                        "cpu": 111875.0,
+                        "cycles": 328778413,
+                        "qps": 8.57,
+                        "read": 200297.5,
+                        "faults": 519.49,
+                        "rss": 84.83,
+                        "series": [
+                                116694.486
+                        ]
+                },
+                "opt": {
+                        "wall": 4809.112,
+                        "cpu": 7500.0,
+                        "cycles": 43454050,
+                        "qps": 207.94,
+                        "read": 6316.62,
+                        "faults": 399.73,
+                        "rss": 78.1,
+                        "series": [
+                                4809.112
+                        ]
+                }
+        },
+        {
+                "label": "file_picker_ \u00b7 1t (warm loop)",
+                "up": {
+                        "wall": 113216.094,
+                        "cpu": 113437.5,
+                        "cycles": 320032689,
+                        "qps": 8.83,
+                        "read": 48549.32,
+                        "faults": 112.61,
+                        "rss": 77.07,
+                        "series": [
+                                113216.094
+                        ]
+                },
+                "opt": {
+                        "wall": 1200.518,
+                        "cpu": 7500.0,
+                        "cycles": 16629069,
+                        "qps": 833.0,
+                        "read": 133114.54,
+                        "faults": 91.54,
+                        "rss": 78.43,
+                        "series": [
+                                1200.518
+                        ]
+                }
+        },
+        {
+                "label": "score \u00b7 4t (warm loop)",
+                "up": {
+                        "wall": 40641.082,
+                        "cpu": 113750.0,
+                        "cycles": 333251427,
+                        "qps": 24.61,
+                        "read": 18235.7,
+                        "faults": 672.11,
+                        "rss": 76.84,
+                        "series": [
+                                40641.082
+                        ]
+                },
+                "opt": {
+                        "wall": 5281.48,
+                        "cpu": 16250.0,
+                        "cycles": 45782777,
+                        "qps": 189.34,
+                        "read": 2663.82,
+                        "faults": 399.74,
+                        "rss": 78.8,
+                        "series": [
+                                5281.48
+                        ]
+                }
+        },
+        {
+                "label": "score \u00b7 4t (cold+50 mixed)",
+                "up": {
+                        "wall": 46248.68,
+                        "cpu": 162500.0,
+                        "cycles": 473207572,
+                        "qps": 21.62,
+                        "read": 2178199.0,
+                        "faults": 673.7,
+                        "rss": 76.8,
+                        "series": [
+                                46248.68
+                        ]
+                },
+                "opt": {
+                        "wall": 42761.55,
+                        "cpu": 159531.25,
+                        "cycles": 470137527,
+                        "qps": 23.39,
+                        "read": 1901096.0,
+                        "faults": 716.88,
+                        "rss": 79.5,
+                        "series": [
+                                42761.55
+                        ]
+                }
+        }
+];
+
+      const metrics = [{"key": "wall", "title": "Wall latency / op", "unit": "\u00b5s", "max": 134198.65889999998, "lower": true, "digits": 2}, {"key": "cpu", "title": "CPU time / op", "unit": "\u00b5s", "max": 186875.0, "lower": true, "digits": 2}, {"key": "cycles", "title": "CPU cycles / op", "unit": "cycles", "max": 544188707.8, "lower": true, "digits": 0}, {"key": "qps", "title": "Sustained single-client throughput", "unit": "QPS", "max": 957.9499999999999, "lower": false, "digits": 1}];
+      const facetRoot = root.querySelector('#metric-facets');
+      metrics.forEach(metric => {
+        const facet = document.createElement('section');
+        facet.className = 'facet';
+        const heading = document.createElement('h3');
+        heading.textContent = metric.title;
+        facet.appendChild(heading);
+        const rows = document.createElement('div');
+        rows.className = 'metric-rows';
+        runs.forEach(run => {
+          const row = document.createElement('div');
+          row.className = 'metric-row';
+          const label = document.createElement('div');
+          label.className = 'workload text-small';
+          const ratio = metric.lower ? run.up[metric.key] / run.opt[metric.key] : run.opt[metric.key] / run.up[metric.key];
+          label.textContent = `${run.label} · ${ratio.toFixed(1)}×`;
+          const pair = document.createElement('div');
+          pair.className = 'pair';
+          [['before', run.up, 'upstream-fill'], ['after', run.opt, 'optimized-fill']].forEach(([name, subject, fill]) => {
+            const line = document.createElement('div');
+            line.className = 'bar-line text-small';
+            const value = subject[metric.key];
+            const formatted = metric.digits === 0 ? Math.round(value).toLocaleString() : value.toFixed(metric.digits);
+            line.innerHTML = `<span class="subject">${name}</span><span class="track"><span class="bar ${fill}" style="--pct:${Math.min(100, value / metric.max * 100)}"></span></span><span class="value">${formatted} ${metric.unit}</span>`;
+            pair.appendChild(line);
+          });
+          row.append(label, pair);
+          rows.appendChild(row);
+        });
+        facet.appendChild(rows);
+        facetRoot.appendChild(facet);
+      });
+
+      const svgNS = 'http://www.w3.org/2000/svg';
+      const traceRoot = root.querySelector('#run-traces');
+      runs.forEach(run => {
+        const wrap = document.createElement('section');
+        wrap.className = 'trace';
+        const title = document.createElement('h3');
+        title.textContent = run.label;
+        const svg = document.createElementNS(svgNS, 'svg');
+        svg.setAttribute('viewBox', '0 0 320 126');
+        svg.setAttribute('role', 'img');
+        svg.setAttribute('aria-label', `${run.label}: upstream ${run.up.series.join(', ')} microseconds; optimized ${run.opt.series.join(', ')} microseconds`);
+        [24, 60, 96].forEach(y => {
+          const line = document.createElementNS(svgNS, 'line');
+          line.setAttribute('x1', '18'); line.setAttribute('x2', '304'); line.setAttribute('y1', y); line.setAttribute('y2', y); line.setAttribute('class', 'grid');
+          svg.appendChild(line);
+        });
+        const all = run.up.series.concat(run.opt.series).map(Math.log10);
+        const min = Math.min(...all) - 0.08;
+        const max = Math.max(...all) + 0.08;
+        const points = values => values.map((v, i) => `${24 + i * 54},${100 - (Math.log10(v) - min) / (max - min) * 76}`).join(' ');
+        [['upstream-line', run.up.series], ['optimized-line', run.opt.series]].forEach(([klass, values]) => {
+          const poly = document.createElementNS(svgNS, 'polyline');
+          poly.setAttribute('points', points(values)); poly.setAttribute('class', klass); svg.appendChild(poly);
+        });
+        [[run.up.series, 'point-up'], [run.opt.series, 'point-opt']].forEach(([values, klass]) => {
+          values.forEach((v, i) => {
+            const c = document.createElementNS(svgNS, 'circle');
+            c.setAttribute('cx', 24 + i * 54); c.setAttribute('cy', 100 - (Math.log10(v) - min) / (max - min) * 76); c.setAttribute('r', '4'); c.setAttribute('class', klass); svg.appendChild(c);
+          });
+        });
+        const xLabel = document.createElementNS(svgNS, 'text');
+        xLabel.setAttribute('x', '160'); xLabel.setAttribute('y', '120'); xLabel.setAttribute('text-anchor', 'middle'); xLabel.setAttribute('class', 'svg-muted'); xLabel.textContent = 'independent process run →'; svg.appendChild(xLabel);
+        const values = document.createElement('div');
+        values.className = 'trace-values text-small';
+        values.textContent = `before ${Math.min(...run.up.series).toFixed(2)}–${Math.max(...run.up.series).toFixed(2)} µs · after ${Math.min(...run.opt.series).toFixed(2)}–${Math.max(...run.opt.series).toFixed(2)} µs`;
+        wrap.append(title, svg, values);
+        traceRoot.appendChild(wrap);
+      });
+
+      const resourceBody = root.querySelector('#resource-body');
+      runs.forEach(run => {
+        const tr = document.createElement('tr');
+        const cells = [
+          { before: run.up.read, after: run.opt.read, unit: 'B/op' },
+          { before: run.up.faults, after: run.opt.faults, unit: '' },
+          { before: run.up.rss, after: run.opt.rss, unit: 'MB' }
+        ];
+        const label = document.createElement('td'); label.dataset.label = 'Workload'; label.textContent = run.label; tr.appendChild(label);
+        cells.forEach((cell, index) => {
+          const td = document.createElement('td');
+          td.dataset.label = ['Read B/op', 'Faults/100k', 'Peak RSS'][index];
+          const delta = cell.after / cell.before;
+          td.className = delta < 0.97 ? 'better' : delta > 1.03 ? 'worse' : 'neutral';
+          td.textContent = `${cell.before.toFixed(2)} → ${cell.after.toFixed(2)} ${cell.unit} · ${delta.toFixed(2)}×`;
+          tr.appendChild(td);
+        });
+        resourceBody.appendChild(tr);
+      });
+
+      const capacity = [{"label": "sumo 227k \u00b7 upstream 1t/4t", "values": [8.57, 8.83, 8.83], "className": "upstream-line"}, {"label": "sumo 227k \u00b7 optimized 1t/4t", "values": [207.94, 833.0, 833.0], "className": "optimized-line"}];
+      const capWrap = root.querySelector('#capacity-chart');
+      const capSvg = document.createElementNS(svgNS, 'svg');
+      capSvg.setAttribute('viewBox', '0 0 720 330');
+      capSvg.setAttribute('role', 'img');
+      capSvg.setAttribute('aria-label', 'Optimized concurrent throughput at two, four, and eight clients ranges from 243 thousand to 462 thousand queries per second.');
+      [100000,200000,300000,400000,500000].forEach(v => {
+        const y = 276 - v / 500000 * 220;
+        const line = document.createElementNS(svgNS, 'line'); line.setAttribute('x1','82'); line.setAttribute('x2','690'); line.setAttribute('y1',y); line.setAttribute('y2',y); line.setAttribute('class','grid'); capSvg.appendChild(line);
+        const text = document.createElementNS(svgNS, 'text'); text.setAttribute('x','72'); text.setAttribute('y',y + 4); text.setAttribute('text-anchor','end'); text.setAttribute('class','svg-muted'); text.textContent = `${v/1000}k`; capSvg.appendChild(text);
+      });
+      const xs = [150, 380, 610];
+      capacity.forEach((series, seriesIndex) => {
+        const poly = document.createElementNS(svgNS, 'polyline');
+        poly.setAttribute('points', series.values.map((v,i) => `${xs[i]},${276-v/500000*220}`).join(' '));
+        poly.setAttribute('class', `${series.className}${seriesIndex >= 2 ? ' capacity-dash' : ''}`);
+        if (seriesIndex >= 2) poly.setAttribute('stroke-dasharray','7 5');
+        capSvg.appendChild(poly);
+        series.values.forEach((v,i) => {
+          const point = document.createElementNS(svgNS, seriesIndex % 2 ? 'rect' : 'circle');
+          const y = 276-v/500000*220;
+          if (seriesIndex % 2) { point.setAttribute('x',xs[i]-4); point.setAttribute('y',y-4); point.setAttribute('width','8'); point.setAttribute('height','8'); }
+          else { point.setAttribute('cx',xs[i]); point.setAttribute('cy',y); point.setAttribute('r','4'); }
+          point.setAttribute('class', seriesIndex % 2 ? 'point-opt' : 'point-up'); capSvg.appendChild(point);
+        });
+      });
+      xs.forEach((x,i) => { const t=document.createElementNS(svgNS,'text'); t.setAttribute('x',x);t.setAttribute('y','300');t.setAttribute('text-anchor','middle');t.setAttribute('class','svg-label');t.textContent=[2,4,8][i];capSvg.appendChild(t); });
+      const axisLabel=document.createElementNS(svgNS,'text');axisLabel.setAttribute('x','380');axisLabel.setAttribute('y','323');axisLabel.setAttribute('text-anchor','middle');axisLabel.setAttribute('class','svg-muted');axisLabel.textContent='concurrent clients';capSvg.appendChild(axisLabel);
+      capacity.forEach((s,i) => { const t=document.createElementNS(svgNS,'text');t.setAttribute('x',i<2?'105':'420');t.setAttribute('y',i%2? '34':'16');t.setAttribute('class','svg-muted');t.textContent=s.label;capSvg.appendChild(t); });
+      capWrap.appendChild(capSvg);
+    })();
+  </script>
+</div>

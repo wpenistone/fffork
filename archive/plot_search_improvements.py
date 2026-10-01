@@ -22,20 +22,20 @@ SIZES = [200, 1000, 5000, 20000]
 SWEEP = {
     ("upstream", 1): [62, 246, 1279, 4912],
     ("before", 1): [216, 796, 1514, 2277],
-    ("after", 1): [183, 711, 1132, 1843],
+    ("after", 1): [202, 764, 1306, 2258],
     ("upstream", 4): [68, 287, 1075, 2536],
     ("before", 4): [212, 792, 1793, 2771],
-    ("after", 4): [174, 730, 1260, 2039],
+    ("after", 4): [212, 766, 1519, 2338],
 }
-MEGA_US = {"score": (30592, 26061, 24975),
-           "file_picker.rs": (16443, 7418, 7181),
-           "test": (44734, 11802, 12730)}
-SMALL_US = {"AGENTS.md": (19, 262, 115), "readme": (112, 572, 279),
-            "score": (128, 600, 347)}
+MEGA_US = {"score": (30592, 26061, 18259),
+           "file_picker.rs": (16443, 7418, 3066),
+           "test": (44734, 11802, 9073)}
+SMALL_US = {"AGENTS.md": (19, 262, 95), "readme": (112, 572, 266),
+            "score": (128, 600, 292)}
 KEYS = ["s", "sc", "sco", "scor", "score", "file_p", "file_pi", "file_pic",
         "file_pick", "file_picker"]
 TYPING_MS = {"upstream": [3.0, 20.6, 23.0, 24.0, 44.3, 29.7, 16.3, 13.1, 12.5, 13.9],
-             "keepers": [13.3, 11.1, 12.1, 12.1, 23.0, 23.7, 12.3, 10.4, 8.2, 9.9]}
+             "keepers": [10.8, 10.1, 10.3, 9.2, 19.4, 10.7, 5.1, 3.1, 3.7, 9.1]}
 QUALITY = {"clean fff (1.8k)": {"upstream": (16, 0.838), "keepers": (18, 0.927)},
            "noisy tree (477+)": {"upstream": (13, 0.724), "keepers": (17, 0.875)}}
 
@@ -146,7 +146,7 @@ def main():
     fig.suptitle("FFF file search - perf/keepers vs upstream origin/main\n"
                  "measured p50, paired single-process warm runs; "
                  "'branch + fixes' = build restoration, tombstone filter, "
-                 "honoured thread budget, bit-parallel gate", fontsize=12.5, y=0.995)
+                 "honoured thread budget, bit-parallel streaming gate", fontsize=12.5, y=0.995)
     fig.tight_layout(rect=(0, 0, 1, 0.975))
     out = "archive/search-improvements-2026-10-01.png"
     fig.savefig(out, dpi=160); fig.savefig(out.replace(".png", ".svg"))

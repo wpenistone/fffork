@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>optimized vs upstream — multi-corpus atlas</title>
+<style>
+  :root {
+    --bg: #0b1220; --bg2: #121a28; --text: #e8eef8; --muted: #9aa9bd; --dim: #667788;
+    --up: #f97373; --up2: #f08fc0; --opt: #35d19f; --opt2: #60a5fa; --warn: #f59e0b; --line: #243044;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 "Segoe UI", system-ui, sans-serif; font-variant-numeric: tabular-nums; }
+  .wrap { max-width:1120px; margin:0 auto; padding:36px 28px 64px; }
+  h1 { font-size:28px; margin:0 0 6px; letter-spacing:-0.02em; }
+  .sub { color:var(--muted); font-size:13px; margin:0 0 10px; }
+  .legend { display:flex; gap:16px; color:var(--dim); font-size:12px; margin:12px 0 28px; flex-wrap:wrap; }
+  .swatch { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:6px; vertical-align:middle; }
+  h2 { font-size:18px; margin:36px 0 12px; }
+  h2 .shape { color:var(--dim); font-size:13px; font-weight:400; margin-left:8px; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+  .panel { background:var(--bg2); border:1px solid var(--line); border-radius:10px; padding:14px 16px 12px; }
+  .ptitle { font-size:14px; font-weight:600; }
+  .psub { color:var(--dim); font-size:11px; margin:2px 0 12px; }
+  .brow { display:grid; grid-template-columns:110px 1fr 56px; gap:8px; align-items:center; margin:8px 0; }
+  .blab { color:var(--muted); font-size:11px; text-align:right; }
+  .bbars { min-width:0; }
+  .bline { display:flex; align-items:center; gap:6px; margin:2px 0; }
+  .bfill { height:9px; border-radius:2px; min-width:2px; }
+  .bfill.up { background:var(--up); }
+  .bfill.opt { background:var(--opt); }
+  .bval { font-size:10px; white-space:nowrap; }
+  .bval.up { color:var(--up2); }
+  .bval.opt { color:var(--opt); }
+  .bratio { font-family:ui-monospace,Consolas,monospace; font-size:12px; text-align:right; }
+  .bratio.good { color:var(--opt); }
+  .bratio.bad { color:var(--up); }
+  table { width:100%; border-collapse:collapse; background:var(--bg2); border:1px solid var(--line); border-radius:10px; overflow:hidden; font-size:12px; }
+  th, td { padding:6px 10px; text-align:left; border-bottom:1px solid var(--line); }
+  th { color:var(--dim); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:0.04em; }
+  tr:last-child td { border-bottom:none; }
+  td.num, th.num { text-align:right; font-family:ui-monospace,Consolas,monospace; }
+  td.up { color:var(--up); }
+  td.opt { color:var(--opt); }
+  tr.cspan td { background:rgba(96,165,250,0.08); color:var(--opt2); font-weight:600; font-size:12px; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px; }
+  .pill.ok { background:rgba(53,209,159,0.15); color:var(--opt); border:1px solid rgba(53,209,159,0.4); }
+  .pill.bad { background:rgba(249,115,115,0.15); color:var(--up); border:1px solid rgba(249,115,115,0.4); }
+  .warnbox { margin:12px 0; padding:12px 14px; border-radius:8px; background:rgba(249,115,115,0.08); border:1px solid rgba(249,115,115,0.35); color:var(--up2); font-size:12px; }
+  .meta { margin-top:40px; color:var(--dim); font-size:11px; border-top:1px solid var(--line); padding-top:14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>Bundle-level before &rarr; after &mdash; multi-corpus</h1>
+  <p class="sub">Three counterbalanced blocks x 4 corpora x 4 workloads x 2 subjects = 96 process runs &middot; warm index &middot; lower is better except QPS</p>
+  <div class="legend">
+    <span><span class="swatch" style="background:#f97373"></span>upstream (pink)</span>
+    <span><span class="swatch" style="background:#35d19f"></span>optimized (green)</span>
+    <span>rows in capture: 96 &middot; subjects: upstream, optimized</span>
+    <span><span class="pill bad">checksum DIFF 42/48</span></span>
+  </div>
+</header>
+<div class="warnbox"><strong>CHECKSUM DIFFERENCES (6)</strong><ul><li><code>('linux-100k', 'score', 1, 1)</code>: [('upstream', 4072000), ('optimized', 4073750)]</li><li><code>('linux-100k', 'score', 1, 2)</code>: [('optimized', 4073750), ('upstream', 4072000)]</li><li><code>('linux-100k', 'score', 1, 3)</code>: [('upstream', 4072000), ('optimized', 4073750)]</li><li><code>('linux-100k', 'score', 4, 1)</code>: [('upstream', 4072000), ('optimized', 4073750)]</li><li><code>('linux-100k', 'score', 4, 2)</code>: [('optimized', 4073750), ('upstream', 4072000)]</li><li><code>('linux-100k', 'score', 4, 3)</code>: [('upstream', 4072000), ('optimized', 4073750)]</li></ul></div>
+<section>
+  <h2>Performance panels</h2>
+  <h2>sumo-227k <span class="shape">sumo tiny-files (227k)</span></h2><div class="grid2"><div class="panel">
+<div class="ptitle">Wall latency / op</div>
+<div class="psub">us (lower better)</div>
+<div class="brow">
+<div class="blab">file_picker_ 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:100.0%"></div><span class="bval up">65,496</span></div>
+<div class="bline"><div class="bfill opt" style="width:97.2%"></div><span class="bval opt">63,668</span></div>
+</div>
+<div class="bratio good">1.03x</div>
+</div>
+<div class="brow">
+<div class="blab">file_picker_ 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:34.7%"></div><span class="bval up">22,732</span></div>
+<div class="bline"><div class="bfill opt" style="width:33.7%"></div><span class="bval opt">22,075</span></div>
+</div>
+<div class="bratio good">1.03x</div>
+</div>
+<div class="brow">
+<div class="blab">score 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:87.9%"></div><span class="bval up">57,595</span></div>
+<div class="bline"><div class="bfill opt" style="width:85.8%"></div><span class="bval opt">56,174</span></div>
+</div>
+<div class="bratio good">1.03x</div>
+</div>
+<div class="brow">
+<div class="blab">score 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:43.6%"></div><span class="bval up">28,575</span></div>
+<div class="bline"><div class="bfill opt" style="width:37.5%"></div><span class="bval opt">24,533</span></div>
+</div>
+<div class="bratio good">1.16x</div>
+</div>
+</div><div class="panel">
+<div class="ptitle">CPU time / op</div>
+<div class="psub">us (lower better)</div>
+<div class="brow">
+<div class="blab">file_picker_ 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:64.6%"></div><span class="bval up">69,844</span></div>
+<div class="bline"><div class="bfill opt" style="width:63.8%"></div><span class="bval opt">68,906</span></div>
+</div>
+<div class="bratio good">1.01x</div>
+</div>
+<div class="brow">
+<div class="blab">file_picker_ 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:90.9%"></div><span class="bval up">98,281</span></div>
+<div class="bline"><div class="bfill opt" style="width:94.8%"></div><span class="bval opt">102,500</span></div>
+</div>
+<div class="bratio bad">0.96x</div>
+</div>
+<div class="brow">
+<div class="blab">score 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:68.9%"></div><span class="bval up">74,479</span></div>
+<div class="bline"><div class="bfill opt" style="width:76.6%"></div><span class="bval opt">82,812</span></div>
+</div>
+<div class="bratio bad">0.90x</div>
+</div>
+<div class="brow">
+<div class="blab">score 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:89.4%"></div><span class="bval up">96,615</span></div>
+<div class="bline"><div class="bfill opt" style="width:100.0%"></div><span class="bval opt">108,073</span></div>
+</div>
+<div class="bratio bad">0.89x</div>
+</div>
+</div><div class="panel">
+<div class="ptitle">CPU cycles / op</div>
+<div class="psub">cycles (lower better)</div>
+<div class="brow">
+<div class="blab">file_picker_ 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:68.9%"></div><span class="bval up">205,347,402</span></div>
+<div class="bline"><div class="bfill opt" style="width:69.7%"></div><span class="bval opt">207,777,838</span></div>
+</div>
+<div class="bratio bad">0.99x</div>
+</div>
+<div class="brow">
+<div class="blab">file_picker_ 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:96.1%"></div><span class="bval up">286,386,022</span></div>
+<div class="bline"><div class="bfill opt" style="width:98.9%"></div><span class="bval opt">294,612,844</span></div>
+</div>
+<div class="bratio bad">0.97x</div>
+</div>
+<div class="brow">
+<div class="blab">score 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:72.3%"></div><span class="bval up">215,430,543</span></div>
+<div class="bline"><div class="bfill opt" style="width:86.0%"></div><span class="bval opt">256,279,221</span></div>
+</div>
+<div class="bratio bad">0.84x</div>
+</div>
+<div class="brow">
+<div class="blab">score 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:95.3%"></div><span class="bval up">283,866,196</span></div>
+<div class="bline"><div class="bfill opt" style="width:100.0%"></div><span class="bval opt">297,979,269</span></div>
+</div>
+<div class="bratio bad">0.95x</div>
+</div>
+</div><div class="panel">
+<div class="ptitle">Sustained single-client QPS</div>
+<div class="psub">qps = 1e6/us_per_op (higher better)</div>
+<div class="brow">
+<div class="blab">file_picker_ 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:33.7%"></div><span class="bval up">15.3</span></div>
+<div class="bline"><div class="bfill opt" style="width:34.7%"></div><span class="bval opt">15.7</span></div>
+</div>
+<div class="bratio good">1.03x</div>
+</div>
+<div class="brow">
+<div class="blab">file_picker_ 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:97.1%"></div><span class="bval up">44.0</span></div>
+<div class="bline"><div class="bfill opt" style="width:100.0%"></div><span class="bval opt">45.3</span></div>
+</div>
+<div class="bratio good">1.03x</div>
+</div>
+<div class="brow">
+<div class="blab">score 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:38.3%"></div><span class="bval up">17.4</span></div>
+<div class="bline"><div class="bfill opt" style="width:39.3%"></div><span class="bval opt">17.8</span></div>
+</div>
+<div class="bratio good">1.03x</div>
+</div>
+<div class="brow">
+<div class="blab">score 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:77.3%"></div><span class="bval up">35.0</span></div>
+<div class="bline"><div class="bfill opt" style="width:90.0%"></div><span class="bval opt">40.8</span></div>
+</div>
+<div class="bratio good">1.16x</div>
+</div>
+</div></div><h2>linux-100k <span class="shape">linux medium-source (100k)</span></h2><div class="grid2"><div class="panel">
+<div class="ptitle">Wall latency / op</div>
+<div class="psub">us (lower better)</div>
+<div class="brow">
+<div class="blab">file_picker_ 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:67.4%"></div><span class="bval up">10,951</span></div>
+<div class="bline"><div class="bfill opt" style="width:62.4%"></div><span class="bval opt">10,151</span></div>
+</div>
+<div class="bratio good">1.08x</div>
+</div>
+<div class="brow">
+<div class="blab">file_picker_ 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:22.6%"></div><span class="bval up">3,674</span></div>
+<div class="bline"><div class="bfill opt" style="width:22.3%"></div><span class="bval opt">3,631</span></div>
+</div>
+<div class="bratio good">1.01x</div>
+</div>
+<div class="brow">
+<div class="blab">score 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:100.0%"></div><span class="bval up">16,258</span></div>
+<div class="bline"><div class="bfill opt" style="width:90.0%"></div><span class="bval opt">14,636</span></div>
+</div>
+<div class="bratio good">1.11x</div>
+</div>
+<div class="brow">
+<div class="blab">score 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:51.8%"></div><span class="bval up">8,418</span></div>
+<div class="bline"><div class="bfill opt" style="width:45.0%"></div><span class="bval opt">7,324</span></div>
+</div>
+<div class="bratio good">1.15x</div>
+</div>
+</div><div class="panel">
+<div class="ptitle">CPU time / op</div>
+<div class="psub">us (lower better)</div>
+<div class="brow">
+<div class="blab">file_picker_ 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:67.9%"></div><span class="bval up">22,070</span></div>
+<div class="bline"><div class="bfill opt" style="width:31.9%"></div><span class="bval opt">10,352</span></div>
+</div>
+<div class="bratio good">2.13x</div>
+</div>
+<div class="brow">
+<div class="blab">file_picker_ 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:50.5%"></div><span class="bval up">16,406</span></div>
+<div class="bline"><div class="bfill opt" style="width:30.6%"></div><span class="bval opt">9,961</span></div>
+</div>
+<div class="bratio good">1.65x</div>
+</div>
+<div class="brow">
+<div class="blab">score 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:100.0%"></div><span class="bval up">32,500</span></div>
+<div class="bline"><div class="bfill opt" style="width:64.4%"></div><span class="bval opt">20,938</span></div>
+</div>
+<div class="bratio good">1.55x</div>
+</div>
+<div class="brow">
+<div class="blab">score 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:75.0%"></div><span class="bval up">24,375</span></div>
+<div class="bline"><div class="bfill opt" style="width:66.3%"></div><span class="bval opt">21,562</span></div>
+</div>
+<div class="bratio good">1.13x</div>
+</div>
+</div><div class="panel">
+<div class="ptitle">CPU cycles / op</div>
+<div class="psub">cycles (lower better)</div>
+<div class="brow">
+<div class="blab">file_picker_ 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:68.2%"></div><span class="bval up">63,020,652</span></div>
+<div class="bline"><div class="bfill opt" style="width:33.1%"></div><span class="bval opt">30,587,749</span></div>
+</div>
+<div class="bratio good">2.06x</div>
+</div>
+<div class="brow">
+<div class="blab">file_picker_ 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:50.5%"></div><span class="bval up">46,644,409</span></div>
+<div class="bline"><div class="bfill opt" style="width:37.3%"></div><span class="bval opt">34,518,901</span></div>
+</div>
+<div class="bratio good">1.35x</div>
+</div>
+<div class="brow">
+<div class="blab">score 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:100.0%"></div><span class="bval up">92,443,519</span></div>
+<div class="bline"><div class="bfill opt" style="width:65.9%"></div><span class="bval opt">60,917,073</span></div>
+</div>
+<div class="bratio good">1.52x</div>
+</div>
+<div class="brow">
+<div class="blab">score 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:85.1%"></div><span class="bval up">78,654,153</span></div>
+<div class="bline"><div class="bfill opt" style="width:73.4%"></div><span class="bval opt">67,888,746</span></div>
+</div>
+<div class="bratio good">1.16x</div>
+</div>
+</div><div class="panel">
+<div class="ptitle">Sustained single-client QPS</div>
+<div class="psub">qps = 1e6/us_per_op (higher better)</div>
+<div class="brow">
+<div class="blab">file_picker_ 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:33.2%"></div><span class="bval up">91.3</span></div>
+<div class="bline"><div class="bfill opt" style="width:35.8%"></div><span class="bval opt">98.5</span></div>
+</div>
+<div class="bratio good">1.08x</div>
+</div>
+<div class="brow">
+<div class="blab">file_picker_ 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:98.8%"></div><span class="bval up">272.2</span></div>
+<div class="bline"><div class="bfill opt" style="width:100.0%"></div><span class="bval opt">275.4</span></div>
+</div>
+<div class="bratio good">1.01x</div>
+</div>
+<div class="brow">
+<div class="blab">score 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:22.3%"></div><span class="bval up">61.5</span></div>
+<div class="bline"><div class="bfill opt" style="width:24.8%"></div><span class="bval opt">68.3</span></div>
+</div>
+<div class="bratio good">1.11x</div>
+</div>
+<div class="brow">
+<div class="blab">score 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:43.1%"></div><span class="bval up">118.8</span></div>
+<div class="bline"><div class="bfill opt" style="width:49.6%"></div><span class="bval opt">136.5</span></div>
+</div>
+<div class="bratio good">1.15x</div>
+</div>
+</div></div><h2>pager-flat-51k <span class="shape">pager flat (51k)</span></h2><div class="grid2"><div class="panel">
+<div class="ptitle">Wall latency / op</div>
+<div class="psub">us (lower better)</div>
+<div class="brow">
+<div class="blab">file_picker_ 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:100.0%"></div><span class="bval up">1,933</span></div>
+<div class="bline"><div class="bfill opt" style="width:99.5%"></div><span class="bval opt">1,923</span></div>
+</div>
+<div class="bratio good">1.01x</div>
+</div>
+<div class="brow">
+<div class="blab">file_picker_ 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:42.3%"></div><span class="bval up">817</span></div>
+<div class="bline"><div class="bfill opt" style="width:44.1%"></div><span class="bval opt">853</span></div>
+</div>
+<div class="bratio bad">0.96x</div>
+</div>
+<div class="brow">
+<div class="blab">score 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:73.3%"></div><span class="bval up">1,416</span></div>
+<div class="bline"><div class="bfill opt" style="width:68.6%"></div><span class="bval opt">1,326</span></div>
+</div>
+<div class="bratio good">1.07x</div>
+</div>
+<div class="brow">
+<div class="blab">score 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:43.7%"></div><span class="bval up">844</span></div>
+<div class="bline"><div class="bfill opt" style="width:41.5%"></div><span class="bval opt">803</span></div>
+</div>
+<div class="bratio good">1.05x</div>
+</div>
+</div><div class="panel">
+<div class="ptitle">CPU time / op</div>
+<div class="psub">us (lower better)</div>
+<div class="brow">
+<div class="blab">file_picker_ 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:84.6%"></div><span class="bval up">2,148</span></div>
+<div class="bline"><div class="bfill opt" style="width:76.9%"></div><span class="bval opt">1,953</span></div>
+</div>
+<div class="bratio good">1.10x</div>
+</div>
+<div class="brow">
+<div class="blab">file_picker_ 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:76.9%"></div><span class="bval up">1,953</span></div>
+<div class="bline"><div class="bfill opt" style="width:100.0%"></div><span class="bval opt">2,539</span></div>
+</div>
+<div class="bratio bad">0.77x</div>
+</div>
+<div class="brow">
+<div class="blab">score 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:61.5%"></div><span class="bval up">1,562</span></div>
+<div class="bline"><div class="bfill opt" style="width:49.2%"></div><span class="bval opt">1,250</span></div>
+</div>
+<div class="bratio good">1.25x</div>
+</div>
+<div class="brow">
+<div class="blab">score 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:86.2%"></div><span class="bval up">2,188</span></div>
+<div class="bline"><div class="bfill opt" style="width:98.5%"></div><span class="bval opt">2,500</span></div>
+</div>
+<div class="bratio bad">0.88x</div>
+</div>
+</div><div class="panel">
+<div class="ptitle">CPU cycles / op</div>
+<div class="psub">cycles (lower better)</div>
+<div class="brow">
+<div class="blab">file_picker_ 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:81.1%"></div><span class="bval up">5,844,484</span></div>
+<div class="bline"><div class="bfill opt" style="width:81.0%"></div><span class="bval opt">5,835,938</span></div>
+</div>
+<div class="bratio good">1.00x</div>
+</div>
+<div class="brow">
+<div class="blab">file_picker_ 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:98.8%"></div><span class="bval up">7,117,265</span></div>
+<div class="bline"><div class="bfill opt" style="width:100.0%"></div><span class="bval opt">7,204,746</span></div>
+</div>
+<div class="bratio bad">0.99x</div>
+</div>
+<div class="brow">
+<div class="blab">score 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:59.5%"></div><span class="bval up">4,290,324</span></div>
+<div class="bline"><div class="bfill opt" style="width:55.7%"></div><span class="bval opt">4,016,032</span></div>
+</div>
+<div class="bratio good">1.07x</div>
+</div>
+<div class="brow">
+<div class="blab">score 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:77.4%"></div><span class="bval up">5,576,695</span></div>
+<div class="bline"><div class="bfill opt" style="width:73.7%"></div><span class="bval opt">5,310,141</span></div>
+</div>
+<div class="bratio good">1.05x</div>
+</div>
+</div><div class="panel">
+<div class="ptitle">Sustained single-client QPS</div>
+<div class="psub">qps = 1e6/us_per_op (higher better)</div>
+<div class="brow">
+<div class="blab">file_picker_ 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:41.5%"></div><span class="bval up">517.4</span></div>
+<div class="bline"><div class="bfill opt" style="width:41.8%"></div><span class="bval opt">520.0</span></div>
+</div>
+<div class="bratio good">1.01x</div>
+</div>
+<div class="brow">
+<div class="blab">file_picker_ 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:98.3%"></div><span class="bval up">1224.3</span></div>
+<div class="bline"><div class="bfill opt" style="width:94.1%"></div><span class="bval opt">1172.5</span></div>
+</div>
+<div class="bratio bad">0.96x</div>
+</div>
+<div class="brow">
+<div class="blab">score 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:56.7%"></div><span class="bval up">706.2</span></div>
+<div class="bline"><div class="bfill opt" style="width:60.6%"></div><span class="bval opt">754.3</span></div>
+</div>
+<div class="bratio good">1.07x</div>
+</div>
+<div class="brow">
+<div class="blab">score 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:95.1%"></div><span class="bval up">1184.7</span></div>
+<div class="bline"><div class="bfill opt" style="width:100.0%"></div><span class="bval opt">1245.4</span></div>
+</div>
+<div class="bratio good">1.05x</div>
+</div>
+</div></div><h2>faces-19k <span class="shape">faces large-media (19k)</span></h2><div class="grid2"><div class="panel">
+<div class="ptitle">Wall latency / op</div>
+<div class="psub">us (lower better)</div>
+<div class="brow">
+<div class="blab">file_picker_ 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:35.4%"></div><span class="bval up">886</span></div>
+<div class="bline"><div class="bfill opt" style="width:33.5%"></div><span class="bval opt">840</span></div>
+</div>
+<div class="bratio good">1.05x</div>
+</div>
+<div class="brow">
+<div class="blab">file_picker_ 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:18.5%"></div><span class="bval up">463</span></div>
+<div class="bline"><div class="bfill opt" style="width:33.9%"></div><span class="bval opt">849</span></div>
+</div>
+<div class="bratio bad">0.54x</div>
+</div>
+<div class="brow">
+<div class="blab">score 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:91.8%"></div><span class="bval up">2,301</span></div>
+<div class="bline"><div class="bfill opt" style="width:92.2%"></div><span class="bval opt">2,312</span></div>
+</div>
+<div class="bratio bad">1.00x</div>
+</div>
+<div class="brow">
+<div class="blab">score 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:73.0%"></div><span class="bval up">1,829</span></div>
+<div class="bline"><div class="bfill opt" style="width:100.0%"></div><span class="bval opt">2,506</span></div>
+</div>
+<div class="bratio bad">0.73x</div>
+</div>
+</div><div class="panel">
+<div class="ptitle">CPU time / op</div>
+<div class="psub">us (lower better)</div>
+<div class="brow">
+<div class="blab">file_picker_ 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:14.3%"></div><span class="bval up">781</span></div>
+<div class="bline"><div class="bfill opt" style="width:14.3%"></div><span class="bval opt">781</span></div>
+</div>
+<div class="bratio good">1.00x</div>
+</div>
+<div class="brow">
+<div class="blab">file_picker_ 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:23.8%"></div><span class="bval up">1,302</span></div>
+<div class="bline"><div class="bfill opt" style="width:14.3%"></div><span class="bval opt">781</span></div>
+</div>
+<div class="bratio good">1.67x</div>
+</div>
+<div class="brow">
+<div class="blab">score 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:57.1%"></div><span class="bval up">3,125</span></div>
+<div class="bline"><div class="bfill opt" style="width:78.6%"></div><span class="bval opt">4,297</span></div>
+</div>
+<div class="bratio bad">0.73x</div>
+</div>
+<div class="brow">
+<div class="blab">score 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:100.0%"></div><span class="bval up">5,469</span></div>
+<div class="bline"><div class="bfill opt" style="width:42.9%"></div><span class="bval opt">2,344</span></div>
+</div>
+<div class="bratio good">2.33x</div>
+</div>
+</div><div class="panel">
+<div class="ptitle">CPU cycles / op</div>
+<div class="psub">cycles (lower better)</div>
+<div class="brow">
+<div class="blab">file_picker_ 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:27.9%"></div><span class="bval up">3,424,443</span></div>
+<div class="bline"><div class="bfill opt" style="width:19.9%"></div><span class="bval opt">2,443,314</span></div>
+</div>
+<div class="bratio good">1.40x</div>
+</div>
+<div class="brow">
+<div class="blab">file_picker_ 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:38.7%"></div><span class="bval up">4,752,220</span></div>
+<div class="bline"><div class="bfill opt" style="width:20.1%"></div><span class="bval opt">2,462,418</span></div>
+</div>
+<div class="bratio good">1.93x</div>
+</div>
+<div class="brow">
+<div class="blab">score 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:77.7%"></div><span class="bval up">9,530,487</span></div>
+<div class="bline"><div class="bfill opt" style="width:87.1%"></div><span class="bval opt">10,680,785</span></div>
+</div>
+<div class="bratio bad">0.89x</div>
+</div>
+<div class="brow">
+<div class="blab">score 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:90.4%"></div><span class="bval up">11,086,255</span></div>
+<div class="bline"><div class="bfill opt" style="width:100.0%"></div><span class="bval opt">12,263,887</span></div>
+</div>
+<div class="bratio bad">0.90x</div>
+</div>
+</div><div class="panel">
+<div class="ptitle">Sustained single-client QPS</div>
+<div class="psub">qps = 1e6/us_per_op (higher better)</div>
+<div class="brow">
+<div class="blab">file_picker_ 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:52.2%"></div><span class="bval up">1128.5</span></div>
+<div class="bline"><div class="bfill opt" style="width:55.1%"></div><span class="bval opt">1190.6</span></div>
+</div>
+<div class="bratio good">1.05x</div>
+</div>
+<div class="brow">
+<div class="blab">file_picker_ 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:100.0%"></div><span class="bval up">2162.0</span></div>
+<div class="bline"><div class="bfill opt" style="width:54.5%"></div><span class="bval opt">1177.5</span></div>
+</div>
+<div class="bratio bad">0.54x</div>
+</div>
+<div class="brow">
+<div class="blab">score 1t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:20.1%"></div><span class="bval up">434.5</span></div>
+<div class="bline"><div class="bfill opt" style="width:20.0%"></div><span class="bval opt">432.6</span></div>
+</div>
+<div class="bratio bad">1.00x</div>
+</div>
+<div class="brow">
+<div class="blab">score 4t</div>
+<div class="bbars">
+<div class="bline"><div class="bfill up" style="width:25.3%"></div><span class="bval up">546.7</span></div>
+<div class="bline"><div class="bfill opt" style="width:18.5%"></div><span class="bval opt">399.0</span></div>
+</div>
+<div class="bratio bad">0.73x</div>
+</div>
+</div></div>
+</section>
+<section>
+  <h2>Median detail (per corpus x workload)</h2>
+  <table>
+    <thead><tr><th>corpus</th><th>workload</th><th>metric</th><th class="num">upstream</th><th class="num">optimized</th><th class="num">ratio</th></tr></thead>
+    <tbody>
+<tr class="cspan"><td colspan="6">sumo-227k — sumo tiny-files (227k)</td></tr>
+<tr><td>sumo-227k</td><td>file_picker_ 1t</td><td>wall us</td><td class='num up'>65,496</td><td class='num opt'>63,668</td><td class='num'>1.03x</td></tr>
+<tr><td></td><td></td><td>cpu us</td><td class='num up'>69,844</td><td class='num opt'>68,906</td><td class='num'>1.01x</td></tr>
+<tr><td></td><td></td><td>cycles</td><td class='num up'>205,347,402</td><td class='num opt'>207,777,838</td><td class='num'>0.99x</td></tr>
+<tr><td></td><td></td><td>read B/op</td><td class='num up'>73,413</td><td class='num opt'>172,117</td><td class='num'>0.43x</td></tr>
+<tr><td></td><td></td><td>faults/100k</td><td class='num up'>110,375,000</td><td class='num opt'>118,600,000</td><td class='num'>0.93x</td></tr>
+<tr><td></td><td></td><td>peak RSS MB</td><td class='num up'>76.6</td><td class='num opt'>78.6</td><td class='num'>0.97x</td></tr>
+<tr><td></td><td></td><td>QPS</td><td class='num up'>15.27</td><td class='num opt'>15.71</td><td class='num'>1.03x</td></tr>
+<tr><td>sumo-227k</td><td>file_picker_ 4t</td><td>wall us</td><td class='num up'>22,732</td><td class='num opt'>22,075</td><td class='num'>1.03x</td></tr>
+<tr><td></td><td></td><td>cpu us</td><td class='num up'>98,281</td><td class='num opt'>102,500</td><td class='num'>0.96x</td></tr>
+<tr><td></td><td></td><td>cycles</td><td class='num up'>286,386,022</td><td class='num opt'>294,612,844</td><td class='num'>0.97x</td></tr>
+<tr><td></td><td></td><td>read B/op</td><td class='num up'>1,997,767</td><td class='num opt'>1,789,373</td><td class='num'>1.12x</td></tr>
+<tr><td></td><td></td><td>faults/100k</td><td class='num up'>146,303,000</td><td class='num opt'>161,683,000</td><td class='num'>0.90x</td></tr>
+<tr><td></td><td></td><td>peak RSS MB</td><td class='num up'>76.7</td><td class='num opt'>78.6</td><td class='num'>0.98x</td></tr>
+<tr><td></td><td></td><td>QPS</td><td class='num up'>43.99</td><td class='num opt'>45.30</td><td class='num'>1.03x</td></tr>
+<tr><td>sumo-227k</td><td>score 1t</td><td>wall us</td><td class='num up'>57,595</td><td class='num opt'>56,174</td><td class='num'>1.03x</td></tr>
+<tr><td></td><td></td><td>cpu us</td><td class='num up'>74,479</td><td class='num opt'>82,812</td><td class='num'>0.90x</td></tr>
+<tr><td></td><td></td><td>cycles</td><td class='num up'>215,430,543</td><td class='num opt'>256,279,221</td><td class='num'>0.84x</td></tr>
+<tr><td></td><td></td><td>read B/op</td><td class='num up'>1,293,329</td><td class='num opt'>1,760,615</td><td class='num'>0.73x</td></tr>
+<tr><td></td><td></td><td>faults/100k</td><td class='num up'>516,791,667</td><td class='num opt'>523,280,000</td><td class='num'>0.99x</td></tr>
+<tr><td></td><td></td><td>peak RSS MB</td><td class='num up'>76.7</td><td class='num opt'>78.5</td><td class='num'>0.98x</td></tr>
+<tr><td></td><td></td><td>QPS</td><td class='num up'>17.36</td><td class='num opt'>17.80</td><td class='num'>1.03x</td></tr>
+<tr><td>sumo-227k</td><td>score 4t</td><td>wall us</td><td class='num up'>28,575</td><td class='num opt'>24,533</td><td class='num'>1.16x</td></tr>
+<tr><td></td><td></td><td>cpu us</td><td class='num up'>96,615</td><td class='num opt'>108,073</td><td class='num'>0.89x</td></tr>
+<tr><td></td><td></td><td>cycles</td><td class='num up'>283,866,196</td><td class='num opt'>297,979,269</td><td class='num'>0.95x</td></tr>
+<tr><td></td><td></td><td>read B/op</td><td class='num up'>2,612,145</td><td class='num opt'>1,980,578</td><td class='num'>1.32x</td></tr>
+<tr><td></td><td></td><td>faults/100k</td><td class='num up'>682,180,000</td><td class='num opt'>679,861,667</td><td class='num'>1.00x</td></tr>
+<tr><td></td><td></td><td>peak RSS MB</td><td class='num up'>76.9</td><td class='num opt'>78.6</td><td class='num'>0.98x</td></tr>
+<tr><td></td><td></td><td>QPS</td><td class='num up'>35.00</td><td class='num opt'>40.76</td><td class='num'>1.16x</td></tr>
+<tr class="cspan"><td colspan="6">linux-100k — linux medium-source (100k)</td></tr>
+<tr><td>linux-100k</td><td>file_picker_ 1t</td><td>wall us</td><td class='num up'>10,951</td><td class='num opt'>10,151</td><td class='num'>1.08x</td></tr>
+<tr><td></td><td></td><td>cpu us</td><td class='num up'>22,070</td><td class='num opt'>10,352</td><td class='num'>2.13x</td></tr>
+<tr><td></td><td></td><td>cycles</td><td class='num up'>63,020,652</td><td class='num opt'>30,587,749</td><td class='num'>2.06x</td></tr>
+<tr><td></td><td></td><td>read B/op</td><td class='num up'>3,640</td><td class='num opt'>4,815</td><td class='num'>0.76x</td></tr>
+<tr><td></td><td></td><td>faults/100k</td><td class='num up'>670,000</td><td class='num opt'>0</td><td class='num'>n/a</td></tr>
+<tr><td></td><td></td><td>peak RSS MB</td><td class='num up'>125.0</td><td class='num opt'>37.2</td><td class='num'>3.36x</td></tr>
+<tr><td></td><td></td><td>QPS</td><td class='num up'>91.32</td><td class='num opt'>98.51</td><td class='num'>1.08x</td></tr>
+<tr><td>linux-100k</td><td>file_picker_ 4t</td><td>wall us</td><td class='num up'>3,674</td><td class='num opt'>3,631</td><td class='num'>1.01x</td></tr>
+<tr><td></td><td></td><td>cpu us</td><td class='num up'>16,406</td><td class='num opt'>9,961</td><td class='num'>1.65x</td></tr>
+<tr><td></td><td></td><td>cycles</td><td class='num up'>46,644,409</td><td class='num opt'>34,518,901</td><td class='num'>1.35x</td></tr>
+<tr><td></td><td></td><td>read B/op</td><td class='num up'>1,419</td><td class='num opt'>1,123</td><td class='num'>1.26x</td></tr>
+<tr><td></td><td></td><td>faults/100k</td><td class='num up'>5,113,750</td><td class='num opt'>2,835,000</td><td class='num'>1.80x</td></tr>
+<tr><td></td><td></td><td>peak RSS MB</td><td class='num up'>110.4</td><td class='num opt'>37.2</td><td class='num'>2.97x</td></tr>
+<tr><td></td><td></td><td>QPS</td><td class='num up'>272.19</td><td class='num opt'>275.39</td><td class='num'>1.01x</td></tr>
+<tr><td>linux-100k</td><td>score 1t</td><td>wall us</td><td class='num up'>16,258</td><td class='num opt'>14,636</td><td class='num'>1.11x</td></tr>
+<tr><td></td><td></td><td>cpu us</td><td class='num up'>32,500</td><td class='num opt'>20,938</td><td class='num'>1.55x</td></tr>
+<tr><td></td><td></td><td>cycles</td><td class='num up'>92,443,519</td><td class='num opt'>60,917,073</td><td class='num'>1.52x</td></tr>
+<tr><td></td><td></td><td>read B/op</td><td class='num up'>7,312</td><td class='num opt'>6,246</td><td class='num'>1.17x</td></tr>
+<tr><td></td><td></td><td>faults/100k</td><td class='num up'>168,716,000</td><td class='num opt'>192,080,000</td><td class='num'>0.88x</td></tr>
+<tr><td></td><td></td><td>peak RSS MB</td><td class='num up'>133.7</td><td class='num opt'>37.1</td><td class='num'>3.60x</td></tr>
+<tr><td></td><td></td><td>QPS</td><td class='num up'>61.51</td><td class='num opt'>68.32</td><td class='num'>1.11x</td></tr>
+<tr><td>linux-100k</td><td>score 4t</td><td>wall us</td><td class='num up'>8,418</td><td class='num opt'>7,324</td><td class='num'>1.15x</td></tr>
+<tr><td></td><td></td><td>cpu us</td><td class='num up'>24,375</td><td class='num opt'>21,562</td><td class='num'>1.13x</td></tr>
+<tr><td></td><td></td><td>cycles</td><td class='num up'>78,654,153</td><td class='num opt'>67,888,746</td><td class='num'>1.16x</td></tr>
+<tr><td></td><td></td><td>read B/op</td><td class='num up'>3,830</td><td class='num opt'>3,625</td><td class='num'>1.06x</td></tr>
+<tr><td></td><td></td><td>faults/100k</td><td class='num up'>167,074,000</td><td class='num opt'>245,338,000</td><td class='num'>0.68x</td></tr>
+<tr><td></td><td></td><td>peak RSS MB</td><td class='num up'>136.2</td><td class='num opt'>38.2</td><td class='num'>3.57x</td></tr>
+<tr><td></td><td></td><td>QPS</td><td class='num up'>118.79</td><td class='num opt'>136.54</td><td class='num'>1.15x</td></tr>
+<tr class="cspan"><td colspan="6">pager-flat-51k — pager flat (51k)</td></tr>
+<tr><td>pager-flat-51k</td><td>file_picker_ 1t</td><td>wall us</td><td class='num up'>1,933</td><td class='num opt'>1,923</td><td class='num'>1.01x</td></tr>
+<tr><td></td><td></td><td>cpu us</td><td class='num up'>2,148</td><td class='num opt'>1,953</td><td class='num'>1.10x</td></tr>
+<tr><td></td><td></td><td>cycles</td><td class='num up'>5,844,484</td><td class='num opt'>5,835,938</td><td class='num'>1.00x</td></tr>
+<tr><td></td><td></td><td>read B/op</td><td class='num up'>69</td><td class='num opt'>67</td><td class='num'>1.03x</td></tr>
+<tr><td></td><td></td><td>faults/100k</td><td class='num up'>0</td><td class='num opt'>0</td><td class='num'>n/a</td></tr>
+<tr><td></td><td></td><td>peak RSS MB</td><td class='num up'>21.3</td><td class='num opt'>50.5</td><td class='num'>0.42x</td></tr>
+<tr><td></td><td></td><td>QPS</td><td class='num up'>517.41</td><td class='num opt'>520.03</td><td class='num'>1.01x</td></tr>
+<tr><td>pager-flat-51k</td><td>file_picker_ 4t</td><td>wall us</td><td class='num up'>817</td><td class='num opt'>853</td><td class='num'>0.96x</td></tr>
+<tr><td></td><td></td><td>cpu us</td><td class='num up'>1,953</td><td class='num opt'>2,539</td><td class='num'>0.77x</td></tr>
+<tr><td></td><td></td><td>cycles</td><td class='num up'>7,117,265</td><td class='num opt'>7,204,746</td><td class='num'>0.99x</td></tr>
+<tr><td></td><td></td><td>read B/op</td><td class='num up'>27</td><td class='num opt'>29</td><td class='num'>0.93x</td></tr>
+<tr><td></td><td></td><td>faults/100k</td><td class='num up'>2,457,500</td><td class='num opt'>2,025,000</td><td class='num'>1.21x</td></tr>
+<tr><td></td><td></td><td>peak RSS MB</td><td class='num up'>21.2</td><td class='num opt'>50.5</td><td class='num'>0.42x</td></tr>
+<tr><td></td><td></td><td>QPS</td><td class='num up'>1224.30</td><td class='num opt'>1172.46</td><td class='num'>0.96x</td></tr>
+<tr><td>pager-flat-51k</td><td>score 1t</td><td>wall us</td><td class='num up'>1,416</td><td class='num opt'>1,326</td><td class='num'>1.07x</td></tr>
+<tr><td></td><td></td><td>cpu us</td><td class='num up'>1,562</td><td class='num opt'>1,250</td><td class='num'>1.25x</td></tr>
+<tr><td></td><td></td><td>cycles</td><td class='num up'>4,290,324</td><td class='num opt'>4,016,032</td><td class='num'>1.07x</td></tr>
+<tr><td></td><td></td><td>read B/op</td><td class='num up'>46</td><td class='num opt'>47</td><td class='num'>0.98x</td></tr>
+<tr><td></td><td></td><td>faults/100k</td><td class='num up'>1,064,000</td><td class='num opt'>1,786,000</td><td class='num'>0.60x</td></tr>
+<tr><td></td><td></td><td>peak RSS MB</td><td class='num up'>21.2</td><td class='num opt'>50.5</td><td class='num'>0.42x</td></tr>
+<tr><td></td><td></td><td>QPS</td><td class='num up'>706.18</td><td class='num opt'>754.34</td><td class='num'>1.07x</td></tr>
+<tr><td>pager-flat-51k</td><td>score 4t</td><td>wall us</td><td class='num up'>844</td><td class='num opt'>803</td><td class='num'>1.05x</td></tr>
+<tr><td></td><td></td><td>cpu us</td><td class='num up'>2,188</td><td class='num opt'>2,500</td><td class='num'>0.88x</td></tr>
+<tr><td></td><td></td><td>cycles</td><td class='num up'>5,576,695</td><td class='num opt'>5,310,141</td><td class='num'>1.05x</td></tr>
+<tr><td></td><td></td><td>read B/op</td><td class='num up'>48</td><td class='num opt'>29</td><td class='num'>1.63x</td></tr>
+<tr><td></td><td></td><td>faults/100k</td><td class='num up'>5,082,000</td><td class='num opt'>2,298,000</td><td class='num'>2.21x</td></tr>
+<tr><td></td><td></td><td>peak RSS MB</td><td class='num up'>21.2</td><td class='num opt'>50.5</td><td class='num'>0.42x</td></tr>
+<tr><td></td><td></td><td>QPS</td><td class='num up'>1184.70</td><td class='num opt'>1245.43</td><td class='num'>1.05x</td></tr>
+<tr class="cspan"><td colspan="6">faces-19k — faces large-media (19k)</td></tr>
+<tr><td>faces-19k</td><td>file_picker_ 1t</td><td>wall us</td><td class='num up'>886</td><td class='num opt'>840</td><td class='num'>1.05x</td></tr>
+<tr><td></td><td></td><td>cpu us</td><td class='num up'>781</td><td class='num opt'>781</td><td class='num'>1.00x</td></tr>
+<tr><td></td><td></td><td>cycles</td><td class='num up'>3,424,443</td><td class='num opt'>2,443,314</td><td class='num'>1.40x</td></tr>
+<tr><td></td><td></td><td>read B/op</td><td class='num up'>83,308</td><td class='num opt'>0</td><td class='num'>n/a</td></tr>
+<tr><td></td><td></td><td>faults/100k</td><td class='num up'>0</td><td class='num opt'>0</td><td class='num'>n/a</td></tr>
+<tr><td></td><td></td><td>peak RSS MB</td><td class='num up'>16.4</td><td class='num opt'>25.9</td><td class='num'>0.63x</td></tr>
+<tr><td></td><td></td><td>QPS</td><td class='num up'>1128.51</td><td class='num opt'>1190.58</td><td class='num'>1.05x</td></tr>
+<tr><td>faces-19k</td><td>file_picker_ 4t</td><td>wall us</td><td class='num up'>463</td><td class='num opt'>849</td><td class='num'>0.54x</td></tr>
+<tr><td></td><td></td><td>cpu us</td><td class='num up'>1,302</td><td class='num opt'>781</td><td class='num'>1.67x</td></tr>
+<tr><td></td><td></td><td>cycles</td><td class='num up'>4,752,220</td><td class='num opt'>2,462,418</td><td class='num'>1.93x</td></tr>
+<tr><td></td><td></td><td>read B/op</td><td class='num up'>402,909</td><td class='num opt'>0</td><td class='num'>n/a</td></tr>
+<tr><td></td><td></td><td>faults/100k</td><td class='num up'>2,410,000</td><td class='num opt'>0</td><td class='num'>n/a</td></tr>
+<tr><td></td><td></td><td>peak RSS MB</td><td class='num up'>16.4</td><td class='num opt'>25.6</td><td class='num'>0.64x</td></tr>
+<tr><td></td><td></td><td>QPS</td><td class='num up'>2161.97</td><td class='num opt'>1177.47</td><td class='num'>0.54x</td></tr>
+<tr><td>faces-19k</td><td>score 1t</td><td>wall us</td><td class='num up'>2,301</td><td class='num opt'>2,312</td><td class='num'>1.00x</td></tr>
+<tr><td></td><td></td><td>cpu us</td><td class='num up'>3,125</td><td class='num opt'>4,297</td><td class='num'>0.73x</td></tr>
+<tr><td></td><td></td><td>cycles</td><td class='num up'>9,530,487</td><td class='num opt'>10,680,785</td><td class='num'>0.89x</td></tr>
+<tr><td></td><td></td><td>read B/op</td><td class='num up'>272,234</td><td class='num opt'>0</td><td class='num'>n/a</td></tr>
+<tr><td></td><td></td><td>faults/100k</td><td class='num up'>38,275,000</td><td class='num opt'>38,945,000</td><td class='num'>0.98x</td></tr>
+<tr><td></td><td></td><td>peak RSS MB</td><td class='num up'>16.3</td><td class='num opt'>25.9</td><td class='num'>0.63x</td></tr>
+<tr><td></td><td></td><td>QPS</td><td class='num up'>434.50</td><td class='num opt'>432.55</td><td class='num'>1.00x</td></tr>
+<tr><td>faces-19k</td><td>score 4t</td><td>wall us</td><td class='num up'>1,829</td><td class='num opt'>2,506</td><td class='num'>0.73x</td></tr>
+<tr><td></td><td></td><td>cpu us</td><td class='num up'>5,469</td><td class='num opt'>2,344</td><td class='num'>2.33x</td></tr>
+<tr><td></td><td></td><td>cycles</td><td class='num up'>11,086,255</td><td class='num opt'>12,263,887</td><td class='num'>0.90x</td></tr>
+<tr><td></td><td></td><td>read B/op</td><td class='num up'>211,282</td><td class='num opt'>0</td><td class='num'>n/a</td></tr>
+<tr><td></td><td></td><td>faults/100k</td><td class='num up'>40,417,500</td><td class='num opt'>39,427,500</td><td class='num'>1.03x</td></tr>
+<tr><td></td><td></td><td>peak RSS MB</td><td class='num up'>18.1</td><td class='num opt'>25.8</td><td class='num'>0.70x</td></tr>
+<tr><td></td><td></td><td>QPS</td><td class='num up'>546.72</td><td class='num opt'>398.99</td><td class='num'>0.73x</td></tr>
+    </tbody>
+  </table>
+</section>
+<div class="meta">
+  Checksum gate: DIFFS (42/48 match) &middot; subject labels: upstream, optimized &middot; n_rows=96<br/>
+  source: archive/paired-sensors-multi.jsonl &middot; corpora: sumo-worktree 227k (tiny-files), keen-oppenheimer 100k (linux medium-source), 911-pager-v2 51k (flat), studyofus-faces 19k (large-media) &middot; warm index
+</div>
+</div>
+</body>
+</html>

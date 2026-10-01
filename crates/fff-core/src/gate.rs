@@ -252,7 +252,109 @@ impl GateNeedle {
         })
     }
 
+    /// Gate a `FileItem` directly: reads its chunk pointers from the arena and
+    /// streams the LCS in one pass. No path copy, no per-chunk callback —
+    /// the chunk walk is inlined here so the compiler can keep it in registers.
+    pub fn hit_file(
+        &self,
+        file: &FileItem,
+        arena: ArenaPtr,
+    ) -> Option<GateHit> {
+        if file.is_deleted() || self.needle.is_empty() {
+            return None;
+        }
+        let byte_len = file.path.byte_len as usize;
+        if byte_len == 0 {
+            return None;
+        }
+        if self.needle.len() <= 64 {
+            // Typos cover the whole needle: every path is a candidate and the
+            // window is the full path (same short-circuit as `hit`).
+            if self.need == 0 {
+                return Some(GateHit {
+                    start: 0,
+                    end: byte_len as u32,
+                    include_prefix: true,
+                });
+            }
+            let pm = &*self.pm;
+            let mask = self.len_mask;
+            let greedy = self.typos == 0;
+            let mut s = 0u64;
+            let mut next_needle = 0usize;
+            let mut first = usize::MAX;
+            let mut last = 0usize;
+            let mut n = 0usize;
+            let path = &file.path;
+            path.for_each_chunk(arena, |off, chunk| {
+                let end = (off + chunk.len()).min(byte_len);
+                for (i, &b) in chunk[..end - off].iter().enumerate() {
+                    // One fold, one lookup: `pm[c] != 0` is exactly "c is a
+                    // needle byte", so this replaces the separate span test.
+                    // Bytes outside the needle (separators, digits) can't move
+                    // the LCS, so they cost a single load and a branch.
+                    let m = pm[fold_byte(b) as usize];
+                    if m == 0 {
+                        continue;
+                    }
+                    if n == 0 {
+                        first = off + i;
+                    }
+                    last = off + i;
+                    n += 1;
+                    if greedy {
+                        if next_needle < self.needle.len()
+                            && fold_byte(self.needle[next_needle]) == fold_byte(b)
+                        {
+                            next_needle += 1;
+                        }
+                    } else {
+                        let x = s | m;
+                        let y = (s << 1) | 1;
+                        s = x & (x ^ x.wrapping_sub(y));
+                    }
+                }
+            });
+            let lcs = if greedy {
+                next_needle
+            } else {
+                (s & mask).count_ones() as usize
+            };
+            if lcs < self.need || first == usize::MAX {
+                return None;
+            }
+            return Some(GateHit {
+                start: first as u32,
+                end: (last + 1).min(byte_len) as u32,
+                include_prefix: first == 0,
+            });
+        }
+        // Long needles need random access: stage the path, then skip-DP.
+        thread_local! {
+            static HAY: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let mut hay = HAY.with(|c| {
+            let mut b = c.borrow_mut();
+            if b.len() < byte_len {
+                b.resize(byte_len, 0);
+            } else {
+                unsafe { b.set_len(byte_len) };
+            }
+            std::mem::take(&mut *b)
+        });
+        file.path.read_to_buf(arena, &mut hay[..byte_len]);
+        let hit = self.hit(&hay[..byte_len]);
+        HAY.with(|c| *c.borrow_mut() = hay);
+        hit
+    }
+
     /// Gate a path visited in 16-byte chunks (no caller buffer, no truncation).
+    ///
+    /// Single streaming pass for the common case (`needle.len() <= 64`): the
+    /// bit-parallel LCS state and the needle-byte span are tracked together, so
+    /// the path is never copied into a scratch buffer. Bytes outside the span
+    /// carry no needle byte and cannot join an LCS alignment, so streaming the
+    /// whole path yields the same LCS as scoring the span alone.
     pub fn hit_chunks(
         &self,
         byte_len: usize,
@@ -268,6 +370,58 @@ impl GateNeedle {
                 include_prefix: true,
             });
         }
+        if self.needle.len() <= 64 {
+            let pm = &*self.pm;
+            let mask = self.len_mask;
+            let mut s = 0u64;
+            let mut next_needle = 0usize; // greedy cursor for the T == 0 path
+            let mut first = usize::MAX;
+            let mut last = 0usize;
+            let mut n = 0usize;
+            visit(&mut |off, chunk| {
+                let end = (off + chunk.len()).min(byte_len);
+                let slice = &chunk[..end - off];
+                for (i, &b) in slice.iter().enumerate() {
+                    let fb = fold_byte(b);
+                    if self.span.contains(b) {
+                        if n == 0 {
+                            first = off + i;
+                        }
+                        last = off + i;
+                        n += 1;
+                    }
+                    if self.typos == 0 {
+                        if next_needle < self.needle.len()
+                            && fb == fold_byte(self.needle[next_needle])
+                        {
+                            next_needle += 1;
+                        }
+                    } else {
+                        let x = s | pm[fb as usize];
+                        let y = (s << 1) | 1;
+                        s = x & (x ^ x.wrapping_sub(y));
+                    }
+                }
+            });
+            let lcs = if self.typos == 0 {
+                if next_needle == self.needle.len() {
+                    self.needle.len()
+                } else {
+                    next_needle
+                }
+            } else {
+                (s & mask).count_ones() as usize
+            };
+            if lcs < self.need || first == usize::MAX {
+                return None;
+            }
+            return Some(GateHit {
+                start: first as u32,
+                end: (last + 1).min(byte_len) as u32,
+                include_prefix: first == 0,
+            });
+        }
+        // Long needles: keep the buffered path (skip-DP needs random access).
         thread_local! {
             static HAY: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
@@ -363,30 +517,24 @@ pub fn gate_path_chunks(
 /// Parallel match-set over FileItems. Emits frizbee-compatible
 /// `Match { score: start, end_col: end }` (skip_sw encoding).
 /// `resolve_chunks` visits every 16-byte path chunk (no truncation).
-pub fn gate_match_range<F, R>(
+pub fn gate_match_range<'a, F, G>(
     needle: &[u8],
     n: usize,
     max_typos: u16,
     threads: usize,
     file_index: F,
-    resolve_len: R,
-    resolve_chunks: impl Fn(u32, &mut dyn FnMut(usize, &[u8])) + Sync,
+    file_at: G,
+    arena: ArenaPtr,
 ) -> Vec<neo_frizbee::Match>
 where
     F: Fn(u32) -> u32 + Sync,
-    R: Fn(u32) -> usize + Sync,
+    G: Fn(u32) -> &'a FileItem + Sync,
 {
     // Needle state (span mask + bit-parallel position masks) is per query, so
     // it is built once and shared by every path instead of per path.
     let state = GateNeedle::new(needle, max_typos);
     let scan = |i: u32| -> Option<neo_frizbee::Match> {
-        let hay_len = resolve_len(i);
-        if hay_len == 0 {
-            return None;
-        }
-        let hit = state.hit_chunks(hay_len, |cb| {
-            resolve_chunks(i, cb);
-        })?;
+        let hit = state.hit_file(file_at(i), arena)?;
         Some(neo_frizbee::Match {
             score: hit.start as u16,
             index: file_index(i),
@@ -394,9 +542,9 @@ where
             end_col: hit.end as u16,
         })
     };
-    // Honor the dispatch decision: below ~1k paths (or an explicit 1T search)
-    // the rayon pool wakeup costs more than the gate itself.
-    if threads <= 1 || n < 1024 {
+    // The work estimate already decided serial-vs-parallel (see
+    // `effective_match_threads`); the gate just honors it.
+    if threads <= 1 {
         return (0..n as u32).filter_map(scan).collect();
     }
     use rayon::prelude::*;
@@ -534,6 +682,49 @@ mod tests {
             "DIFF both={both} gate_only={gate_only} friz_only={friz_only} neither={neither} gate_wrong={gate_wrong} friz_wrong={friz_wrong}"
         );
         assert_eq!(gate_wrong, 0, "gate must equal LCS");
+    }
+
+    #[test]
+    fn hit_file_matches_staged_hit_across_chunk_boundaries() {
+        // `hit_file` streams chunks from the arena; `hit` sees a flat slice.
+        // They must agree for every length that straddles a 16-byte chunk.
+        use crate::simd_path::build_chunked_path_store_from_strings;
+        let mut state = 0x5EEDu32;
+        let mut next = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 16) as u16
+        };
+        for _ in 0..200 {
+            let nl = 2 + (next() % 20) as usize;
+            let hl = 1 + (next() % 80) as usize;
+            let needle: Vec<u8> = (0..nl).map(|_| b'a' + (next() % 6) as u8).collect();
+            let hay: Vec<u8> = (0..hl).map(|_| b'a' + (next() % 6) as u8).collect();
+            let t = (next() % 3) as u16;
+
+            let rel = String::from_utf8_lossy(&hay).to_string();
+            let files = vec![FileItem::new_raw(0, 0, 0, None, false)];
+            let (store, strings) = build_chunked_path_store_from_strings(&[rel], &files);
+            let mut file = files.into_iter().next().unwrap();
+            file.set_path(strings[0].clone());
+            file.set_presence(crate::presence::mask_of(&hay));
+
+            let arena = store.as_arena_ptr();
+            let g = GateNeedle::new(&needle, t);
+            let streamed = g.hit_file(&file, arena);
+            let staged = g.hit(&hay);
+            assert_eq!(
+                streamed.is_some(),
+                staged.is_some(),
+                "hit disagreement n={needle:?} h={hay:?} t={t}"
+            );
+            if let (Some(a), Some(b)) = (streamed, staged) {
+                assert_eq!(
+                    (a.start, a.end, a.include_prefix),
+                    (b.start, b.end, b.include_prefix),
+                    "window disagreement n={needle:?} h={hay:?} t={t}"
+                );
+            }
+        }
     }
 
     #[test]

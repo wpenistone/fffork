@@ -1,0 +1,129 @@
+//! SW cost probe: window sizes + score_haystack vs match_end_col split.
+//! Usage: sw_probe.exe <corpus> <query>
+
+use fff::file_picker::{FFFMode, FilePicker};
+use fff::{SharedFilePicker, SharedFrecency};
+use std::time::{Duration, Instant};
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let root = args.get(1).expect("corpus").clone();
+    let query = args.get(2).map(String::as_str).unwrap_or("score");
+
+    let shared_picker = SharedFilePicker::default();
+    FilePicker::new_with_shared_state(
+        shared_picker.clone(),
+        SharedFrecency::default(),
+        fff::FilePickerOptions {
+            base_path: root.clone(),
+            enable_mmap_cache: false,
+            enable_content_indexing: false,
+            mode: FFFMode::Neovim,
+            watch: false,
+            skip_git: true,
+            ..Default::default()
+        },
+    )
+    .expect("open corpus");
+    assert!(
+        shared_picker.wait_for_scan(Duration::from_secs(600)),
+        "scan timed out"
+    );
+
+    let guard = shared_picker.read().expect("lock");
+    let picker = guard.as_ref().expect("picker");
+    let mut paths: Vec<String> = Vec::new();
+    for f in picker.get_files() {
+        if !f.is_deleted() {
+            paths.push(f.relative_path(picker));
+        }
+    }
+    let n = paths.len();
+    let lens: Vec<usize> = paths.iter().map(|p| p.len()).collect();
+    let avg = lens.iter().sum::<usize>() as f64 / n as f64;
+    println!("paths={n} avg_len={avg:.1}");
+
+    let max_typos = (query.len() as u16 / 4).clamp(2, 6);
+    let cfg = neo_frizbee::Config {
+        max_typos: Some(max_typos),
+        sort: neo_frizbee::SortStrategy::Unsorted,
+        ..Default::default()
+    };
+
+    // Warmup
+    {
+        let mut m = neo_frizbee::Matcher::new(query, &cfg);
+        let _ = m.match_list(&paths);
+    }
+
+    // Full match timing
+    let iters = 10;
+    let mut sink = 0usize;
+    let t = Instant::now();
+    for _ in 0..iters {
+        let mut m = neo_frizbee::Matcher::new(query, &cfg);
+        let h = m.match_list(&paths);
+        sink = sink.wrapping_add(h.len());
+    }
+    let full_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+    println!("full_match_us={full_us:.1} n_hits={sink}");
+
+    // Window size distribution: re-run prefilter logic by using match_list_indices
+    // is too costly; instead infer from end_col (approximate match end) and a
+    // cheap forward scan for the first needle char (approximate match start).
+    let needle: Vec<u8> = query.as_bytes().to_vec();
+    let first_c = needle[0].to_ascii_lowercase();
+    let last_c = needle[needle.len() - 1].to_ascii_lowercase();
+    let mut m = neo_frizbee::Matcher::new(query, &cfg);
+    let hits = m.match_list(&paths);
+    let mut widths: Vec<usize> = Vec::with_capacity(hits.len());
+    for h in &hits {
+        let hay = paths[h.index as usize].as_bytes();
+        let start = hay
+            .iter()
+            .position(|&b| b.to_ascii_lowercase() == first_c)
+            .unwrap_or(0);
+        let end = hay
+            .iter()
+            .rposition(|&b| b.to_ascii_lowercase() == last_c)
+            .unwrap_or(hay.len().saturating_sub(1));
+        widths.push(end.saturating_sub(start) + 1);
+    }
+    widths.sort_unstable();
+    let q = |p: f64| -> usize {
+        let i = ((widths.len() as f64 - 1.0) * p) as usize;
+        widths[i]
+    };
+    println!(
+        "window_width p10={} p50={} p90={} p99={} max={} avg={:.1}",
+        q(0.10),
+        q(0.50),
+        q(0.90),
+        q(0.99),
+        widths[widths.len() - 1],
+        widths.iter().sum::<usize>() as f64 / widths.len() as f64
+    );
+
+    // end_col distribution (proxy for match span)
+    let mut ecs: Vec<u16> = hits.iter().map(|h| h.end_col).collect();
+    ecs.sort_unstable();
+    let eq = |p: f64| -> u16 {
+        let i = ((ecs.len() as f64 - 1.0) * p) as usize;
+        ecs[i]
+    };
+    println!("end_col p10={} p50={} p90={} max={}", eq(0.10), eq(0.50), eq(0.90), ecs[ecs.len() - 1]);
+
+    // Cost of match_end_col alone: time a loop that only calls match_list
+    // (end_col included) vs a synthetic score-only loop is not exposed; instead
+    // measure cost per hit of the trailing scan by timing 1-hit vs n-hit lists.
+    let single = vec![paths[hits[0].index as usize].clone()];
+    let t1 = Instant::now();
+    for _ in 0..100_000 {
+        let mut mm = neo_frizbee::Matcher::new(query, &cfg);
+        let h = mm.match_list(&single);
+        sink = sink.wrapping_add(h.len());
+    }
+    let one_us = t1.elapsed().as_secs_f64() * 1e6 / 100_000.0;
+    println!("single_path_match_us={one_us:.4} (incl. construct+call overhead)");
+    let _ = sink;
+}

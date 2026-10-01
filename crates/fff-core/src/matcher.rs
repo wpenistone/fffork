@@ -119,6 +119,12 @@ pub(crate) fn with_hit_capture<T>(sink: &mut Vec<u32>, f: impl FnOnce() -> T) ->
     t
 }
 
+/// Max path byte length over a plain slice (tests and non-cached callers).
+#[inline]
+pub(crate) fn max_path_len_of(files: &[FileItem]) -> usize {
+    files.iter().map(|f| f.path.byte_len as usize).max().unwrap_or(0)
+}
+
 pub(crate) enum FileItems<'a> {
     All(&'a [FileItem]),
     /// Compact candidate list over a base slice — indices avoid a

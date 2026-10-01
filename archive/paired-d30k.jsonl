@@ -1,0 +1,8 @@
+{"subject":"upstream","block":1,"order":1,"query":"file_picker_","threads":1,"iterations":400,"us_per_op":8899.238,"cpu_us_per_op":8476.562,"cycles_per_op":24495377.0,"checksum":922000}
+{"subject":"keepers","block":1,"order":2,"query":"file_picker_","threads":1,"iterations":400,"us_per_op":8531.876,"cpu_us_per_op":0.0,"cycles_per_op":0.0,"checksum":922000}
+{"subject":"upstream","block":1,"order":1,"query":"file_picker_","threads":4,"iterations":400,"us_per_op":3726.187,"cpu_us_per_op":9101.562,"cycles_per_op":26786239.0,"checksum":922000}
+{"subject":"keepers","block":1,"order":2,"query":"file_picker_","threads":4,"iterations":400,"us_per_op":3856.729,"cpu_us_per_op":0.0,"cycles_per_op":0.0,"checksum":922000}
+{"subject":"upstream","block":1,"order":1,"query":"score","threads":1,"iterations":200,"us_per_op":12750.687,"cpu_us_per_op":11484.375,"cycles_per_op":35150779.0,"checksum":6106400}
+{"subject":"keepers","block":1,"order":2,"query":"score","threads":1,"iterations":200,"us_per_op":12590.486,"cpu_us_per_op":0.0,"cycles_per_op":0.0,"checksum":6106400}
+{"subject":"upstream","block":1,"order":1,"query":"score","threads":4,"iterations":200,"us_per_op":3166.451,"cpu_us_per_op":6796.875,"cycles_per_op":21014400.0,"checksum":6106400}
+{"subject":"keepers","block":1,"order":2,"query":"score","threads":4,"iterations":200,"us_per_op":4479.725,"cpu_us_per_op":0.0,"cycles_per_op":0.0,"checksum":6106400}
