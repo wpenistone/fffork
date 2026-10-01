@@ -561,6 +561,10 @@ where
     };
 
     let search_start = std::time::Instant::now();
+    let phase_timing = std::env::var_os("FFF_PHASE_TIMING").is_some();
+    // Per-phase nanos, summed across chunk iterations. Cheap: two adds per file.
+    let mut phase_read_ns = 0u64;
+    let mut phase_scan_ns = 0u64;
     let page_limit = options.page_limit;
     // Lowest index an abort skipped; everything below it was searched, so it is
     // the resume point for the next page. usize::MAX means no abort happened.
@@ -614,15 +618,15 @@ where
             PageFillGate::new(chunk.len(), all_matches.len(), page_limit)
         });
 
-        let chunk_results: Vec<(usize, &'a FileItem, Vec<GrepMatch>)> = chunk
+        let chunk_results: Vec<(usize, &'a FileItem, Vec<GrepMatch>, u64, u64)> = chunk
             .par_iter()
             .enumerate()
             .map_init(
                 // tested it out a few times, this is just fine for rayon worker in this specific
                 // case it doesn't reallocate this many times and it is actually faster than using
                 // scoped threads with a predefined local scratch buffers because of spawn cost
-                || (Vec::with_capacity(64 * 1024), MmapSlot::default(), false),
-                |(buf, mmap_slot, aborted), (local_idx, file)| {
+                || (Vec::with_capacity(64 * 1024), MmapSlot::default(), false, 0u64, 0u64),
+                |(buf, mmap_slot, aborted, read_ns, scan_ns), (local_idx, file)| {
                     let idx = chunk_offset + local_idx;
                     let found = (|| -> Option<Vec<GrepMatch>> {
                         // Page already full from lower-indexed files: skip. This
@@ -643,6 +647,7 @@ where
                             return None;
                         }
 
+                        let t_read = phase_timing.then(std::time::Instant::now);
                         let content = file.get_content_for_search(
                             buf,
                             mmap_slot,
@@ -650,6 +655,9 @@ where
                             ctx.base_path,
                             ctx.budget,
                         )?;
+                        if let Some(t) = t_read {
+                            *read_ns += t.elapsed().as_nanos() as u64;
+                        }
 
                         // Fast whole-file memmem check before entering the
                         // grep-searcher machinery. Skips Vec alloc, Searcher
@@ -660,7 +668,11 @@ where
                             return None;
                         }
 
+                        let t_scan = phase_timing.then(std::time::Instant::now);
                         let file_matches = search_file(content, options.max_matches_per_file);
+                        if let Some(t) = t_scan {
+                            *scan_ns += t.elapsed().as_nanos() as u64;
+                        }
 
                         if file_matches.is_empty() {
                             return None;
@@ -673,7 +685,7 @@ where
                         g.record_done(local_idx, found.as_ref().map_or(0, Vec::len));
                     }
 
-                    found.map(|m| (idx, *file, m))
+                    found.map(|m| (idx, *file, m, *read_ns, *scan_ns))
                 },
             )
             .flatten()
@@ -684,7 +696,9 @@ where
         aborted = resume_at != usize::MAX;
         files_consumed = resume_at.min(chunk_offset + chunk.len());
 
-        for (batch_idx, file, file_matches) in chunk_results {
+        for (batch_idx, file, file_matches, read_ns, scan_ns) in chunk_results {
+            phase_read_ns += read_ns;
+            phase_scan_ns += scan_ns;
             // Matches past the abort point are dropped; the next page re-searches them.
             if batch_idx >= resume_at {
                 continue;
@@ -727,6 +741,16 @@ where
     } else {
         0
     };
+
+    if phase_timing {
+        eprintln!(
+            "PHASE grep files={} read_ms={:.1} scan_ms={:.1} total_ms={:.1}",
+            files_consumed,
+            phase_read_ns as f64 / 1e6,
+            phase_scan_ns as f64 / 1e6,
+            search_start.elapsed().as_secs_f64() * 1e3,
+        );
+    }
 
     GrepResult {
         matches: all_matches,
