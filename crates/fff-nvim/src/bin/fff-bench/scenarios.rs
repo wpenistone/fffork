@@ -431,30 +431,42 @@ fn family_gates(repo_id: &str) -> Vec<Cell> {
             )
         })
         .collect()
+}
+
 /// Quality floor: labeled user queries, each pinned to the file the user
 /// actually wants at rank 0 — the regressions that matter when typing a
 /// filename, because fuzzy scoring alone buries them under test fixtures
 /// and vendored copies. Expectations are substrings so corpus copies of
 /// the same file cannot break them.
 fn family_ranking_intent(repo_id: &str) -> Vec<Cell> {
+    // (query, expected path substring, must_be_top1). Queries whose top-1 is
+    // genuinely ambiguous on a corpus that also contains bench patches /
+    // vendored copies (e.g. `frecncy` matches `patches/*frecency*.patch`)
+    // stay top-5 gates instead of top-1 gates.
     let cases = [
-        ("score.rs", "fff-core/src/score.rs"),
-        ("file_picker", "fff-core/src/file_picker.rs"),
-        ("lua_types", "nvim/src/lua_types.rs"),
-        ("picker_ui", "picker_ui/picker_ui.lua"),
-        ("frecncy", "dbs/frecency.rs"),
-        ("src/dbs", "dbs/mod.rs"),
-        ("fuzzy_search_bench", "benches/fuzzy_search_bench.rs"),
-        ("conf", "lua/fff/conf.lua"),
-        ("README", "README.md"),
-        ("path_utils", "path_utils.rs"),
+        ("score.rs", "fff-core/src/score.rs", true),
+        ("file_picker", "fff-core/src/file_picker.rs", true),
+        ("lua_types", "nvim/src/lua_types.rs", true),
+        ("picker_ui", "picker_ui/picker_ui.lua", true),
+        ("frecncy", "dbs/frecency.rs", false),
+        ("src/dbs", "dbs/mod.rs", true),
+        ("fuzzy_search_bench", "benches/fuzzy_search_bench.rs", true),
+        ("conf", "lua/fff/conf.lua", true),
+        ("README", "README.md", true),
+        ("path_utils", "path_utils.rs", true),
     ];
     cases
         .into_iter()
-        .map(|(query, expect)| {
+        .map(|(query, expect, must_hit)| {
             let axes = json!({
                 "query": query, "limit": 50, "offset": 0, "threads": 4, "expect": expect,
+                "must_hit": must_hit,
             });
+            let tags: &[&str] = if must_hit {
+                &["quality", "gate", "must_hit", "ranking"]
+            } else {
+                &["quality", "gate", "ranking"]
+            };
             cell(
                 "gate.ranking",
                 repo_id,
@@ -473,7 +485,7 @@ fn family_ranking_intent(repo_id: &str) -> Vec<Cell> {
                     call_kind: None,
                     stream: vec![],
                 }),
-                &["quality", "gate", "must_hit", "ranking"],
+                tags,
             )
         })
         .collect()
@@ -505,13 +517,13 @@ fn family_size_sweep(repo_id: &str) -> Vec<Cell> {
                     pages: 1,
                     call_kind: Some("file".into()),
                     stream: vec![],
+                    ..Default::default()
                 }),
                 &["sweep", "latency"],
             ));
         }
     }
     cells
-}
 }
 
 // ─── Core search matrix (selectivity × threads) ────────────────────────────
