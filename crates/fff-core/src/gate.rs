@@ -246,10 +246,24 @@ pub fn gate_path_chunks(
         });
     }
     let mask = NeedleMask::new(needle);
+    // One visit: copy path into TLS buffer while tracking needle-byte span.
+    thread_local! {
+        static HAY: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let mut hay = HAY.with(|c| {
+        let mut b = c.borrow_mut();
+        b.clear();
+        b.resize(byte_len, 0);
+        std::mem::take(&mut *b)
+    });
     let mut first = None;
     let mut last = 0usize;
     let mut n = 0usize;
     visit(&mut |_off, chunk| {
+        let end = (_off + chunk.len()).min(byte_len);
+        if _off < end {
+            hay[_off..end].copy_from_slice(&chunk[..end - _off]);
+        }
         for (i, &b) in chunk.iter().enumerate() {
             if mask.contains(b) {
                 if first.is_none() {
@@ -261,30 +275,18 @@ pub fn gate_path_chunks(
         }
     });
     if n < need {
+        HAY.with(|c| *c.borrow_mut() = hay);
         return None;
     }
     let first = first.unwrap();
     let hi = (last + 1).min(byte_len);
     if hi.saturating_sub(first) < need {
+        HAY.with(|c| *c.borrow_mut() = hay);
         return None;
     }
-    // Copy only the span (not the whole path) for exact skip-DP.
-    let span = hi - first;
-    thread_local! { static SPAN_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) }; }
-    let mut buf = SPAN_BUF.with(|c| { let mut b = c.borrow_mut(); b.clear(); b.resize(span, 0); std::mem::take(&mut *b) });
-    visit(&mut |_off, chunk| {
-        let a = _off.max(first);
-        let b = (_off + chunk.len()).min(hi);
-        if a < b {
-            let dst = a - first;
-            let src = a - _off;
-            let ncp = b - a;
-            if dst + ncp <= buf.len() {
-                buf[dst..dst + ncp].copy_from_slice(&chunk[src..src + ncp]);
-            }
-        }
-    });
-    if !skip_dp_accept(needle, &buf, 0, span, typos.min(MAX_SKIPS)) {
+    let ok = skip_dp_accept(needle, &hay, first, hi, typos.min(MAX_SKIPS));
+    HAY.with(|c| *c.borrow_mut() = hay);
+    if !ok {
         return None;
     }
     Some(GateHit {
@@ -293,7 +295,6 @@ pub fn gate_path_chunks(
         include_prefix: first == 0,
     })
 }
-
 
 /// Parallel match-set over FileItems. Emits frizbee-compatible
 /// `Match { score: start, end_col: end }` (skip_sw encoding).
