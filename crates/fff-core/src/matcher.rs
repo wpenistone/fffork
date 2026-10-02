@@ -201,6 +201,11 @@ pub(crate) fn resolve_file_chunks(
 /// the corpus is large enough (keeps 4T efficiency honest).
 pub(crate) const MATCH_WORK_PER_THREAD: usize = 40_000;
 
+/// Test-only override so thread scaling is actually measurable. Without it
+/// the estimate below overwrites the caller's request, which silently makes
+/// every "1T / 4T" comparison the same thread count. Read once.
+static THREAD_OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+
 pub(crate) fn effective_match_threads(
     item_count: usize,
     needle_len: usize,
@@ -208,6 +213,15 @@ pub(crate) fn effective_match_threads(
     max_typos: Option<u16>,
     max_threads: usize,
 ) -> usize {
+    let forced = *THREAD_OVERRIDE.get_or_init(|| {
+        std::env::var("FFF_MATCH_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|n| *n >= 1)
+    });
+    if let Some(n) = forced {
+        return n.min(max_threads.max(1));
+    }
     if item_count < 1024 {
         return 1;
     }

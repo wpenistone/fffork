@@ -289,12 +289,23 @@ fn match_fuzzy_parts(
         let batch_sz: usize = if use_u8 { 32 } else { 16 };
         let use_simd = avx2_ok && needle.len() <= 16;
 
-        let mut collect_ms = 0.0f64;
-        let mut batch_ms = 0.0f64;
-        let mut assemble_ms = 0.0f64;
-        let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+        // Sub-phase accounting, accumulated across rayon workers.
+        let t_collect_us = std::sync::atomic::AtomicU64::new(0);
+        let t_batch_us = std::sync::atomic::AtomicU64::new(0);
+        let t_assemble_us = std::sync::atomic::AtomicU64::new(0);
+        let collect_ms = 0.0f64;
+        let batch_ms = 0.0f64;
+        let assemble_ms = 0.0f64;
+        let timing = part_timing;
 
-        for matches_chunk in matches.chunks_mut(CHUNK) {
+        // Chunks are disjoint slices of `matches` and every scratch buffer is
+        // thread-local, so this fans out safely. It used to be a serial `for`,
+        // which pinned ~6 ms of the query to one core no matter how many
+        // threads were available.
+        {
+        use rayon::prelude::*;
+        matches.par_chunks_mut(CHUNK).for_each(|matches_chunk| {
+            let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
             let t_chunk = std::time::Instant::now();
             let n_matches = matches_chunk.len();
             let mut trims = TRIMS.with(|c| take_tls(c, n_matches));
@@ -317,7 +328,8 @@ fn match_fuzzy_parts(
                     trims.push(crate::matcher::Trim::from_window(w));
                 }
             }
-            collect_ms += t_chunk.elapsed().as_secs_f64() * 1e3;
+            let _ = t_chunk;
+            if timing { t_collect_us.fetch_add(t_chunk.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); }
 
             let t_batch = std::time::Instant::now();
             // 64-byte align the batch output buffers: batch_sz=32 u16 is
@@ -500,7 +512,7 @@ fn match_fuzzy_parts(
                 scores[oi as usize] = ps_aligned[i];
                 end_cols[oi as usize] = pe_aligned[i];
             }
-            batch_ms += t_batch.elapsed().as_secs_f64() * 1e3;
+            if timing { t_batch_us.fetch_add(t_batch.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); }
 
             // Assemble this chunk into the match structs (no full-size hold).
             let t_asm = std::time::Instant::now();
@@ -519,7 +531,7 @@ fn match_fuzzy_parts(
                     .saturating_add(start_adj.min(u16::MAX as u32) as u16);
                 m.exact = exact;
             }
-            assemble_ms += t_asm.elapsed().as_secs_f64() * 1e3;
+            if timing { t_assemble_us.fetch_add(t_asm.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); }
 
             TRIMS.with(|c| reclaim(&mut c.borrow_mut(), trims));
             SCORES.with(|c| reclaim(&mut c.borrow_mut(), scores));
@@ -527,9 +539,13 @@ fn match_fuzzy_parts(
             ORDER.with(|c| reclaim(&mut c.borrow_mut(), order));
             PERM_SCORES.with(|c| reclaim(&mut c.borrow_mut(), perm_scores));
             PERM_ECOLS.with(|c| reclaim(&mut c.borrow_mut(), perm_ecols));
+        });
         }
 
         let sw_us = t_sw.elapsed().as_micros();
+        let collect_ms = t_collect_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
+        let batch_ms = t_batch_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
+        let assemble_ms = t_assemble_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
         if part_timing {
             eprintln!(
                 "PHASE parts gate_us={gate_us} exact_us={exact_us} sw_us={sw_us} threads={threads} n={}",

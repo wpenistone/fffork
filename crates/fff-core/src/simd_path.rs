@@ -1,9 +1,18 @@
 use ahash::AHashMap;
 use std::borrow::Cow;
 
-/// SIMD chunk size in bytes (matches NEON/SSE2 register width).
-/// This must stay in sync with neo_frizbee's internal chunk size.
-pub(crate) const SIMD_CHUNK_BYTES: usize = 16;
+/// Path chunk size in bytes. Swept on sumo_fork (226k files, 87 B avg path):
+///
+///   bytes   heap    dedup    gate      sw
+///    16     7.5MB   12.2x   4879us   6478us
+///    32     8.2MB    4.6x   4223us   5783us
+///    64    14.1MB    2.2x   4438us   6715us
+///
+/// 32 wins: it halves the index table (1.33M -> 0.72M slots) and shortens
+/// the dependent chunk chain, which is what the gate actually costs. 64
+/// overshoots - dedup collapses and the chunk array (12.3 MB) no longer
+/// fits cache, so both gate and SW get worse again.
+pub(crate) const SIMD_CHUNK_BYTES: usize = 32;
 
 /// Read-only view of a path store: 16-byte chunk arena plus the flat table of
 /// per-path chunk indices. Both point into the owning store's Vecs.
@@ -581,26 +590,29 @@ mod tests {
 
     #[test]
     fn test_chunked_string_resolve_ptrs() {
-        let (store, strings, _files) = build_test_store(&["src/components/Button.tsx"]);
+        // Sized from the constant so it always spans several chunks.
+        let long = format!("a/{}", "bcdefgh/".repeat(SIMD_CHUNK_BYTES));
+        let (store, strings, _files) = build_test_store(&[long.as_str()]);
         let arena = store.as_arena_ptr();
         let cs = &strings[0];
+        let total = cs.byte_len as usize;
 
         let mut ptrs = [std::ptr::null::<u8>(); MAX_PATH_CHUNKS];
         let resolved = cs.resolve_ptrs(arena, &mut ptrs);
-        assert_eq!(resolved.len(), 2); // 25 bytes = 2 chunks
+        assert_eq!(resolved.len(), total.div_ceil(SIMD_CHUNK_BYTES));
+        assert!(
+            resolved.len() > 1,
+            "fixture must span more than one chunk at SIMD_CHUNK_BYTES={SIMD_CHUNK_BYTES}"
+        );
 
         // Verify we can read back the bytes
         let mut reconstructed = Vec::new();
         for (i, &ptr) in resolved.iter().enumerate() {
-            let chunk = unsafe { std::slice::from_raw_parts(ptr, SIMD_CHUNK_BYTES) };
             let start = i * SIMD_CHUNK_BYTES;
-            let take = SIMD_CHUNK_BYTES.min(25 - start);
-            reconstructed.extend_from_slice(&chunk[..take]);
+            let take = SIMD_CHUNK_BYTES.min(total - start);
+            reconstructed.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr, take) });
         }
-        assert_eq!(
-            std::str::from_utf8(&reconstructed).unwrap(),
-            "src/components/Button.tsx"
-        );
+        assert_eq!(std::str::from_utf8(&reconstructed).unwrap(), long);
     }
 
     #[test]
@@ -618,7 +630,14 @@ mod tests {
         let (store, strings, _files) = build_test_store(&[path.as_str()]);
         let arena = store.as_arena_ptr();
         let cs = &strings[0];
-        assert!(cs.chunk_count() > 32, "path must span more than 32 chunks");
+        assert!(
+            cs.chunk_count() > 1,
+            "path must span more than one chunk at SIMD_CHUNK_BYTES={SIMD_CHUNK_BYTES}"
+        );
+        assert!(
+            cs.chunk_count() <= MAX_PATH_CHUNKS,
+            "PATH_MAX-legal path must fit the resolve buffer"
+        );
 
         let mut ptrs = [std::ptr::null::<u8>(); MAX_PATH_CHUNKS];
         let resolved = cs.resolve_ptrs(arena, &mut ptrs);
