@@ -1289,7 +1289,20 @@ impl FilePicker {
         // Path-store layout stats. The gate is bound by arena load latency,
         // so the working-set shape matters more than anything else; this is
         // the only place the real dedup ratio is visible.
+        // Path-store layout stats and the machine profile these numbers are
+        // interpreted against. The gate is bound by arena load latency, so the
+        // working-set shape matters more than anything else.
         if std::env::var_os("FFF_PHASE_TIMING").is_some() {
+            let m = crate::machine::machine();
+            eprintln!(
+                "PHASE machine cores={} cache_line={} llc_mb={} read_bytes_per_ns={:.2} work_per_thread={} scan_cap={}",
+                m.cores,
+                m.cache_line,
+                m.llc_bytes / (1024 * 1024),
+                m.read_bytes_per_ns,
+                crate::machine::match_work_per_thread(),
+                crate::machine::scan_thread_cap(),
+            );
             if let Some(store) = self.sync_data.chunked_paths.as_ref() {
                 let slots: usize = self
                     .sync_data
@@ -2550,12 +2563,19 @@ impl FileSync {
         let base_count = files.len();
         let base_dirs_count = dirs.len();
 
+        // Seed the cached max path length from the files just scanned. Leaving it
+        // zeroed made `effective_match_threads` see a 0-byte haystack, so the
+        // work estimate was 3-6x too small and the stage ran under-threaded.
+        let scanned_max_path_len = files.iter().map(|f| f.path.byte_len).max().unwrap_or(0);
+        let max_path_len = Arc::new(MaxPathLen::new());
+        max_path_len.observe(scanned_max_path_len);
+
         Ok(FileSync {
             files: StableVec::from_vec_with_reserve(files, MAX_OVERFLOW_FILES),
             indexable_count,
             base_count,
             live_count: base_count,
-            max_path_len: Arc::new(MaxPathLen::new()),
+            max_path_len,
             dirs: StableVec::from_vec_with_reserve(dirs, MAX_OVERFLOW_FILES),
             base_dirs_count,
             live_dirs_count: base_dirs_count,

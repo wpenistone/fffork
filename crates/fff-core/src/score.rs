@@ -95,10 +95,9 @@ fn match_fuzzy_parts(
 
     // Prefilter is an internal scan — parallelize even when the *search*
     // is 1 thread (one query). Interseq SW already uses the bg pool this way.
-    let scan_cap = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(4)
-        .min(8);
+    // The cap comes from the machine profile (cores, bounded by LLC), not a
+    // literal: `.min(8)` starved 32-core servers and oversubscribed phones.
+    let scan_cap = crate::machine::scan_thread_cap();
     // Thread count comes from the work estimate alone (no size cutoffs); the
     // picker's cached max path length keeps this O(1) per query.
     let threads = effective_match_threads(

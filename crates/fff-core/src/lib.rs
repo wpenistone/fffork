@@ -168,6 +168,7 @@ pub(crate) mod path_pack;
 pub(crate) mod presence;
 
 pub(crate) mod index;
+pub(crate) mod machine;
 pub(crate) mod parallelism;
 pub(crate) mod simd_path;
 pub(crate) mod stable_vec;

@@ -196,11 +196,6 @@ pub(crate) fn resolve_file_chunks(
     Some((ptrs.len(), file.path.byte_len))
 }
 
-/// Thread dispatch only pays off past ~1k candidates; below that it adds
-/// latency. Scale by estimated DP work so 1T stays 1T and 4T is used when
-/// the corpus is large enough (keeps 4T efficiency honest).
-pub(crate) const MATCH_WORK_PER_THREAD: usize = 40_000;
-
 /// Test-only override so thread scaling is actually measurable. Without it
 /// the estimate below overwrites the caller's request, which silently makes
 /// every "1T / 4T" comparison the same thread count. Read once.
@@ -238,5 +233,5 @@ pub(crate) fn effective_match_threads(
         .saturating_mul(max_haystack_len.min(512).div_ceil(16).max(1) as u64)
         .saturating_mul(selectivity)
         / 100;
-    (work.div_ceil(MATCH_WORK_PER_THREAD as u64) as usize).clamp(1, max_threads.max(1))
+    (work.div_ceil(crate::machine::match_work_per_thread() as u64) as usize).clamp(1, max_threads.max(1))
 }
