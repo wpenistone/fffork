@@ -1713,7 +1713,22 @@ fn match_and_score_in_arena<'a>(
             usize::MAX / 4
         })
         .saturating_add(1);
-    let use_topk = page_cap < path_matches.len() && path_matches.len() > 256;
+    // Top-k only pays for itself when the match set is large. Below that,
+    // `run_on_bg_pool` does a `pool.install`, and the fixed cost of handing
+    // work to the pool and waiting exceeds the scoring itself (the same
+    // failure the SW chunk loop had: 782us of pool time for 97us of work).
+    // The work estimate already answers "is there enough to fan out?", and it
+    // is calibrated per machine, so reuse it instead of another constant.
+    let topk_threads = effective_match_threads(
+        path_matches.len(),
+        context.effective_query().len().max(1),
+        max_path_len,
+        Some(context.max_typos),
+        context.max_threads,
+    );
+    let use_topk = page_cap < path_matches.len()
+        && path_matches.len() > 256
+        && topk_threads > 1;
     let t_score = std::time::Instant::now();
     let score_entrance_count = path_matches.len();
 
