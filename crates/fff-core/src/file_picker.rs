@@ -1445,6 +1445,7 @@ impl FilePicker {
                     NarrowPlan::Full
                 }
             };
+            let t_msa = std::time::Instant::now();
             match plan {
                 NarrowPlan::Narrow { orig } => {
                     let mut local_hits: Vec<u32> = Vec::new();
@@ -1487,14 +1488,17 @@ impl FilePicker {
             // Move, don't copy â€” hit_buf is dead after this.
             live.candidates = hit_buf;
         }
+            let t_msa = std::time::Instant::now();
+        let post_us = t_msa.elapsed().as_micros();
         let t_offsets = std::time::Instant::now();
         let match_byte_offsets =
             fuzzy_match_byte_offsets_for_page(query, &items, max_typos, base_arena, overflow_arena);
         if std::env::var_os("FFF_PHASE_TIMING").is_some() {
+            let now_us = t_total.elapsed().as_micros();
+            let offsets_us = t_offsets.elapsed().as_micros();
             eprintln!(
-                "PHASE total_us={} tracker_us={tracker_us} offsets_us={} page={}",
-                t_total.elapsed().as_micros(),
-                t_offsets.elapsed().as_micros(),
+                "PHASE total_us={now_us} msa_us={post_us} post_us={} tracker_us={tracker_us} offsets_us={offsets_us} page={}",
+                now_us.saturating_sub(post_us + offsets_us + tracker_us),
                 items.len()
             );
         }
