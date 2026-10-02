@@ -1471,10 +1471,19 @@ fn match_and_score_in_arena<'a>(
     // high-match queries still fan out so the 200k-match path keeps its win.
     const PARALLEL_SCORE_MIN: usize = 4096;
 
-    type ScoreScratch = (String, [u8; crate::simd_path::PATH_BUF_SIZE]);
+    // Third buffer is the filename scratch. It has to be separate from
+    // `path_buf`: on the common path (`need_rel == false`) the filename is
+    // materialised here while `path_buf` stays free for a later relative-path
+    // read, and one buffer cannot serve both borrows at once.
+    type ScoreScratch = (
+        String,
+        [u8; crate::simd_path::PATH_BUF_SIZE],
+        [u8; crate::simd_path::PATH_BUF_SIZE],
+    );
     let make_scratch = || {
         (
             String::with_capacity(64),
+            [0u8; crate::simd_path::PATH_BUF_SIZE],
             [0u8; crate::simd_path::PATH_BUF_SIZE],
         )
     };
@@ -1500,7 +1509,7 @@ fn match_and_score_in_arena<'a>(
                      match_idx: usize,
                      path_match: &neo_frizbee::Match|
      -> (&'a FileItem, Score) {
-        let (dir_buf, path_buf) = scratch;
+        let (dir_buf, path_buf, fname_buf) = scratch;
             let file_idx = path_match.index as usize;
             let file = working_files.index(file_idx);
 
@@ -1547,23 +1556,27 @@ fn match_and_score_in_arena<'a>(
                 || context.current_file.is_some()
                 || query_intent == crate::intent::QueryIntent::Path
                 || context.last_same_query_match.is_some();
+            // When nothing else needs the path, borrow the filename straight
+            // out of the arena when it fits a chunk and copy into the scratch
+            // buffer otherwise. `filename_cow` heap-allocated on that second
+            // path, which for a repo whose prefixes straddle chunks is every
+            // candidate - 47ns/candidate on linux-kernel vs 8ns on sumo.
             let rel: Option<&str> = if need_rel {
                 Some(file.path.read_to_buf(arena, path_buf))
             } else {
                 None
             };
-            // When nothing else needs the path, keep the zero-copy borrow.
-            let fname_cow = if rel.is_none() && !rank_collapsed {
-                Some(file.path.filename_cow(arena))
-            } else {
-                None
-            };
+            // When nothing else needs the path, borrow the filename straight
+            // out of the arena when it fits a chunk and copy into scratch
+            // otherwise. `filename_cow` heap-allocated on that second path,
+            // which for a repo whose prefixes straddle chunk boundaries is every
+            // candidate - 47ns/candidate on linux-kernel vs 8ns on sumo.
             let fname: Option<&str> = if rank_collapsed {
                 None
             } else if let Some(r) = rel {
                 Some(&r[fname_off..fname_off + fname_len])
             } else {
-                Some(fname_cow.as_ref().unwrap().as_ref())
+                Some(file.path.filename_ref(arena, fname_buf))
             };
 
             let is_exact_filename = !rank_collapsed

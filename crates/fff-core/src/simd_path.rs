@@ -155,6 +155,34 @@ impl ChunkedString {
             off += take;
         }
     }
+/// Filename as `&str`, borrowing from the arena when it fits in one chunk
+    /// and otherwise copying into caller scratch. `filename_cow` heap-allocates
+    /// in exactly that second case, which on a repo whose directory prefixes
+    /// straddle chunk boundaries (measured: linux-kernel, a 26.6 B prefix in a
+    /// 32 B chunk) happens once per candidate.
+    #[inline]
+    pub fn filename_ref<'a>(&self, arena: ArenaPtr, scratch: &'a mut [u8]) -> &'a str {
+        let off = self.filename_offset as usize;
+        let total = self.byte_len as usize;
+        if off >= total {
+            return "";
+        }
+        let len = total - off;
+        let idx = self.indices(arena);
+        let start_chunk = off / SIMD_CHUNK_BYTES;
+        let offset_in_chunk = off % SIMD_CHUNK_BYTES;
+
+        // Zero-copy when the filename sits inside a single chunk.
+        if start_chunk < idx.len() && offset_in_chunk + len <= SIMD_CHUNK_BYTES {
+            let ptr = unsafe { arena.chunk_ptr(idx[start_chunk]).add(offset_in_chunk) };
+            let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
+            return unsafe { core::str::from_utf8_unchecked(slice) };
+        }
+
+        let n = len.min(scratch.len());
+        self.copy_window_to(arena, off as u32, (off + n) as u32, scratch);
+        unsafe { core::str::from_utf8_unchecked(&scratch[..n]) }
+    }
 
     #[inline]
     fn write_slice_to_vec(
