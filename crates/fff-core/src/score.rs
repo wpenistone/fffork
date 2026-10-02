@@ -214,11 +214,14 @@ fn match_fuzzy_parts(
         if looks_like_filename {
             let q = valid_parts[0];
             let qb = q.as_bytes();
+            // Reused scratch: `filename_cow` would heap-allocate per candidate
+            // whose filename straddles a chunk, and this loop walks every match.
+            let mut name_scratch = [0u8; crate::simd_path::PATH_BUF_SIZE];
             for m in matches.iter() {
                 let f = working_files.index(m.index as usize);
                 let flen = f.path.byte_len as usize - f.path.filename_offset as usize;
                 if flen == qb.len() {
-                    let fname = f.path.filename_cow(arena);
+                    let fname = f.path.filename_ref(arena, &mut name_scratch);
                     if fname.eq_ignore_ascii_case(q) {
                         exact_name_hits.push(m.index);
                     }
