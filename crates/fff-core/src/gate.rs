@@ -171,6 +171,45 @@ fn is_subseq_fold(needle: &[u8], hay: &[u8]) -> bool {
     true
 }
 
+/// Bit i set when `chunk[i]` folds to a needle byte. The arena stores paths in
+/// 16-byte chunks, so one SSE2 register covers exactly one chunk and SSE2 is
+/// baseline on x86_64 (no runtime dispatch). Short tails and non-x86 use the
+/// 256-bit span test, which is O(1) like the vector path.
+#[inline]
+fn needle_byte_mask(chunk: &[u8], distinct: &[u8], span: &NeedleMask) -> u16 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if chunk.len() == 16 && !distinct.is_empty() {
+            // SAFETY: SSE2 is baseline on x86_64; `chunk` is exactly 16 bytes.
+            return unsafe { needle_byte_mask_sse2(chunk, distinct) };
+        }
+    }
+    let mut m = 0u16;
+    for (i, &b) in chunk.iter().enumerate() {
+        if span.contains(b) {
+            m |= 1 << i;
+        }
+    }
+    m
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn needle_byte_mask_sse2(chunk: &[u8], distinct: &[u8]) -> u16 {
+    use core::arch::x86_64::*;
+    let v = _mm_loadu_si128(chunk.as_ptr() as *const __m128i);
+    // Branchless ASCII fold: add 32 where the byte is in 'A'..='Z'.
+    let upper = _mm_cmpgt_epi8(v, _mm_set1_epi8(b'A' as i8 - 1));
+    let below_z = _mm_cmpgt_epi8(_mm_set1_epi8(b'Z' as i8 + 1), v);
+    let is_upper = _mm_and_si128(upper, below_z);
+    let folded = _mm_add_epi8(v, _mm_and_si128(is_upper, _mm_set1_epi8(32)));
+    let mut acc = _mm_setzero_si128();
+    for &c in distinct {
+        acc = _mm_or_si128(acc, _mm_cmpeq_epi8(folded, _mm_set1_epi8(c as i8)));
+    }
+    _mm_movemask_epi8(acc) as u16
+}
+
 /// Per-query gate state: span mask + bit-parallel LCS position masks.
 /// Built once per search so per-path work is a single linear pass.
 pub struct GateNeedle {
@@ -182,6 +221,8 @@ pub struct GateNeedle {
     span: NeedleMask,
     /// `pm[c]` = bitmask of needle positions holding folded byte `c`.
     pm: Box<[u64; 256]>,
+    /// Distinct folded needle bytes, for the vectorized membership test.
+    distinct: Box<[u8]>,
     len_mask: u64,
 }
 
@@ -190,8 +231,15 @@ impl GateNeedle {
         let typos = (max_typos as usize).min(MAX_SKIPS);
         let m = needle.len();
         let mut pm = Box::new([0u64; 256]);
+        let mut seen = [false; 256];
+        let mut distinct = Vec::with_capacity(m.min(16));
         for (i, &b) in needle.iter().enumerate().take(64) {
-            pm[fold_byte(b) as usize] |= 1u64 << i;
+            let f = fold_byte(b);
+            pm[f as usize] |= 1u64 << i;
+            if !seen[f as usize] {
+                seen[f as usize] = true;
+                distinct.push(f);
+            }
         }
         Self {
             span: NeedleMask::new(needle),
@@ -204,6 +252,7 @@ impl GateNeedle {
             typos,
             need: m.saturating_sub(typos),
             pm,
+            distinct: distinct.into_boxed_slice(),
         }
     }
 
@@ -278,6 +327,7 @@ impl GateNeedle {
                 });
             }
             let pm = &*self.pm;
+            let distinct = &*self.distinct;
             let mask = self.len_mask;
             let greedy = self.typos == 0;
             let mut s = 0u64;
@@ -288,31 +338,36 @@ impl GateNeedle {
             let path = &file.path;
             path.for_each_chunk(arena, |off, chunk| {
                 let end = (off + chunk.len()).min(byte_len);
-                for (i, &b) in chunk[..end - off].iter().enumerate() {
-                    // One fold, one lookup: `pm[c] != 0` is exactly "c is a
-                    // needle byte", so this replaces the separate span test.
-                    // Bytes outside the needle (separators, digits) can't move
-                    // the LCS, so they cost a single load and a branch.
-                    let m = pm[fold_byte(b) as usize];
-                    if m == 0 {
-                        continue;
-                    }
-                    if n == 0 {
-                        first = off + i;
-                    }
-                    last = off + i;
-                    n += 1;
-                    if greedy {
-                        if next_needle < self.needle.len()
-                            && fold_byte(self.needle[next_needle]) == fold_byte(b)
-                        {
-                            next_needle += 1;
+                let len = end - off;
+                let view = &chunk[..len];
+                // One vector op per 16 bytes finds every needle-byte position;
+                // the Hyyro update stays serial but only runs on those.
+                let mut base = 0usize;
+                while base < len {
+                    let step = 16.min(len - base);
+                    let mut mask = needle_byte_mask(&view[base..base + step], distinct, &self.span);
+                    while mask != 0 {
+                        let bit = mask.trailing_zeros() as usize;
+                        mask &= mask - 1;
+                        let pos = base + bit;
+                        if n == 0 {
+                            first = off + pos;
                         }
-                    } else {
-                        let x = s | m;
-                        let y = (s << 1) | 1;
-                        s = x & (x ^ x.wrapping_sub(y));
+                        last = off + pos;
+                        n += 1;
+                        if greedy {
+                            if next_needle < self.needle.len()
+                                && fold_byte(self.needle[next_needle]) == fold_byte(view[pos])
+                            {
+                                next_needle += 1;
+                            }
+                        } else {
+                            let x = s | pm[fold_byte(view[pos]) as usize];
+                            let y = (s << 1) | 1;
+                            s = x & (x ^ x.wrapping_sub(y));
+                        }
                     }
+                    base += step;
                 }
             });
             let lcs = if greedy {
