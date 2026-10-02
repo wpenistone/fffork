@@ -1312,9 +1312,26 @@ impl FilePicker {
                     .sum();
                 let unique = store.unique_chunks_for_stats();
                 let files = self.sync_data.files.len();
+                // Directory prefix = bytes before the filename. Files are sorted
+                // by (parent_dir, filename), so that prefix is shared by every
+                // sibling and could be stored once per directory instead of
+                // once per file - which is what the index table pays for today.
+                let path_bytes: usize = self
+                    .sync_data
+                    .files
+                    .iter()
+                    .map(|f| f.path.byte_len as usize)
+                    .sum();
+                let prefix_bytes: usize = self
+                    .sync_data
+                    .files
+                    .iter()
+                    .map(|f| f.path.filename_offset as usize)
+                    .sum();
                 eprintln!(
                     "PHASE arena files={files} chunk_slots={slots} unique_chunks={unique} \
-                     dedup_ratio={:.2} heap_bytes={} file_bytes={} avg_path_bytes={:.1}",
+                     dedup_ratio={:.2} heap_bytes={} file_bytes={} avg_path_bytes={:.1} \
+                     avg_prefix_bytes={:.1} prefix_share={:.2}",
                     if unique > 0 {
                         slots as f64 / unique as f64
                     } else {
@@ -1323,12 +1340,17 @@ impl FilePicker {
                     store.heap_bytes(),
                     files * std::mem::size_of::<FileItem>(),
                     if files > 0 {
-                        self.sync_data
-                            .files
-                            .iter()
-                            .map(|f| f.path.byte_len as usize)
-                            .sum::<usize>() as f64
-                            / files as f64
+                        path_bytes as f64 / files as f64
+                    } else {
+                        0.0
+                    },
+                    if files > 0 {
+                        prefix_bytes as f64 / files as f64
+                    } else {
+                        0.0
+                    },
+                    if path_bytes > 0 {
+                        prefix_bytes as f64 / path_bytes as f64
                     } else {
                         0.0
                     },
