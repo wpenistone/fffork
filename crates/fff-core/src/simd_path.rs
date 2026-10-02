@@ -377,6 +377,11 @@ impl ChunkedPathStore {
         self.arena.len()
     }
 
+    /// Deduplicated chunk count, for FFF_PHASE_TIMING layout stats.
+    pub fn unique_chunks_for_stats(&self) -> usize {
+        self.arena.len()
+    }
+
     #[inline]
     pub fn as_arena_ptr(&self) -> ArenaPtr {
         ArenaPtr::new(self.arena.as_ptr() as *const u8, self.indices.as_ptr())

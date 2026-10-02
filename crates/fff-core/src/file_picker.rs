@@ -1286,6 +1286,43 @@ impl FilePicker {
             "Fuzzy search",
         );
 
+        // Path-store layout stats. The gate is bound by arena load latency,
+        // so the working-set shape matters more than anything else; this is
+        // the only place the real dedup ratio is visible.
+        if std::env::var_os("FFF_PHASE_TIMING").is_some() {
+            if let Some(store) = self.sync_data.chunked_paths.as_ref() {
+                let slots: usize = self
+                    .sync_data
+                    .files
+                    .iter()
+                    .map(|f| f.path.chunk_count())
+                    .sum();
+                let unique = store.unique_chunks_for_stats();
+                let files = self.sync_data.files.len();
+                eprintln!(
+                    "PHASE arena files={files} chunk_slots={slots} unique_chunks={unique} \
+                     dedup_ratio={:.2} heap_bytes={} file_bytes={} avg_path_bytes={:.1}",
+                    if unique > 0 {
+                        slots as f64 / unique as f64
+                    } else {
+                        0.0
+                    },
+                    store.heap_bytes(),
+                    files * std::mem::size_of::<FileItem>(),
+                    if files > 0 {
+                        self.sync_data
+                            .files
+                            .iter()
+                            .map(|f| f.path.byte_len as usize)
+                            .sum::<usize>() as f64
+                            / files as f64
+                    } else {
+                        0.0
+                    },
+                );
+            }
+        }
+
         // small queries with a large number of results can match absolutely everything
         let max_typos = (effective_query.len() as u16 / 4).clamp(2, 6);
         // Look up the last file selected for this query (combo-boost scoring)
