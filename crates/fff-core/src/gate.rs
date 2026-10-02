@@ -589,6 +589,11 @@ where
     // it is built once and shared by every path instead of per path.
     let state = GateNeedle::new(needle, max_typos);
     let scan = |i: u32| -> Option<neo_frizbee::Match> {
+        // Warm the next candidate's path chunks: the gate is bound by arena
+        // load latency, not by the LCS arithmetic.
+        if i + 1 < n as u32 {
+            file_at(i + 1).path.prefetch(arena);
+        }
         let hit = state.hit_file(file_at(i), arena)?;
         Some(neo_frizbee::Match {
             score: hit.start as u16,

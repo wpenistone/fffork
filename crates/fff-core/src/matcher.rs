@@ -199,7 +199,7 @@ pub(crate) fn resolve_file_chunks(
 /// Thread dispatch only pays off past ~1k candidates; below that it adds
 /// latency. Scale by estimated DP work so 1T stays 1T and 4T is used when
 /// the corpus is large enough (keeps 4T efficiency honest).
-pub(crate) const MATCH_WORK_PER_THREAD: usize = 200_000;
+pub(crate) const MATCH_WORK_PER_THREAD: usize = 40_000;
 
 pub(crate) fn effective_match_threads(
     item_count: usize,

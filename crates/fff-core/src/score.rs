@@ -532,7 +532,7 @@ fn match_fuzzy_parts(
         let sw_us = t_sw.elapsed().as_micros();
         if part_timing {
             eprintln!(
-                "PHASE parts gate_us={gate_us} exact_us={exact_us} sw_us={sw_us} n={}",
+                "PHASE parts gate_us={gate_us} exact_us={exact_us} sw_us={sw_us} threads={threads} n={}",
                 matches.len()
             );
         }

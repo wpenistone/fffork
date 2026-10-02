@@ -203,6 +203,31 @@ impl ChunkedString {
         Cow::Owned(out)
     }
 
+    /// Prefetch this path's arena chunks. The match gate is latency-bound on
+    /// the scattered dedup store rather than compute-bound, so issuing the
+    /// next candidate's loads early hides most of the miss.
+    #[inline]
+    pub fn prefetch(&self, arena: ArenaPtr) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            let total = self.byte_len as usize;
+            if total == 0 {
+                return;
+            }
+            let mut off = 0usize;
+            for &idx in self.indices(arena).iter() {
+                if off >= total {
+                    break;
+                }
+                unsafe {
+                    _mm_prefetch(arena.chunk_ptr(idx) as *const i8, _MM_HINT_T0);
+                }
+                off += SIMD_CHUNK_BYTES;
+            }
+        }
+    }
+
     /// Copy path bytes `[start, end)` into `out` (needs `end - start` bytes),
     /// touching only the arena chunks that cover the window. One arena pass,
     /// no full-path bounce buffer. Short/missing trailing chunks zero-fill.
