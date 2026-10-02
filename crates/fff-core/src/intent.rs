@@ -217,8 +217,12 @@ fn looks_like_typo(q: &str) -> bool {
     }
     false
 }
-/// Case-insensitive substring test without allocating. `needle` may already be
-/// lowercased; the comparison is ASCII-case-insensitive either way.
+/// Case-insensitive substring test without allocating.
+///
+/// The naive `h.windows(n).any(eq_ignore_ascii_case)` pays a full slice
+/// comparison at every offset. Screening on the first byte first turns the
+/// common case (most offsets mismatch immediately) into one compare, which
+/// matters because this runs once per candidate on the non-collapsed path.
 #[inline]
 pub(crate) fn contains_ignore_ascii(hay: &str, needle: &str) -> bool {
     let h = hay.as_bytes();
@@ -229,7 +233,19 @@ pub(crate) fn contains_ignore_ascii(hay: &str, needle: &str) -> bool {
     if n.len() > h.len() {
         return false;
     }
-    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+    let lo = n[0].to_ascii_lowercase();
+    let up = n[0].to_ascii_uppercase();
+    let last = h.len() - n.len();
+    for i in 0..=last {
+        let c = h[i];
+        if c != lo && c != up {
+            continue;
+        }
+        if h[i..i + n.len()].eq_ignore_ascii_case(n) {
+            return true;
+        }
+    }
+    false
 }
 
 #[inline]

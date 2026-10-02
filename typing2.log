@@ -1,0 +1,10 @@
+
+corpus         word        keys k_total_ms k_peak_us u_total_ms u_peak_us total_x k_sequence                                                   
+------         ----        ---- ---------- --------- ---------- --------- ------- ----------                                                   
+sumo_fork-227k file_picker   11      144.1     19926                              18300 9377 10478 13330 13141 13902 19926 19521 9427 9141 7536
+kernel-100k    score          5       58.4     16718                              10959 16718 9199 9412 12086                                  
+squad-ds-107k  test           4       25.8      7835                              7835 4870 5655 7416                                          
+opencode-6.6k  file           4        6.6      2384                              479 1527 2227 2384                                           
+
+
+
