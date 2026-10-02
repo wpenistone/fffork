@@ -1473,6 +1473,8 @@ fn match_and_score_in_arena<'a>(
         true,
     );
     let main_needle_as_str = context.effective_query();
+    // Query-constant evidence state, built once instead of per candidate.
+    let prepared_query = crate::intent::PreparedQuery::new(main_needle_as_str);
 
     let score_one = |scratch: &mut ScoreScratch,
                      match_idx: usize,
@@ -1637,18 +1639,20 @@ fn match_and_score_in_arena<'a>(
                 let need_path = query_intent == crate::intent::QueryIntent::Path
                     || context.current_file.is_some();
                 let ev = if need_path {
-                    crate::intent::evidence_for(
+                    crate::intent::evidence_prepared(
+                        &prepared_query,
                         rel.unwrap_or(""),
                         fname_ref,
-                        main_needle_as_str,
                         query_intent,
                         context.current_file,
                     )
                 } else {
-                    crate::intent::evidence_filename_only(
+                    crate::intent::evidence_prepared(
+                        &prepared_query,
+                        "",
                         fname_ref,
-                        main_needle_as_str,
                         query_intent,
+                        None,
                     )
                 };
                 crate::intent::evidence_bonus(query_intent, &ev, base_score)

@@ -217,58 +217,86 @@ fn looks_like_typo(q: &str) -> bool {
     }
     false
 }
+/// Case-insensitive substring test without allocating. `needle` may already be
+/// lowercased; the comparison is ASCII-case-insensitive either way.
+#[inline]
+pub(crate) fn contains_ignore_ascii(hay: &str, needle: &str) -> bool {
+    let h = hay.as_bytes();
+    let n = needle.as_bytes();
+    if n.is_empty() {
+        return true;
+    }
+    if n.len() > h.len() {
+        return false;
+    }
+    h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
 
-/// File role from a filename (not the full path).
+#[inline]
+pub(crate) fn ends_with_ignore_ascii(hay: &str, suffix: &str) -> bool {
+    let h = hay.as_bytes();
+    let s = suffix.as_bytes();
+    h.len() >= s.len() && h[h.len() - s.len()..].eq_ignore_ascii_case(s)
+}
+
+#[inline]
+fn matches_ignore_ascii(hay: &str, options: &[&str]) -> bool {
+    options.iter().any(|o| hay.eq_ignore_ascii_case(o))
+}
+
+/// File role from a filename (not the full path). Allocation-free: this runs
+/// once per candidate, and the lowercase copy it used to build showed up as
+/// ~20ns of the per-candidate evidence cost.
 pub fn role_of_filename(fname: &str) -> FileRole {
-    let lower = fname.to_ascii_lowercase();
-    let stem_ext = lower.as_str();
-    if lower.ends_with("_test.rs")
-        || lower.ends_with(".test.ts")
-        || lower.ends_with(".test.tsx")
-        || lower.ends_with(".test.js")
-        || lower.ends_with(".spec.ts")
-        || lower.ends_with(".spec.js")
-        || lower.ends_with(".spec.rs")
-        || lower.contains("_test.")
-        || lower.contains("/tests/")
+    if ends_with_ignore_ascii(fname, "_test.rs")
+        || ends_with_ignore_ascii(fname, ".test.ts")
+        || ends_with_ignore_ascii(fname, ".test.tsx")
+        || ends_with_ignore_ascii(fname, ".test.js")
+        || ends_with_ignore_ascii(fname, ".spec.ts")
+        || ends_with_ignore_ascii(fname, ".spec.js")
+        || ends_with_ignore_ascii(fname, ".spec.rs")
+        || contains_ignore_ascii(fname, "_test.")
+        || contains_ignore_ascii(fname, "/tests/")
     {
         return FileRole::Test;
     }
-    if matches!(
-        stem_ext,
-        "mod.rs" | "index.ts" | "index.tsx" | "index.js" | "index.jsx" | "main.rs"
-            | "main.go" | "main.py" | "app.rs" | "lib.rs" | "__init__.py" | "main.cpp"
-            | "main.c" | "main.ts" | "main.js"
-    ) || stem_ext == "mod.rs"
-    {
+    if matches_ignore_ascii(
+        fname,
+        &[
+            "mod.rs", "index.ts", "index.tsx", "index.js", "index.jsx", "main.rs", "main.go",
+            "main.py", "app.rs", "lib.rs", "__init__.py", "main.cpp", "main.c", "main.ts", "main.js",
+        ],
+    ) {
         return FileRole::Entrypoint;
     }
-    if lower.ends_with(".d.ts")
-        || lower.ends_with("_pb.rs")
-        || lower.contains("types")
-        || lower.ends_with("type.ts")
-        || lower.ends_with("type.rs")
+    if ends_with_ignore_ascii(fname, ".d.ts")
+        || ends_with_ignore_ascii(fname, "_pb.rs")
+        || contains_ignore_ascii(fname, "types")
+        || ends_with_ignore_ascii(fname, "type.ts")
+        || ends_with_ignore_ascii(fname, "type.rs")
     {
         return FileRole::Type;
     }
-    if lower.ends_with(".toml")
-        || lower.ends_with(".yaml")
-        || lower.ends_with(".yml")
-        || lower.ends_with(".json")
-        || lower.ends_with(".ini")
-        || lower == "makefile"
-        || lower == "dockerfile"
+    if ends_with_ignore_ascii(fname, ".toml")
+        || ends_with_ignore_ascii(fname, ".yaml")
+        || ends_with_ignore_ascii(fname, ".yml")
+        || ends_with_ignore_ascii(fname, ".json")
+        || ends_with_ignore_ascii(fname, ".ini")
+        || matches_ignore_ascii(fname, &["makefile", "dockerfile"])
     {
         return FileRole::Config;
     }
-    if lower.ends_with(".css")
-        || lower.ends_with(".scss")
-        || lower.ends_with(".less")
-        || lower.ends_with(".styl")
+    if ends_with_ignore_ascii(fname, ".css")
+        || ends_with_ignore_ascii(fname, ".scss")
+        || ends_with_ignore_ascii(fname, ".less")
+        || ends_with_ignore_ascii(fname, ".styl")
     {
         return FileRole::Style;
     }
-    if lower.ends_with(".md") || lower.ends_with(".rst") || lower.ends_with(".txt") {
+    if ends_with_ignore_ascii(fname, ".md")
+        || ends_with_ignore_ascii(fname, ".rst")
+        || ends_with_ignore_ascii(fname, ".txt")
+    {
         return FileRole::Doc;
     }
     FileRole::Other
@@ -436,6 +464,33 @@ pub fn evidence_filename_only(
     evidence_for("", filename, query, intent, None)
 }
 
+/// Query-side state that is identical for every candidate. Built once per
+/// query so the per-candidate evidence pass does no heap allocation: the
+/// lowercased query and its stem used to be rebuilt for every file, which on
+/// a 100k-match query was most of the scoring cost.
+pub struct PreparedQuery<'a> {
+    pub query: &'a str,
+    pub lower: String,
+    pub name_ext: Option<NameExt<'a>>,
+    pub stem_lower: Option<String>,
+    pub wants_role: Option<FileRole>,
+}
+
+impl<'a> PreparedQuery<'a> {
+    pub fn new(query: &'a str) -> Self {
+        let query = query.trim();
+        let name_ext = split_name_ext(query);
+        let stem_lower = name_ext.as_ref().map(|ne| ne.stem.to_ascii_lowercase());
+        Self {
+            query,
+            lower: query.to_ascii_lowercase(),
+            name_ext,
+            stem_lower,
+            wants_role: implied_role_from_query(query),
+        }
+    }
+}
+
 /// Full evidence bundle for one file vs one query + intent.
 pub fn evidence_for(
     relative_path: &str,
@@ -444,8 +499,20 @@ pub fn evidence_for(
     intent: QueryIntent,
     current_file: Option<&str>,
 ) -> Evidence {
+    let pq = PreparedQuery::new(query);
+    evidence_prepared(&pq, relative_path, filename, intent, current_file)
+}
+
+/// [`evidence_for`] against a pre-computed query. Allocation-free per call.
+pub fn evidence_prepared(
+    pq: &PreparedQuery<'_>,
+    relative_path: &str,
+    filename: &str,
+    intent: QueryIntent,
+    current_file: Option<&str>,
+) -> Evidence {
     let mut ev = Evidence::default();
-    let q = query.trim();
+    let q = pq.query;
     if q.is_empty() && intent != QueryIntent::WorkingSet {
         return ev;
     }
@@ -464,7 +531,7 @@ pub fn evidence_for(
     }
 
     // Name / ext
-    if let Some(ne) = split_name_ext(q) {
+    if let Some(ne) = pq.name_ext.as_ref() {
         ev.ext_match = filename
             .rsplit_once('.')
             .map(|(_, e)| e.eq_ignore_ascii_case(&ne.ext[1..]))
@@ -472,14 +539,13 @@ pub fn evidence_for(
         ev.ext_mismatch = !ev.ext_match && filename.contains('.');
         let stem_matches = filename_stem(filename).eq_ignore_ascii_case(ne.stem);
         ev.exact_filename = filename.eq_ignore_ascii_case(q) || (stem_matches && ev.ext_match);
-        ev.filename_substring = filename
-            .to_ascii_lowercase()
-            .contains(&ne.stem.to_ascii_lowercase());
+        ev.filename_substring =
+            contains_ignore_ascii(filename, pq.stem_lower.as_deref().unwrap_or_default());
     } else {
         // Bare name query: stem equality is "this is the file", not just contains.
         let stem = filename_stem(filename);
         ev.exact_filename = filename.eq_ignore_ascii_case(q) || stem.eq_ignore_ascii_case(q);
-        ev.filename_substring = filename.to_ascii_lowercase().contains(&q.to_ascii_lowercase());
+        ev.filename_substring = contains_ignore_ascii(filename, &pq.lower);
     }
 
     // Path structure
@@ -496,7 +562,7 @@ pub fn evidence_for(
 
     // Role
     let role = role_of_filename(filename);
-    if let Some(want) = implied_role_from_query(q) {
+    if let Some(want) = pq.wants_role {
         ev.role_match = role == want;
     } else if intent == QueryIntent::FileName || intent == QueryIntent::Typo {
         ev.role_match = false;
