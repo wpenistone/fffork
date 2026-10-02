@@ -7,9 +7,7 @@ use std::sync::LazyLock;
 
 /// Dedicated thread pool for background work (scan, warmup, bigram build).
 pub static BACKGROUND_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
-    let total = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(4);
+    let total = effective_core_count();
 
     // Background work is mostly syscall-bound; halving parallelism leaves
     // cores for search/UI at negligible throughput cost.
@@ -32,40 +30,44 @@ pub static BACKGROUND_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|
         .expect("failed to create background rayon pool")
 });
 
-/// Physical performance-core count via sysctl, falling back to logical cores.
-/// On a 12P+4E M4 Max, grep runs 16t=6.2s vs 13t=4.9s — fewer threads win.
-#[cfg(target_os = "macos")]
-fn performance_core_count() -> usize {
-    let mut count: libc::c_int = 0;
-    let mut size = std::mem::size_of::<libc::c_int>();
-    let name = c"hw.perflevel0.physicalcpu";
-    let ok = unsafe {
-        libc::sysctlbyname(
-            name.as_ptr(),
-            &mut count as *mut _ as *mut libc::c_void,
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if ok == 0 && count > 0 {
-        count as usize
-    } else {
-        std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4)
+/// Cores worth actually using for parallel work.
+///
+/// On Apple silicon the E-cores are ~2x slower and `open()` contends on a
+/// per-VFS lock past P-core count, so prefer the performance cores: on a 12P+4E
+/// M4 Max, grep runs 16t=6.2s vs 13t=4.9s. Everywhere else this is just the
+/// logical core count.
+///
+/// This is the single source of truth for "how many threads can this machine
+/// usefully run" - the pools below and `crate::machine` all derive from it, so
+/// they cannot disagree about core count.
+pub fn effective_core_count() -> usize {
+    #[cfg(target_os = "macos")]
+    {
+        let mut count: libc::c_int = 0;
+        let mut size = std::mem::size_of::<libc::c_int>();
+        let name = c"hw.perflevel0.physicalcpu";
+        let ok = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                &mut count as *mut _ as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if ok == 0 && count > 0 {
+            return count as usize;
+        }
     }
+    std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
 }
 
 /// Pool for grep content search: P-core sized and QoS-pinned on macOS, full
 /// parallelism elsewhere. Avoids E-core drag and VFS-lock contention.
 pub static SEARCH_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
-    #[cfg(target_os = "macos")]
-    let threads = performance_core_count();
-    #[cfg(not(target_os = "macos"))]
-    let threads = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(4);
+    let threads = effective_core_count();
 
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)

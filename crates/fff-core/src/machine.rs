@@ -159,9 +159,10 @@ pub(crate) fn scan_thread_cap() -> usize {
 
 impl Machine {
     fn probe() -> Self {
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
+        // Core count comes from `parallelism`, which already prefers Apple
+        // performance cores; re-deriving it here with `available_parallelism`
+        // would size every cap in this module off E-cores on asymmetric chips.
+        let cores = crate::parallelism::effective_core_count();
         let (cache_line, llc_bytes) = cache_geometry();
         // The probe must not fit in LLC, or it measures cache bandwidth and
         // over-estimates how fast this box walks a real (multi-MB) index.

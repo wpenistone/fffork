@@ -11,7 +11,7 @@ use neo_frizbee::{Matcher, Scoring};
 use rayon::prelude::*;
 use smallvec::SmallVec;
 use std::sync::Arc;
-use std::{borrow::Cow, path::MAIN_SEPARATOR};
+use std::path::MAIN_SEPARATOR;
 
 /// Raw frizbee match lists are expensive (full corpus × needle). Cache them
 /// across identical searches on an unchanged index generation — typing and
@@ -1391,7 +1391,12 @@ fn match_and_score_in_arena<'a>(
     {
         vec![]
     } else {
-        let mut fallback_filenames: Vec<Cow<'_, str>> = Vec::new();
+        // One reused buffer for all fallback filenames instead of a `Cow` per
+        // candidate. `filename_cow` heap-allocates whenever the filename
+        // straddles a 16-byte chunk boundary, and this loop runs over every
+        // match - ~125ns per candidate on a mid-sized corpus.
+        let mut name_buf: Vec<u8> = Vec::new();
+        let mut name_spans: Vec<(u32, u32)> = Vec::new();
 
         for (i, path_match) in path_matches.iter().enumerate() {
             let file = working_files.index(path_match.index as usize);
@@ -1399,17 +1404,32 @@ fn match_and_score_in_arena<'a>(
             let match_start_approx = path_match.end_col.saturating_sub(main_needle_len - 1);
 
             if match_start_approx < filename_start {
+                let off = file.path.filename_offset as u32;
+                let end = file.path.byte_len as u32;
+                let start = name_buf.len() as u32;
+                let len = end.saturating_sub(off) as usize;
+                name_buf.resize(start as usize + len, 0);
+                file.path
+                    .copy_window_to(arena, off, end, &mut name_buf[start as usize..]);
                 fallback_indices.push(i as u32);
-                fallback_filenames.push(file.path.filename_cow(arena));
+                name_spans.push((start, len as u32));
             }
         }
 
-        if fallback_filenames.is_empty() {
+        if name_spans.is_empty() {
             vec![]
         } else {
             // Match on `&str` so frizbee reuses the instantiation its index
             // resolver already emits instead of a separate `Cow<str>` copy.
-            let filename_strs: Vec<&str> = fallback_filenames.iter().map(Cow::as_ref).collect();
+            let filename_strs: Vec<&str> = name_spans
+                .iter()
+                .map(|&(s, l)| {
+                    let s = s as usize;
+                    // SAFETY: arena path bytes are valid UTF-8, the same
+                    // assumption `ChunkedString::read_to_buf` already makes.
+                    unsafe { std::str::from_utf8_unchecked(&name_buf[s..s + l as usize]) }
+                })
+                .collect();
             let mut matches = with_cached_matcher(fuzzy_parts[0], &options, |matcher| {
                 matcher.match_list_parallel(
                     &filename_strs,
