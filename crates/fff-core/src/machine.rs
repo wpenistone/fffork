@@ -43,17 +43,46 @@ impl Machine {
     ///
     /// Was a literal `.min(8)`, which under-uses a 32-core server and
     /// over-uses a phone. Cores alone are the wrong bound: the gate is memory
-    /// bound (it stops scaling past ~2 threads even on 20 cores), so cap
-    /// against LLC too - no point running more threads than the cache feeds.
+    /// bound, so the bound is the point where extra threads stop adding
+    /// bandwidth. Measured on a 20-core desktop, p50 for a 226k-file query
+    /// is 32700us at 1 thread, 10214us at 2, then flat-to-worse (11457us at
+    /// 6, 10691us at 11) - so the knee, not the core count, is the limit.
     pub fn scan_thread_cap(&self) -> usize {
         let by_cores = self.cores.saturating_sub(1).max(1);
+        let by_bandwidth = self.saturation_threads();
         let by_cache = if self.llc_bytes == 0 {
             by_cores
         } else {
             // ~2 MB working set per active thread; past that they evict each other.
             (self.llc_bytes / (2 * 1024 * 1024)).max(1)
         };
-        by_cache.min(by_cores).clamp(1, 64)
+        by_bandwidth.min(by_cache).min(by_cores).clamp(1, 64)
+    }
+
+    /// Smallest thread count reaching ~90% of the best observed read
+    /// bandwidth: the knee of the memory-scaling curve. Threads past it
+    /// contend for the same DRAM and only add fork/join and cache pressure.
+    /// Measured once, so it adapts to the box instead of assuming the core
+    /// count is the limit.
+    pub fn saturation_threads(&self) -> usize {
+        static KNEE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *KNEE.get_or_init(|| {
+            let probe = self.llc_bytes.saturating_mul(2).clamp(32 << 20, 256 << 20);
+            let mut peak = 0.0f64;
+            for t in [2usize, 4, 8, 16] {
+                if t > self.cores {
+                    break;
+                }
+                let b = parallel_read_bw(probe, t);
+                if b > peak {
+                    peak = b;
+                }
+                if b >= peak * 0.9 {
+                    return t;
+                }
+            }
+            self.cores.clamp(1, 16)
+        })
     }
 }
 
@@ -86,6 +115,35 @@ pub(crate) fn match_work_per_thread() -> usize {
             .unwrap_or_else(|| machine().match_work_per_thread())
     });
     *W
+}
+
+/// Aggregate read bandwidth in bytes/ns with `threads` threads over a shared
+/// buffer, used only to locate the memory-scaling knee.
+fn parallel_read_bw(n_bytes: usize, threads: usize) -> f64 {
+    let mut buf = vec![0u8; n_bytes];
+    let mut x: u64 = 0x243f_6a88_85a3_08d3;
+    for (i, b) in buf.iter_mut().enumerate() {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *b = (x >> 33) as u8 ^ (i as u8);
+    }
+    let t0 = std::time::Instant::now();
+    let mut total = 0u64;
+    std::thread::scope(|s| {
+        let per = n_bytes / threads;
+        for t in 0..threads {
+            let slice = &buf[t * per..(t + 1) * per];
+            let h = s.spawn(move || {
+                let mut acc: u64 = 0;
+                for i in (0..slice.len()).step_by(64) {
+                    acc = acc.wrapping_add(slice[i] as u64);
+                }
+                acc
+            });
+            total += h.join().unwrap_or(0);
+        }
+    });
+    std::hint::black_box(total);
+    n_bytes as f64 / t0.elapsed().as_nanos().max(1) as f64
 }
 
 pub(crate) fn scan_thread_cap() -> usize {
