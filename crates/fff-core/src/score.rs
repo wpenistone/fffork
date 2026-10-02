@@ -113,6 +113,7 @@ fn match_fuzzy_parts(
     // then re-score with validated SW that replicates frizbee's gap model
     // on the SAME trimmed slices with the SAME include_prefix semantics.
     let first_part_matches = {
+        let part_timing = std::env::var_os("FFF_PHASE_TIMING").is_some();
         let t_prefilter = std::time::Instant::now();
         // Phase 1: frizbee prefilter only (skip its SW). The skip_sw path
         // encodes (start_pos_adj, end_pos) in (score, end_col).
@@ -172,6 +173,7 @@ fn match_fuzzy_parts(
         let use_cand = try_cand && cand.len() * 2 < working_files.len() && !cand.is_empty();
         // TISG gate (span + skip-DP) — match-set + window without frizbee.
         // Emits the same skip_sw Match encoding the pipeline already decodes.
+        let t_gate = std::time::Instant::now();
         let mut matches = if use_cand {
             let cand = cand.as_slice();
             crate::gate::gate_match_range(
@@ -194,6 +196,7 @@ fn match_fuzzy_parts(
                 arena,
             )
         };
+        let gate_us = t_gate.elapsed().as_micros();
         let prefilter_ms = t_prefilter.elapsed().as_secs_f64() * 1e3;
 
         // Phase 2: re-score with inter-sequence SW on trimmed windows.
@@ -208,6 +211,7 @@ fn match_fuzzy_parts(
             q.len() >= 4 && q.contains('.') && !q.contains('/')
         };
         let mut exact_name_hits: Vec<u32> = Vec::new();
+        let t_exact = std::time::Instant::now();
         if looks_like_filename {
             let q = valid_parts[0];
             let qb = q.as_bytes();
@@ -223,6 +227,8 @@ fn match_fuzzy_parts(
             }
         }
 
+        let exact_us = t_exact.elapsed().as_micros();
+
         // SW scoring (collapse removed: cheap rank disagreed with SW
         // on real corpora; reordering would be a UX regression).
         let t_collect = std::time::Instant::now();
@@ -231,6 +237,7 @@ fn match_fuzzy_parts(
         if std::env::var_os("FFF_PHASE_TIMING").is_some() {
             eprintln!("PHASE cand_ms={cand_ms:.1} wins_ms={wins_ms:.1} samp_ms={samp_ms:.1} collapsed=false n={}", matches.len());
         }
+        let t_sw = std::time::Instant::now();
         {
 
         // Chunked scoring: process at most CHUNK matches of metadata at a
@@ -522,6 +529,13 @@ fn match_fuzzy_parts(
             PERM_ECOLS.with(|c| reclaim(&mut c.borrow_mut(), perm_ecols));
         }
 
+        let sw_us = t_sw.elapsed().as_micros();
+        if part_timing {
+            eprintln!(
+                "PHASE parts gate_us={gate_us} exact_us={exact_us} sw_us={sw_us} n={}",
+                matches.len()
+            );
+        }
         if std::env::var_os("FFF_PHASE_TIMING").is_some() {
             eprintln!(
                 "PHASE interseq prefilter_ms={prefilter_ms:.1} collect_ms={collect_ms:.1} batch_ms={batch_ms:.1} assemble_ms={assemble_ms:.1} n={}",
