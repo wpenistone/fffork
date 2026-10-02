@@ -301,9 +301,11 @@ fn match_fuzzy_parts(
         // thread-local, so this fans out safely. It used to be a serial `for`,
         // which pinned ~6 ms of the query to one core no matter how many
         // threads were available.
-        {
-        use rayon::prelude::*;
-        matches.par_chunks_mut(CHUNK).for_each(|matches_chunk| {
+        //
+        // Only fan out when there is more than one chunk: a single chunk has
+        // nothing to split, and the fork/join alone measured ~8x the whole
+        // serial body on a few-hundred-match corpus (782us vs 97us).
+        let sw_body = |matches_chunk: &mut [neo_frizbee::Match]| {
             let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
             let t_chunk = std::time::Instant::now();
             let n_matches = matches_chunk.len();
@@ -538,7 +540,14 @@ fn match_fuzzy_parts(
             ORDER.with(|c| reclaim(&mut c.borrow_mut(), order));
             PERM_SCORES.with(|c| reclaim(&mut c.borrow_mut(), perm_scores));
             PERM_ECOLS.with(|c| reclaim(&mut c.borrow_mut(), perm_ecols));
-        });
+        };
+        if matches.len() <= CHUNK {
+            for chunk in matches.chunks_mut(CHUNK) {
+                sw_body(chunk);
+            }
+        } else {
+            use rayon::prelude::*;
+            matches.par_chunks_mut(CHUNK).for_each(sw_body);
         }
 
         let sw_us = t_sw.elapsed().as_micros();
@@ -755,7 +764,16 @@ fn fuzzy_match_and_score_files_impl<'a>(
         )
     };
 
-    sort_and_paginate(results, context, total_matched)
+    let t_sort = std::time::Instant::now();
+    let out = sort_and_paginate(results, context, total_matched);
+    if std::env::var_os("FFF_PHASE_TIMING").is_some() {
+        eprintln!(
+            "PHASE paginate_us={} n={}",
+            t_sort.elapsed().as_micros(),
+            out.2
+        );
+    }
+    out
 }
 
 pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
