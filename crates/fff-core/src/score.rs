@@ -1480,12 +1480,35 @@ fn match_and_score_in_arena<'a>(
             };
 
             let is_filename_match = end_col_filename_match || simd_filename_match.is_some();
-            let fname_len = file.path.byte_len as usize - file.path.filename_offset as usize;
-            // Hoist filename once (was up to 3× filename_cow per hit).
-            let fname = if rank_collapsed {
-                None
+            let fname_off = file.path.filename_offset as usize;
+            let fname_len = file.path.byte_len as usize - fname_off;
+            // The full relative path is needed by the path-alignment suffix
+            // test, by the intent evidence (path intent or an open file) and by
+            // the combo test. Materialize it once and slice the filename out
+            // of it, instead of each consumer re-reading the path and the
+            // filename going through filename_cow (which heap-allocates
+            // whenever the filename straddles a chunk boundary).
+            let need_rel = query_contains_path_separator
+                || context.current_file.is_some()
+                || query_intent == crate::intent::QueryIntent::Path
+                || context.last_same_query_match.is_some();
+            let rel: Option<&str> = if need_rel {
+                Some(file.path.read_to_buf(arena, path_buf))
             } else {
+                None
+            };
+            // When nothing else needs the path, keep the zero-copy borrow.
+            let fname_cow = if rel.is_none() && !rank_collapsed {
                 Some(file.path.filename_cow(arena))
+            } else {
+                None
+            };
+            let fname: Option<&str> = if rank_collapsed {
+                None
+            } else if let Some(r) = rel {
+                Some(&r[fname_off..fname_off + fname_len])
+            } else {
+                Some(fname_cow.as_ref().unwrap().as_ref())
             };
 
             let is_exact_filename = !rank_collapsed
@@ -1532,8 +1555,7 @@ fn match_and_score_in_arena<'a>(
                     if last_bytes.len() < total_len {
                         return false;
                     }
-                    file.write_relative_path_from_arena(arena, dir_buf);
-                    last_bytes.ends_with(dir_buf.as_bytes())
+                    last_bytes.ends_with(rel.unwrap_or("").as_bytes())
                 });
 
                 match last_same_query_match {
@@ -1551,8 +1573,7 @@ fn match_and_score_in_arena<'a>(
             // Uses suffix overlap — bytes matching from the end. A full prefix
             // match is just the 100% coverage case, so no separate branch needed.
             let path_alignment_bonus = if query_contains_path_separator {
-                let rel_path = file.path.read_to_buf(arena, path_buf);
-                let path_bytes = rel_path.as_bytes();
+                let path_bytes = rel.unwrap_or("").as_bytes();
                 let common_suffix = main_needle
                     .iter()
                     .rev()
@@ -1583,17 +1604,16 @@ fn match_and_score_in_arena<'a>(
                 let need_path = query_intent == crate::intent::QueryIntent::Path
                     || context.current_file.is_some();
                 let ev = if need_path {
-                    let rel = file.path.read_to_buf(arena, path_buf);
                     crate::intent::evidence_for(
-                        rel.as_ref(),
-                        fname_ref.as_ref(),
+                        rel.unwrap_or(""),
+                        fname_ref,
                         main_needle_as_str,
                         query_intent,
                         context.current_file,
                     )
                 } else {
                     crate::intent::evidence_filename_only(
-                        fname_ref.as_ref(),
+                        fname_ref,
                         main_needle_as_str,
                         query_intent,
                     )
