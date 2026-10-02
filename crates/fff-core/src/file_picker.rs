@@ -1289,7 +1289,11 @@ impl FilePicker {
         // Path-store layout stats and the machine profile these numbers are
         // interpreted against. The gate is bound by arena load latency, so the
         // working-set shape matters more than anything else.
+        // Path-store layout stats walk every file, so they are gated separately from
+        // FFF_PHASE_TIMING: leaving them on the timing path cost ~560us on a
+        // 227k-file query and skewed every phase measurement taken with it.
         let t_total = std::time::Instant::now();
+        let arena_stats = std::env::var_os("FFF_ARENA_STATS").is_some();
         if std::env::var_os("FFF_PHASE_TIMING").is_some() {
             let m = crate::machine::machine();
             eprintln!(
@@ -1301,7 +1305,9 @@ impl FilePicker {
                 crate::machine::match_work_per_thread(),
                 crate::machine::scan_thread_cap(),
             );
-            if let Some(store) = self.sync_data.chunked_paths.as_ref() {
+            if arena_stats
+                && let Some(store) = self.sync_data.chunked_paths.as_ref()
+            {
                 let slots: usize = self
                     .sync_data
                     .files
