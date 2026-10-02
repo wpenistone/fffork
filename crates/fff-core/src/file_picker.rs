@@ -1286,12 +1286,10 @@ impl FilePicker {
             "Fuzzy search",
         );
 
-        // Path-store layout stats. The gate is bound by arena load latency,
-        // so the working-set shape matters more than anything else; this is
-        // the only place the real dedup ratio is visible.
         // Path-store layout stats and the machine profile these numbers are
         // interpreted against. The gate is bound by arena load latency, so the
         // working-set shape matters more than anything else.
+        let t_total = std::time::Instant::now();
         if std::env::var_os("FFF_PHASE_TIMING").is_some() {
             let m = crate::machine::machine();
             eprintln!(
@@ -1361,6 +1359,7 @@ impl FilePicker {
         // small queries with a large number of results can match absolutely everything
         let max_typos = (effective_query.len() as u16 / 4).clamp(2, 6);
         // Look up the last file selected for this query (combo-boost scoring)
+        let t_tracker = std::time::Instant::now();
         let last_same_query_entry =
             query_tracker
                 .zip(options.project_path)
@@ -1374,6 +1373,7 @@ impl FilePicker {
                         .ok()
                         .flatten()
                 });
+        let tracker_us = t_tracker.elapsed().as_micros();
 
         let context = ScoringContext {
             query,
@@ -1487,8 +1487,17 @@ impl FilePicker {
             // Move, don't copy â€” hit_buf is dead after this.
             live.candidates = hit_buf;
         }
+        let t_offsets = std::time::Instant::now();
         let match_byte_offsets =
             fuzzy_match_byte_offsets_for_page(query, &items, max_typos, base_arena, overflow_arena);
+        if std::env::var_os("FFF_PHASE_TIMING").is_some() {
+            eprintln!(
+                "PHASE total_us={} tracker_us={tracker_us} offsets_us={} page={}",
+                t_total.elapsed().as_micros(),
+                t_offsets.elapsed().as_micros(),
+                items.len()
+            );
+        }
 
         info!(
             ?query,
