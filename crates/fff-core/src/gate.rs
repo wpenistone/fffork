@@ -603,7 +603,7 @@ where
     G: Fn(u32) -> &'a FileItem + Sync,
 {
     // Needle state (span mask + bit-parallel position masks) is per query, so
-    // it is built once and shared by every path instead of per path.
+    // Built once per query and shared by every path.
     let state = GateNeedle::new(needle, max_typos);
     let scan = |i: u32| -> Option<neo_frizbee::Match> {
         // Warm the next candidate's path chunks: the gate is bound by arena

@@ -243,7 +243,7 @@ fn match_fuzzy_parts(
         {
 
         // Chunked scoring: process at most CHUNK matches of metadata at a
-        // time so peak working set stays small (faults/RSS vs upstream).
+        // time so peak working set stays small (faults/RSS).
         // 32k Ãƒâ€” ~16 B Ãƒâ€” a few arrays Ã¢â€°Ë† 1 MB peak, vs a full 227k-wide set.
         const CHUNK: usize = 32 * 1024;
         thread_local! {
@@ -301,9 +301,7 @@ fn match_fuzzy_parts(
         let timing = part_timing;
 
         // Chunks are disjoint slices of `matches` and every scratch buffer is
-        // thread-local, so this fans out safely. It used to be a serial `for`,
-        // which pinned ~6 ms of the query to one core no matter how many
-        // threads were available.
+        // thread-local, so this fans out safely.
         //
         // Only fan out when there is more than one chunk: a single chunk has
         // nothing to split, and the fork/join alone measured ~8x the whole
@@ -418,8 +416,7 @@ fn match_fuzzy_parts(
                             std::mem::take(&mut *b)
                         });
                         stage.truncate(buf_len);
-                        // Zero only padding (was fill(0) of the whole buffer,
-                        // then overwrite every window Ã¢â‚¬â€ double-touch).
+                        // Zero only the padding lanes.
                         for k in n..batch_sz {
                             stage[k * rows..(k + 1) * rows].fill(0);
                         }
@@ -1443,10 +1440,10 @@ fn match_and_score_in_arena<'a>(
                     unsafe { std::str::from_utf8_unchecked(&name_buf[s..s + l as usize]) }
                 })
                 .collect();
-            // Thread count from the calibrated work estimate instead of a
-            // literal match count. The old `max_threads.div_ceil(2048)` was
-            // always 1 for any realistic pool, and the `4096` replacement left
-            // the fallback serial on exactly the mid-size corpora where it runs.
+            // Thread count from the calibrated work estimate, which accounts
+            // for path length, needle length and typo budget. A bare match
+            // count leaves this serial on the mid-size corpora where the
+            // fallback actually runs.
             let fb_threads = effective_match_threads(
                 filename_strs.len(),
                 fuzzy_parts[0].len(),
@@ -1510,14 +1507,9 @@ fn match_and_score_in_arena<'a>(
     // Ranking-feature collapse: when the query hit nearly every path, skip per-hit
     // filename arena reads (filename_cow / special-entry) and intent evidence.
     //
-    // This is a ratio, not a time budget, and that is deliberate. A frame-budget
-    // reformulation was tried and reverted: with `scan_cap` threads the budget
-    // works out to ~800k candidates, which no corpus reaches, so it degenerated
-    // into "never collapse" and cost 1.3-1.4x on the 99%-match queries
-    // (`test` 7315 -> 10377 us, `mod` 6891 -> 9049 us) for no benefit anywhere.
-    //
-    // The ratio does carry real signal even though it looks arbitrary: when
-    // ~99% of files match, per-candidate features cannot discriminate the top
+    // This is a ratio, not a time budget, and that is deliberate. The ratio
+    // carries real signal: when ~99% of files match, per-candidate features
+    // cannot discriminate the top
     // page, so the 25-40 ns each costs buys nothing. Measured: 7.9 ns/candidate
     // collapsed vs 37.9 ns uncollapsed. The cliff between them is the cost.
     let rank_collapsed = {
@@ -1923,10 +1915,8 @@ fn match_and_score_in_arena<'a>(
             .map(|Reverse(r)| (r.file, r.score))
             .collect();
         // The parallel top-k heap plus `sort_unstable_by` leaves equal-scored
-        // candidates in arbitrary order (observed: two files at 144 swapping
-        // between runs of the same binary). Tie-break on the file's index so
-        // output is reproducible; ordering among equals is not a ranking
-        // decision, it was previously just nondeterministic.
+        // candidates in arbitrary order. Ordering among equals is not a ranking
+        // decision, so it only needs to be reproducible.
         results.sort_unstable_by(|a, b| {
             b.1.total
                 .cmp(&a.1.total)
@@ -2072,8 +2062,7 @@ fn score_filtered_by_frecency<'a>(
     };
 
     match files {
-        // Small indexes cannot amortize Rayon scheduling for this cheap pass
-        // (upstream parity: stay serial under 32k or an explicit 1T search).
+        // Small indexes cannot amortize Rayon scheduling for this cheap pass.
         FileItems::All(s) if s.len() >= 32_768 && context.max_threads > 1 => s
             .par_iter()
             .filter_map(|f| {

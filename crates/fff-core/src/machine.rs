@@ -1,10 +1,7 @@
 //! Machine calibration.
 //!
-//! The tuning constants this crate used to hardcode (`MATCH_WORK_PER_THREAD`,
-//! the `.min(8)` scan cap) were measured on one 20-core desktop and shipped as
-//! literals, which is wrong everywhere else: a 4-core laptop, a 32-core server
-//! and an M-series Mac all want different numbers, and the *shape* of the
-//! curve differs too.
+//! Tuning constants must hold on a 4-core laptop, a 32-core server and an
+//! M-series Mac alike, so none of them is a literal.
 //!
 //! **Topology first, measurement only for what topology cannot give us.**
 //! Core counts, SMT siblings, cache-line size, LLC and L2 size, clock, NUMA
@@ -12,14 +9,11 @@
 //! sysfs (Linux, any arch) or sysctl (macOS). Everything the dispatcher needs is
 //! derived from those. The one measured quantity is memory latency, which no
 //! register reports and which belongs to the memory controller rather than the
-//! CPU - and that is probed with one small buffer sized from the LLC, not with
-//! the hundreds of MB a bandwidth sweep used to allocate per thread-count
-//! sample.
+//! CPU - and that is probed with one small buffer sized from the LLC.
 //!
-//! The gate is latency-bound rather than bandwidth-bound (vectorising it changed
-//! nothing; thread scaling flattens past two threads), so the model that
-//! matters is "how many misses can this box keep in flight" - latency x line
-//! size x memory-level parallelism - not aggregate GB/s.
+//! The gate moves little data per byte it touches, so the model that matters is
+//! "how many misses can this box keep in flight" - latency x line size x
+//! memory-level parallelism - rather than aggregate GB/s.
 //!
 //! Overrides: `FFF_MATCH_WORK_PER_THREAD`, `FFF_SCAN_THREAD_CAP`,
 //! `FFF_FORK_JOIN_NS`, `FFF_NO_PROBE`.

@@ -312,8 +312,8 @@ pub(crate) fn detect_binary_content(content: &[u8]) -> bool {
 /// `presence::fold_bit`.
 ///
 /// Built during the index-time binary sniff, which already streams every byte
-/// of every file, so it costs one OR per byte on a pass that was happening
-/// anyway. Grep can then reject a candidate file without opening it: a length
+/// of every file, so it costs one OR per byte on an existing pass. Grep can
+/// then reject a candidate file without opening it: a length
 /// `m` match with `T` typos needs at least `m - T` distinct needle bytes
 /// present, which is a sound necessary condition.
 ///
@@ -1188,8 +1188,8 @@ mod content_cache_budget_tests {
 
     #[test]
     fn fileitem_stays_48_bytes_on_64bit() {
-        // Packed layout (presence + u32 git_status sentinel). 56 B × 227k
-        // was ~1.8 MB of extra peak RSS vs the pre-presence upstream build.
+        // Packed layout keeps FileItem at 48 B on 64-bit targets, which
+        // matters at 227k files.
         #[cfg(target_pointer_width = "64")]
         {
             let sz = std::mem::size_of::<FileItem>();
@@ -1202,8 +1202,7 @@ mod content_cache_budget_tests {
 
     #[test]
     fn with_max_files_applies_the_cap_verbatim() {
-        // regression: the cap used to be routed through new_for_repo, which
-        // read it as a repo file count and bucketed 2000 up to 30_000
+        // The cap is applied verbatim, not bucketed.
         assert_eq!(ContentCacheBudget::with_max_files(2000).max_files, 2000);
         assert_eq!(ContentCacheBudget::with_max_files(7).max_files, 7);
         assert_eq!(

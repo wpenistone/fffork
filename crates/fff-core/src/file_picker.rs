@@ -1470,9 +1470,7 @@ impl FilePicker {
         // candidate vector, and the kept indices stay aligned with the subset
         // so hit mapping is exact even when the presence mask drops items.
         let mut hit_buf: Vec<u32> = Vec::new();
-        // Timed BEFORE the narrow plan: the presence-mask prune walks the whole
-        // previous hit set, and starting the timer after it made that cost
-        // invisible (it was attributed to the caller's `post_us` instead).
+        // Starts before the narrow plan so the presence-mask prune is included.
         let t_msa = std::time::Instant::now();
         let (items, scores, total_matched) = {
             enum NarrowPlan {
@@ -1561,9 +1559,7 @@ impl FilePicker {
             // Move, don't copy â€” hit_buf is dead after this.
             live.candidates = hit_buf;
         }
-        // The outer `t_msa` above is the real match+score timer. A second
-        // `let t_msa` used to shadow it here, so `msa_us` always reported ~0
-        // and `post_us` (total minus the rest) absorbed the whole query.
+        // `msa_us` covers match+score, including the narrow plan above.
         let msa_us = t_msa.elapsed().as_micros();
         let post_us = msa_us;
         let t_offsets = std::time::Instant::now();
@@ -2131,7 +2127,7 @@ impl FilePicker {
             // overlay coherence tests once masks were populated for all files.
             self.sync_data.content_masks.set(pos, mask);
         } else {
-            // Binary now: no mask, so grep reads (and rejects) it as before.
+            // Binary now: no mask, so grep reads (and rejects) it.
             self.sync_data
                 .content_masks
                 .set(pos, crate::types::ContentMask::default());
@@ -2647,7 +2643,7 @@ impl FileSync {
                 && f.size <= crate::constants::MAX_INDEXABLE_FILE_SIZE as u64
         };
 
-        // Match upstream's (indexable, parent_dir, filename) order exactly.
+        // Sort order is (indexable, parent_dir, filename).
         // The O(n) compact is not enough: `par_sort_unstable_by` on
         // file_name(arena) is not the same key as the walk-path sort, and
         // downstream binary_search / match index maps assume this order.
@@ -2689,9 +2685,9 @@ impl FileSync {
         let base_count = files.len();
         let base_dirs_count = dirs.len();
 
-        // Seed the cached max path length from the files just scanned. Leaving it
-        // zeroed made `effective_match_threads` see a 0-byte haystack, so the
-        // work estimate was 3-6x too small and the stage ran under-threaded.
+        // Seed the cached max path length from the files just scanned.
+        // `effective_match_threads` needs a real haystack length or it
+        // under-provisions threads.
         let scanned_max_path_len = files.iter().map(|f| f.path.byte_len).max().unwrap_or(0);
         let max_path_len = Arc::new(MaxPathLen::new());
         max_path_len.observe(scanned_max_path_len);
@@ -2719,7 +2715,7 @@ impl FileSync {
         })
     }
 
-    /// Build (once) the path bigram index used to prefilter typo-free fuzzy
+    /// Build (once) the path bigram index that prefilters typo-free fuzzy
     /// queries. Deferred from scan so peak RSS does not include the builder
     /// slab for workloads that never ask for a zero-typo filter.
     pub(crate) fn ensure_path_bigram(&mut self) {

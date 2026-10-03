@@ -247,9 +247,9 @@ impl ChunkedString {
         Cow::Owned(out)
     }
 
-    /// Prefetch this path's arena chunks. The match gate is latency-bound on
-    /// the scattered dedup store rather than compute-bound, so issuing the
-    /// next candidate's loads early hides most of the miss.
+    /// Prefetch this path's arena chunks. The gate's chunk lookups are scattered
+    /// across the dedup store, so issuing the next candidate's loads early
+    /// hides part of the miss.
     #[inline]
     pub fn prefetch(&self, arena: ArenaPtr) {
         #[cfg(target_arch = "x86_64")]

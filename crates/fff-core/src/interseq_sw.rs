@@ -504,7 +504,7 @@ pub(crate) mod avx2 {
         let cap_v = set1(p.capitalization_bonus as u8);
         let case_v = set1(p.matching_case_bonus as u8);
         let prefix_v = set1(p.prefix_bonus as u8);
-        // Hoist class thresholds out of the hot column loop (was set1 per column).
+        // Class thresholds are constant across columns, so hoist them out.
         let a_lo = set1(b'A' - 1);
         let z_hi = set1(b'Z' + 1);
         let la_lo = set1(b'a' - 1);
@@ -523,7 +523,7 @@ pub(crate) mod avx2 {
             _mm256_loadu_si256(arr.as_ptr() as *const __m256i)
         };
 
-        // Pre-broadcast needle bytes (was set1 twice per needle row per column).
+        // Broadcast each needle byte once per batch.
         let mut nc_v = [zero; 33];
         let mut nf_v = [zero; 33];
         for i in 0..m {
@@ -595,7 +595,7 @@ pub(crate) mod avx2 {
             } else {
                 zero
             };
-            // Column-invariant bonus pack (was inside the row loop).
+            // The bonus pack is column-invariant, so build it once.
             let bonus_base = _mm256_add_epi8(
                 _mm256_add_epi8(delim_bonus, cap_bonus),
                 _mm256_add_epi8(prefix_bonus, match_add_v),
