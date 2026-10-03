@@ -1443,17 +1443,19 @@ fn match_and_score_in_arena<'a>(
                     unsafe { std::str::from_utf8_unchecked(&name_buf[s..s + l as usize]) }
                 })
                 .collect();
+            // Thread count from the calibrated work estimate instead of a
+            // literal match count. The old `max_threads.div_ceil(2048)` was
+            // always 1 for any realistic pool, and the `4096` replacement left
+            // the fallback serial on exactly the mid-size corpora where it runs.
+            let fb_threads = effective_match_threads(
+                filename_strs.len(),
+                fuzzy_parts[0].len(),
+                max_path_len,
+                options.max_typos,
+                crate::machine::scan_thread_cap().max(context.max_threads),
+            );
             let mut matches = with_cached_matcher(fuzzy_parts[0], &options, |matcher| {
-                matcher.match_list_parallel(
-                    &filename_strs,
-                    if path_matches.len() > 4096 {
-                        // Was max_threads.div_ceil(2048), which is 1 for any
-                        // realistic pool and left 4T filename fallback serial.
-                        context.max_threads.clamp(1, 8)
-                    } else {
-                        1
-                    },
-                )
+                matcher.match_list_parallel(&filename_strs, fb_threads)
             });
 
             sort_by_key_with_buffer(&mut matches, |m| fallback_indices[m.index as usize]);
