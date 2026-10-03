@@ -682,10 +682,12 @@ where
             .par_iter()
             .enumerate()
             .map_init(
-                // tested it out a few times, this is just fine for rayon worker in this specific
-                // case it doesn't reallocate this many times and it is actually faster than using
-                // scoped threads with a predefined local scratch buffers because of spawn cost
-                || (Vec::with_capacity(64 * 1024), MmapSlot::default(), false, 0u64, 0u64),
+                // Scratch for one file's matches. Capacity is per *chunk*, because map_init
+                // runs once per rayon worker per chunk: at 64K entries this
+                // allocated megabytes per worker per chunk, and a full-corpus
+                // grep runs hundreds of chunks. The vector still grows on
+                // demand, so this only changes how much is reserved up front.
+                || (Vec::with_capacity(1024), MmapSlot::default(), false, 0u64, 0u64),
                 |(buf, mmap_slot, aborted, read_ns, scan_ns), (local_idx, file)| {
                     let idx = chunk_offset + local_idx;
                     let found = (|| -> Option<Vec<GrepMatch>> {
