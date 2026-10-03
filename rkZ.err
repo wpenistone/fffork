@@ -1,5 +1,6 @@
 warning: C:\Users\kanal\Projects\fff-upstream\crates\fff-core\Cargo.toml: unused manifest key: dependencies.fff-grep.version
 warning: C:\Users\kanal\Projects\fff-upstream\crates\fff-core\Cargo.toml: unused manifest key: dependencies.fff-query-parser.version
+   Compiling fff-search v0.11.0 (C:\Users\kanal\Projects\fff-upstream\crates\fff-core)
 warning: unused import: `algo::with_skip_sw`
   --> C:\Users\kanal\Projects\fff-upstream\vendor\neo_frizbee\src\matcher\mod.rs:28:9
    |
@@ -25,7 +26,6 @@ note: an unsafe function restricts its caller, but its body is safe by default
 
 For more information about this error, try `rustc --explain E0133`.
 warning: `neo_frizbee` (lib) generated 2 warnings (run `cargo fix --lib -p neo_frizbee` to apply 2 suggestions)
-   Compiling fff-search v0.11.0 (C:\Users\kanal\Projects\fff-upstream\crates\fff-core)
 warning: unused import: `Matcher`
   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\score.rs:10:19
    |
@@ -35,9 +35,9 @@ warning: unused import: `Matcher`
    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
 
 warning: unused variable: `t_msa`
-    --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\file_picker.rs:1448:17
+    --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\file_picker.rs:1494:17
      |
-1448 |             let t_msa = std::time::Instant::now();
+1494 |             let t_msa = std::time::Instant::now();
      |                 ^^^^^ help: if this is intentional, prefix it with an underscore: `_t_msa`
      |
      = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
@@ -69,33 +69,33 @@ note: an unsafe function restricts its caller, but its body is safe by default
     = note: `#[warn(unsafe_op_in_unsafe_fn)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
 
 warning: unused variable: `t_collect`
-   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\score.rs:233:13
+   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\score.rs:236:13
     |
-233 |         let t_collect = std::time::Instant::now();
+236 |         let t_collect = std::time::Instant::now();
     |             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_t_collect`
 
 warning: unused variable: `collect_ms`
-   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\score.rs:295:13
+   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\score.rs:298:13
     |
-295 |         let collect_ms = 0.0f64;
+298 |         let collect_ms = 0.0f64;
     |             ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_collect_ms`
 
 warning: unused variable: `batch_ms`
-   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\score.rs:296:13
+   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\score.rs:299:13
     |
-296 |         let batch_ms = 0.0f64;
+299 |         let batch_ms = 0.0f64;
     |             ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_batch_ms`
 
 warning: unused variable: `assemble_ms`
-   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\score.rs:297:13
+   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\score.rs:300:13
     |
-297 |         let assemble_ms = 0.0f64;
+300 |         let assemble_ms = 0.0f64;
     |             ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_assemble_ms`
 
 warning: unused variable: `t_fn`
-    --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\score.rs:1348:9
+    --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\score.rs:1351:9
      |
-1348 |     let t_fn = std::time::Instant::now();
+1351 |     let t_fn = std::time::Instant::now();
      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_t_fn`
 
 warning[E0133]: call to unsafe function `std::arch::x86_64::_mm256_loadu_si256` is unsafe and requires unsafe block
@@ -840,89 +840,113 @@ warning: variable does not need to be mutable
      = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
 
 warning: unnecessary `unsafe` block
-   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\machine.rs:211:20
+   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\machine.rs:230:20
     |
-211 |     let max_leaf = unsafe { __cpuid_count(0x8000_0000, 0) }.eax;
+230 |     let max_leaf = unsafe { __cpuid_count(0x8000_0000, 0) }.eax;
     |                    ^^^^^^ unnecessary `unsafe` block
     |
     = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
 
 warning: unnecessary `unsafe` block
-   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\machine.rs:220:17
+   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\machine.rs:239:17
     |
-220 |         let r = unsafe { __cpuid_count(4, sub) };
+239 |         let r = unsafe { __cpuid_count(4, sub) };
     |                 ^^^^^^ unnecessary `unsafe` block
 
-warning: field `path_bigram_index` is never read
+warning: fields `path_bigram_index` and `content_masks` are never read
    --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\file_picker.rs:126:5
     |
  96 | pub(crate) struct FileSync {
-    |                   -------- field in this struct
+    |                   -------- fields in this struct
 ...
 126 |     path_bigram_index: Option<Arc<BigramFilter>>,
     |     ^^^^^^^^^^^^^^^^^
+...
+137 |     pub(crate) content_masks: Arc<ContentMaskStore>,
+    |                ^^^^^^^^^^^^^
     |
     = note: `FileSync` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
 
-warning: method `bump_index_generation` is never used
-   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\file_picker.rs:717:19
+warning: method `set` is never used
+   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\file_picker.rs:159:19
     |
-710 | impl FilePicker {
+149 | impl ContentMaskStore {
+    | --------------------- method in this implementation
+...
+159 |     pub(crate) fn set(&self, index: usize, mask: crate::types::ContentMask) {
+    |                   ^^^
+
+warning: method `bump_index_generation` is never used
+   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\file_picker.rs:757:19
+    |
+750 | impl FilePicker {
     | --------------- method in this implementation
 ...
-717 |     pub(crate) fn bump_index_generation(&self) {
+757 |     pub(crate) fn bump_index_generation(&self) {
     |                   ^^^^^^^^^^^^^^^^^^^^^
 
 warning: method `ensure_path_bigram` is never used
-    --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\file_picker.rs:2632:19
+    --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\file_picker.rs:2679:19
      |
-2412 | impl FileSync {
+2458 | impl FileSync {
      | ------------- method in this implementation
 ...
-2632 |     pub(crate) fn ensure_path_bigram(&mut self) {
+2679 |     pub(crate) fn ensure_path_bigram(&mut self) {
      |                   ^^^^^^^^^^^^^^^^^^
 
-warning: method `write_file_name_from_arena` is never used
-   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\types.rs:402:19
+warning: methods `get` and `is_empty` are never used
+   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\types.rs:332:19
     |
-311 | impl FileItem {
+325 | impl ContentMask {
+    | ---------------- methods in this implementation
+...
+332 |     pub(crate) fn get(self) -> u64 {
+    |                   ^^^
+...
+337 |     pub(crate) fn is_empty(self) -> bool {
+    |                   ^^^^^^^^
+
+warning: method `write_file_name_from_arena` is never used
+   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\types.rs:468:19
+    |
+377 | impl FileItem {
     | ------------- method in this implementation
 ...
-402 |     pub(crate) fn write_file_name_from_arena(&self, arena: ArenaPtr, out: &mut String) {
+468 |     pub(crate) fn write_file_name_from_arena(&self, arena: ArenaPtr, out: &mut String) {
     |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: function `evidence_filename_only` is never used
-   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\intent.rs:459:8
+   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\intent.rs:475:8
     |
-459 | pub fn evidence_filename_only(
+475 | pub fn evidence_filename_only(
     |        ^^^^^^^^^^^^^^^^^^^^^^
 
 warning: method `hit_chunks` is never used
-   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\gate.rs:413:12
+   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\gate.rs:430:12
     |
 229 | impl GateNeedle {
     | --------------- method in this implementation
 ...
-413 |     pub fn hit_chunks(
+430 |     pub fn hit_chunks(
     |            ^^^^^^^^^^
 
 warning: function `gate_batch` is never used
-   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\gate.rs:535:8
+   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\gate.rs:552:8
     |
-535 | pub fn gate_batch<'a, I>(needle: &[u8], hays: I, max_typos: u16, out: &mut Vec<(u32, GateHit)>)
+552 | pub fn gate_batch<'a, I>(needle: &[u8], hays: I, max_typos: u16, out: &mut Vec<(u32, GateHit)>)
     |        ^^^^^^^^^^
 
 warning: function `gate_file` is never used
-   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\gate.rs:548:8
+   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\gate.rs:565:8
     |
-548 | pub fn gate_file(
+565 | pub fn gate_file(
     |        ^^^^^^^^^
 
 warning: function `gate_path_chunks` is never used
-   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\gate.rs:561:8
+   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\gate.rs:578:8
     |
-561 | pub fn gate_path_chunks(
+578 | pub fn gate_path_chunks(
     |        ^^^^^^^^^^^^^^^^
 
 warning: function `max_path_len_of` is never used
@@ -941,9 +965,9 @@ warning: method `clear` is never used
    |                   ^^^^^
 
 warning: function `fuzzy_match_and_score_files_cached` is never used
-   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\score.rs:700:15
+   --> C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\score.rs:703:15
     |
-700 | pub(crate) fn fuzzy_match_and_score_files_cached<'a>(
+703 | pub(crate) fn fuzzy_match_and_score_files_cached<'a>(
     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: function `score_one_scalar` is never used
@@ -1089,72 +1113,6 @@ warning: function `path_fuzzy_candidates` is never used
 112 | pub(crate) fn path_fuzzy_candidates(
     |               ^^^^^^^^^^^^^^^^^^^^^
 
-memory allocation of 2088960 bytes failed
-stack backtrace:
-   0: std::alloc::rust_oom
-   1: __rustc::__rust_alloc_error_handler
-   2: alloc::alloc::handle_alloc_error
-   3: alloc::raw_vec::handle_error
-   4: <rustc_arena::TypedArena<rustc_target::callconv::FnAbi<rustc_middle::ty::Ty>>>::grow
-   5: rustc_ty_utils::ty::param_env
-   6: rustc_ty_utils::abi::fn_abi_of_instance_no_deduced_attrs
-   7: rustc_query_impl::dep_kind_vtables::make_dep_kind_vtables
-   8: RINvMs6_NtCsg0ZueQqA6eZ_9hashbrown3rawINtB6_8RawTableTINtNtCs7nZR6j92QD7_13rustc_type_ir14predicate_kind13PredicateKindNtNtNtCsj9e11zrNyvM_12rustc_middle2ty7context6TyCtxtEjEE14reserve_rehashNCINvNtB8_3map11make_hasherBQ_jNtCsbiJtfKIeGaz_10rustc_hash13FxBu
-   9: rustc_query_impl::dep_kind_vtables::make_dep_kind_vtables
-  10: rustc_ty_utils::abi::fn_abi_of_instance_raw
-  11: rustc_query_impl::dep_kind_vtables::make_dep_kind_vtables
-  12: RINvMs6_NtCsg0ZueQqA6eZ_9hashbrown3rawINtB6_8RawTableTINtNtCs7nZR6j92QD7_13rustc_type_ir14predicate_kind13PredicateKindNtNtNtCsj9e11zrNyvM_12rustc_middle2ty7context6TyCtxtEjEE14reserve_rehashNCINvNtB8_3map11make_hasherBQ_jNtCsbiJtfKIeGaz_10rustc_hash13FxBu
-  13: rustc_query_impl::dep_kind_vtables::make_dep_kind_vtables
-  14: rustc_monomorphize::mono_checks::check_mono_item
-  15: rustc_query_impl::dep_kind_vtables::make_dep_kind_vtables
-  16: RINvMs6_NtCsg0ZueQqA6eZ_9hashbrown3rawINtB6_8RawTableTINtNtCs7nZR6j92QD7_13rustc_type_ir14predicate_kind13PredicateKindNtNtNtCsj9e11zrNyvM_12rustc_middle2ty7context6TyCtxtEjEE14reserve_rehashNCINvNtB8_3map11make_hasherBQ_jNtCsbiJtfKIeGaz_10rustc_hash13FxBu
-  17: rustc_query_impl::dep_kind_vtables::make_dep_kind_vtables
-  18: rustc_monomorphize::collector::items_of_instance
-  19: rustc_query_impl::dep_kind_vtables::make_dep_kind_vtables
-  20: RINvMs6_NtCsg0ZueQqA6eZ_9hashbrown3rawINtB6_8RawTableTINtNtCs7nZR6j92QD7_13rustc_type_ir14predicate_kind13PredicateKindNtNtNtCsj9e11zrNyvM_12rustc_middle2ty7context6TyCtxtEjEE14reserve_rehashNCINvNtB8_3map11make_hasherBQ_jNtCsbiJtfKIeGaz_10rustc_hash13FxBu
-  21: rustc_query_impl::dep_kind_vtables::make_dep_kind_vtables
-  22: RINvNtNtNtNtCs9N2lWLRSIT9_4core5slice4sort6stable9quicksort9quicksortTRNtNtCsj9e11zrNyvM_12rustc_middle4mono8MonoItemNtNtB1b_2ty10SymbolNameENCINvMNtCsgRIRWNK8DTq_5alloc5sliceSB15_11sort_by_keyB1R_NCINvNtCs69INEiTvPmR_18rustc_monomorphize12partitioning27as
-  23: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  24: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  25: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  26: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  27: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  28: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  29: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  30: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  31: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  32: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  33: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  34: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  35: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  36: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  37: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  38: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  39: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  40: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  41: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  42: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  43: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  44: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  45: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  46: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  47: core::slice::sort::stable::quicksort::quicksort::<rustc_middle::mono::CodegenUnit, <[rustc_middle::mono::CodegenUnit]>::sort_by<rustc_monomorphize::partitioning::merge_codegen_units::{closure#6}>::{closure#0}>
-  48: rustc_monomorphize::partitioning::collect_and_partition_mono_items
-  49: llvm::TargetTransformInfoImplBase::canHaveNonUndefGlobalInitializerInAddressSpace
-  50: <<rustc_ty_utils::opaque_types::OpaqueTypeCollector>::collect_taits_declared_in_body::TaitInBodyFinder as rustc_hir::intravisit::Visitor>::visit_nested_item
-  51: llvm::TargetTransformInfoImplBase::canHaveNonUndefGlobalInitializerInAddressSpace
-  52: rustc_codegen_ssa::back::symbol_export::exported_generic_symbols_provider_local
-  53: llvm::TargetTransformInfoImplBase::canHaveNonUndefGlobalInitializerInAddressSpace
-  54: <<rustc_ty_utils::opaque_types::OpaqueTypeCollector>::collect_taits_declared_in_body::TaitInBodyFinder as rustc_hir::intravisit::Visitor>::visit_nested_item
-  55: llvm::TargetTransformInfoImplBase::canHaveNonUndefGlobalInitializerInAddressSpace
-  56: <rustc_metadata::creader::CStore>::from_tcx
-  57: <rustc_metadata::creader::CStore as rustc_session::cstore::CrateStore>::def_path
-  58: rustc_metadata::rmeta::encoder::encode_metadata
-  59: rustc_metadata::fs::encode_and_write_metadata
-  60: <rustc_interface::queries::Linker>::codegen_and_build_linker
-note: Some details are omitted, run with `RUST_BACKTRACE=full` for a verbose backtrace.
-warning: `fff-search` (lib) generated 120 warnings (run `cargo fix --lib -p fff-search` to apply 14 suggestions)
-error: could not compile `fff-search` (lib); 120 warnings emitted
-
-Caused by:
-  process didn't exit successfully: `C:\Users\kanal\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustc.exe --crate-name fff_search --edition=2024 C:\Users\kanal\Projects\fff-upstream\crates\fff-core\src\lib.rs --error-format=json --json=diagnostic-rendered-ansi,artifacts,future-incompat --crate-type rlib --emit=dep-info,metadata,link -C opt-level=3 -C linker-plugin-lto -C codegen-units=1 --allow=clippy::module_inception --cfg "feature=\"default\"" --cfg "feature=\"ripgrep\"" --check-cfg cfg(docsrs,test) --check-cfg "cfg(feature, values(\"default\", \"definitions\", \"ffi\", \"mimalloc\", \"mimalloc-collect\", \"rescan-stats\", \"ripgrep\", \"zlob\"))" -C metadata=59a61fb03697c3e5 -C extra-filename=-d78153bb361e644d --out-dir C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps -C strip=debuginfo -L dependency=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps --extern ahash=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libahash-cce59e795a458745.rmeta --extern aho_corasick=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libaho_corasick-c9157069a66aebd2.rmeta --extern blake3=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libblake3-11be8d9f6a211da4.rmeta --extern dirs=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libdirs-647173d87c94c8d5.rmeta --extern dunce=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libdunce-beea9a72ddf99b0f.rmeta --extern fff_grep=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libfff_grep-e1875f4947f26308.rmeta --extern notify_debouncer_full=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libfff_notify_debouncer_full-82bbb4c017f4f41f.rmeta --extern fff_query_parser=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libfff_query_parser-f82ffc088aa66e49.rmeta --extern git2=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libgit2-17bc1f2346c45a44.rmeta --extern glidesort=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libglidesort-669dcd6544feca33.rmeta --extern globset=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libglobset-6520deddc1a7e345.rmeta --extern heed=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libheed-7d998b66f8669082.rmeta --extern ignore=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libignore-29ba2397514e897e.rmeta --extern libc=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\liblibc-001eb2f56a2afb0c.rmeta --extern memchr=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libmemchr-bfccae21fe703bbc.rmeta --extern memmap2=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libmemmap2-6a4b5805da440dba.rmeta --extern neo_frizbee=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libneo_frizbee-044f15357ea3ebb5.rmeta --extern notify=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libnotify-fff9fe9492c6ad6d.rmeta --extern parking_lot=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libparking_lot-486ef8b6c2f12ac0.rmeta --extern pathdiff=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libpathdiff-b62cb55b5358695d.rmeta --extern rayon=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\librayon-6c41a8b69ef88728.rmeta --extern regex=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libregex-9e14db15be9aba68.rmeta --extern regex_syntax=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libregex_syntax-6e660a485b6b801e.rmeta --extern serde=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libserde-df8688244864f84c.rmeta --extern smallvec=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libsmallvec-a46cb8007423da4c.rmeta --extern thiserror=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libthiserror-dfe4a5b2fecf0952.rmeta --extern tracing=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libtracing-863593714d0b3ba1.rmeta --extern tracing_appender=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libtracing_appender-b262e3b5a6d9871e.rmeta --extern tracing_subscriber=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\deps\libtracing_subscriber-13b889214fbd6701.rmeta -L native=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\build\blake3-2f6c915a17b31149\out -L native=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\build\blake3-2f6c915a17b31149\out -L native=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\build\libgit2-sys-1c5b5f0f6a65e6cc\out\build -L native=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\build\libz-sys-1c013bf45ec523a1\out\lib -L native=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\build\libz-sys-1c013bf45ec523a1\out\lib -L native=C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver\target\release\build\lmdb-master-sys-df4c984fd6d33eb0\out -L "native=C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231\atlmfc\lib\x64" -L "native=C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231\atlmfc\lib\x64" -L native=C:\Users\kanal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows_x86_64_msvc-0.48.5\lib -L native=C:\Users\kanal\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\windows_x86_64_msvc-0.53.1\lib -L "native=C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231\atlmfc\lib\x64" -L "native=C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231\atlmfc\lib\x64" -L "native=C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231\atlmfc\lib\x64" --check-cfg cfg(stress) --check-cfg cfg(rescan_stats)` (exit code: 0xc0000409, STATUS_STACK_BUFFER_OVERRUN)
+warning: `fff-search` (lib) generated 122 warnings (run `cargo fix --lib -p fff-search` to apply 14 suggestions)
+   Compiling fff-profile-driver v0.1.0 (C:\Users\kanal\Projects\fff-upstream\.fff-bench\profile-driver)
+    Finished `release` profile [optimized] target(s) in 4m 46s
