@@ -1,6 +1,0 @@
-query="20" total_matched=6615
-0	28	packages/stats/core/migrations/20260522121617_common_dust/migration.sql	fuzzy_filename
-timing query="20" iters=1 threads=30 mean_us=9023.0 p50_us=9023.0 p95_us=9023.0 checksum=6579
-query="file" total_matched=5464
-0	114	packages/session-ui/src/components/file.css	fuzzy_filename
-timing query="file" iters=1 threads=30 mean_us=7484.8 p50_us=7484.8 p95_us=7484.8 checksum=5436

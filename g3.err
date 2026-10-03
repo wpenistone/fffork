@@ -1,5 +1,0 @@
-SCAN us=663384
-PHASE grep files=117 read_ms=2.1 scan_ms=0.1 total_ms=2.7 mask_skips=138
-PHASE grep files=117 read_ms=2.1 scan_ms=0.6 total_ms=5.4 mask_skips=271
-PHASE grep files=117 read_ms=1.8 scan_ms=0.1 total_ms=5.4 mask_skips=407
-PHASE grep files=117 read_ms=1.6 scan_ms=0.1 total_ms=4.9 mask_skips=540
