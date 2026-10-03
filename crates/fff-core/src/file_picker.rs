@@ -1470,6 +1470,10 @@ impl FilePicker {
         // candidate vector, and the kept indices stay aligned with the subset
         // so hit mapping is exact even when the presence mask drops items.
         let mut hit_buf: Vec<u32> = Vec::new();
+        // Timed BEFORE the narrow plan: the presence-mask prune walks the whole
+        // previous hit set, and starting the timer after it made that cost
+        // invisible (it was attributed to the caller's `post_us` instead).
+        let t_msa = std::time::Instant::now();
         let (items, scores, total_matched) = {
             enum NarrowPlan {
                 Full,
@@ -1515,7 +1519,6 @@ impl FilePicker {
                     NarrowPlan::Full
                 }
             };
-            let t_msa = std::time::Instant::now();
             match plan {
                 NarrowPlan::Narrow { orig } => {
                     let mut local_hits: Vec<u32> = Vec::new();
@@ -1558,8 +1561,11 @@ impl FilePicker {
             // Move, don't copy â€” hit_buf is dead after this.
             live.candidates = hit_buf;
         }
-            let t_msa = std::time::Instant::now();
-        let post_us = t_msa.elapsed().as_micros();
+        // The outer `t_msa` above is the real match+score timer. A second
+        // `let t_msa` used to shadow it here, so `msa_us` always reported ~0
+        // and `post_us` (total minus the rest) absorbed the whole query.
+        let msa_us = t_msa.elapsed().as_micros();
+        let post_us = msa_us;
         let t_offsets = std::time::Instant::now();
         let match_byte_offsets =
             fuzzy_match_byte_offsets_for_page(query, &items, max_typos, base_arena, overflow_arena);

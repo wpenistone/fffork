@@ -1354,6 +1354,7 @@ fn match_and_score_in_arena<'a>(
         .zip(cache_key.as_ref())
         .and_then(|((cache, _, _), key)| cache.try_lock().and_then(|g| g.get(key)))
         .unwrap_or_else(|| {
+            let t_call = std::time::Instant::now();
             let matches = match_fuzzy_parts(
                 fuzzy_parts,
                 &working_files,
@@ -1362,11 +1363,17 @@ fn match_and_score_in_arena<'a>(
                 arena,
                 max_path_len,
             );
+            let call_us = t_call.elapsed().as_micros();
+            let t_arc = std::time::Instant::now();
             let matches_arc = Arc::new(matches);
             if let Some(((cache, _, _), key)) = raw_cache.zip(cache_key) {
                 if let Some(mut guard) = cache.try_lock() {
                     guard.insert(key, Arc::clone(&matches_arc));
                 }
+            }
+            let arc_us = t_arc.elapsed().as_micros();
+            if phase_timing {
+                eprintln!("PHASE mmcall call_us={call_us} arc_us={arc_us}");
             }
             matches_arc
         });
