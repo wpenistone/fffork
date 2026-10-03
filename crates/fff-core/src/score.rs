@@ -13,8 +13,8 @@ use smallvec::SmallVec;
 use std::sync::Arc;
 use std::path::MAIN_SEPARATOR;
 
-/// Raw frizbee match lists are expensive (full corpus Ã— needle). Cache them
-/// across identical searches on an unchanged index generation â€” typing and
+/// Raw frizbee match lists are expensive (full corpus Ãƒâ€” needle). Cache them
+/// across identical searches on an unchanged index generation Ã¢â‚¬â€ typing and
 /// the profile-driver warm loop otherwise re-pay matching every op.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RawMatchKey {
@@ -93,7 +93,7 @@ fn match_fuzzy_parts(
         return vec![];
     }
 
-    // Prefilter is an internal scan â€” parallelize even when the *search*
+    // Prefilter is an internal scan Ã¢â‚¬â€ parallelize even when the *search*
     // is 1 thread (one query). Interseq SW already uses the bg pool this way.
     // The cap comes from the machine profile (cores, bounded by LLC), not a
     // literal: `.min(8)` starved 32-core servers and oversubscribed phones.
@@ -123,7 +123,7 @@ fn match_fuzzy_parts(
         // Index reject before frizbee: only resolve paths that pass
         // length+presence. Only worth the extra scan when the needle can
         // actually reject (longer / typed letters). Common short queries
-        // match almost everything â€” skip so we don't scan twice.
+        // match almost everything Ã¢â‚¬â€ skip so we don't scan twice.
         let mut cand: Vec<u32> = Vec::new();
         let t_cand = std::time::Instant::now();
         let try_cand = valid_parts[0].len() >= 6 && working_files.len() >= 8_192;
@@ -170,7 +170,7 @@ fn match_fuzzy_parts(
         }
         let cand_ms = t_cand.elapsed().as_secs_f64() * 1e3;
         let use_cand = try_cand && cand.len() * 2 < working_files.len() && !cand.is_empty();
-        // TISG gate (span + skip-DP) â€” match-set + window without frizbee.
+        // TISG gate (span + skip-DP) Ã¢â‚¬â€ match-set + window without frizbee.
         // Emits the same skip_sw Match encoding the pipeline already decodes.
         let t_gate = std::time::Instant::now();
         let mut matches = if use_cand {
@@ -203,7 +203,7 @@ fn match_fuzzy_parts(
         let p = crate::interseq_sw::SwParams::for_query(has_upper);
         let needle = valid_parts[0].as_bytes();
 
-        // Query intent: `name.ext` â€” pin exact filename hits among the match
+        // Query intent: `name.ext` Ã¢â‚¬â€ pin exact filename hits among the match
         // set (not a full-corpus walk; score_one already ranks exact names).
         let looks_like_filename = {
             let q = valid_parts[0];
@@ -244,7 +244,7 @@ fn match_fuzzy_parts(
 
         // Chunked scoring: process at most CHUNK matches of metadata at a
         // time so peak working set stays small (faults/RSS vs upstream).
-        // 32k Ã— ~16 B Ã— a few arrays â‰ˆ 1 MB peak, vs a full 227k-wide set.
+        // 32k Ãƒâ€” ~16 B Ãƒâ€” a few arrays Ã¢â€°Ë† 1 MB peak, vs a full 227k-wide set.
         const CHUNK: usize = 32 * 1024;
         thread_local! {
             static TRIMS: std::cell::RefCell<Vec<crate::matcher::Trim>> =
@@ -419,7 +419,7 @@ fn match_fuzzy_parts(
                         });
                         stage.truncate(buf_len);
                         // Zero only padding (was fill(0) of the whole buffer,
-                        // then overwrite every window â€” double-touch).
+                        // then overwrite every window Ã¢â‚¬â€ double-touch).
                         for k in n..batch_sz {
                             stage[k * rows..(k + 1) * rows].fill(0);
                         }
@@ -653,7 +653,7 @@ fn match_fuzzy_parts(
     matches
 }
 
-/// Score only `idx` (indices into `base`) â€” used for typing live-narrow.
+/// Score only `idx` (indices into `base`) Ã¢â‚¬â€ used for typing live-narrow.
 /// `total_matched` is the subset hit count.
 pub(crate) fn fuzzy_match_and_score_subset<'a>(
     base: &'a [FileItem],
@@ -936,7 +936,7 @@ fn resolve_dir_chunks(
 }
 
 /// Run SIMD fuzzy match across directory items, narrowing the candidate set
-/// through each query part â€” same pipeline as file matching.
+/// through each query part Ã¢â‚¬â€ same pipeline as file matching.
 fn match_fuzzy_parts_dirs(
     fuzzy_parts: &[&str],
     working_dirs: &[&DirItem],
@@ -1378,14 +1378,17 @@ fn match_and_score_in_arena<'a>(
         working_files.len()
     ));
 
-    // Expose file indices for typing live-narrow (Match(longer,T) âŠ†
+    // Expose file indices for typing live-narrow (Match(longer,T) Ã¢Å â€ 
     // Match(shorter,T) when T is unchanged).
+    let t_capture = std::time::Instant::now();
     crate::score::capture_hit_indices(
         path_matches
             .iter()
             .map(|m| working_files.file_index(m.index as usize)),
     );
 
+    let capture_us = t_capture.elapsed().as_micros();
+    let t_fallback = std::time::Instant::now();
     let main_needle = fuzzy_parts[0].as_bytes(); // safe
     let main_needle_len = main_needle.len() as u16;
 
@@ -1454,8 +1457,13 @@ fn match_and_score_in_arena<'a>(
     // Map filename-fallback hits by path-match index so the scoring loop can
     // run without a sequential cursor. `fallback_indices` is strictly
     // increasing (build order); the fallback match list is sorted by it.
-    // Skip the table entirely when nothing fell back â€” common on filename-hit
+    // Skip the table entirely when nothing fell back Ã¢â‚¬â€ common on filename-hit
     // queries like `file_picker_`.
+    let fallback_us = t_fallback.elapsed().as_micros();
+    if phase_timing {
+        phase_log(format!("PHASE capture_us={capture_us} fallback_us={fallback_us} n={}", path_matches.len()));
+    }
+
     let fallback_hit: Vec<Option<(bool, i32)>> = if filename_fallback_matches.is_empty() {
         Vec::new()
     } else {
@@ -1651,7 +1659,7 @@ fn match_and_score_in_arena<'a>(
 
             // Path alignment bonus: when the query looks like a file path,
             // reward candidates whose path closely matches the typed query.
-            // Uses suffix overlap â€” bytes matching from the end. A full prefix
+            // Uses suffix overlap Ã¢â‚¬â€ bytes matching from the end. A full prefix
             // match is just the 100% coverage case, so no separate branch needed.
             let path_alignment_bonus = if query_contains_path_separator {
                 let path_bytes = rel.unwrap_or("").as_bytes();
@@ -1805,7 +1813,7 @@ fn match_and_score_in_arena<'a>(
     }
 
     // Cheap upper bound on `Score.total` when combo/current_file/path-align
-    // are all inert. filename â‰¤ 40% base, git_status â‰¤ 15% base, frecency is
+    // are all inert. filename Ã¢â€°Â¤ 40% base, git_status Ã¢â€°Â¤ 15% base, frecency is
     // `base * freq / 100`. Skip `score_one` when this bound cannot beat the
     // current kth best. Ranking stays exact.
     let prunable = context.current_file.is_none()
@@ -1856,8 +1864,8 @@ fn match_and_score_in_arena<'a>(
             // Fold into per-worker heaps sized page_cap and reduce. Avoids
             // materializing 226k Score structs (~10 MB of faults/RSS) just to
             // keep the top 100. Ranking stays exact (same comparator).
-            // scratch stays per-thread via map_init â€” do NOT carry it in the
-            // fold accumulator (4 KB Ã— rayon tree overflowed the worker stack).
+            // scratch stays per-thread via map_init Ã¢â‚¬â€ do NOT carry it in the
+            // fold accumulator (4 KB Ãƒâ€” rayon tree overflowed the worker stack).
             type Heap<'a> = BinaryHeap<Reverse<Ranked<'a>>>;
             fn merge<'a>(mut a: Heap<'a>, b: Heap<'a>, page_cap: usize) -> Heap<'a> {
                 for Reverse(r) in b {
@@ -2803,7 +2811,7 @@ mod typo_resistance_tests {
             "src/config/feature_flags.rs",
         ]);
 
-        // Exact substring â€” must always match
+        // Exact substring Ã¢â‚¬â€ must always match
         let results = search_with_typos(&files, "bid_comparison", arena, 6);
         assert!(
             results
@@ -2812,10 +2820,10 @@ mod typo_resistance_tests {
             "exact substring 'bid_comparison' should match, got: {results:?}"
         );
 
-        // Concatenated query with typos â€” the real-world scenario.
+        // Concatenated query with typos Ã¢â‚¬â€ the real-world scenario.
         // "bidcomparsionsupplierpartcostmodfiers" is a smushed version of
         // "bid_comparison_supplier_part_cost_modifiers" with 2 typos
-        // (comparison â†’ comparison, modifiers â†’ modifiers).
+        // (comparison Ã¢â€ â€™ comparison, modifiers Ã¢â€ â€™ modifiers).
         let results = search_with_typos(&files, "bidcomparsionsupplierpartcostmodfiers", arena, 6);
         assert!(
             results
@@ -2949,13 +2957,13 @@ mod constraint_only_query_tests {
     }
 }
 
-/// Executable ranking policy. If these fail, result order changed â€”
+/// Executable ranking policy. If these fail, result order changed Ã¢â‚¬â€
 /// update this spec deliberately, not as a side effect of a perf patch.
 ///
 /// Policy (base = SW score):
 /// 1. exact filename match > fuzzy filename match > path-only match
 /// 2. at equal match quality, higher frecency wins
-/// 3. special entry-point names (mod.rs, index.ts, â€¦) beat ordinary
+/// 3. special entry-point names (mod.rs, index.ts, Ã¢â‚¬Â¦) beat ordinary
 ///    path-only matches but lose to filename hits
 #[cfg(test)]
 mod ranking_policy_tests {
@@ -3052,7 +3060,7 @@ mod ranking_policy_tests {
         );
     }
 
-    /// Job: "I know the name + ext" â€” exact stem+ext wins over wrong ext.
+    /// Job: "I know the name + ext" Ã¢â‚¬â€ exact stem+ext wins over wrong ext.
     #[test]
     fn filename_intent_prefers_matching_extension() {
         let (files, arena) = make(&[
@@ -3064,7 +3072,7 @@ mod ranking_policy_tests {
         assert_eq!(order[0], "src/user_service.rs", "matching ext first, got {order:?}");
     }
 
-    /// Job: "I know the path" â€” segment hits beat scattered letters.
+    /// Job: "I know the path" Ã¢â‚¬â€ segment hits beat scattered letters.
     #[test]
     fn path_intent_prefers_segment_sequence() {
         let (files, arena) = make(&[
@@ -3078,7 +3086,7 @@ mod ranking_policy_tests {
         );
     }
 
-    /// Job: "I know the concept" â€” filename words beat path-only scatter.
+    /// Job: "I know the concept" Ã¢â‚¬â€ filename words beat path-only scatter.
     #[test]
     fn concept_intent_prefers_filename_words() {
         let (files, arena) = make(&[
@@ -3089,7 +3097,7 @@ mod ranking_policy_tests {
         assert_eq!(order[0], "src/api/handler.rs", "filename word hit first, got {order:?}");
     }
 
-    /// Job: "I want the test for this role" â€” role keyword ranks test files up.
+    /// Job: "I want the test for this role" Ã¢â‚¬â€ role keyword ranks test files up.
     #[test]
     fn concept_test_role_ranks_test_files() {
         let (files, arena) = make(&[

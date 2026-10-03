@@ -1,0 +1,113 @@
+SCAN us=49039
+PHASE machine cores=20 phys=20 cache_line=64 llc_mb=24 latency_ns=0.0 read_bytes_per_ns=8.00 work_per_thread=200000 scan_cap=2
+PHASE cand_ms=0.0 wins_ms=0.0 samp_ms=0.0 collapsed=false n=6615
+PHASE parts gate_us=151 exact_us=0 sw_us=471 threads=1 n=6615
+PHASE interseq prefilter_ms=0.2 collect_ms=0.0 batch_ms=0.3 assemble_ms=0.1 n=6615
+PHASE match_us=13971 n_matches=6615 n_files=6615
+PHASE score_us=575 (full) n=6615
+PHASE paginate_us=132 n=6615
+PHASE total_us=54802 msa_us=0 post_us=54756 tracker_us=0 offsets_us=46 page=1
+PHASE machine cores=20 phys=20 cache_line=64 llc_mb=24 latency_ns=0.0 read_bytes_per_ns=8.00 work_per_thread=200000 scan_cap=2
+PHASE cand_ms=0.0 wins_ms=0.0 samp_ms=0.0 collapsed=false n=6615
+PHASE parts gate_us=149 exact_us=0 sw_us=340 threads=1 n=6615
+PHASE interseq prefilter_ms=0.1 collect_ms=0.0 batch_ms=0.2 assemble_ms=0.1 n=6615
+PHASE match_us=7388 n_matches=6615 n_files=6615
+PHASE score_us=354 (full) n=6615
+PHASE paginate_us=186 n=6615
+PHASE total_us=18156 msa_us=0 post_us=18109 tracker_us=0 offsets_us=47 page=100
+PHASE machine cores=20 phys=20 cache_line=64 llc_mb=24 latency_ns=0.0 read_bytes_per_ns=8.00 work_per_thread=200000 scan_cap=2
+PHASE cand_ms=0.0 wins_ms=0.0 samp_ms=0.0 collapsed=false n=6615
+PHASE parts gate_us=142 exact_us=0 sw_us=329 threads=1 n=6615
+PHASE interseq prefilter_ms=0.1 collect_ms=0.0 batch_ms=0.2 assemble_ms=0.1 n=6615
+PHASE match_us=3289 n_matches=6615 n_files=6615
+PHASE score_us=413 (full) n=6615
+PHASE paginate_us=149 n=6615
+PHASE total_us=6845 msa_us=0 post_us=6797 tracker_us=0 offsets_us=48 page=100
+PHASE machine cores=20 phys=20 cache_line=64 llc_mb=24 latency_ns=0.0 read_bytes_per_ns=8.00 work_per_thread=200000 scan_cap=2
+PHASE cand_ms=0.0 wins_ms=0.0 samp_ms=0.0 collapsed=false n=6615
+PHASE parts gate_us=191 exact_us=0 sw_us=360 threads=1 n=6615
+PHASE interseq prefilter_ms=0.2 collect_ms=0.0 batch_ms=0.2 assemble_ms=0.1 n=6615
+PHASE match_us=4022 n_matches=6615 n_files=6615
+PHASE score_us=335 (full) n=6615
+PHASE paginate_us=170 n=6615
+PHASE total_us=9912 msa_us=0 post_us=9831 tracker_us=0 offsets_us=81 page=100
+PHASE machine cores=20 phys=20 cache_line=64 llc_mb=24 latency_ns=0.0 read_bytes_per_ns=8.00 work_per_thread=200000 scan_cap=2
+PHASE cand_ms=0.0 wins_ms=0.0 samp_ms=0.0 collapsed=false n=6615
+PHASE parts gate_us=158 exact_us=0 sw_us=378 threads=1 n=6615
+PHASE interseq prefilter_ms=0.2 collect_ms=0.0 batch_ms=0.2 assemble_ms=0.1 n=6615
+PHASE match_us=6079 n_matches=6615 n_files=6615
+PHASE score_us=263 (full) n=6615
+PHASE paginate_us=233 n=6615
+PHASE total_us=12388 msa_us=0 post_us=12325 tracker_us=0 offsets_us=63 page=100
+PHASE machine cores=20 phys=20 cache_line=64 llc_mb=24 latency_ns=0.0 read_bytes_per_ns=8.00 work_per_thread=200000 scan_cap=2
+PHASE cand_ms=0.0 wins_ms=0.0 samp_ms=0.0 collapsed=false n=6615
+PHASE parts gate_us=237 exact_us=0 sw_us=326 threads=1 n=6615
+PHASE interseq prefilter_ms=0.2 collect_ms=0.0 batch_ms=0.2 assemble_ms=0.1 n=6615
+PHASE match_us=4994 n_matches=6615 n_files=6615
+PHASE score_us=322 (full) n=6615
+PHASE paginate_us=150 n=6615
+PHASE total_us=10695 msa_us=0 post_us=10639 tracker_us=0 offsets_us=56 page=100
+PHASE machine cores=20 phys=20 cache_line=64 llc_mb=24 latency_ns=0.0 read_bytes_per_ns=8.00 work_per_thread=200000 scan_cap=2
+PHASE cand_ms=0.0 wins_ms=0.0 samp_ms=0.0 collapsed=false n=6615
+PHASE parts gate_us=163 exact_us=0 sw_us=311 threads=1 n=6615
+PHASE interseq prefilter_ms=0.2 collect_ms=0.0 batch_ms=0.2 assemble_ms=0.1 n=6615
+PHASE match_us=3228 n_matches=6615 n_files=6615
+PHASE score_us=203 (full) n=6615
+PHASE paginate_us=169 n=6615
+PHASE total_us=7476 msa_us=0 post_us=7425 tracker_us=0 offsets_us=51 page=100
+PHASE machine cores=20 phys=20 cache_line=64 llc_mb=24 latency_ns=0.0 read_bytes_per_ns=8.00 work_per_thread=200000 scan_cap=2
+PHASE cand_ms=0.0 wins_ms=0.0 samp_ms=0.0 collapsed=false n=5464
+PHASE parts gate_us=525 exact_us=0 sw_us=279 threads=1 n=5464
+PHASE interseq prefilter_ms=0.5 collect_ms=0.0 batch_ms=0.2 assemble_ms=0.0 n=5464
+PHASE match_us=3097 n_matches=5464 n_files=6615
+PHASE score_us=424 (full) n=5464
+PHASE paginate_us=24 n=5464
+PHASE total_us=7065 msa_us=0 post_us=7050 tracker_us=0 offsets_us=15 page=1
+PHASE machine cores=20 phys=20 cache_line=64 llc_mb=24 latency_ns=0.0 read_bytes_per_ns=8.00 work_per_thread=200000 scan_cap=2
+PHASE cand_ms=0.0 wins_ms=0.0 samp_ms=0.0 collapsed=false n=5464
+PHASE parts gate_us=513 exact_us=0 sw_us=234 threads=1 n=5464
+PHASE interseq prefilter_ms=0.5 collect_ms=0.0 batch_ms=0.2 assemble_ms=0.0 n=5464
+PHASE match_us=3476 n_matches=5464 n_files=6615
+PHASE score_us=337 (full) n=5464
+PHASE paginate_us=88 n=5464
+PHASE total_us=6169 msa_us=0 post_us=6121 tracker_us=0 offsets_us=48 page=100
+PHASE machine cores=20 phys=20 cache_line=64 llc_mb=24 latency_ns=0.0 read_bytes_per_ns=8.00 work_per_thread=200000 scan_cap=2
+PHASE cand_ms=0.0 wins_ms=0.0 samp_ms=0.0 collapsed=false n=5464
+PHASE parts gate_us=495 exact_us=0 sw_us=219 threads=1 n=5464
+PHASE interseq prefilter_ms=0.5 collect_ms=0.0 batch_ms=0.2 assemble_ms=0.0 n=5464
+PHASE match_us=4042 n_matches=5464 n_files=6615
+PHASE score_us=282 (full) n=5464
+PHASE paginate_us=58 n=5464
+PHASE total_us=7089 msa_us=0 post_us=7038 tracker_us=0 offsets_us=51 page=100
+PHASE machine cores=20 phys=20 cache_line=64 llc_mb=24 latency_ns=0.0 read_bytes_per_ns=8.00 work_per_thread=200000 scan_cap=2
+PHASE cand_ms=0.0 wins_ms=0.0 samp_ms=0.0 collapsed=false n=5464
+PHASE parts gate_us=504 exact_us=0 sw_us=222 threads=1 n=5464
+PHASE interseq prefilter_ms=0.5 collect_ms=0.0 batch_ms=0.2 assemble_ms=0.0 n=5464
+PHASE match_us=3615 n_matches=5464 n_files=6615
+PHASE score_us=261 (full) n=5464
+PHASE paginate_us=117 n=5464
+PHASE total_us=6278 msa_us=0 post_us=6225 tracker_us=0 offsets_us=53 page=100
+PHASE machine cores=20 phys=20 cache_line=64 llc_mb=24 latency_ns=0.0 read_bytes_per_ns=8.00 work_per_thread=200000 scan_cap=2
+PHASE cand_ms=0.0 wins_ms=0.0 samp_ms=0.0 collapsed=false n=5464
+PHASE parts gate_us=508 exact_us=0 sw_us=225 threads=1 n=5464
+PHASE interseq prefilter_ms=0.5 collect_ms=0.0 batch_ms=0.2 assemble_ms=0.0 n=5464
+PHASE match_us=3566 n_matches=5464 n_files=6615
+PHASE score_us=279 (full) n=5464
+PHASE paginate_us=118 n=5464
+PHASE total_us=6202 msa_us=0 post_us=6150 tracker_us=0 offsets_us=52 page=100
+PHASE machine cores=20 phys=20 cache_line=64 llc_mb=24 latency_ns=0.0 read_bytes_per_ns=8.00 work_per_thread=200000 scan_cap=2
+PHASE cand_ms=0.0 wins_ms=0.0 samp_ms=0.0 collapsed=false n=5464
+PHASE parts gate_us=498 exact_us=0 sw_us=195 threads=1 n=5464
+PHASE interseq prefilter_ms=0.5 collect_ms=0.0 batch_ms=0.2 assemble_ms=0.0 n=5464
+PHASE match_us=3581 n_matches=5464 n_files=6615
+PHASE score_us=339 (full) n=5464
+PHASE paginate_us=118 n=5464
+PHASE total_us=6463 msa_us=0 post_us=6410 tracker_us=0 offsets_us=53 page=100
+PHASE machine cores=20 phys=20 cache_line=64 llc_mb=24 latency_ns=0.0 read_bytes_per_ns=8.00 work_per_thread=200000 scan_cap=2
+PHASE cand_ms=0.0 wins_ms=0.0 samp_ms=0.0 collapsed=false n=5464
+PHASE parts gate_us=509 exact_us=0 sw_us=183 threads=1 n=5464
+PHASE interseq prefilter_ms=0.5 collect_ms=0.0 batch_ms=0.2 assemble_ms=0.0 n=5464
+PHASE match_us=3773 n_matches=5464 n_files=6615
+PHASE score_us=431 (full) n=5464
+PHASE paginate_us=94 n=5464
+PHASE total_us=6701 msa_us=0 post_us=6621 tracker_us=0 offsets_us=80 page=100
