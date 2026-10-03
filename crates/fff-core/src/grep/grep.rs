@@ -555,6 +555,10 @@ pub(super) struct GrepContext<'a, 'b> {
     pub(super) files: &'a [FileItem],
 }
 
+/// Files skipped by the content-mask prefilter since process start.
+pub(crate) static CONTENT_MASK_REJECTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Recover a file's original position in the picker's contiguous `FileItem`
 /// slice from its address.
 ///
@@ -715,6 +719,9 @@ where
                             && let Some(mask) = masks.get(pos)
                             && mask.allows(needle, ctx.content_max_typos) == Some(false)
                         {
+                            // Counted so we can prove the prefilter actually fires
+                            // rather than silently never matching.
+                            CONTENT_MASK_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             return None;
                         }
                         let content = file.get_content_for_search(
@@ -734,6 +741,9 @@ where
                         if let Some(pf) = ctx.prefilter
                             && pf.find(content).is_none()
                         {
+                            // Counted so we can prove the prefilter actually fires
+                            // rather than silently never matching.
+                            CONTENT_MASK_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             return None;
                         }
 
