@@ -1,13 +1,50 @@
 #!/usr/bin/env python3
-"""Chunk-read amplification: does P1.4 (share dir prefixes) actually pay?
+"""P1.2 feasibility: do index entries fit in u16?
 
-Per file the gate reads ceil(prefix/CH) + ceil(name/CH) chunks.
-With prefix sharing: dirs*ceil(prefix/CH) + files*ceil(name/CH).
-Also reports memory trade: index bytes saved vs arena bytes added.
+The index table is Vec<u32> (one per chunk slot). Halving it needs the
+UNIQUE chunk count < 65536, not the slot count. Also reports P1.4's
+read-amplification model for comparison.
 """
 import os, sys
+from collections import Counter
 
 CH = int(sys.argv[2]) if len(sys.argv) > 2 else 32
+root0 = sys.argv[1]
+
+slots = 0
+uniq = Counter()
+files = 0
+dirs_seen = set()
+cur_reads = 0
+shared_reads = 0
+
+for root, _d, names in os.walk(root0):
+    rel = os.path.relpath(root, root0)
+    prefix = b"" if rel == "." else rel.replace("\\", "/").encode() + b"/"
+    plen_ch = -(-len(prefix) // CH)
+    for n in names:
+        p = prefix + n.encode()
+        files += 1
+        n_ch = -(-len(n) // CH)
+        cur_reads += plen_ch + n_ch
+        shared_reads += n_ch
+        if plen_ch and root not in dirs_seen:
+            dirs_seen.add(root)
+            shared_reads += plen_ch
+        for j in range(0, len(p), CH):
+            c = p[j:j + CH]
+            slots += 1
+            buf = bytearray(CH)
+            buf[: len(c)] = c
+            uniq[bytes(buf)] += 1
+
+u = len(uniq)
+print(f"corpus={root0} chunk={CH} files={files} dirs={len(dirs_seen)}")
+print(f"  index slots  : {slots:,}  -> {slots*4/1e6:.2f} MB as u32")
+print(f"  unique chunks: {u:,} -> needs {u.bit_length()} bits")
+print(f"  u16 table    : {'FITS' if u < 65536 else 'DOES NOT FIT'} ({slots*2/1e6:.2f} MB)")
+print(f"  dedup        : {slots/u:.2f}x")
+print(f"  P1.4 reads   : {cur_reads:,} -> {shared_reads:,} ({cur_reads/shared_reads:.2f}x fewer)")
 
 files = 0
 cur_reads = 0          # chunk reads today
