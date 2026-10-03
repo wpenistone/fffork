@@ -2816,6 +2816,9 @@ fn populates_dirs_files_chunked_storage(
         file.path = chunk_storage.add_file_immediate(&rel, file.path.filename_offset);
         file.set_presence(crate::presence::mask_of(rel.as_bytes()));
         file.parent_dir_index = current_dir_idx;
+        if crate::types::dir_is_vendored(dir_part) {
+            file.set_vendored();
+        }
         out_files.push(file);
     }
 

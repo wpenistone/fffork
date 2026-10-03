@@ -1483,6 +1483,12 @@ fn match_and_score_in_arena<'a>(
         hit
     };
 
+    // Ranking demotion for files under a third-party dependency directory.
+// Sized to outrank the bonuses a vendored namesake can accumulate
+// (filename + evidence + path alignment) without displacing a genuinely
+// better first-party match.
+const VENDORED_PATH_PENALTY: i32 = 120;
+
     // Rayon dispatch + per-worker 4KB scratch costs more than scoring itself
     // below a few thousand matches (file_picker_-class queries). Short
     // high-match queries still fan out so the 200k-match path keeps its win.
@@ -1713,6 +1719,8 @@ fn match_and_score_in_arena<'a>(
                 crate::intent::evidence_bonus(query_intent, &ev, base_score)
             };
 
+            let vendored_penalty = if file.is_vendored() { VENDORED_PATH_PENALTY } else { 0 };
+
             let total = base_score
                 .saturating_add(frecency_boost)
                 .saturating_add(git_status_boost)
@@ -1722,7 +1730,8 @@ fn match_and_score_in_arena<'a>(
                 .saturating_add(evidence_bonus)
                 .saturating_add(current_file_penalty)
                 .saturating_add(combo_match_boost)
-                .saturating_add(path_alignment_bonus);
+                .saturating_add(path_alignment_bonus)
+                .saturating_sub(vendored_penalty);
 
             let score = Score {
                 total,

@@ -53,6 +53,33 @@ impl FileSliceExt for [FileItem] {
     }
 }
 
+/// Directory names that hold third-party code. Ranking demotes files under
+/// these so a first-party module outranks a dependency with the same name.
+const VENDORED_DIRS: &[&str] = &[
+    "vendor",
+    "node_modules",
+    "third_party",
+    "thirdparty",
+    "external",
+    "deps",
+    "site-packages",
+];
+
+fn segment_is_vendored(name: &str) -> bool {
+    let b = name.as_bytes();
+    VENDORED_DIRS.iter().any(|v| {
+        b.len() == v.len()
+            && b.iter()
+                .zip(v.as_bytes())
+                .all(|(a, c)| a.to_ascii_lowercase() == *c)
+    })
+}
+
+/// True when any segment of the relative directory is a dependency directory.
+pub(crate) fn dir_is_vendored(dir: &str) -> bool {
+    dir.split(['/', '\\']).any(segment_is_vendored)
+}
+
 pub struct FileItemFlags;
 
 impl FileItemFlags {
@@ -63,6 +90,9 @@ impl FileItemFlags {
     /// File was added after the last full reindex; its indices point
     /// into the overflow builder arena, not the base arena.
     pub const OVERFLOW: u8 = 1 << 2;
+    /// Path lies under a third-party dependency directory. Ranking demotes
+    /// these so a first-party module outranks a vendored namesake.
+    pub const VENDORED: u8 = 1 << 3;
 }
 
 pub struct DirFlags;
@@ -665,6 +695,16 @@ impl FileItem {
     }
 
     #[inline]
+    pub fn is_vendored(&self) -> bool {
+        self.flags.load(Ordering::Relaxed) & FileItemFlags::VENDORED != 0
+    }
+
+    #[inline]
+    pub fn set_vendored(&self) {
+        self.flags.fetch_or(FileItemFlags::VENDORED, Ordering::Relaxed);
+    }
+
+    #[inline]
     pub fn set_binary(&self, val: bool) {
         if val {
             self.flags
@@ -1185,6 +1225,32 @@ impl Default for ContentCacheBudget {
 #[cfg(test)]
 mod content_cache_budget_tests {
     use super::*;
+
+    #[test]
+    fn vendored_dirs_are_matched_per_segment() {
+        for d in [
+            "vendor/neo_frizbee/src",
+            "crates/x/node_modules/react",
+            "a/third_party/b",
+            "site-packages",
+            "VENDOR",
+        ] {
+            assert!(dir_is_vendored(d), "should be vendored: {d}");
+        }
+        for d in [
+            "",
+            "src",
+            "crates/fff-core/src",
+            "vendors",
+            "node_modules_old",
+            "lua/fff",
+            "src/vendorish",
+            "myvendor",
+            "src/vendorization",
+        ] {
+            assert!(!dir_is_vendored(d), "should not be vendored: {d}");
+        }
+    }
 
     #[test]
     fn fileitem_stays_48_bytes_on_64bit() {
