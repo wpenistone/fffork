@@ -404,6 +404,42 @@ impl ContentMask {
     }
 }
 
+/// Sound necessary condition for `content` to contain `needle`, with the
+/// needle's byte classes resolved once so each file costs one AND + popcount.
+#[derive(Clone, Copy)]
+pub(crate) struct MaskNeedle {
+    /// Folded byte classes the needle uses, deduplicated.
+    classes: u64,
+    /// Distinct classes that must be present. Clamped to the class count,
+    /// since repeats in the needle cannot require more than they provide.
+    need: usize,
+}
+
+impl MaskNeedle {
+    pub(crate) fn new(needle: &[u8], max_typos: u16) -> Self {
+        let mut classes = 0u64;
+        for &b in needle {
+            classes |= 1u64 << crate::presence::fold_bit(b);
+        }
+        let need = needle
+            .len()
+            .saturating_sub(max_typos as usize)
+            .min(classes.count_ones() as usize);
+        Self { classes, need }
+    }
+
+    #[inline(always)]
+    pub(crate) fn allows(self, mask: ContentMask) -> Option<bool> {
+        if mask.0 == 0 {
+            return None;
+        }
+        if self.need == 0 {
+            return Some(true);
+        }
+        Some((mask.0 & self.classes).count_ones() as usize >= self.need)
+    }
+}
+
 impl FileItem {
     pub fn new_raw(
         filename_start: u16,

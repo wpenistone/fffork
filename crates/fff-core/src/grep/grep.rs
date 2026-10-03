@@ -397,11 +397,13 @@ fn grep_search_parsed<'a>(
 
     // The content mask needs a literal needle. Plain text gives one; regex and
     // fuzzy do not, and testing a decomposed pattern would be unsound.
-    let content_needle: Option<&[u8]> = match options.mode {
-        GrepMode::PlainText => Some(effective_pattern.as_bytes()),
+    let mask_needle: Option<crate::types::MaskNeedle> = match options.mode {
+        GrepMode::PlainText => Some(crate::types::MaskNeedle::new(
+            effective_pattern.as_bytes(),
+            0,
+        )),
         _ => None,
     };
-    let content_max_typos: u16 = 0;
     let should_prefilter = regex.is_none();
     let mut result = perform_grep(
         &files_to_search,
@@ -416,8 +418,7 @@ fn grep_search_parsed<'a>(
             prefilter: should_prefilter.then_some(&finder),
             abort_signal,
             content_masks,
-            content_needle,
-            content_max_typos,
+            mask_needle,
             files,
         },
         // The single sink-selection point: every mode's matcher/sink pairing
@@ -548,8 +549,9 @@ pub(super) struct GrepContext<'a, 'b> {
     pub(super) content_masks: Option<&'a crate::file_picker::ContentMaskStore>,
     /// Literal needle bytes for the content mask pre-check. `None` disables it
     /// (regex queries have no single literal to test for).
-    pub(super) content_needle: Option<&'a [u8]>,
-    pub(super) content_max_typos: u16,
+    /// Needle with its byte classes precomputed, so the per-file check is one
+    /// AND + popcount instead of a scan over the needle bytes.
+    pub(super) mask_needle: Option<crate::types::MaskNeedle>,
     /// The picker's contiguous FileItem slice, used to recover original
     /// positions from the prefilter's filtered output.
     pub(super) files: &'a [FileItem],
@@ -714,10 +716,10 @@ where
                         // Uses the file's position in the original slice, not the
                         // loop index: `files_to_search` is filtered, so `idx` is
                         // not the mask index.
-                        if let (Some(masks), Some(needle)) = (ctx.content_masks, ctx.content_needle)
-                            && let Some(pos) = original_index(ctx.files, file)
-                            && let Some(mask) = masks.get(pos)
-                            && mask.allows(needle, ctx.content_max_typos) == Some(false)
+                        if let (Some(masks), Some(needle)) = (ctx.content_masks, ctx.mask_needle)
+    && let Some(pos) = original_index(ctx.files, file)
+    && let Some(mask) = masks.get(pos)
+    && needle.allows(mask) == Some(false)
                         {
                             // Diagnostic only, and gated: an unconditional
                             // fetch_add here is a contended atomic on a single

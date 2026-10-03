@@ -167,8 +167,7 @@ pub(crate) fn multi_grep_search<'a>(
             // Multi-pattern has no single literal needle, so the mask check
             // cannot be sound here.
             content_masks: None,
-            content_needle: None,
-            content_max_typos: 0,
+            mask_needle: None,
             files,
         },
         |file_bytes: &[u8], max_matches: usize| {
