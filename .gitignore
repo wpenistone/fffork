@@ -99,5 +99,5 @@ archive/keepers-review-*/
 archive/keepers-scratch-*/
 
 # arena research lab artifacts
-arena_lab/*.exe
-arena_lab/*.bin
+archive/arena_lab/*.exe
+archive/arena_lab/*.bin
