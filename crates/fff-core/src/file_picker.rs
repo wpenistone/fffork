@@ -141,23 +141,39 @@ pub(crate) struct FileSync {
 ///
 /// Kept out of `FileItem` (packed to 48 B for cache reasons) and indexed by
 /// file position. `AtomicU64` because the indexer writes while grep reads.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct ContentMaskStore {
-    slots: Vec<std::sync::atomic::AtomicU64>,
+    /// Sized during the scan, before any reader exists, so get stays
+    /// lock-free on grep's per-file path. Uninitialised means 'no masks yet'
+    /// and every lookup misses, which is safe.
+    slots: std::sync::OnceLock<Vec<std::sync::atomic::AtomicU64>>,
 }
 
 impl ContentMaskStore {
     pub(crate) fn with_capacity(n: usize) -> Self {
-        Self {
-            slots: (0..n)
+        let s = Self {
+            slots: std::sync::OnceLock::new(),
+        };
+        s.ensure_capacity(n);
+        s
+    }
+
+    /// Size the table. Called once during the scan, before grep can run.
+    /// NOTE: OnceLock initialises on first use only, so this must be called
+    /// before any set, not after.
+    pub(crate) fn ensure_capacity(&self, n: usize) {
+        let _ = self.slots.get_or_init(|| {
+            (0..n)
                 .map(|_| std::sync::atomic::AtomicU64::new(0))
-                .collect(),
-        }
+                .collect()
+        });
     }
 
     #[inline]
     pub(crate) fn set(&self, index: usize, mask: crate::types::ContentMask) {
-        if let Some(slot) = self.slots.get(index) {
+        if let Some(slots) = self.slots.get()
+            && let Some(slot) = slots.get(index)
+        {
             slot.store(mask.get(), Ordering::Relaxed);
         }
     }
@@ -165,7 +181,8 @@ impl ContentMaskStore {
     /// `None` when the index is out of range or no mask was recorded.
     #[inline]
     pub(crate) fn get(&self, index: usize) -> Option<crate::types::ContentMask> {
-        let raw = self.slots.get(index)?.load(Ordering::Relaxed);
+        let slots = self.slots.get()?;
+        let raw = slots.get(index)?.load(Ordering::Relaxed);
         if raw == 0 {
             None
         } else {
@@ -761,6 +778,11 @@ impl FilePicker {
 
     /// Max path byte length across live files (0 when the index is empty).
     /// Maintained incrementally so search never rescans the file list.
+    /// Shared handle to the content byte-presence masks, for the scan pipeline.
+    pub(crate) fn content_mask_store(&self) -> std::sync::Arc<ContentMaskStore> {
+        self.sync_data.content_masks.clone()
+    }
+
     pub(crate) fn max_path_len(&self) -> usize {
         let cache = &self.sync_data.max_path_len;
         if cache.stale.load(Ordering::Relaxed) {

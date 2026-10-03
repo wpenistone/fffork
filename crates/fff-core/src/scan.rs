@@ -242,7 +242,16 @@ impl ScanJob {
         if !signals.cancelled.load(Ordering::Acquire)
             && let Some(snap) = snapshot.as_ref()
         {
-            Self::run_post_scan(&shared_picker, &signals, &config, snap);
+            // Read the mask handle OUTSIDE the no-picker-read region, but never
+            // make post-scan conditional on it: it builds the bigram index and
+            // overlay, and skipping it silently breaks the overlay. An earlier
+            // attempt wrapped this call in if let Some(store) and lost 6
+            // coherence tests whenever the picker lock was contended.
+            let mask_store = shared_picker
+                .read()
+                .ok()
+                .and_then(|g| g.as_ref().map(|p| p.content_mask_store()));
+            Self::run_post_scan(&shared_picker, &signals, &config, snap, mask_store.as_ref());
         }
 
         drop(snapshot); // SNAPSHOT SHOULD NOT BE USED AFTER THIS POINT
@@ -312,6 +321,7 @@ impl ScanJob {
         signals: &ScanSignals,
         config: &ScanConfig,
         unsafe_snapshot: &crate::file_picker::PostScanUnsafeSnapshot,
+        content_masks: Option<&std::sync::Arc<crate::file_picker::ContentMaskStore>>,
     ) {
         let Some(arena) = unsafe_snapshot
             .arena // we are never touching overlays so this arena is always correct
@@ -327,10 +337,21 @@ impl ScanJob {
             return;
         }
 
+        // Size the mask table before anything can read it. Runs once during
+        // the scan; grep cannot run until the picker is published.
+        if let Some(store) = content_masks {
+            store.ensure_capacity(unsafe_snapshot.files.len());
+        }
+
         if config.content_indexing {
             let indexable_count = unsafe_snapshot.indexable_count.min(files.len());
             let (indexable_files, non_indexable_files) = files.split_at(indexable_count);
-            let index = build_bigram_index(indexable_files, &unsafe_snapshot.base_path, arena);
+            let index = build_bigram_index(
+                indexable_files,
+                &unsafe_snapshot.base_path,
+                arena,
+                content_masks,
+            );
 
             if let Ok(mut guard) = shared_picker.write()
                 && let Some(picker) = guard.as_mut()

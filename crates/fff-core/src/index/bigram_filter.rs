@@ -1103,6 +1103,7 @@ pub(crate) fn build_bigram_index(
     files: &[crate::types::FileItem],
     base_path: &std::path::Path,
     arena: crate::simd_path::ArenaPtr,
+    content_masks: Option<&std::sync::Arc<crate::file_picker::ContentMaskStore>>,
 ) -> BigramFilter {
     let builder = BigramIndexBuilder::new(files.len());
     let skip_builder = BigramIndexBuilder::new(files.len());
@@ -1679,7 +1680,7 @@ mod tests {
             file.set_presence(crate::presence::mask_of(names[i].as_bytes()));
         }
 
-        let index = build_bigram_index(&files, base, store.as_arena_ptr());
+        let index = build_bigram_index(&files, base, store.as_arena_ptr(), None);
         let candidates = index
             .query(b"unicorn")
             .expect("the text files must be in the index");
