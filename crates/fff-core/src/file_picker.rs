@@ -1337,11 +1337,13 @@ impl FilePicker {
         if std::env::var_os("FFF_PHASE_TIMING").is_some() {
             let m = crate::machine::machine();
             eprintln!(
-                "PHASE machine cores={} cache_line={} llc_mb={} read_bytes_per_ns={:.2} work_per_thread={} scan_cap={}",
+                "PHASE machine cores={} phys={} cache_line={} llc_mb={} latency_ns={:.1} read_bytes_per_ns={:.2} work_per_thread={} scan_cap={}",
                 m.cores,
+                m.physical_cores,
                 m.cache_line,
                 m.llc_bytes / (1024 * 1024),
-                m.read_bytes_per_ns,
+                m.mem_latency_ns,
+                m.read_bytes_per_ns(),
                 crate::machine::match_work_per_thread(),
                 crate::machine::scan_thread_cap(),
             );
