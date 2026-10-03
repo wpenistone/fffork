@@ -548,47 +548,10 @@ pub fn gate_hit(needle: &[u8], hay: &[u8], max_typos: u16) -> Option<GateHit> {
     GateNeedle::new(needle, max_typos).hit(hay)
 }
 
-/// Batch gate over paths (same needle). Indices of hits are pushed to `out`.
-pub fn gate_batch<'a, I>(needle: &[u8], hays: I, max_typos: u16, out: &mut Vec<(u32, GateHit)>)
-where
-    I: IntoIterator<Item = (u32, &'a [u8])>,
-{
-    let n = GateNeedle::new(needle, max_typos);
-    for (idx, hay) in hays {
-        if let Some(hit) = n.hit(hay) {
-            out.push((idx, hit));
-        }
-    }
-}
-
-/// Resolve + gate one FileItem against the arena path bytes.
-pub fn gate_file(
-    needle: &[u8],
-    file: &FileItem,
-    arena: ArenaPtr,
-    max_typos: u16,
-    buf: &mut [u8],
-) -> Option<GateHit> {
-    let hay = file.path.read_to_buf(arena, buf);
-    GateNeedle::new(needle, max_typos).hit(hay.as_ref())
-}
-
-/// Scan one path via 16-byte chunks. Returns gate hit without a
-/// PATH_BUF_SIZE truncation.
-pub fn gate_path_chunks(
-    needle: &[u8],
-    byte_len: usize,
-    max_typos: u16,
-    visit: impl FnMut(&mut dyn FnMut(usize, &[u8])),
-) -> Option<GateHit> {
-    GateNeedle::new(needle, max_typos).hit_chunks(byte_len, visit)
-}
-
-
-
 /// Parallel match-set over FileItems. Emits frizbee-compatible
 /// `Match { score: start, end_col: end }` (skip_sw encoding).
-/// `resolve_chunks` visits every 16-byte path chunk (no truncation).
+/// `file_at` resolves an index to its FileItem, `file_index` maps a
+/// position in `0..n` back to a candidate index.
 pub fn gate_match_range<'a, F, G>(
     needle: &[u8],
     n: usize,

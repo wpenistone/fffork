@@ -22,7 +22,7 @@ use std::sync::LazyLock;
 
 pub(crate) struct Machine {
     /// Logical CPUs usable (Apple performance cores on macOS, not E-cores).
-    pub cores: usize,
+    pub logical_cores: usize,
     /// Physical cores: one per SMT sibling group. Siblings share L1/L2 and the
     /// load unit, so a dependent-load chain gets no second stream from them.
     pub physical_cores: usize,
@@ -103,7 +103,7 @@ impl Machine {
             .min(by_llc)
             .min(by_numa)
             .min(self.bandwidth_knee())
-            .min(self.cores.max(1))
+            .min(self.logical_cores.max(1))
             .clamp(1, 64)
     }
 
@@ -237,7 +237,7 @@ impl Machine {
         // The only measured quantity: memory latency. See `measure_latency_ns`.
         let mem_latency_ns = measure_latency_ns(&[l2_bytes, llc_bytes]);
         Machine {
-            cores,
+            logical_cores: cores,
             physical_cores,
             cache_line,
             l2_bytes,
@@ -590,7 +590,7 @@ mod tests {
 
     fn m(cores: usize, physical: usize, llc: usize, numa: usize) -> Machine {
         Machine {
-            cores,
+            logical_cores: cores,
             physical_cores: physical,
             cache_line: 64,
             l2_bytes: 1 << 20,
@@ -669,9 +669,9 @@ mod tests {
         assert!((8 * 1024..=8 * 1024 * 1024).contains(&w), "work {w}");
         let cap = real.scan_thread_cap();
         assert!((1..=64).contains(&cap), "cap {cap}");
-        assert!(cap <= real.cores.max(1), "cap exceeds cores");
+        assert!(cap <= real.logical_cores.max(1), "cap exceeds cores");
         assert!(real.physical_cores >= 1, "physical_cores {}", real.physical_cores);
-        assert!(real.physical_cores <= real.cores.max(1));
+        assert!(real.physical_cores <= real.logical_cores.max(1));
         assert!((16..=256).contains(&real.cache_line));
     }
 

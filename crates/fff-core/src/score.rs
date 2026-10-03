@@ -7,7 +7,7 @@ use crate::{
     types::{DirItem, FileItem, Score, ScoringContext},
 };
 use fff_query_parser::{FFFQuery, FuzzyQuery};
-use neo_frizbee::{Matcher, Scoring};
+use neo_frizbee::{ Scoring};
 use rayon::prelude::*;
 use smallvec::SmallVec;
 use std::sync::Arc;

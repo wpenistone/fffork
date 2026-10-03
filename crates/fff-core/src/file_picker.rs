@@ -130,9 +130,9 @@ pub(crate) struct FileSync {
     /// Ignore rules the walker assembled (zlob backend only). Shared with the
     /// background watcher so filesystem events can be filtered without libgit2.
     pub(crate) ignore_rules: Option<Arc<crate::walk::WalkIgnoreRules>>,
-    /// Cached max path length (see `MaxPathLen`). Arc because `FileSync` is
+    /// Cached max path length (see `PathLenCache`). Arc because `FileSync` is
     /// cloned for post-scan snapshots.
-    pub(crate) max_path_len: Arc<MaxPathLen>,
+    pub(crate) max_path_len: Arc<PathLenCache>,
     /// Content byte-presence masks, indexed by file position.
     pub(crate) content_masks: Arc<ContentMaskStore>,
 }
@@ -207,7 +207,7 @@ impl FileSync {
             bigram_overlay: None,
             path_bigram_index: None,
             chunked_paths: None,
-            max_path_len: Arc::new(MaxPathLen::new()),
+            max_path_len: Arc::new(PathLenCache::new()),
             content_masks: Arc::new(ContentMaskStore::with_capacity(0)),
             ignore_rules: None,
         }
@@ -466,12 +466,12 @@ impl FileSync {
 /// size its thread estimate, and walking the file list for it is O(n) on every
 /// keystroke.
 #[derive(Debug)]
-pub(crate) struct MaxPathLen {
+pub(crate) struct PathLenCache {
     value: std::sync::atomic::AtomicU32,
     stale: std::sync::atomic::AtomicBool,
 }
 
-impl MaxPathLen {
+impl PathLenCache {
     fn new() -> Self {
         Self {
             value: std::sync::atomic::AtomicU32::new(0),
@@ -484,7 +484,7 @@ impl MaxPathLen {
             .fetch_max(byte_len as u32, Ordering::Relaxed);
     }
 
-    pub(crate) fn observe_removal(&self, byte_len: u16) {
+    pub(crate) fn forget(&self, byte_len: u16) {
         if self.value.load(Ordering::Relaxed) == byte_len as u32 {
             self.stale.store(true, Ordering::Relaxed);
         }
@@ -1360,7 +1360,7 @@ impl FilePicker {
             let m = crate::machine::machine();
             eprintln!(
                 "PHASE machine cores={} phys={} cache_line={} llc_mb={} latency_ns={:.1} read_bytes_per_ns={:.2} work_per_thread={} scan_cap={}",
-                m.cores,
+                m.logical_cores,
                 m.physical_cores,
                 m.cache_line,
                 m.llc_bytes / (1024 * 1024),
@@ -2232,7 +2232,7 @@ impl FilePicker {
             .set(index, crate::types::ContentMask::default());
         // Removing the longest path can only lower the cached max; recompute
         // lazily on the next read instead of walking the file list here.
-        self.sync_data.max_path_len.observe_removal(file.path.byte_len);
+        self.sync_data.max_path_len.forget(file.path.byte_len);
 
         // Only base-region files participate in the bigram overlay
         if index < self.sync_data.base_count
@@ -2689,7 +2689,7 @@ impl FileSync {
         // `effective_match_threads` needs a real haystack length or it
         // under-provisions threads.
         let scanned_max_path_len = files.iter().map(|f| f.path.byte_len).max().unwrap_or(0);
-        let max_path_len = Arc::new(MaxPathLen::new());
+        let max_path_len = Arc::new(PathLenCache::new());
         max_path_len.observe(scanned_max_path_len);
         let content_masks = Arc::new(ContentMaskStore::with_capacity(files.len()));
 
