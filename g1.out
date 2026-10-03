@@ -1,4 +1,0 @@
-grep=plain:zzqqxx_unlikely_token mode=PlainText files_searched=175752 searchable=175752 matches=0 files_with_matches=0 mean_us=3094524.9 p50_us=3521757.0 p95_us=4143232.2 checksum=26
-grep=plain:impl mode=PlainText files_searched=1245 searchable=175752 matches=81 files_with_matches=16 mean_us=46528.5 p50_us=46375.1 p95_us=52105.8 checksum=0
-grep=plain:pub mode=PlainText files_searched=124 searchable=175752 matches=51 files_with_matches=22 mean_us=18081.7 p50_us=18302.5 p95_us=19618.5 checksum=0
-grep=fn mode=PlainText files_searched=1244 searchable=175752 matches=124 files_with_matches=5 mean_us=44431.1 p50_us=45397.4 p95_us=48913.8 checksum=0
