@@ -719,9 +719,14 @@ where
                             && let Some(mask) = masks.get(pos)
                             && mask.allows(needle, ctx.content_max_typos) == Some(false)
                         {
-                            // Counted so we can prove the prefilter actually fires
-                            // rather than silently never matching.
-                            CONTENT_MASK_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // Diagnostic only, and gated: an unconditional
+                            // fetch_add here is a contended atomic on a single
+                            // cache line, once per file. On a full-corpus grep
+                            // that costs more than the check being measured.
+                            if phase_timing {
+                                CONTENT_MASK_REJECTS
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             return None;
                         }
                         let content = file.get_content_for_search(
@@ -741,9 +746,11 @@ where
                         if let Some(pf) = ctx.prefilter
                             && pf.find(content).is_none()
                         {
-                            // Counted so we can prove the prefilter actually fires
-                            // rather than silently never matching.
-                            CONTENT_MASK_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // Diagnostic only, and gated (see above).
+                            if phase_timing {
+                                CONTENT_MASK_REJECTS
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
                             return None;
                         }
 
