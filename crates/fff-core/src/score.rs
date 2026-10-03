@@ -794,17 +794,29 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
         return ranges_by_item;
     }
 
-    let paths: Vec<String> = items
+    // One flat buffer for every path instead of a `String` per item. The
+    // slices below borrow `flat`, which is a local that outlives them, so
+    // no borrow has to escape and nothing is thread-local.
+    let mut flat: Vec<u8> = Vec::with_capacity(items.iter().map(|i| i.relative_path_len()).sum());
+    let mut spans: Vec<(u32, u32)> = Vec::with_capacity(items.len());
+    for item in items.iter() {
+        let arena = if item.is_overflow() {
+            overflow_arena
+        } else {
+            base_arena
+        };
+        let want = item.path.byte_len as usize;
+        let start = flat.len();
+        flat.resize(start + want, 0);
+        item.path.copy_window_to(arena, 0, want as u32, &mut flat[start..]);
+        spans.push((start as u32, want as u32));
+    }
+    // SAFETY: arena path bytes are valid UTF-8, the same assumption
+    // `ChunkedString::read_to_buf` already makes.
+    let path_strs: Vec<&str> = spans
         .iter()
-        .map(|item| {
-            let arena = if item.is_overflow() {
-                overflow_arena
-            } else {
-                base_arena
-            };
-            let mut path = String::with_capacity(item.relative_path_len());
-            item.write_relative_path_from_arena(arena, &mut path);
-            path
+        .map(|&(s, l)| unsafe {
+            std::str::from_utf8_unchecked(&flat[s as usize..s as usize + l as usize])
         })
         .collect();
 
@@ -822,8 +834,6 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
         ..Default::default()
     };
 
-    // Match on `&str` so this shares frizbee's instantiation with fuzzy grep.
-    let path_strs: Vec<&str> = paths.iter().map(String::as_str).collect();
     for (idx, part) in parts.iter().copied().enumerate() {
         let mut part_config = config;
         if idx > 0 {
@@ -835,7 +845,7 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
         });
         for mut matched in matched_list {
             let item_idx = matched.index as usize;
-            let Some(path) = paths.get(item_idx) else {
+            let Some(path) = path_strs.get(item_idx) else {
                 continue;
             };
 
