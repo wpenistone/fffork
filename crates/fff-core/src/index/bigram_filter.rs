@@ -1155,6 +1155,15 @@ pub(crate) fn build_bigram_index(
                             // Need to find a better way to do this.
                             file.set_binary(crate::types::detect_binary_content(content));
 
+                            if let Some(store) = content_masks
+                                && file.size > 0
+                                && content.len() as u64 == file.size
+                            {
+                                let mut mask = crate::types::ContentMask::default();
+                                mask.accumulate(content);
+                                store.set(file_idx, mask);
+                            }
+
                             builder.add_file_content(&skip_builder, file_idx, content);
                         }
                     });

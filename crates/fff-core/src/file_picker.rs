@@ -2118,7 +2118,17 @@ impl FilePicker {
         // buffer). Already-binary files are left alone.
         if !file.is_binary() {
             let mut chunk = [0u8; crate::types::BINARY_CLASSIFICATION_CHUNK_SIZE];
-            file.detect_binary_per_byte(path, &mut chunk);
+            let mask = file.detect_binary_per_byte(path, &mut chunk);
+            // Refresh the content mask: the bytes just changed, so a mask
+            // recorded at scan time is stale and would make grep reject this
+            // file until the next rescan. Not doing this broke 6 bigram
+            // overlay coherence tests once masks were populated for all files.
+            self.sync_data.content_masks.set(pos, mask);
+        } else {
+            // Binary now: no mask, so grep reads (and rejects) it as before.
+            self.sync_data
+                .content_masks
+                .set(pos, crate::types::ContentMask::default());
         }
 
         // Indexable base-region files feed fresh content to the bigram overlay.
@@ -2214,6 +2224,10 @@ impl FilePicker {
         file.set_deleted(true);
         file.invalidate_mmap(&self.cache_budget);
         file.set_git_status(None);
+        // Drop the stale content mask so a resurrected file is never skipped.
+        self.sync_data
+            .content_masks
+            .set(index, crate::types::ContentMask::default());
         // Removing the longest path can only lower the cached max; recompute
         // lazily on the next read instead of walking the file list here.
         self.sync_data.max_path_len.observe_removal(file.path.byte_len);
