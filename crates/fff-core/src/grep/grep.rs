@@ -472,7 +472,7 @@ fn grep_search_parsed<'a>(
 /// preserved as-is (escaped backslash + literal `n`, e.g. `\\nvim-data`).
 pub(super) fn replace_newline_escapes(text: &str) -> Option<(String, usize)> {
     let bytes = text.as_bytes();
-    // Most queries have no backslash escape — skip the Vec entirely.
+    // Most queries have no backslash escape Ã¢â‚¬â€ skip the Vec entirely.
     if !bytes.contains(&b'\\') {
         return None;
     }
@@ -627,7 +627,7 @@ where
     // Lowest index an abort skipped; everything below it was searched, so it is
     // the resume point for the next page. usize::MAX means no abort happened.
     let first_skipped = AtomicUsize::new(usize::MAX);
-    // `usize::MAX` means "collect everything" — no page can fill, so skip the
+    // `usize::MAX` means "collect everything" Ã¢â‚¬â€ no page can fill, so skip the
     // per-chunk gate overhead entirely.
     let gate_enabled = page_limit < usize::MAX;
 
@@ -823,11 +823,12 @@ where
 
     if phase_timing {
         eprintln!(
-            "PHASE grep files={} read_ms={:.1} scan_ms={:.1} total_ms={:.1}",
+            "PHASE grep files={} read_ms={:.1} scan_ms={:.1} total_ms={:.1} mask_skips={}",
             files_consumed,
             phase_read_ns as f64 / 1e6,
             phase_scan_ns as f64 / 1e6,
             search_start.elapsed().as_secs_f64() * 1e3,
+            CONTENT_MASK_REJECTS.load(std::sync::atomic::Ordering::Relaxed),
         );
     }
 
