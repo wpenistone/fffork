@@ -648,7 +648,15 @@ where
     // when bigram cut the set in half, keep fixed small chunks for cheap page-fill termination.
     let base_chunk = rayon::current_num_threads() * 4;
     let prefilter_strong = ctx.total_files > 0 && files_to_search.len() * 2 < ctx.total_files;
-    let max_chunk = if prefilter_strong {
+    // Early exit only pays once the page can actually fill. With nothing
+    // matched yet there is nothing to terminate against, so a query matching
+    // nothing across the whole corpus would pay the per-chunk cost (barrier,
+    // scratch init, page-fill gate) hundreds of times over for no benefit.
+    let no_early_exit = all_matches.is_empty() && !prefilter_strong;
+    let max_chunk = if no_early_exit {
+        // Nothing to terminate against, so run the tail in few large chunks.
+        files_to_search.len().max(8 * 1024)
+    } else if prefilter_strong {
         base_chunk
     } else if page_limit > 0 && page_limit <= 256 {
         // Weak prefilter + small page: keep chunks modest so a page that fills
@@ -659,7 +667,7 @@ where
         (base_chunk * 256).max(8 * 1024)
     };
     let growth = if prefilter_strong { 1 } else { 2 };
-    let mut chunk_size = base_chunk;
+    let mut chunk_size = if no_early_exit { max_chunk } else { base_chunk };
     let mut chunk_start = 0;
 
     while chunk_start < files_to_search.len() {
