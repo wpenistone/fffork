@@ -164,6 +164,10 @@ pub(crate) fn multi_grep_search<'a>(
             overflow_arena,
             prefilter: None, // no memmem prefilter for multi-pattern search
             abort_signal,
+            // See grep.rs: disabled until the prefilter carries original positions.
+            content_masks: None,
+            content_needle: None,
+            content_max_typos: 0,
         },
         |file_bytes: &[u8], max_matches: usize| {
             let state = SinkState {

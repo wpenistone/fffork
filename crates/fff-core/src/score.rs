@@ -1474,6 +1474,18 @@ fn match_and_score_in_arena<'a>(
     // high-match queries still fan out so the 200k-match path keeps its win.
     const PARALLEL_SCORE_MIN: usize = 4096;
 
+    // Measured cost of the per-candidate ranking features (filename arena read
+    // + intent evidence) after this crate's allocation work landed:
+    // 37.9 ns/candidate on linux-kernel, 7.9 ns/candidate on sumo_fork. The
+    // higher figure is the planning number, so the budget errs toward doing
+    // the work.
+    const EVIDENCE_NS_PER_CANDIDATE: u32 = 40;
+
+    // Wall-clock the ranking features may consume. One interactive frame at
+    // 60Hz, over `scan_thread_cap` threads - the same reasoning as every other
+    // dispatch decision here: spend what a frame can hide, then degrade.
+    const RANK_FEATURE_BUDGET_MS: u32 = 16;
+
     // Third buffer is the filename scratch. It has to be separate from
     // `path_buf`: on the common path (`need_rel == false`) the filename is
     // materialised here while `path_buf` stays free for a later relative-path
@@ -1491,12 +1503,25 @@ fn match_and_score_in_arena<'a>(
         )
     };
 
-    // Collapse-aware rank: when the query hit ~every path, skip per-hit
-    // filename arena reads (filename_cow / special-entry).
+    // Ranking-feature collapse: when too many candidates matched for the
+    // per-hit filename reads and intent evidence to fit the budget, skip them.
+    //
+    // Was `match_rate >= 85%`, which is a cliff, not a cost model: 11 points
+    // of match rate (89.7% -> 78.3%) switched the features back on and cost
+    // 4.8x per candidate between corpora of nearly identical shape. Now the
+    // features run whenever the work fits a machine-derived budget, so a
+    // bigger repo on a slower box degrades gradually instead of falling off a
+    // step.
+    //
+    // NOTE: this changes ranking, not just cost - collapsed candidates score
+    // without filename/evidence bonuses. `ranking-gates` must stay green.
     let rank_collapsed = {
-        let n_files = working_files.len().max(1);
+        let budget = crate::machine::machine().evidence_budget_candidates(
+            EVIDENCE_NS_PER_CANDIDATE,
+            RANK_FEATURE_BUDGET_MS,
+        );
         path_matches.len() >= 4096
-            && path_matches.len() * 100 >= n_files * 85
+            && path_matches.len() > budget
             && main_needle_len <= 8
     };
     let query_intent = crate::intent::detect_intent(
@@ -1895,10 +1920,16 @@ fn match_and_score_in_arena<'a>(
             .into_iter()
             .map(|Reverse(r)| (r.file, r.score))
             .collect();
+        // The parallel top-k heap plus `sort_unstable_by` leaves equal-scored
+        // candidates in arbitrary order (observed: two files at 144 swapping
+        // between runs of the same binary). Tie-break on the file's index so
+        // output is reproducible; ordering among equals is not a ranking
+        // decision, it was previously just nondeterministic.
         results.sort_unstable_by(|a, b| {
             b.1.total
                 .cmp(&a.1.total)
                 .then_with(|| b.0.modified.cmp(&a.0.modified))
+                .then_with(|| path_rank(a.0).cmp(&path_rank(b.0)))
         });
         if phase_timing {
             eprintln!(
@@ -1937,6 +1968,14 @@ fn match_and_score_in_arena<'a>(
         );
     }
     (results, n)
+}
+
+/// Stable tie-break key for equal scores. `sort_unstable_by` gives no order
+/// among equals, so without this the parallel path emitted different orderings
+/// run to run (observed: two files at 144 swapping between runs of one binary).
+#[inline]
+fn path_rank(file: &FileItem) -> u64 {
+    file.path.rank_key()
 }
 
 /// Byte compare avoids materializing a `String` per scored match.

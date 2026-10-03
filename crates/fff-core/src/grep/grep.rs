@@ -404,6 +404,13 @@ fn grep_search_parsed<'a>(
             overflow_arena,
             prefilter: should_prefilter.then_some(&finder),
             abort_signal,
+            // DISABLED until the prefilter carries original file positions:
+            // iles_to_search is a *filtered* subset, so the loop index is not
+            // the index into content_masks. Wiring it naively would make grep
+            // skip files that DO match. See doc/search-perf-plan.md.
+            content_masks: None,
+            content_needle: None,
+            content_max_typos: 0,
         },
         // The single sink-selection point: every mode's matcher/sink pairing
         // is decided here based on the compiled pattern.
@@ -527,6 +534,14 @@ pub(super) struct GrepContext<'a, 'b> {
     pub(super) overflow_arena: crate::simd_path::ArenaPtr,
     pub(super) prefilter: Option<&'a NeedleFinder<'b>>,
     pub(super) abort_signal: &'a AtomicBool,
+    /// Content byte-presence masks, indexed by file position. Lets grep skip
+    /// `get_content_for_search` for files that provably cannot contain the
+    /// needle, which is ~95% of grep's wall time.
+    pub(super) content_masks: Option<&'a crate::file_picker::ContentMaskStore>,
+    /// Literal needle bytes for the content mask pre-check. `None` disables it
+    /// (regex queries have no single literal to test for).
+    pub(super) content_needle: Option<&'a [u8]>,
+    pub(super) content_max_typos: u16,
 }
 
 impl GrepContext<'_, '_> {
@@ -648,6 +663,16 @@ where
                         }
 
                         let t_read = phase_timing.then(std::time::Instant::now);
+                        // Content-mask pre-check: skip the open+read entirely for
+                        // files whose indexed byte classes cannot contain the
+                        // needle. Reading is ~95% of grep's wall time, so this
+                        // is the one check worth doing before touching the disk.
+                        if let (Some(masks), Some(needle)) = (ctx.content_masks, ctx.content_needle)
+                            && let Some(mask) = masks.get(idx)
+                            && mask.allows(needle, ctx.content_max_typos) == Some(false)
+                        {
+                            return None;
+                        }
                         let content = file.get_content_for_search(
                             buf,
                             mmap_slot,

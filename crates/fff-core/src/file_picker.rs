@@ -133,6 +133,45 @@ pub(crate) struct FileSync {
     /// Cached max path length (see `MaxPathLen`). Arc because `FileSync` is
     /// cloned for post-scan snapshots.
     pub(crate) max_path_len: Arc<MaxPathLen>,
+    /// Content byte-presence masks, indexed by file position.
+    pub(crate) content_masks: Arc<ContentMaskStore>,
+}
+
+/// Side table of per-file content byte-presence masks.
+///
+/// Kept out of `FileItem` (packed to 48 B for cache reasons) and indexed by
+/// file position. `AtomicU64` because the indexer writes while grep reads.
+#[derive(Debug)]
+pub(crate) struct ContentMaskStore {
+    slots: Vec<std::sync::atomic::AtomicU64>,
+}
+
+impl ContentMaskStore {
+    pub(crate) fn with_capacity(n: usize) -> Self {
+        Self {
+            slots: (0..n)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn set(&self, index: usize, mask: crate::types::ContentMask) {
+        if let Some(slot) = self.slots.get(index) {
+            slot.store(mask.get(), Ordering::Relaxed);
+        }
+    }
+
+    /// `None` when the index is out of range or no mask was recorded.
+    #[inline]
+    pub(crate) fn get(&self, index: usize) -> Option<crate::types::ContentMask> {
+        let raw = self.slots.get(index)?.load(Ordering::Relaxed);
+        if raw == 0 {
+            None
+        } else {
+            Some(crate::types::ContentMask::from_raw(raw))
+        }
+    }
 }
 
 impl FileSync {
@@ -152,6 +191,7 @@ impl FileSync {
             path_bigram_index: None,
             chunked_paths: None,
             max_path_len: Arc::new(MaxPathLen::new()),
+            content_masks: Arc::new(ContentMaskStore::with_capacity(0)),
             ignore_rules: None,
         }
     }
@@ -2617,6 +2657,7 @@ impl FileSync {
             base_count,
             live_count: base_count,
             max_path_len,
+            content_masks: Arc::new(ContentMaskStore::with_capacity(0)),
             dirs: StableVec::from_vec_with_reserve(dirs, MAX_OVERFLOW_FILES),
             base_dirs_count,
             live_dirs_count: base_dirs_count,

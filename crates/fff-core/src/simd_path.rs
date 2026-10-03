@@ -92,6 +92,13 @@ pub(crate) struct ChunkedString {
 }
 
 impl ChunkedString {
+    /// Stable ordering key for tie-breaks. Paths are stored in scan order, so
+    /// this is unique per path and orders deterministically.
+    #[inline]
+    pub(crate) fn rank_key(&self) -> u64 {
+        (self.byte_len as u64) << 32 | self.index_offset as u64
+    }
+
     pub fn empty() -> Self {
         Self {
             index_offset: 0,

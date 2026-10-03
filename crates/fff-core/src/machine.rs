@@ -39,6 +39,24 @@ impl Machine {
         bytes.clamp(8 * 1024, 8 * 1024 * 1024)
     }
 
+    /// Candidates that can get the per-candidate ranking features (filename
+    /// lookup + intent evidence) before the work exceeds `budget_ms`.
+    ///
+    /// This replaces `rank_collapsed`'s `match_rate >= 85%` literal, which was
+    /// a cliff rather than a cost model: dropping 11 points of match rate
+    /// (89.7% -> 78.3%) turned the features back on and cost 4.8x per
+    /// candidate (7.9 ns -> 37.9 ns) between two corpora of nearly identical
+    /// shape. The work is real and bounded, so bound it by time instead of by
+    /// a ratio of the corpus.
+    ///
+    /// `per_candidate_ns` is measured from this crate's own scoring loop, not
+    /// guessed: see `score::EVIDENCE_NS_PER_CANDIDATE`.
+    pub fn evidence_budget_candidates(&self, per_candidate_ns: u32, budget_ms: u32) -> usize {
+        let threads = self.scan_thread_cap().max(1) as u64;
+        let total_ns = budget_ms as u64 * 1_000_000 * threads;
+        (total_ns / per_candidate_ns.max(1) as u64) as usize
+    }
+
     /// Upper bound on threads for an internal scan.
     ///
     /// Was a literal `.min(8)`, which under-uses a 32-core server and

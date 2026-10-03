@@ -316,6 +316,13 @@ impl GateNeedle {
         if byte_len == 0 {
             return None;
         }
+        // `LCS(needle, hay) <= min(needle_len, hay_len)`, so a path shorter than
+        // `need` cannot reach the threshold. Reject before touching a chunk:
+        // `byte_len` is already in a register and prefix-heavy corpora (short
+        // paths) hit this often.
+        if byte_len < self.need {
+            return None;
+        }
         if self.needle.len() <= 64 {
             // Typos cover the whole needle: every path is a candidate and the
             // window is the full path (same short-circuit as `hit`).
@@ -330,6 +337,16 @@ impl GateNeedle {
             let distinct = &*self.distinct;
             let mask = self.len_mask;
             let greedy = self.typos == 0;
+            // Folded needle, built once per query rather than per candidate
+            // byte: the greedy compare ran `fold_byte(needle[next])` inline.
+            let mut folded_needle = [0u8; 64];
+            let needle_folded = {
+                let n = self.needle.len().min(64);
+                for (i, slot) in folded_needle.iter_mut().enumerate().take(n) {
+                    *slot = fold_byte(self.needle[i]);
+                }
+                &folded_needle[..n]
+            };
             let mut s = 0u64;
             let mut next_needle = 0usize;
             let mut first = usize::MAX;
@@ -356,8 +373,8 @@ impl GateNeedle {
                         last = off + pos;
                         n += 1;
                         if greedy {
-                            if next_needle < self.needle.len()
-                                && fold_byte(self.needle[next_needle]) == fold_byte(view[pos])
+                            if next_needle < needle_folded.len()
+                                && needle_folded[next_needle] == fold_byte(view[pos])
                             {
                                 next_needle += 1;
                             }

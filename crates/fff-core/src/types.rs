@@ -308,6 +308,72 @@ pub(crate) fn detect_binary_content(content: &[u8]) -> bool {
     memchr::memchr(0, content).is_some()
 }
 
+/// Byte-presence mask of *file content*, folded to the same 64 classes as
+/// `presence::fold_bit`.
+///
+/// Built during the index-time binary sniff, which already streams every byte
+/// of every file, so it costs one OR per byte on a pass that was happening
+/// anyway. Grep can then reject a candidate file without opening it: a length
+/// `m` match with `T` typos needs at least `m - T` distinct needle bytes
+/// present, which is a sound necessary condition.
+///
+/// Stored out of line (not in `FileItem`, which is packed to 48 B) - see
+/// `ContentMaskStore`.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ContentMask(u64);
+
+impl ContentMask {
+    #[inline]
+    pub(crate) fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub(crate) fn get(self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Fold bytes into the mask. Call once per content chunk.
+    #[inline]
+    pub fn accumulate(&mut self, content: &[u8]) {
+        let mut m = self.0;
+        for &b in content {
+            m |= 1u64 << crate::presence::fold_bit(b);
+        }
+        self.0 = m;
+    }
+
+    /// Sound necessary condition for `content` to contain `needle`.
+    ///
+    /// `None` means "unknown" (no mask recorded) and the caller must read the
+    /// file. `Some(false)` means it provably cannot match.
+    #[inline]
+    pub(crate) fn allows(self, needle: &[u8], max_typos: u16) -> Option<bool> {
+        if self.0 == 0 {
+            return None;
+        }
+        let need = needle.len().saturating_sub(max_typos as usize);
+        if need == 0 {
+            return Some(true);
+        }
+        let mut hits = 0usize;
+        for &b in needle {
+            if self.0 & (1u64 << crate::presence::fold_bit(b)) != 0 {
+                hits += 1;
+                if hits >= need {
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
+    }
+}
+
 impl FileItem {
     pub fn new_raw(
         filename_start: u16,
@@ -611,9 +677,13 @@ impl FileItem {
 
     /// Chunked classifier of the binary content of the file chunk by chunk
     /// accepts path which to reuse the allocated buffer for absolute path read
-    pub(crate) fn detect_binary_per_byte(&self, path: &Path, chunk: &mut [u8]) {
+    ///
+    /// Returns the content byte-presence mask built from the same read. Callers
+    /// store it so grep can reject this file without opening it.
+    pub(crate) fn detect_binary_per_byte(&self, path: &Path, chunk: &mut [u8]) -> ContentMask {
+        let mut mask = ContentMask::default();
         if self.size == 0 {
-            return;
+            return mask;
         }
 
         let Ok(mut file) = std::fs::OpenOptions::new()
@@ -622,7 +692,7 @@ impl FileItem {
             .open(path)
         else {
             tracing::error!(path = ?path.display(), "Failed to open indexed file");
-            return;
+            return mask;
         };
 
         // Streaming sniff to EOF (bounded by grep's max_file_size downstream):
@@ -637,13 +707,16 @@ impl FileItem {
                     break;
                 }
                 Ok(n) => {
-                    if detect_binary_content(&chunk[..n]) {
+                    let view = &chunk[..n];
+                    mask.accumulate(view);
+                    if detect_binary_content(view) {
                         self.set_binary(true);
                         break;
                     }
                 }
             }
         }
+        mask
     }
 
     #[inline]
