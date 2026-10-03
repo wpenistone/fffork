@@ -1210,6 +1210,7 @@ pub(crate) fn sniff_binary_for_non_indexable(
     base_path: &std::path::Path,
     arena: crate::simd_path::ArenaPtr,
     cancelled: &std::sync::atomic::AtomicBool,
+    content_masks: Option<&crate::file_picker::ContentMaskStore>,
 ) {
     // Non-indexable files are few in a typical repo, so a serial pass with a
     // single reused chunk buffer beats spinning up the thread pool.
@@ -1233,7 +1234,12 @@ pub(crate) fn sniff_binary_for_non_indexable(
         }
 
         let abs = file.write_absolute_path(arena, base_path, &mut path_buf);
-        file.detect_binary_per_byte(abs, &mut chunk);
+        let mask = file.detect_binary_per_byte(abs, &mut chunk);
+        // The sniff already read every byte, so record the mask for grep to use
+        // and skip opening this file again.
+        if let Some(store) = content_masks {
+            store.set(i, mask);
+        }
     }
 }
 

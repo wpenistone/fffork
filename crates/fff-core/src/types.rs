@@ -1230,3 +1230,79 @@ mod content_cache_budget_tests {
         assert_eq!(budget.max_file_size, default.max_file_size);
     }
 }
+
+#[cfg(test)]
+mod content_mask_tests {
+    use super::ContentMask;
+
+    fn mask_of(content: &[u8]) -> ContentMask {
+        let mut m = ContentMask::default();
+        m.accumulate(content);
+        m
+    }
+
+    /// The whole point of the check: `Some(false)` must mean "provably cannot
+    /// match". A false negative here makes grep silently skip real matches.
+    #[test]
+    fn never_rejects_a_substring_that_exists() {
+        let contents: &[&[u8]] = &[
+            b"hello world",
+            b"fn main() { println!() }",
+            b"struct Foo { bar: u32 }",
+            b"aab",
+            b"",
+            b"   \n\t  ",
+        ];
+        let needles: &[&[u8]] = &[
+            b"h", b"ello", b"o w", b"fn", b"main", b"println", b"()",
+            b"struct", b"Foo", b"bar", b"u32", b"aab", b"ab", b"  ", b"xyz",
+        ];
+        for c in contents {
+            let m = mask_of(c);
+            for n in needles {
+                if let Some(false) = m.allows(n, 0) {
+                    assert!(
+                        !contains(c, n),
+                        "mask rejected needle {:?} for content {:?} that contains it",
+                        String::from_utf8_lossy(n),
+                        String::from_utf8_lossy(c)
+                    );
+                }
+            }
+        }
+    }
+
+    /// Case folding must not create false negatives either.
+    #[test]
+    fn case_insensitive_substrings_are_not_rejected() {
+        let m = mask_of(b"Hello World");
+        assert_ne!(m.allows(b"hello", 0), Some(false));
+        assert_ne!(m.allows(b"HELLO", 0), Some(false));
+        assert_ne!(m.allows(b"World", 0), Some(false));
+    }
+
+    /// An empty or unrecorded mask must fall through to reading the file.
+    #[test]
+    fn unknown_mask_returns_none() {
+        assert_eq!(ContentMask::default().allows(b"anything", 0), None);
+    }
+
+    /// A typo budget can only make the check more permissive.
+    #[test]
+    fn typos_only_relax_the_check() {
+        let m = mask_of(b"abcdefghij");
+        assert_eq!(m.allows(b"zzzz", 0), Some(false));
+        assert_eq!(m.allows(b"zzzz", 4), Some(true));
+    }
+
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+        if needle.len() > hay.len() {
+            return false;
+        }
+        hay.windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
+    }
+}

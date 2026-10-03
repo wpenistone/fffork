@@ -2,10 +2,35 @@ use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
-use fff_search::FilePickerOptions;
+use fff_search::{FilePickerOptions, SharedFilePicker};
 use fff_search::file_picker::FilePicker;
 use fff_search::grep::{Casing, GrepMode, GrepSearchOptions, parse_grep_query};
 
+/// Poll `cond` against the picker until it holds or the deadline passes.
+///
+/// Background classification finishes after the bigram index is published, so
+/// tests that wait on `bigram_index().is_some()` race the work they actually
+/// care about. Polling the assertion is deterministic.
+fn wait_until<F>(shared: &SharedFilePicker, cond: F) -> bool
+where
+    F: Fn(&FilePicker) -> bool,
+{
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        {
+            let guard = shared.read().unwrap();
+            if let Some(picker) = guard.as_ref()
+                && cond(picker)
+            {
+                return true;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
 /// Build a batch of test files and return a FilePicker with them indexed.
 fn create_picker(base: &Path, specs: &[(&str, &str)]) -> FilePicker {
     for (rel, contents) in specs {
@@ -632,18 +657,24 @@ fn large_unknown_extension_binary_is_classified_at_scan_time() {
         );
     }
 
-    let guard = shared_picker.read().unwrap();
-    let picker = guard.as_ref().unwrap();
-    let was_flagged = picker
-        .get_files()
-        .iter()
-        .any(|f| f.relative_path(picker).contains("codex_view") && f.is_binary());
+    // Poll the assertion itself rather than an unrelated readiness signal.
+    // `bigram_index().is_some()` can be published *before* the header sniff
+    // finishes, so waiting on it raced: this test passed or failed depending on
+    // scheduling, on this branch and on upstream alike.
+    let was_flagged = wait_until(&shared_picker, |picker| {
+        picker
+            .get_files()
+            .iter()
+            .any(|f| f.relative_path(picker).contains("codex_view") && f.is_binary())
+    });
     assert!(
         was_flagged,
         "large no-extension binary must be flagged via the header sniff"
     );
 
     let parsed = parse_grep_query("match this text");
+    let guard = shared_picker.read().unwrap();
+    let picker = guard.as_ref().unwrap();
     let opts = GrepSearchOptions {
         max_file_size: 10 * 1024 * 1024,
         ..plain_opts()
@@ -722,18 +753,21 @@ fn large_binary_with_nuls_past_header_is_classified() {
         );
     }
 
-    let guard = shared_picker.read().unwrap();
-    let picker = guard.as_ref().unwrap();
-    let flagged = picker
-        .get_files()
-        .iter()
-        .any(|f| f.relative_path(picker).contains("late_nul.dat") && f.is_binary());
+    // See the note in the sibling test: poll the assertion, not bigram readiness.
+    let flagged = wait_until(&shared_picker, |picker| {
+        picker
+            .get_files()
+            .iter()
+            .any(|f| f.relative_path(picker).contains("late_nul.dat") && f.is_binary())
+    });
     assert!(
         flagged,
         "NULs past the 8 KB header window must still be detected by the streaming scan"
     );
 
     let parsed = parse_grep_query("match this text");
+    let guard = shared_picker.read().unwrap();
+    let picker = guard.as_ref().unwrap();
     let opts = GrepSearchOptions {
         max_file_size: 10 * 1024 * 1024,
         ..plain_opts()

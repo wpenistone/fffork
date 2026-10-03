@@ -200,6 +200,7 @@ pub(crate) fn grep_search<'a>(
     base_path: &Path,
     arena: crate::simd_path::ArenaPtr,
     overflow_arena: crate::simd_path::ArenaPtr,
+    content_masks: Option<&'a crate::file_picker::ContentMaskStore>,
 ) -> GrepResult<'a> {
     let result = grep_search_parsed(
         files,
@@ -212,6 +213,7 @@ pub(crate) fn grep_search<'a>(
         base_path,
         arena,
         overflow_arena,
+        content_masks,
     );
 
     // Constraint parsing can swallow tokens the user meant literally (e.g. `!=`
@@ -257,6 +259,7 @@ pub(crate) fn grep_search<'a>(
         base_path,
         arena,
         overflow_arena,
+        content_masks,
     );
 
     if fallback.matches.is_empty() {
@@ -279,6 +282,7 @@ fn grep_search_parsed<'a>(
     base_path: &Path,
     arena: crate::simd_path::ArenaPtr,
     overflow_arena: crate::simd_path::ArenaPtr,
+    content_masks: Option<&'a crate::file_picker::ContentMaskStore>,
 ) -> GrepResult<'a> {
     let total_files = files.live_count();
     let constraints_from_query = &query.constraints[..];
@@ -391,6 +395,13 @@ fn grep_search_parsed<'a>(
     }
     .build();
 
+    // The content mask needs a literal needle. Plain text gives one; regex and
+    // fuzzy do not, and testing a decomposed pattern would be unsound.
+    let content_needle: Option<&[u8]> = match options.mode {
+        GrepMode::PlainText => Some(effective_pattern.as_bytes()),
+        _ => None,
+    };
+    let content_max_typos: u16 = 0;
     let should_prefilter = regex.is_none();
     let mut result = perform_grep(
         &files_to_search,
@@ -404,13 +415,10 @@ fn grep_search_parsed<'a>(
             overflow_arena,
             prefilter: should_prefilter.then_some(&finder),
             abort_signal,
-            // DISABLED until the prefilter carries original file positions:
-            // iles_to_search is a *filtered* subset, so the loop index is not
-            // the index into content_masks. Wiring it naively would make grep
-            // skip files that DO match. See doc/search-perf-plan.md.
-            content_masks: None,
-            content_needle: None,
-            content_max_typos: 0,
+            content_masks,
+            content_needle,
+            content_max_typos,
+            files,
         },
         // The single sink-selection point: every mode's matcher/sink pairing
         // is decided here based on the compiled pattern.
@@ -542,6 +550,37 @@ pub(super) struct GrepContext<'a, 'b> {
     /// (regex queries have no single literal to test for).
     pub(super) content_needle: Option<&'a [u8]>,
     pub(super) content_max_typos: u16,
+    /// The picker's contiguous FileItem slice, used to recover original
+    /// positions from the prefilter's filtered output.
+    pub(super) files: &'a [FileItem],
+}
+
+/// Recover a file's original position in the picker's contiguous `FileItem`
+/// slice from its address.
+///
+/// The grep prefilter returns a *filtered* `Vec<&FileItem>`, so its loop index
+/// is not the file's position, and `GrepMatch::file_index` indexes
+/// `result_files` rather than the index either. Using either as a mask index
+/// would make grep skip files that do match.
+///
+/// The slice is contiguous - `FileSync` lays out base and overflow files in one
+/// allocation, partitioned by `base_count` - so the offset is exact. Returning
+/// `None` for anything outside the slice keeps the caller safe if that layout
+/// ever changes.
+#[inline]
+fn original_index(files: &[FileItem], f: &FileItem) -> Option<usize> {
+    let base = files.as_ptr() as usize;
+    let addr = f as *const FileItem as usize;
+    let stride = std::mem::size_of::<FileItem>();
+    if stride == 0 || addr < base {
+        return None;
+    }
+    let off = addr - base;
+    if off % stride != 0 {
+        return None;
+    }
+    let idx = off / stride;
+    (idx < files.len()).then_some(idx)
 }
 
 impl GrepContext<'_, '_> {
@@ -665,10 +704,15 @@ where
                         let t_read = phase_timing.then(std::time::Instant::now);
                         // Content-mask pre-check: skip the open+read entirely for
                         // files whose indexed byte classes cannot contain the
-                        // needle. Reading is ~95% of grep's wall time, so this
-                        // is the one check worth doing before touching the disk.
+                        // needle. Reading is ~95% of grep's wall time, so this is
+                        // the one check worth doing before touching the disk.
+                        //
+                        // Uses the file's position in the original slice, not the
+                        // loop index: `files_to_search` is filtered, so `idx` is
+                        // not the mask index.
                         if let (Some(masks), Some(needle)) = (ctx.content_masks, ctx.content_needle)
-                            && let Some(mask) = masks.get(idx)
+                            && let Some(pos) = original_index(ctx.files, file)
+                            && let Some(mask) = masks.get(pos)
                             && mask.allows(needle, ctx.content_max_typos) == Some(false)
                         {
                             return None;

@@ -1809,6 +1809,7 @@ impl FilePicker {
                 &self.base_path,
                 arena,
                 overflow_arena,
+                Some(&self.sync_data.content_masks),
             )
         };
 
@@ -2652,6 +2653,7 @@ impl FileSync {
         let scanned_max_path_len = files.iter().map(|f| f.path.byte_len).max().unwrap_or(0);
         let max_path_len = Arc::new(MaxPathLen::new());
         max_path_len.observe(scanned_max_path_len);
+        let content_masks = Arc::new(ContentMaskStore::with_capacity(files.len()));
 
         Ok(FileSync {
             files: StableVec::from_vec_with_reserve(files, MAX_OVERFLOW_FILES),
@@ -2659,7 +2661,7 @@ impl FileSync {
             base_count,
             live_count: base_count,
             max_path_len,
-            content_masks: Arc::new(ContentMaskStore::with_capacity(0)),
+            content_masks,
             dirs: StableVec::from_vec_with_reserve(dirs, MAX_OVERFLOW_FILES),
             base_dirs_count,
             live_dirs_count: base_dirs_count,

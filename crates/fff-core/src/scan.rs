@@ -348,6 +348,7 @@ impl ScanJob {
                     &unsafe_snapshot.base_path,
                     arena,
                     &signals.cancelled,
+                    None,
                 );
             }
         } else {
@@ -357,6 +358,7 @@ impl ScanJob {
                 &unsafe_snapshot.base_path,
                 arena,
                 &signals.cancelled,
+                None,
             );
         }
 
