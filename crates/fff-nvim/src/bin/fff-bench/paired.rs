@@ -548,7 +548,18 @@ fn block_mean_pair(base: &BenchReport, cand: &BenchReport) -> Option<(f64, f64)>
 fn rewrite_cells_from_blocks(report: &mut BenchReport, walls: &BTreeMap<String, Vec<f64>>) {
     for c in &mut report.cells {
         if let Some(vs) = walls.get(&c.cell_key) {
-            let dist = Dist::from_values(vs.clone());
+            // Single-transient rejection: with few blocks, p95 is the max,
+            // so one descheduled block defines the cell (seen: +44% on a
+            // cell whose min/median never moved). Drop a lone outlier.
+            let mut vals = vs.clone();
+            vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            if vals.len() >= 4 {
+                let top = vals.len() - 1;
+                if vals[top] > vals[top - 1] * 1.25 {
+                    vals.pop();
+                }
+            }
+            let dist = Dist::from_values(vals);
             c.cost = CostSummary {
                 wall_us: dist,
                 threads_configured: c.cost.threads_configured,
@@ -790,7 +801,8 @@ mod tests {
     }
 
     #[test]
-    fn block_mean_pair_joins_by_cell_key() {        let base = treport(vec![
+    fn block_mean_pair_joins_by_cell_key() {
+        let base = treport(vec![
             tcell("k1", "search", 100.0),
             tcell("k2", "search", 200.0),
             tcell("q1", "quality", 9999.0),
@@ -801,6 +813,22 @@ mod tests {
             tcell("zzz", "search", 5.0),
         ]);
         assert_eq!(block_mean_pair(&base, &cand), Some((150.0, 200.0)));
+    }
+
+    #[test]
+    fn lone_outlier_block_is_trimmed() {
+        let mut report = treport(vec![tcell("k1", "search", 0.0)]);
+        let mut walls = std::collections::BTreeMap::new();
+        walls.insert("k1".to_string(), vec![615.0, 650.0, 670.0, 995.0]);
+        rewrite_cells_from_blocks(&mut report, &walls);
+        // 995 > 670 * 1.25 trims to [615, 650, 670]: p95 must drop.
+        assert!(report.cells[0].cost.wall_us.p95 < 900.0);
+        // No outlier: all four kept.
+        let mut report2 = treport(vec![tcell("k1", "search", 0.0)]);
+        let mut walls2 = std::collections::BTreeMap::new();
+        walls2.insert("k1".to_string(), vec![600.0, 650.0, 670.0, 690.0]);
+        rewrite_cells_from_blocks(&mut report2, &walls2);
+        assert!(report2.cells[0].cost.wall_us.p95 >= 690.0);
     }
 
     #[test]

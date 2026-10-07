@@ -1555,12 +1555,14 @@ fn match_and_score_in_arena<'a>(
             matches_arc
         });
     let match_elapsed = t_match.elapsed();
-    phase_log(format!(
-        "PHASE match_us={} n_matches={} n_files={}",
-        match_elapsed.as_micros(),
-        path_matches.len(),
-        working_files.len()
-    ));
+    if phase_timing {
+        phase_log(format!(
+            "PHASE match_us={} n_matches={} n_files={}",
+            match_elapsed.as_micros(),
+            path_matches.len(),
+            working_files.len()
+        ));
+    }
 
     // Expose file indices for typing live-narrow (Match(longer,T) Ã¢Å â€
     // Match(shorter,T) when T is unchanged).
