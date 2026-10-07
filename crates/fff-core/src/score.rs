@@ -109,7 +109,8 @@ fn match_fuzzy_parts(
     arena: ArenaPtr,
     max_path_len: usize,
 ) -> Vec<neo_frizbee::Match> {
-    let valid_parts: Vec<&str> = fuzzy_parts
+    // Stack for the common 1-2 part queries; spills rarely.
+    let valid_parts: SmallVec<[&str; 4]> = fuzzy_parts
         .iter()
         .copied()
         .filter(|p| p.len() >= 2)
@@ -267,6 +268,9 @@ fn match_fuzzy_parts(
         }
 
         let exact_us = t_exact.elapsed().as_micros();
+        // Sorted for binary search in the assemble pass below, which
+        // applies the bump inline (no second pass, no hash set).
+        exact_name_hits.sort_unstable();
 
         // SW scoring (collapse removed: cheap rank disagreed with SW
         // on real corpora; reordering would be a UX regression).
@@ -694,6 +698,12 @@ fn match_fuzzy_parts(
                     m.score = scores[i].saturating_add(bonus);
                     m.end_col = end_cols[i].saturating_add(start_adj.min(u16::MAX as u32) as u16);
                     m.exact = exact;
+                    if !exact_name_hits.is_empty()
+                        && exact_name_hits.binary_search(&m.index).is_ok()
+                    {
+                        m.score = m.score.max(200);
+                        m.exact = true;
+                    }
                 }
                 if timing {
                     t_assemble_us.fetch_add(
@@ -730,15 +740,6 @@ fn match_fuzzy_parts(
                     "PHASE interseq prefilter_ms={prefilter_ms:.1} collect_ms={collect_ms:.1} batch_ms={batch_ms:.1} assemble_ms={assemble_ms:.1} n={}",
                     matches.len()
                 );
-            }
-            if !exact_name_hits.is_empty() {
-                let pinned: ahash::AHashSet<u32> = exact_name_hits.iter().copied().collect();
-                for m in matches.iter_mut() {
-                    if pinned.contains(&m.index) {
-                        m.score = m.score.max(200);
-                        m.exact = true;
-                    }
-                }
             }
             matches
         }
@@ -1118,7 +1119,8 @@ fn match_fuzzy_parts_dirs(
     arena: ArenaPtr,
     overflow_arena: ArenaPtr,
 ) -> Vec<neo_frizbee::Match> {
-    let valid_parts: Vec<&str> = fuzzy_parts
+    // Stack for the common 1-2 part queries; spills rarely.
+    let valid_parts: SmallVec<[&str; 4]> = fuzzy_parts
         .iter()
         .copied()
         .filter(|p| p.len() >= 2)
@@ -1240,7 +1242,8 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         }
     };
 
-    let valid_parts: Vec<&str> = fuzzy_parts
+    // Stack for the common 1-2 part queries; spills rarely.
+    let valid_parts: SmallVec<[&str; 4]> = fuzzy_parts
         .iter()
         .copied()
         .filter(|p| p.len() >= 2)
