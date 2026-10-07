@@ -416,13 +416,52 @@ fn measure_subject(
     if !bin.exists() {
         return Err(format!("artifact not found: {}", bin.display()));
     }
+    // Old artifacts predate --slim: try slim first, retry plain on
+    // freshness failure so a stale block file can never pass as data.
+    match measure_subject_inner(
+        bin, corpus, suite, iterations, warmup, output, load_profile, true,
+    ) {
+        Ok(r) => Ok(r),
+        Err(first) => {
+            let retry = measure_subject_inner(
+                bin, corpus, suite, iterations, warmup, output, load_profile, false,
+            );
+            retry.map_err(|_| first)
+        }
+    }
+}
+
+/// Freshness rule: the report file must be newer than the spawn.
+/// A subject that errors (unknown flag, crash) without writing must
+/// never let a previous run's file pass as this block's data.
+fn report_is_fresh(output: &Path, start: std::time::SystemTime) -> bool {
+    std::fs::metadata(output)
+        .and_then(|m| m.modified())
+        .map(|t| t > start)
+        .unwrap_or(false)
+}
+
+fn measure_subject_inner(
+    bin: &Path,
+    corpus: &Path,
+    suite: &str,
+    iterations: usize,
+    warmup: usize,
+    output: &Path,
+    load_profile: &str,
+    slim: bool,
+) -> Result<BenchReport, String> {
+    if !bin.exists() {
+        return Err(format!("artifact not found: {}", bin.display()));
+    }
     let profile = if load_profile.is_empty() {
         "quiet_v1"
     } else {
         load_profile
     };
-    let status = Command::new(bin)
-        .arg("run")
+    let start = std::time::SystemTime::now();
+    let mut cmd = Command::new(bin);
+    cmd.arg("run")
         .arg("--path")
         .arg(corpus)
         .arg("--suite")
@@ -434,8 +473,11 @@ fn measure_subject(
         .arg("--sample")
         .arg("mem,cpu")
         .arg("--load-profile")
-        .arg(profile)
-        .arg("--slim")
+        .arg(profile);
+    if slim {
+        cmd.arg("--slim");
+    }
+    let status = cmd
         .arg("--output")
         .arg(output)
         .arg("--patch")
@@ -447,15 +489,19 @@ fn measure_subject(
         .env("FFF_SCAN_THREAD_CAP", "4")
         .status()
         .map_err(|e| format!("spawn {}: {e}", bin.display()))?;
-    if !status.success() {
-        // Still try to load report if written (gates may fail with exit 1).
-        if !output.exists() {
-            return Err(format!(
-                "subject {} exited {} without report",
-                bin.display(),
-                status
-            ));
-        }
+    if !status.success() && !report_is_fresh(output, start) {
+        return Err(format!(
+            "subject {} exited {} without a fresh report",
+            bin.display(),
+            status
+        ));
+    }
+    if !report_is_fresh(output, start) {
+        return Err(format!(
+            "subject {} left a stale report {}",
+            bin.display(),
+            output.display()
+        ));
     }
     let s = fs::read_to_string(output).map_err(|e| format!("read report: {e}"))?;
     serde_json::from_str(&s).map_err(|e| format!("parse report: {e}"))
@@ -726,8 +772,25 @@ mod tests {
     }
 
     #[test]
-    fn block_mean_pair_joins_by_cell_key() {
-        let base = treport(vec![
+    fn stale_report_never_passes_as_fresh() {
+        let dir = std::env::temp_dir().join("fff-paired-fresh-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let f = dir.join("block.json");
+        std::fs::write(&f, "{}").unwrap();
+        // File from the past is stale against a fresh spawn instant.
+        let past = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        assert!(!report_is_fresh(&f, past));
+        // A just-written file is fresh.
+        std::fs::write(&f, "{}").unwrap();
+        let before = std::time::SystemTime::now() - std::time::Duration::from_secs(5);
+        assert!(report_is_fresh(&f, before));
+        // Missing file is never fresh.
+        assert!(!report_is_fresh(&dir.join("nope.json"), before));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn block_mean_pair_joins_by_cell_key() {        let base = treport(vec![
             tcell("k1", "search", 100.0),
             tcell("k2", "search", 200.0),
             tcell("q1", "quality", 9999.0),
