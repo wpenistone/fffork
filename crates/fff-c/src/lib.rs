@@ -1,14 +1,5 @@
-//! C FFI bindings for fff-core, usable from any language with C FFI
-//! (Bun, Node.js, Python, Ruby, etc.).
-//!
-//! All state is owned by an opaque instance handle: create with
-//! `fff_create_instance*`, pass to every call, free with `fff_destroy`.
-//! Multiple instances can coexist in one process.
-//!
-//! Conventions: every returned `*mut FffResult` is freed with
-//! `fff_free_result`; optional string params take NULL/empty; numeric 0 means
-//! "use default" unless documented otherwise; grep mode `u8` is 0 = plain
-//! text, 1 = regex, 2 = fuzzy; multi-grep patterns are `\n`-separated.
+//! C FFI bindings for fff-core, usable from any language with C FFI.
+//! Instance-based: create with `fff_create_instance*`, free with `fff_destroy`.
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::PathBuf;
@@ -31,7 +22,7 @@ use ffi_types::{
     FffScore, FffSearchResult,
 };
 
-/// Opaque handle holding all per-instance state; freed by `fff_destroy`.
+// Opaque handle holding all per-instance state; freed by `fff_destroy`.
 struct FffInstance {
     picker: SharedFilePicker,
     frecency: SharedFrecency,
@@ -40,7 +31,7 @@ struct FffInstance {
     watch_callback: std::sync::Arc<watch::WatchCallbackSlot>,
 }
 
-/// Convert a C string to `&str`; `None` if null or invalid UTF-8.
+// Convert a C string to `&str`; `None` if null or invalid UTF-8.
 pub(crate) unsafe fn cstr_to_str<'a>(s: *const c_char) -> Option<&'a str> {
     if s.is_null() {
         None
@@ -49,12 +40,12 @@ pub(crate) unsafe fn cstr_to_str<'a>(s: *const c_char) -> Option<&'a str> {
     }
 }
 
-/// Optional C string param: `None` if null, empty, or invalid UTF-8.
+// Optional C string param: `None` if null, empty, or invalid UTF-8.
 unsafe fn optional_cstr<'a>(s: *const c_char) -> Option<&'a str> {
     unsafe { cstr_to_str(s) }.filter(|s| !s.is_empty())
 }
 
-/// Recover a `&FffInstance` from the opaque pointer; error `FffResult` if null.
+// Recover a `&FffInstance` from the opaque pointer; error `FffResult` if null.
 pub(crate) unsafe fn instance_ref<'a>(
     fff_handle: *mut c_void,
 ) -> Result<&'a FffInstance, *mut FffResult> {
@@ -67,7 +58,7 @@ pub(crate) unsafe fn instance_ref<'a>(
     }
 }
 
-/// Decode a `u8` grep mode into the core enum.
+// Decode a `u8` grep mode into the core enum.
 fn grep_mode_from_u8(mode: u8) -> fff::GrepMode {
     match mode {
         1 => fff::GrepMode::Regex,
@@ -76,7 +67,7 @@ fn grep_mode_from_u8(mode: u8) -> fff::GrepMode {
     }
 }
 
-/// Apply "0 means default" convention.
+// Apply "0 means default" convention.
 fn default_u32(val: u32, default: u32) -> u32 {
     if val == 0 { default } else { val }
 }

@@ -1321,6 +1321,102 @@ uint32_t fff_grep_result_get_next_file_offset(const struct FffGrepResult *r);
 const char *fff_grep_result_get_regex_fallback_error(const struct FffGrepResult *r);
 
 /**
+ * Total combined score; `0` if `s` is null.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+int32_t fff_score_get_total(const struct FffScore *s);
+
+/**
+ * Base fuzzy match score; `0` if `s` is null.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+int32_t fff_score_get_base_score(const struct FffScore *s);
+
+/**
+ * Bonus for filename match; `0` if `s` is null.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+int32_t fff_score_get_filename_bonus(const struct FffScore *s);
+
+/**
+ * Bonus for special filenames; `0` if `s` is null.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+int32_t fff_score_get_special_filename_bonus(const struct FffScore *s);
+
+/**
+ * Boost from frecency; `0` if `s` is null.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+int32_t fff_score_get_frecency_boost(const struct FffScore *s);
+
+/**
+ * Penalty for distance in path; `0` if `s` is null.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+int32_t fff_score_get_distance_penalty(const struct FffScore *s);
+
+/**
+ * Penalty if this is the current file; `0` if `s` is null.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+int32_t fff_score_get_current_file_penalty(const struct FffScore *s);
+
+/**
+ * Boost from query history combo matching; `0` if `s` is null.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+int32_t fff_score_get_combo_match_boost(const struct FffScore *s);
+
+/**
+ * Bonus for path alignment; `0` if `s` is null.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+int32_t fff_score_get_path_alignment_bonus(const struct FffScore *s);
+
+/**
+ * Reserved: `FffScore` predates `Score::evidence_bonus`, always `0`.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+int32_t fff_score_get_evidence_bonus(const struct FffScore *s);
+
+/**
+ * Whether this was an exact match; `false` if `s` is null.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+bool fff_score_get_exact_match(const struct FffScore *s);
+
+/**
+ * Match type string; null if `s` is null. Do not free.
+ *
+ * ## Safety
+ * `s` must be a valid `FffScore` pointer or null.
+ */
+const char *fff_score_get_match_type(const struct FffScore *s);
+
+/**
  * Register the instance-wide watch callback used by all `fff_watch`
  * subscriptions; call before the first `fff_watch`, calling again replaces it.
  *

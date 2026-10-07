@@ -474,6 +474,7 @@ const FFF_SCORE_STRUCT = {
   distance_penalty: DataType.I32,
   current_file_penalty: DataType.I32,
   combo_match_boost: DataType.I32,
+  path_alignment_bonus: DataType.I32,
   exact_match: DataType.U8,
   match_type: DataType.External,
 };
@@ -487,6 +488,7 @@ interface FffScoreRaw {
   distance_penalty: number;
   current_file_penalty: number;
   combo_match_boost: number;
+  path_alignment_bonus: number;
   exact_match: number;
   match_type: JsExternal;
 }
@@ -623,7 +625,7 @@ const FFF_GREP_MATCH_STRUCT = {
   match_ranges_count: DataType.U32,
   context_before_count: DataType.U32,
   context_after_count: DataType.U32,
-  fuzzy_score: DataType.U32, // actually u16 in C, but ffi-rs doesn't so we read it as u32 with padding
+  fuzzy_score: DataType.U16,
   has_fuzzy_score: DataType.U8,
   is_binary: DataType.U8,
   is_definition: DataType.U8,
@@ -700,6 +702,7 @@ function readFileItemFromRaw(raw: FffFileItemRaw): FileItem {
     accessFrecencyScore: Number(raw.access_frecency_score),
     modificationFrecencyScore: Number(raw.modification_frecency_score),
     totalFrecencyScore: Number(raw.total_frecency_score),
+    isBinary: raw.is_binary !== 0,
   };
 }
 
@@ -713,6 +716,7 @@ function readScoreFromRaw(raw: FffScoreRaw): Score {
     distancePenalty: raw.distance_penalty,
     currentFilePenalty: raw.current_file_penalty,
     comboMatchBoost: raw.combo_match_boost,
+    pathAlignmentBonus: raw.path_alignment_bonus,
     exactMatch: raw.exact_match !== 0,
     matchType: readCString(raw.match_type) ?? "",
   };
@@ -750,6 +754,7 @@ function readMixedItemFromRaw(raw: FffMixedItemRaw): MixedItem {
       accessFrecencyScore: Number(raw.access_frecency_score),
       modificationFrecencyScore: Number(raw.modification_frecency_score),
       totalFrecencyScore: Number(raw.total_frecency_score),
+      isBinary: raw.is_binary !== 0,
     },
   };
 }

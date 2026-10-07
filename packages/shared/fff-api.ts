@@ -149,6 +149,8 @@ export interface FileItem {
   modificationFrecencyScore: number;
   /** Combined frecency score */
   totalFrecencyScore: number;
+  /** Whether the file was detected as binary (absent on older natives) */
+  isBinary?: boolean;
   /** Git status: 'clean', 'modified', 'untracked', 'staged_new', etc. */
   gitStatus: string;
 }
@@ -173,6 +175,14 @@ export interface Score {
   currentFilePenalty: number;
   /** Boost from query history combo matching */
   comboMatchBoost: number;
+  /** Bonus for path alignment (absent on older natives) */
+  pathAlignmentBonus?: number;
+  /**
+   * Intent-evidence mix (filename/ext/segments/role/proximity).
+   * Reserved: the frozen FffScore ABI has no field for it yet, so FFI
+   * results never populate this; `total` already folds it in.
+   */
+  evidenceBonus?: number;
   /** Whether this was an exact match */
   exactMatch: boolean;
   /** Type of match: 'fuzzy', 'exact', 'prefix', etc. */

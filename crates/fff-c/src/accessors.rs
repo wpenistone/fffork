@@ -1,13 +1,11 @@
-//! Stable accessor functions for `fff-c` FFI struct fields: a named API so
-//! FFI callers (Emacs Lisp, Python `ctypes`, etc.) don't hardcode struct byte
-//! offsets that break silently on layout changes. For array iteration use
-//! `fff_search_result_get_item` / `fff_grep_result_get_match` in `lib.rs`.
+//! Stable field accessors for FFI structs (no hardcoded offsets).
+//! For array iteration use `fff_search_result_get_item` in `lib.rs`.
 
 use std::ffi::c_char;
 use std::ptr;
 
 use crate::ffi_types::{
-    FffFileItem, FffGrepMatch, FffGrepResult, FffMatchRange, FffResult, FffSearchResult,
+    FffFileItem, FffGrepMatch, FffGrepResult, FffMatchRange, FffResult, FffScore, FffSearchResult,
 };
 
 // ── FffResult ────────────────────────────────────────────────────────────────
@@ -474,6 +472,153 @@ pub unsafe extern "C" fn fff_grep_match_get_is_binary(m: *const FffGrepMatch) ->
     unsafe { (*m).is_binary }
 }
 
+// ── FffScore ───────────────────────────────────────────────────────────────────
+// `FffScore` layout is frozen (array element: growing it changes the stride).
+// `Score::evidence_bonus` and the git boosts live in `total` but have no FFI
+// field; `fff_score_get_evidence_bonus` reserves the name and returns 0.
+
+/// Total combined score; `0` if `s` is null.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_total(s: *const FffScore) -> i32 {
+    if s.is_null() {
+        return 0;
+    }
+    unsafe { (*s).total }
+}
+
+/// Base fuzzy match score; `0` if `s` is null.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_base_score(s: *const FffScore) -> i32 {
+    if s.is_null() {
+        return 0;
+    }
+    unsafe { (*s).base_score }
+}
+
+/// Bonus for filename match; `0` if `s` is null.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_filename_bonus(s: *const FffScore) -> i32 {
+    if s.is_null() {
+        return 0;
+    }
+    unsafe { (*s).filename_bonus }
+}
+
+/// Bonus for special filenames; `0` if `s` is null.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_special_filename_bonus(s: *const FffScore) -> i32 {
+    if s.is_null() {
+        return 0;
+    }
+    unsafe { (*s).special_filename_bonus }
+}
+
+/// Boost from frecency; `0` if `s` is null.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_frecency_boost(s: *const FffScore) -> i32 {
+    if s.is_null() {
+        return 0;
+    }
+    unsafe { (*s).frecency_boost }
+}
+
+/// Penalty for distance in path; `0` if `s` is null.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_distance_penalty(s: *const FffScore) -> i32 {
+    if s.is_null() {
+        return 0;
+    }
+    unsafe { (*s).distance_penalty }
+}
+
+/// Penalty if this is the current file; `0` if `s` is null.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_current_file_penalty(s: *const FffScore) -> i32 {
+    if s.is_null() {
+        return 0;
+    }
+    unsafe { (*s).current_file_penalty }
+}
+
+/// Boost from query history combo matching; `0` if `s` is null.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_combo_match_boost(s: *const FffScore) -> i32 {
+    if s.is_null() {
+        return 0;
+    }
+    unsafe { (*s).combo_match_boost }
+}
+
+/// Bonus for path alignment; `0` if `s` is null.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_path_alignment_bonus(s: *const FffScore) -> i32 {
+    if s.is_null() {
+        return 0;
+    }
+    unsafe { (*s).path_alignment_bonus }
+}
+
+/// Reserved: `FffScore` predates `Score::evidence_bonus`, always `0`.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_evidence_bonus(s: *const FffScore) -> i32 {
+    let _ = s;
+    0
+}
+
+/// Whether this was an exact match; `false` if `s` is null.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_exact_match(s: *const FffScore) -> bool {
+    if s.is_null() {
+        return false;
+    }
+    unsafe { (*s).exact_match }
+}
+
+/// Match type string; null if `s` is null. Do not free.
+///
+/// ## Safety
+/// `s` must be a valid `FffScore` pointer or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fff_score_get_match_type(s: *const FffScore) -> *const c_char {
+    if s.is_null() {
+        return ptr::null();
+    }
+    unsafe { (*s).match_type }
+}
+
 // ── FffSearchResult ──────────────────────────────────────────────────────────
 
 /// Number of items in the result; `0` if `r` is null.
@@ -711,6 +856,30 @@ mod tests {
         }
     }
 
+    fn make_score() -> FffScore {
+        FffScore {
+            total: 100,
+            base_score: 60,
+            filename_bonus: 10,
+            special_filename_bonus: 5,
+            frecency_boost: 7,
+            distance_penalty: -3,
+            current_file_penalty: -50,
+            combo_match_boost: 12,
+            path_alignment_bonus: 9,
+            exact_match: true,
+            match_type: CString::new("fuzzy_filename").unwrap().into_raw(),
+        }
+    }
+
+    unsafe fn free_score(s: &mut FffScore) {
+        unsafe {
+            if !s.match_type.is_null() {
+                drop(CString::from_raw(s.match_type));
+            }
+        }
+    }
+
     // ── null-guard tests: every function returns its zero-value on NULL ───────
 
     #[test]
@@ -793,6 +962,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn null_score_returns_zero_or_null() {
+        let null: *const FffScore = ptr::null();
+        unsafe {
+            assert_eq!(fff_score_get_total(null), 0);
+            assert_eq!(fff_score_get_base_score(null), 0);
+            assert_eq!(fff_score_get_filename_bonus(null), 0);
+            assert_eq!(fff_score_get_special_filename_bonus(null), 0);
+            assert_eq!(fff_score_get_frecency_boost(null), 0);
+            assert_eq!(fff_score_get_distance_penalty(null), 0);
+            assert_eq!(fff_score_get_current_file_penalty(null), 0);
+            assert_eq!(fff_score_get_combo_match_boost(null), 0);
+            assert_eq!(fff_score_get_path_alignment_bonus(null), 0);
+            assert_eq!(fff_score_get_evidence_bonus(null), 0);
+            assert!(!fff_score_get_exact_match(null));
+            assert!(fff_score_get_match_type(null).is_null());
+        }
+    }
+
     // ── data correctness tests ────────────────────────────────────────────────
 
     #[test]
@@ -865,6 +1053,29 @@ mod tests {
             assert!(fff_grep_match_get_is_definition(p));
 
             free_grep_match(&mut m);
+        }
+    }
+
+    #[test]
+    fn score_getters_return_correct_values() {
+        let mut s = make_score();
+        let p = &s as *const FffScore;
+        unsafe {
+            assert_eq!(fff_score_get_total(p), 100);
+            assert_eq!(fff_score_get_base_score(p), 60);
+            assert_eq!(fff_score_get_filename_bonus(p), 10);
+            assert_eq!(fff_score_get_special_filename_bonus(p), 5);
+            assert_eq!(fff_score_get_frecency_boost(p), 7);
+            assert_eq!(fff_score_get_distance_penalty(p), -3);
+            assert_eq!(fff_score_get_current_file_penalty(p), -50);
+            assert_eq!(fff_score_get_combo_match_boost(p), 12);
+            assert_eq!(fff_score_get_path_alignment_bonus(p), 9);
+            assert_eq!(fff_score_get_evidence_bonus(p), 0);
+            assert!(fff_score_get_exact_match(p));
+            let mt = std::ffi::CStr::from_ptr(fff_score_get_match_type(p));
+            assert_eq!(mt.to_str().unwrap(), "fuzzy_filename");
+
+            free_score(&mut s);
         }
     }
 

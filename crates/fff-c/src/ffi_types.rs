@@ -61,8 +61,8 @@ pub struct FffCreateOptions {
 }
 
 impl FffCreateOptions {
-    /// Default values for a v1 options struct.
-    pub fn defaults() -> Self {
+    // Default values for a v1 options struct.
+    pub(crate) fn defaults() -> Self {
         Self {
             version: FFF_CREATE_OPTIONS_VERSION,
             base_path: ptr::null(),
@@ -84,12 +84,12 @@ impl FffCreateOptions {
     }
 }
 
-/// Allocate a heap CString from a `&str`, returning a raw pointer.
+// Allocate a heap CString from a `&str`, returning a raw pointer.
 fn cstring_new(s: &str) -> *mut c_char {
     CString::new(s).unwrap_or_default().into_raw()
 }
 
-/// Convert a `Vec<T>` into a raw pointer + count, leaking the memory.
+// Convert a `Vec<T>` into a raw pointer + count, leaking the memory.
 fn vec_to_raw<T>(v: Vec<T>) -> (*mut T, u32) {
     if v.is_empty() {
         return (ptr::null_mut(), 0);
@@ -101,7 +101,7 @@ fn vec_to_raw<T>(v: Vec<T>) -> (*mut T, u32) {
     (p, count)
 }
 
-/// Convert a `&[String]` into a heap-allocated array of C strings.
+// Convert a `&[String]` into a heap-allocated array of C strings.
 fn strings_to_raw(v: &[String]) -> (*mut *mut c_char, u32) {
     if v.is_empty() {
         return (ptr::null_mut(), 0);
@@ -110,10 +110,8 @@ fn strings_to_raw(v: &[String]) -> (*mut *mut c_char, u32) {
     vec_to_raw(ptrs)
 }
 
-/// Free a heap-allocated array of C strings.
-///
-/// ## Safety
-/// `arr` must have been produced by `strings_to_raw`.
+// Free a heap-allocated array of C strings.
+// Safety: `arr` must have been produced by `strings_to_raw`.
 unsafe fn free_cstring_array(arr: *mut *mut c_char, count: u32) {
     if arr.is_null() {
         return;
@@ -144,7 +142,7 @@ pub struct FffFileItem {
 }
 
 impl FffFileItem {
-    pub fn from_item(item: &FileItem, picker: &FilePicker) -> Self {
+    pub(crate) fn from_item(item: &FileItem, picker: &FilePicker) -> Self {
         FffFileItem {
             relative_path: cstring_new(&item.relative_path(picker)),
             file_name: cstring_new(&item.file_name(picker)),
@@ -160,9 +158,8 @@ impl FffFileItem {
 }
 
 impl FffFileItem {
-    /// ## Safety
-    /// All string pointers must have been allocated by `CString::into_raw`.
-    pub unsafe fn free_strings(&mut self) {
+    // Safety: all string pointers must have been allocated by `CString::into_raw`.
+    pub(crate) unsafe fn free_strings(&mut self) {
         unsafe {
             if !self.relative_path.is_null() {
                 drop(CString::from_raw(self.relative_path));
@@ -212,9 +209,8 @@ impl From<&Score> for FffScore {
 }
 
 impl FffScore {
-    /// ## Safety
-    /// `match_type` must have been allocated by `CString::into_raw`.
-    pub unsafe fn free_strings(&mut self) {
+    // Safety: `match_type` must have been allocated by `CString::into_raw`.
+    pub(crate) unsafe fn free_strings(&mut self) {
         unsafe {
             if !self.match_type.is_null() {
                 drop(CString::from_raw(self.match_type));
@@ -288,8 +284,8 @@ pub struct FffSearchResult {
 }
 
 impl FffSearchResult {
-    /// Convert a core `SearchResult` into a heap-allocated `FffSearchResult`.
-    pub fn from_core(result: &SearchResult, picker: &FilePicker) -> *mut Self {
+    // Convert a core `SearchResult` into a heap-allocated `FffSearchResult`.
+    pub(crate) fn from_core(result: &SearchResult, picker: &FilePicker) -> *mut Self {
         let items: Vec<FffFileItem> = result
             .items
             .iter()
@@ -397,9 +393,8 @@ impl FffGrepMatch {
         }
     }
 
-    /// ## Safety
-    /// All pointers must have been allocated by the corresponding `from_core`.
-    pub unsafe fn free_fields(&mut self) {
+    // Safety: all pointers must have been allocated by the corresponding `from_core`.
+    pub(crate) unsafe fn free_fields(&mut self) {
         unsafe {
             if !self.relative_path.is_null() {
                 drop(CString::from_raw(self.relative_path));
@@ -449,8 +444,8 @@ pub struct FffGrepResult {
 }
 
 impl FffGrepResult {
-    /// Convert a core `GrepResult` into a heap-allocated `FffGrepResult`.
-    pub fn from_core(result: &GrepResult, picker: &FilePicker) -> *mut Self {
+    // Convert a core `GrepResult` into a heap-allocated `FffGrepResult`.
+    pub(crate) fn from_core(result: &GrepResult, picker: &FilePicker) -> *mut Self {
         let items: Vec<FffGrepMatch> = result
             .matches
             .iter()
@@ -514,8 +509,8 @@ pub struct FffResult {
 }
 
 impl FffResult {
-    /// Create a successful result with no payload, returned as heap pointer.
-    pub fn ok_empty() -> *mut Self {
+    // Create a successful result with no payload, returned as heap pointer.
+    pub(crate) fn ok_empty() -> *mut Self {
         Box::into_raw(Box::new(FffResult {
             success: true,
             error: ptr::null_mut(),
@@ -524,8 +519,8 @@ impl FffResult {
         }))
     }
 
-    /// Create a successful result with an integer value.
-    pub fn ok_int(value: i64) -> *mut Self {
+    // Create a successful result with an integer value.
+    pub(crate) fn ok_int(value: i64) -> *mut Self {
         Box::into_raw(Box::new(FffResult {
             success: true,
             error: ptr::null_mut(),
@@ -534,8 +529,8 @@ impl FffResult {
         }))
     }
 
-    /// Create a successful result carrying an opaque pointer (handle, typed struct, or string).
-    pub fn ok_handle(handle: *mut c_void) -> *mut Self {
+    // Create a successful result carrying an opaque pointer (handle, typed struct, or string).
+    pub(crate) fn ok_handle(handle: *mut c_void) -> *mut Self {
         Box::into_raw(Box::new(FffResult {
             success: true,
             error: ptr::null_mut(),
@@ -544,9 +539,9 @@ impl FffResult {
         }))
     }
 
-    /// Create a successful result carrying a C string in the `handle` field.
-    /// The caller must free it with `fff_free_string`.
-    pub fn ok_string(s: &str) -> *mut Self {
+    // Create a successful result carrying a C string in the `handle` field.
+    // The caller must free it with `fff_free_string`.
+    pub(crate) fn ok_string(s: &str) -> *mut Self {
         let cstr = CString::new(s).unwrap_or_default().into_raw();
         Box::into_raw(Box::new(FffResult {
             success: true,
@@ -556,8 +551,8 @@ impl FffResult {
         }))
     }
 
-    /// Create an error result, returned as heap pointer.
-    pub fn err(error: &str) -> *mut Self {
+    // Create an error result, returned as heap pointer.
+    pub(crate) fn err(error: &str) -> *mut Self {
         Box::into_raw(Box::new(FffResult {
             success: false,
             error: CString::new(error).unwrap_or_default().into_raw(),
@@ -577,7 +572,7 @@ pub struct FffDirItem {
 }
 
 impl FffDirItem {
-    pub fn from_item(item: &DirItem, picker: &FilePicker) -> Self {
+    pub(crate) fn from_item(item: &DirItem, picker: &FilePicker) -> Self {
         FffDirItem {
             relative_path: cstring_new(&item.relative_path(picker)),
             dir_name: cstring_new(&item.dir_name(picker)),
@@ -585,9 +580,8 @@ impl FffDirItem {
         }
     }
 
-    /// ## Safety
-    /// All string pointers must have been allocated by the rust side
-    pub unsafe fn free_strings(&mut self) {
+    // Safety: all string pointers must have been allocated by the rust side
+    pub(crate) unsafe fn free_strings(&mut self) {
         unsafe {
             if !self.relative_path.is_null() {
                 drop(CString::from_raw(self.relative_path));
@@ -616,8 +610,8 @@ pub struct FffDirSearchResult {
 }
 
 impl FffDirSearchResult {
-    /// Convert a core `DirSearchResult` into a heap-allocated `FffDirSearchResult`.
-    pub fn from_core(result: &DirSearchResult, picker: &FilePicker) -> *mut Self {
+    // Convert a core `DirSearchResult` into a heap-allocated `FffDirSearchResult`.
+    pub(crate) fn from_core(result: &DirSearchResult, picker: &FilePicker) -> *mut Self {
         let items: Vec<FffDirItem> = result
             .items
             .iter()
@@ -663,7 +657,7 @@ pub struct FffMixedItem {
 }
 
 impl FffMixedItem {
-    pub fn from_mixed_ref(item: &MixedItemRef<'_>, picker: &FilePicker) -> Self {
+    pub(crate) fn from_mixed_ref(item: &MixedItemRef<'_>, picker: &FilePicker) -> Self {
         match item {
             MixedItemRef::File(file) => FffMixedItem {
                 item_type: 0,
@@ -692,9 +686,8 @@ impl FffMixedItem {
         }
     }
 
-    /// ## Safety
-    /// All string pointers must have been allocated by rust side
-    pub unsafe fn free_strings(&mut self) {
+    // Safety: all string pointers must have been allocated by rust side
+    pub(crate) unsafe fn free_strings(&mut self) {
         unsafe {
             if !self.relative_path.is_null() {
                 drop(CString::from_raw(self.relative_path));
@@ -730,8 +723,8 @@ pub struct FffMixedSearchResult {
 }
 
 impl FffMixedSearchResult {
-    /// Convert a core `MixedSearchResult` into a heap-allocated `FffMixedSearchResult`.
-    pub fn from_core(result: &MixedSearchResult, picker: &FilePicker) -> *mut Self {
+    // Convert a core `MixedSearchResult` into a heap-allocated `FffMixedSearchResult`.
+    pub(crate) fn from_core(result: &MixedSearchResult, picker: &FilePicker) -> *mut Self {
         let items: Vec<FffMixedItem> = result
             .items
             .iter()
@@ -778,8 +771,29 @@ impl From<fff::file_picker::ScanProgress> for FffScanProgress {
 
 #[cfg(test)]
 mod options_layout_tests {
-    use super::FffCreateOptions;
+    use super::{FffCreateOptions, FffScore};
     use std::mem::{align_of, offset_of, size_of};
+
+    // THIS TEST HAVE TO BE NEVER UPDATED ONLY ADDED NEW FIELDS
+    // this is needed to ensure ABI backward compatibility
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn fff_score_layout_is_frozen_64bit() {
+        assert_eq!(size_of::<FffScore>(), 48);
+        assert_eq!(align_of::<FffScore>(), 8);
+
+        assert_eq!(offset_of!(FffScore, total), 0);
+        assert_eq!(offset_of!(FffScore, base_score), 4);
+        assert_eq!(offset_of!(FffScore, filename_bonus), 8);
+        assert_eq!(offset_of!(FffScore, special_filename_bonus), 12);
+        assert_eq!(offset_of!(FffScore, frecency_boost), 16);
+        assert_eq!(offset_of!(FffScore, distance_penalty), 20);
+        assert_eq!(offset_of!(FffScore, current_file_penalty), 24);
+        assert_eq!(offset_of!(FffScore, combo_match_boost), 28);
+        assert_eq!(offset_of!(FffScore, path_alignment_bonus), 32);
+        assert_eq!(offset_of!(FffScore, exact_match), 36);
+        assert_eq!(offset_of!(FffScore, match_type), 40);
+    }
 
     // THIS TEST HAVE TO BE NEVER UPDATED ONLY ADDED NEW FIELDS
     // this is needed to ensure ABI backward compatibility

@@ -417,7 +417,7 @@ const RES_HANDLE = 16; // *mut c_void (8)
 const RES_INT_VALUE = 24; // i64         (8)
 
 // MUST match `crates/fff-c/src/ffi_types.rs::FffCreateOptions`
-const FFF_CREATE_OPTIONS_VERSION = 1;
+const FFF_CREATE_OPTIONS_VERSION = 2;
 const FFF_CREATE_OPTIONS_SIZE = 88;
 const FCO_VERSION = 0;
 const FCO_BASE_PATH = 8;
@@ -434,6 +434,7 @@ const FCO_CACHE_BUDGET_MAX_BYTES = 64;
 const FCO_CACHE_BUDGET_MAX_FILE_SIZE = 72;
 const FCO_ENABLE_FS_ROOT_SCANNING = 80;
 const FCO_ENABLE_HOME_DIR_SCANNING = 81;
+const FCO_FOLLOW_SYMLINKS = 82;
 
 function readResultEnvelope(
   resultPtr: Pointer | null,
@@ -547,6 +548,7 @@ export function ffiCreate(
   cacheBudgetMaxFileSize: bigint,
   enableFsRootScanning: boolean,
   enableHomeDirScanning: boolean,
+  followSymlinks?: boolean,
 ): Result<NativeHandle> {
   const library = loadLibrary();
 
@@ -574,6 +576,7 @@ export function ffiCreate(
   opts.writeBigUInt64LE(cacheBudgetMaxFileSize, FCO_CACHE_BUDGET_MAX_FILE_SIZE);
   opts.writeUInt8(enableFsRootScanning ? 1 : 0, FCO_ENABLE_FS_ROOT_SCANNING);
   opts.writeUInt8(enableHomeDirScanning ? 1 : 0, FCO_ENABLE_HOME_DIR_SCANNING);
+  opts.writeUInt8(followSymlinks ? 1 : 0, FCO_FOLLOW_SYMLINKS);
 
   const resultPtr = library.symbols.fff_create_instance_with(ptr(opts));
 
@@ -650,9 +653,10 @@ const FI_MODIFIED = 32; // u64         (8)
 const FI_ACCESS = 40; // i64         (8)
 const FI_MODFR = 48; // i64         (8)
 const FI_TOTAL_FR = 56; // i64         (8)
+const FI_IS_BINARY = 64; // bool        (1)
 const FI_SIZE_OF = 72;
 
-// FffScore (48 bytes)
+// FffScore (48 bytes, frozen: must match fff_score_layout_is_frozen_64bit)
 const SC_TOTAL = 0; // i32         (4)
 const SC_BASE = 4; // i32         (4)
 const SC_FNAME = 8; // i32         (4)
@@ -661,7 +665,8 @@ const SC_FREC = 16; // i32         (4)
 const SC_DIST = 20; // i32         (4)
 const SC_CURFILE = 24; // i32         (4)
 const SC_COMBO = 28; // i32         (4)
-const SC_EXACT = 32; // bool        (1 + 7 pad)
+const SC_PATH_ALIGN = 32; // i32         (4)
+const SC_EXACT = 36; // bool        (1 + 3 pad)
 const SC_MTYPE = 40; // *mut c_char (8)
 const SC_SIZE_OF = 48;
 
@@ -684,6 +689,7 @@ function readFileItemStruct(p: number): FileItem {
     accessFrecencyScore: Number(read.i64(pp, FI_ACCESS)),
     modificationFrecencyScore: Number(read.i64(pp, FI_MODFR)),
     totalFrecencyScore: Number(read.i64(pp, FI_TOTAL_FR)),
+    isBinary: read.u8(pp, FI_IS_BINARY) !== 0,
   };
 }
 
@@ -701,6 +707,7 @@ function readScoreStruct(p: number): Score {
     distancePenalty: read.i32(pp, SC_DIST),
     currentFilePenalty: read.i32(pp, SC_CURFILE),
     comboMatchBoost: read.i32(pp, SC_COMBO),
+    pathAlignmentBonus: read.i32(pp, SC_PATH_ALIGN),
     exactMatch: read.u8(pp, SC_EXACT) !== 0,
     matchType: readCString(read.ptr(pp, SC_MTYPE)) ?? "",
   };
@@ -861,6 +868,7 @@ const MI_MODIFIED = 40; // u64         (8)
 const MI_ACCESS = 48; // i64         (8)
 const MI_MODFR = 56; // i64         (8)
 const MI_TOTAL_FR = 64; // i64         (8)
+const MI_IS_BINARY = 72; // bool        (1)
 
 /**
  * Read an FffMixedItem struct at the given raw address and return a MixedItem.
@@ -893,6 +901,7 @@ function readMixedItemStruct(p: number): MixedItem {
       accessFrecencyScore: Number(read.i64(pp, MI_ACCESS)),
       modificationFrecencyScore: Number(read.i64(pp, MI_MODFR)),
       totalFrecencyScore: Number(read.i64(pp, MI_TOTAL_FR)),
+      isBinary: read.u8(pp, MI_IS_BINARY) !== 0,
     },
   };
 }
