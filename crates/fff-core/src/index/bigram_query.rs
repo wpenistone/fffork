@@ -96,15 +96,7 @@ impl BigramQuery {
 
     fn child_rank(child: &BigramQuery, index: &BigramFilter) -> u32 {
         match child {
-            // Rare columns are skipped by eval (decode costs more than
-            // they filter), so rank them last.
-            BigramQuery::Consec(k) if index.is_rare(*k) => u32::MAX,
             BigramQuery::Consec(k) => index.column_popcount(*k).unwrap_or(u32::MAX),
-            BigramQuery::Skip1(k)
-                if index.skip_index().is_some_and(|s| s.is_rare(*k)) =>
-            {
-                u32::MAX
-            }
             BigramQuery::Skip1(k) => index
                 .skip_index()
                 .and_then(|s| s.column_popcount(*k))
@@ -132,13 +124,10 @@ impl BigramQuery {
         let mut any = false;
         let and_child = |result: &mut Vec<u64>, child: &BigramQuery| {
             match child {
-                BigramQuery::Consec(k) if index.is_rare(*k) => {}
                 BigramQuery::Consec(k) => {
                     let col = index.column_ref(*k)?;
                     BigramFilter::and_column(result, col);
                 }
-                BigramQuery::Skip1(k)
-                    if index.skip_index().is_some_and(|s| s.is_rare(*k)) => {}
                 BigramQuery::Skip1(k) => {
                     let col = index.skip_index()?.column_ref(*k)?;
                     BigramFilter::and_column(result, col);
@@ -185,7 +174,6 @@ impl BigramQuery {
                 let mut ok = false;
                 for c in inner {
                     if let BigramQuery::Consec(k) = c
-                        && !index.is_rare(*k)
                         && let Some(col) = index.column_ref(*k)
                     {
                         BigramFilter::and_column(&mut scratch, col);
