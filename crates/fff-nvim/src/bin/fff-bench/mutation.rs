@@ -68,12 +68,7 @@ fn run_on_worktree(work: &Path) -> Result<MutationReport, String> {
     fs::write(&create_abs, b"pub fn created_by_bench() {}\n").map_err(|e| e.to_string())?;
     notify_create(&adapter, &create_abs);
     let t0 = Instant::now();
-    let seen = wait_until(
-        &adapter,
-        "created_by_bench",
-        true,
-        SETTLE_DEADLINE,
-    );
+    let seen = wait_until(&adapter, "created_by_bench", true, SETTLE_DEADLINE);
     let pus = t0.elapsed().as_micros() as u64;
     prop.push(pus);
     if !seen {
@@ -236,11 +231,7 @@ mod tests {
         let _ = fs::remove_dir_all(&cache);
         let (fx, _) = fixture::materialize_public_v1(&cache).unwrap();
         let report = run_mutation_gate(&fx).unwrap();
-        assert!(
-            report.passed,
-            "mutation cases: {:?}",
-            report.cases
-        );
+        assert!(report.passed, "mutation cases: {:?}", report.cases);
         let _ = fs::remove_dir_all(&cache);
     }
 }

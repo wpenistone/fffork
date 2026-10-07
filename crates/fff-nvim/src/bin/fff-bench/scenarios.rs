@@ -296,15 +296,21 @@ fn compose_public_fixture(_repo_id: &str) -> Vec<Cell> {
             continue;
         }
         let (kind, call_kind, scenario) = match q.kind {
-            crate::fixture::QueryKind::Search => {
-                (CellKind::GateGolden, Some("file".into()), "gate.golden.public")
-            }
-            crate::fixture::QueryKind::GrepPlain => {
-                (CellKind::Grep, Some("grep_plain".into()), "gate.grep.public")
-            }
-            crate::fixture::QueryKind::GrepRegex => {
-                (CellKind::Grep, Some("grep_regex".into()), "gate.grep.public")
-            }
+            crate::fixture::QueryKind::Search => (
+                CellKind::GateGolden,
+                Some("file".into()),
+                "gate.golden.public",
+            ),
+            crate::fixture::QueryKind::GrepPlain => (
+                CellKind::Grep,
+                Some("grep_plain".into()),
+                "gate.grep.public",
+            ),
+            crate::fixture::QueryKind::GrepRegex => (
+                CellKind::Grep,
+                Some("grep_regex".into()),
+                "gate.grep.public",
+            ),
         };
         let mut axes = json!({
             "query": q.query,
@@ -797,8 +803,17 @@ fn family_typing(repo_id: &str) -> Vec<Cell> {
     let mut out = Vec::new();
     // Simulate typing "file_picker" one char at a time
     let prefixes_fp: Vec<&str> = vec![
-        "f", "fi", "fil", "file", "file_", "file_p", "file_pi", "file_pic",
-        "file_pick", "file_picke", "file_picker",
+        "f",
+        "fi",
+        "fil",
+        "file",
+        "file_",
+        "file_p",
+        "file_pi",
+        "file_pic",
+        "file_pick",
+        "file_picke",
+        "file_picker",
     ];
     let stream_fp: Vec<String> = prefixes_fp.iter().map(|p| format!("file:{p}")).collect();
     out.push(cell(
@@ -820,8 +835,13 @@ fn family_typing(repo_id: &str) -> Vec<Cell> {
     ));
     // Simulate typing "score" then backspace then retype
     let bounce: Vec<String> = vec![
-        "file:s".into(), "file:sc".into(), "file:sco".into(), "file:scor".into(),
-        "file:score".into(), "file:scor".into(), "file:score".into(),
+        "file:s".into(),
+        "file:sc".into(),
+        "file:sco".into(),
+        "file:scor".into(),
+        "file:score".into(),
+        "file:scor".into(),
+        "file:score".into(),
     ];
     out.push(cell(
         "profile.typing.bounce_edit",
@@ -841,7 +861,14 @@ fn family_typing(repo_id: &str) -> Vec<Cell> {
         &["typing", "bounce", "edit"],
     ));
     // Short prefix latency sweep
-    for (q, thr) in [("m", 1usize), ("mo", 2), ("mod", 4), ("mod.", 4), ("mod.r", 4), ("mod.rs", 4)] {
+    for (q, thr) in [
+        ("m", 1usize),
+        ("mo", 2),
+        ("mod", 4),
+        ("mod.", 4),
+        ("mod.r", 4),
+        ("mod.rs", 4),
+    ] {
         let axes = json!({"query": q, "threads": thr, "typing_sim": true});
         out.push(cell(
             "profile.typing.prefix_stream",
@@ -1263,7 +1290,10 @@ fn family_edges(repo_id: &str) -> Vec<Cell> {
         ("'sq'".into(), "single_quotes"),
         ("mod\ttab".into(), "tab_char"),
         ("mod\nline".into(), "newline_noise"),
-        (String::from_utf8_lossy(&[0xC3, 0x28]).into_owned(), "invalid_utf8_ish"),
+        (
+            String::from_utf8_lossy(&[0xC3, 0x28]).into_owned(),
+            "invalid_utf8_ish",
+        ),
     ];
     let mut out = Vec::new();
     for (query, tag) in owned {
@@ -1368,7 +1398,6 @@ fn family_stress(repo_id: &str) -> Vec<Cell> {
             &["stress", "throughput", "concurrent_clients"],
         ));
     }
-  
 
     // Rapid full alphabet thrash
     let stream: Vec<String> = ('a'..='z').map(|c| format!("file:{c}")).collect();
@@ -1445,7 +1474,8 @@ fn family_combo(repo_id: &str) -> Vec<Cell> {
             }
         }
     }
-    let axes = json!({ "query": "mod .rs", "burst": 30, "threads": 4, "combo": "throughput_constraint" });
+    let axes =
+        json!({ "query": "mod .rs", "burst": 30, "threads": 4, "combo": "throughput_constraint" });
     out.push(cell(
         "profile.combo.throughput_constraint",
         repo_id,
@@ -1637,15 +1667,31 @@ fn family_interleave(repo_id: &str) -> Vec<Cell> {
     let patterns: &[(&str, &[&str])] = &[
         (
             "search_grep_search",
-            &["file:FilePicker", "grep_plain:struct FilePicker", "file:FilePicker"],
+            &[
+                "file:FilePicker",
+                "grep_plain:struct FilePicker",
+                "file:FilePicker",
+            ],
         ),
         (
             "triple_alt",
-            &["file:mod", "grep_plain:mod", "mixed:mod", "file:mod", "grep_fuzzy:mod"],
+            &[
+                "file:mod",
+                "grep_plain:mod",
+                "mixed:mod",
+                "file:mod",
+                "grep_fuzzy:mod",
+            ],
         ),
         (
             "type_then_grep",
-            &["file:f", "file:fi", "file:fil", "file:file", "grep_plain:file"],
+            &[
+                "file:f",
+                "file:fi",
+                "file:fil",
+                "file:file",
+                "grep_plain:file",
+            ],
         ),
         (
             "dir_then_file",
@@ -1715,10 +1761,16 @@ fn family_folder_edge_cases(repo_id: &str) -> Vec<Cell> {
 
     // Deep nested paths: 5-6 directory levels (like linux kernel / game engines)
     for (query, tag) in [
-        ("drivers/net/ethernet/intel/e1000e/netdev.c", "deep_6_driver"),
+        (
+            "drivers/net/ethernet/intel/e1000e/netdev.c",
+            "deep_6_driver",
+        ),
         ("arch/x86/kvm/vmx/nested.c", "deep_5_arch"),
         ("crates/fff-core/src/score.rs", "deep_4_score"),
-        ("vendor/neo_frizbee/src/smith_waterman/simd/algo.rs", "deep_5_vendor"),
+        (
+            "vendor/neo_frizbee/src/smith_waterman/simd/algo.rs",
+            "deep_5_vendor",
+        ),
         ("lua/fff/file_picker/preview.lua", "deep_4_lua"),
         ("lib/x86/insn-eval.c", "deep_3_lib"),
     ] {
@@ -1818,11 +1870,20 @@ fn family_folder_edge_cases(repo_id: &str) -> Vec<Cell> {
     // Asymmetric path ratios: long dir prefix + short filename vs short dir + long filename
     for (query, tag) in [
         // Very long directory, short filename (6 chars)
-        ("crates/fff-core/src/dbs/frecency/mod.rs", "long_dir_short_name"),
+        (
+            "crates/fff-core/src/dbs/frecency/mod.rs",
+            "long_dir_short_name",
+        ),
         // Very short directory, very long filename (60+ chars)
-        ("src/very_long_file_name_with_detailed_description_of_component.rs", "short_dir_long_name"),
+        (
+            "src/very_long_file_name_with_detailed_description_of_component.rs",
+            "short_dir_long_name",
+        ),
         // Max depth with common short name
-        ("drivers/net/ethernet/intel/e1000e/hw.h", "deep_dir_short_name"),
+        (
+            "drivers/net/ethernet/intel/e1000e/hw.h",
+            "deep_dir_short_name",
+        ),
     ] {
         let axes = json!({"query": query, "tag": tag, "ratio": "asymmetric"});
         out.push(cell(
@@ -1850,16 +1911,34 @@ pub fn list_scenarios() -> Vec<(&'static str, &'static str)> {
     vec![
         ("gate.golden", "quality — golden rank gates"),
         ("profile.search.matrix", "search — selectivity × threads"),
-        ("profile.search.query_length_boundary", "search — query-length algorithm transitions"),
+        (
+            "profile.search.query_length_boundary",
+            "search — query-length algorithm transitions",
+        ),
         ("profile.call.kinds", "call types — file/dir/mixed/grep"),
         ("profile.search.pagination", "search — deep offset/limit"),
         ("profile.search.constraints", "search — query constraints"),
-        ("profile.folder.edge_cases", "folder — deep nested / slashes / relative edge cases"),
+        (
+            "profile.folder.edge_cases",
+            "folder — deep nested / slashes / relative edge cases",
+        ),
         ("profile.grep.modes", "grep — plain/fuzzy/regex"),
-        ("profile.grep.pagination", "grep — cursor-linked first/next pages"),
-        ("profile.throughput.burst", "single-client closed-loop throughput"),
-        ("profile.throughput.concurrent", "concurrent-client closed-loop throughput"),
-        ("profile.typing.prefix_stream", "typing keystroke prefixes b2b"),
+        (
+            "profile.grep.pagination",
+            "grep — cursor-linked first/next pages",
+        ),
+        (
+            "profile.throughput.burst",
+            "single-client closed-loop throughput",
+        ),
+        (
+            "profile.throughput.concurrent",
+            "concurrent-client closed-loop throughput",
+        ),
+        (
+            "profile.typing.prefix_stream",
+            "typing keystroke prefixes b2b",
+        ),
         ("profile.typing.bounce_edit", "type then backspace stream"),
         ("profile.b2b.session_mix", "file↔grep↔dir session sequence"),
         ("profile.b2b.alt_file_mixed", "alternate call kinds rapidly"),
@@ -1873,18 +1952,39 @@ pub fn list_scenarios() -> Vec<(&'static str, &'static str)> {
         ("profile.stability.*", "repeat identical for variance"),
         ("profile.stress.*", "pathological fanout/burst/thrash"),
         ("ci-gates", "suite: required public gates only"),
-        ("ranking-gates", "suite: labeled ranking goldens (top-1 quality floor)"),
-        ("size-sweep", "suite: latency floor probe across thread counts"),
+        (
+            "ranking-gates",
+            "suite: labeled ranking goldens (top-1 quality floor)",
+        ),
+        (
+            "size-sweep",
+            "suite: latency floor probe across thread counts",
+        ),
         ("public-v1", "suite: content-addressed fixture query bank"),
-        ("agent-screen", "suite: gates + representative search/grep (fast reject)"),
-        ("agent-confirm", "suite: decision-grade + mutation gate phase"),
-        ("resilience-confirm", "suite: probe under quiet/cpu/memory load profiles"),
+        (
+            "agent-screen",
+            "suite: gates + representative search/grep (fast reject)",
+        ),
+        (
+            "agent-confirm",
+            "suite: decision-grade + mutation gate phase",
+        ),
+        (
+            "resilience-confirm",
+            "suite: probe under quiet/cpu/memory load profiles",
+        ),
         ("peak-diagnose", "suite: wide profiles for diagnosis"),
         ("agent-loop", "alias → agent-screen"),
         ("peak-frontier", "alias → peak-diagnose"),
         ("full", "suite: everything including load/combo/stress"),
-        ("latency", "suite: individual warm-search latency and boundaries"),
-        ("pagination", "suite: fuzzy offsets and cursor-linked grep pages"),
+        (
+            "latency",
+            "suite: individual warm-search latency and boundaries",
+        ),
+        (
+            "pagination",
+            "suite: fuzzy offsets and cursor-linked grep pages",
+        ),
         ("typing", "suite: typing streams only"),
         ("calls", "suite: call-kind matrix only"),
         ("load", "suite: heavy load only"),
@@ -1936,7 +2036,10 @@ mod tests {
             "stability",
             "stress",
         ] {
-            assert!(families.contains(need), "missing family {need} in {families:?}");
+            assert!(
+                families.contains(need),
+                "missing family {need} in {families:?}"
+            );
         }
     }
 
@@ -1982,10 +2085,22 @@ mod tests {
     fn confirm_covers_latency_pagination_and_real_throughput() {
         let cells = expand_suite("agent-confirm", "r");
         assert!(cells.iter().any(|c| c.family == "latency"));
-        assert!(cells.iter().any(|c| c.scenario_id == "profile.search.pagination"));
-        assert!(cells.iter().any(|c| c.scenario_id == "profile.grep.pagination"));
+        assert!(
+            cells
+                .iter()
+                .any(|c| c.scenario_id == "profile.search.pagination")
+        );
+        assert!(
+            cells
+                .iter()
+                .any(|c| c.scenario_id == "profile.grep.pagination")
+        );
         assert!(cells.iter().any(|c| c.kind == CellKind::ThroughputBurst));
-        assert!(cells.iter().any(|c| c.kind == CellKind::ThroughputConcurrent));
+        assert!(
+            cells
+                .iter()
+                .any(|c| c.kind == CellKind::ThroughputConcurrent)
+        );
     }
 
     #[test]
@@ -2019,7 +2134,12 @@ mod tests {
         let pages: Vec<_> = expand_suite("agent-screen", "r")
             .into_iter()
             .filter(|c| c.scenario_id == "profile.search.pagination")
-            .filter_map(|c| c.axes.get("page").and_then(|v| v.as_str()).map(str::to_owned))
+            .filter_map(|c| {
+                c.axes
+                    .get("page")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+            })
             .collect();
         assert_eq!(pages, ["first", "next"]);
     }

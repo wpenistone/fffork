@@ -1,7 +1,7 @@
 //! Layer A gates (FFF_REFERENCE_PACK / CONTRACT).
 
 use crate::adapter::FffAdapter;
-use crate::cost::{score_composition_ok, OpResultData};
+use crate::cost::{OpResultData, score_composition_ok};
 use crate::runner::CellReport;
 use crate::scenarios::{Cell, CellKind};
 use serde::{Deserialize, Serialize};
@@ -76,9 +76,10 @@ pub fn evaluate_all(
             continue;
         };
         n += 1;
-        let result = map.get(&cell.cell_key).cloned().unwrap_or_else(|| {
-            adapter.search(&search.to_spec())
-        });
+        let result = map
+            .get(&cell.cell_key)
+            .cloned()
+            .unwrap_or_else(|| adapter.search(&search.to_spec()));
 
         if result.items_invalid() {
             invariants_ok = false;
@@ -238,7 +239,10 @@ pub fn evaluate_all(
                     });
                 if !in_corpus && r.error.is_none() && !path_only.is_empty() {
                     // Soft only when path looks absolute-outside or empty score noise.
-                    if path_only.contains('/') || path_only.contains('\\') || path_only.contains('.') {
+                    if path_only.contains('/')
+                        || path_only.contains('\\')
+                        || path_only.contains('.')
+                    {
                         // Require relative-ish membership for file results.
                         let bas = path_only
                             .rsplit('/')
@@ -246,7 +250,10 @@ pub fn evaluate_all(
                             .and_then(|p| p.rsplit('\\').next())
                             .unwrap_or(&path_only);
                         if !corpus_paths.iter().any(|cp| cp.ends_with(bas)) {
-                            eprintln!("INVARIANT FAIL: path_only='{}' bas='{}' not found in corpus", path_only, bas);
+                            eprintln!(
+                                "INVARIANT FAIL: path_only='{}' bas='{}' not found in corpus",
+                                path_only, bas
+                            );
                             invariants_ok = false;
                         }
                     }
@@ -404,11 +411,7 @@ fn check_soundness(adapter: &FffAdapter) -> (bool, usize, Vec<String>) {
     let mut by_base: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for p in &paths {
         let norm = p.replace('\\', "/");
-        let base = norm
-            .rsplit('/')
-            .next()
-            .unwrap_or(norm.as_str())
-            .to_string();
+        let base = norm.rsplit('/').next().unwrap_or(norm.as_str()).to_string();
         if base.is_empty() || base == "fixture.manifest.json" {
             continue;
         }
@@ -451,7 +454,9 @@ fn check_soundness(adapter: &FffAdapter) -> (bool, usize, Vec<String>) {
 
     // Also verify fixture must_hit expects under high limit (membership, not rank).
     for q in crate::fixture::query_bank_v1() {
-        if !matches!(q.kind, crate::fixture::QueryKind::Search) || !q.must_hit || q.expect.is_empty()
+        if !matches!(q.kind, crate::fixture::QueryKind::Search)
+            || !q.must_hit
+            || q.expect.is_empty()
         {
             continue;
         }
@@ -659,10 +664,7 @@ mod tests {
 
     #[test]
     fn soundness_passes_on_public_fixture() {
-        let cache = std::env::temp_dir().join(format!(
-            "fff-bench-sound-{}",
-            std::process::id()
-        ));
+        let cache = std::env::temp_dir().join(format!("fff-bench-sound-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&cache);
         let (fx, _) = fixture::materialize_public_v1(&cache).unwrap();
         let adapter = FffAdapter::open_corpus(&fx, AdapterConfig::default()).unwrap();

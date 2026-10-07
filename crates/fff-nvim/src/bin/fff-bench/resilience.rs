@@ -214,16 +214,8 @@ pub fn run_resilience_paired(
     })
 }
 
-fn summarize_report(
-    pid: &str,
-    report: BenchReport,
-    keep: bool,
-) -> (ProfileResult, bool, bool) {
-    let treat_valid = report
-        .treatment
-        .as_ref()
-        .map(|t| t.valid)
-        .unwrap_or(true);
+fn summarize_report(pid: &str, report: BenchReport, keep: bool) -> (ProfileResult, bool, bool) {
+    let treat_valid = report.treatment.as_ref().map(|t| t.valid).unwrap_or(true);
     let busy = report
         .treatment
         .as_ref()
@@ -307,5 +299,6 @@ fn clone_run_config(c: &RunConfig) -> RunConfig {
         converge_warmup: c.converge_warmup,
         load_profile: c.load_profile.clone(),
         network_profile: c.network_profile.clone(),
+        slim: c.slim,
     }
 }

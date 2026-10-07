@@ -137,11 +137,7 @@ pub fn git_diff(path: &Path, base: Option<&str>) -> Option<String> {
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout).to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    if s.is_empty() { None } else { Some(s) }
 }
 
 pub fn hostname() -> String {

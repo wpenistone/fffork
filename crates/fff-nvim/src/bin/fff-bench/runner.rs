@@ -8,7 +8,7 @@ use crate::scenarios::CellKind;
 use crate::sensors::Sensors;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::io::{BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -96,6 +96,271 @@ pub struct ReportMetadata {
     pub machine: identity::MachineMeta,
     pub repos: Vec<RepoMeta>,
     pub stats: StatsMeta,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration: Option<CalibrationMeta>,
+}
+
+/// Core thread-calibration actually used for this report's ops.
+/// Recorded per report so paired runs can attribute thread-count
+/// differences instead of inferring them from wall deltas.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CalibrationMeta {
+    pub logical_cores: usize,
+    pub physical_cores: usize,
+    pub llc_bytes: usize,
+    pub match_work_per_thread: usize,
+    pub scan_cap: usize,
+}
+
+fn default_block_iters() -> usize {
+    12
+}
+
+fn default_block_warmup() -> usize {
+    3
+}
+
+fn default_block_load() -> String {
+    "quiet_v1".into()
+}
+
+fn default_block_sample() -> String {
+    "mem,cpu".into()
+}
+
+fn default_block_slim() -> bool {
+    true
+}
+
+fn default_block_patch() -> String {
+    "none".into()
+}
+
+fn default_block_timeout() -> u64 {
+    600
+}
+
+fn default_block_repo() -> String {
+    "default".into()
+}
+
+/// One persistent-subject measurement (run-stream stdin line).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockSpec {
+    pub suite: String,
+    pub corpus: PathBuf,
+    #[serde(default = "default_block_iters")]
+    pub iters: usize,
+    #[serde(default = "default_block_warmup")]
+    pub warmup: usize,
+    #[serde(default = "default_block_load")]
+    pub load_profile: String,
+    #[serde(default = "default_block_sample")]
+    pub sample: String,
+    #[serde(default = "default_block_slim")]
+    pub slim: bool,
+    #[serde(default = "default_block_patch")]
+    pub patch: String,
+    #[serde(default = "default_block_timeout")]
+    pub timeout_secs: u64,
+    #[serde(default)]
+    pub content_index: bool,
+    #[serde(default)]
+    pub history_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub block_index: usize,
+    #[serde(default = "default_block_repo")]
+    pub repo_id: String,
+}
+
+/// Per-block failure line (run-stream stdout); disjoint from BenchReport.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamError {
+    pub block_index: Option<usize>,
+    pub error: String,
+}
+
+/// Suites with convergence warmup + mutation gate (mirrors run handler).
+pub fn confirmish_suite(suite: &str) -> bool {
+    suite.contains("confirm") || suite.contains("peak") || suite == "full"
+}
+
+fn stream_default_history_dir() -> PathBuf {
+    if let Ok(h) = std::env::var("FFF_BENCH_HISTORY") {
+        return PathBuf::from(h);
+    }
+    PathBuf::from(".fff-bench/history")
+}
+
+/// Persistent subject: one open corpus serving many blocks.
+pub struct StreamSession {
+    open_path: Option<PathBuf>,
+    adapter: Option<FffAdapter>,
+}
+
+impl StreamSession {
+    pub fn new() -> Self {
+        Self {
+            open_path: None,
+            adapter: None,
+        }
+    }
+
+    pub fn measure(&mut self, spec: &BlockSpec) -> Result<BenchReport, String> {
+        let suite = crate::agent::normalize_suite(&spec.suite);
+        let canon =
+            fff::path_utils::canonicalize(&spec.corpus).unwrap_or_else(|_| spec.corpus.clone());
+        let reused = self.open_path.as_ref() == Some(&canon) && self.adapter.is_some();
+        if !reused {
+            let mut acfg = crate::adapter::AdapterConfig::default();
+            acfg.timeout_secs = spec.timeout_secs;
+            if spec.content_index {
+                acfg.enable_content_indexing = true;
+            }
+            let adapter = FffAdapter::open_corpus(&canon, acfg.clone())?;
+            self.open_path = Some(canon.clone());
+            self.adapter = Some(adapter);
+        } else if let Some(a) = self.adapter.as_ref() {
+            a.flush_block_state();
+        }
+        let adapter = self.adapter.as_ref().ok_or("stream: no adapter open")?;
+        let confirmish = confirmish_suite(&suite);
+        let profile = if spec.load_profile.is_empty() {
+            "quiet_v1"
+        } else {
+            spec.load_profile.as_str()
+        };
+        let mut acfg = crate::adapter::AdapterConfig::default();
+        acfg.timeout_secs = spec.timeout_secs;
+        if spec.content_index {
+            acfg.enable_content_indexing = true;
+        }
+        let cfg = RunConfig {
+            iterations: spec.iters,
+            warmup: spec.warmup,
+            sample_packs: spec.sample.clone(),
+            timeout_secs: spec.timeout_secs,
+            suite: suite.clone(),
+            peak: false,
+            log_dir: None,
+            require_quiet: false,
+            quiet_wait_secs: 0,
+            patch_mode: spec.patch.clone(),
+            history_dir: None,
+            history_record: false,
+            primary_span: "harness.op_total".into(),
+            adapter: acfg,
+            flamegraph: false,
+            profile_backend: "none".into(),
+            mutation_gate: confirmish,
+            converge_warmup: confirmish,
+            load_profile: profile.into(),
+            network_profile: "native_local_v1".into(),
+            slim: spec.slim,
+        };
+
+        let started = crate::identity::now_unix();
+        let subject = crate::identity::subject_meta(FffAdapter::id());
+        let run_id = crate::identity::make_run_id(&subject);
+        noise::wait_quiet(cfg.quiet_wait_secs, cfg.require_quiet)?;
+        let net_profile = crate::network::resolve_profile(&cfg.network_profile)
+            .ok_or_else(|| format!("unknown network_profile: {}", cfg.network_profile))?;
+        let network_ev = crate::network::activate(&net_profile);
+        let load_profile = crate::load_actor::resolve_profile(&cfg.load_profile)
+            .ok_or_else(|| format!("unknown load_profile: {}", cfg.load_profile))?;
+        let treatment = crate::load_actor::Treatment::start(load_profile)?;
+
+        let repo_id = if spec.repo_id.is_empty() {
+            "default".to_string()
+        } else {
+            spec.repo_id.clone()
+        };
+        let paths = adapter.path_list();
+        let repo_metas = vec![crate::identity::RepoMeta {
+            id: repo_id.clone(),
+            path: canon.display().to_string(),
+            role: vec!["gates".into(), "profile".into()],
+            optional: false,
+            file_count_live: Some(adapter.file_count()),
+            path_list_hash: Some(crate::identity::path_list_hash(&paths)),
+            git_commit: crate::identity::git_rev(&canon),
+            git_dirty: false,
+            pin: "path".into(),
+        }];
+        let cells = crate::scenarios::expand_suite(&suite, &repo_id);
+        let repos = vec![(repo_id.clone(), canon.clone())];
+        let mut report = measure_with_adapters(
+            &repos,
+            |id| (id == repo_id).then_some(adapter),
+            repo_metas,
+            cells,
+            &cfg,
+            started,
+            subject,
+            run_id,
+            network_ev,
+            treatment,
+        )?;
+        // Mirror the run handler: score against history without recording.
+        let hist = spec
+            .history_dir
+            .clone()
+            .unwrap_or_else(stream_default_history_dir);
+        let baseline = crate::history::latest_comparable_any(
+            &hist,
+            &[
+                suite.as_str(),
+                crate::agent::CONFIRM_SUITE,
+                crate::agent::SCREEN_SUITE,
+            ],
+            Some(report.metadata.run.run_id.as_str()),
+        )
+        .and_then(|p| {
+            std::fs::read_to_string(&p)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+        });
+        report.score = Some(crate::score_cmd::compute(&report, baseline.as_ref()));
+        Ok(report)
+    }
+}
+
+/// Read block specs (JSON lines) on input, write one report or error
+/// object per block on output. Returns blocks measured.
+pub fn run_stream_loop<R: BufRead, W: Write>(input: R, mut output: W) -> Result<usize, String> {
+    let mut session = StreamSession::new();
+    let mut blocks = 0usize;
+    for line in input.lines() {
+        let line = line.map_err(|e| format!("read block spec: {e}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let spec: BlockSpec =
+            serde_json::from_str(&line).map_err(|e| format!("parse block spec: {e}"))?;
+        match session.measure(&spec) {
+            Ok(report) => {
+                serde_json::to_writer(&mut output, &report)
+                    .map_err(|e| format!("write report: {e}"))?;
+                output
+                    .write_all(b"\n")
+                    .map_err(|e| format!("write report: {e}"))?;
+            }
+            Err(e) => {
+                let err = StreamError {
+                    block_index: Some(spec.block_index),
+                    error: e,
+                };
+                serde_json::to_writer(&mut output, &err)
+                    .map_err(|e| format!("write error: {e}"))?;
+                output
+                    .write_all(b"\n")
+                    .map_err(|e| format!("write error: {e}"))?;
+            }
+        }
+        output.flush().map_err(|e| format!("flush report: {e}"))?;
+        blocks += 1;
+    }
+    Ok(blocks)
 }
 
 pub struct RunConfig {
@@ -123,6 +388,8 @@ pub struct RunConfig {
     pub load_profile: String,
     /// Network environment profile: native_local_v1 | loopback_fixture_v1 | external_shared_v1
     pub network_profile: String,
+    /// Slim output: skip per-iter logs and top_k hit details.
+    pub slim: bool,
 }
 
 struct TimedCallOutcome {
@@ -156,11 +423,6 @@ pub fn run_bench_multi(
         return Err("no repos to benchmark".into());
     }
 
-    let sensors = Sensors::from_packs(&cfg.sample_packs);
-    let mut adapters: Vec<(String, FffAdapter, usize, String)> = Vec::new();
-    let mut cells = Vec::new();
-    let mut repo_metas = Vec::new();
-
     // Network/environment identity (Phase 9). Default native_local for FFF.
     let net_profile = crate::network::resolve_profile(&cfg.network_profile)
         .ok_or_else(|| format!("unknown network_profile: {}", cfg.network_profile))?;
@@ -173,6 +435,10 @@ pub fn run_bench_multi(
     let load_profile = crate::load_actor::resolve_profile(&cfg.load_profile)
         .ok_or_else(|| format!("unknown load_profile: {}", cfg.load_profile))?;
     let treatment_session = crate::load_actor::Treatment::start(load_profile)?;
+
+    let mut adapters: Vec<(String, FffAdapter, usize, String)> = Vec::new();
+    let mut cells = Vec::new();
+    let mut repo_metas = Vec::new();
 
     for (repo_id, repo_path) in repos {
         let mut acfg = cfg.adapter.clone();
@@ -199,6 +465,45 @@ pub fn run_bench_multi(
         adapters.push((repo_id.clone(), adapter, file_count, String::new()));
     }
 
+    measure_with_adapters(
+        repos,
+        |id| {
+            adapters
+                .iter()
+                .find(|(rid, _, _, _)| rid == id)
+                .map(|(_, a, _, _)| a)
+        },
+        repo_metas,
+        cells,
+        cfg,
+        started,
+        subject,
+        run_id,
+        network_ev,
+        treatment_session,
+    )
+}
+
+/// Shared cell loop + gates + report assembly over borrowed adapters.
+/// One-shot `run` and persistent `run-stream` blocks run this same
+/// function, so verdict/CI/cap/gate semantics cannot drift.
+#[allow(clippy::too_many_arguments)]
+fn measure_with_adapters<'a, F>(
+    repos: &[(String, PathBuf)],
+    find_adapter: F,
+    repo_metas: Vec<RepoMeta>,
+    cells: Vec<crate::scenarios::Cell>,
+    cfg: &RunConfig,
+    started: u64,
+    subject: identity::SubjectMeta,
+    run_id: String,
+    network_ev: crate::network::NetworkEvidence,
+    treatment_session: crate::load_actor::Treatment,
+) -> Result<BenchReport, String>
+where
+    F: Fn(&str) -> Option<&'a FffAdapter>,
+{
+    let sensors = Sensors::from_packs(&cfg.sample_packs);
     let log_dir = cfg.log_dir.clone().or_else(|| {
         cfg.history_record
             .then(|| PathBuf::from(".fff-bench/runs").join(&run_id))
@@ -218,10 +523,7 @@ pub fn run_bench_multi(
             .find(|(id, _)| id == &cell.repo_id)
             .map(|(_, p)| p.clone())
             .ok_or_else(|| format!("no path for repo {}", cell.repo_id))?;
-        let adapter = adapters
-            .iter()
-            .find(|(id, _, _, _)| id == &cell.repo_id)
-            .map(|(_, a, _, _)| a)
+        let adapter = find_adapter(&cell.repo_id)
             .ok_or_else(|| format!("no adapter for repo {}", cell.repo_id))?;
 
         // Cold open: time a fresh open (edge / launch path)
@@ -295,6 +597,9 @@ pub fn run_bench_multi(
         let mut operations_per_iteration = None;
 
         let mut iter_writer = log_dir.as_ref().and_then(|d| {
+            if cfg.slim {
+                return None;
+            }
             let safe = cell
                 .cell_key
                 .chars()
@@ -330,14 +635,7 @@ pub fn run_bench_multi(
                 result_digests.insert(digest.clone());
             }
             if let Some(w) = iter_writer.as_mut() {
-                log_iter(
-                    w,
-                    cell,
-                    warmups_done - 1,
-                    true,
-                    outcome.cost,
-                    &last_result,
-                );
+                log_iter(w, cell, warmups_done - 1, true, outcome.cost, &last_result);
             }
             if !use_converge {
                 if warmups_done >= cfg.warmup {
@@ -376,14 +674,7 @@ pub fn run_bench_multi(
                 result_digests.insert(digest.clone());
             }
             if let Some(w) = iter_writer.as_mut() {
-                log_iter(
-                    w,
-                    cell,
-                    warmups_done + i,
-                    false,
-                    outcome.cost,
-                    &last_result,
-                );
+                log_iter(w, cell, warmups_done + i, false, outcome.cost, &last_result);
             }
         }
 
@@ -409,9 +700,7 @@ pub fn run_bench_multi(
             (!request_walls.is_empty()).then(|| crate::cost::Dist::from_values(request_walls));
         let is_workload = matches!(
             cell.kind,
-            CellKind::ThroughputBurst
-                | CellKind::ThroughputConcurrent
-                | CellKind::GrepPagination
+            CellKind::ThroughputBurst | CellKind::ThroughputConcurrent | CellKind::GrepPagination
         );
         let mut cost = CostSummary::from_samples(&samples);
         if let Some(qps) = throughput_qps {
@@ -455,8 +744,14 @@ pub fn run_bench_multi(
         invariants_ok: true,
         entries: vec![],
     };
-    for (repo_id, adapter, _, _) in &adapters {
-        let repo_cells: Vec<_> = cells.iter().filter(|c| &c.repo_id == repo_id).cloned().collect();
+    for (repo_id, _) in repos {
+        let adapter =
+            find_adapter(repo_id).ok_or_else(|| format!("no adapter for repo {repo_id}"))?;
+        let repo_cells: Vec<_> = cells
+            .iter()
+            .filter(|c| &c.repo_id == repo_id)
+            .cloned()
+            .collect();
         let pairs: Vec<_> = gate_pairs
             .iter()
             .filter(|(k, _)| repo_cells.iter().any(|c| &c.cell_key == k))
@@ -503,7 +798,10 @@ pub fn run_bench_multi(
     // Mutation gate (isolated fixture) for confirm/diagnose suites.
     let mutation = if cfg.mutation_gate {
         match crate::mutation::run_mutation_gate(
-            repos.first().map(|(_, p)| p.as_path()).unwrap_or(Path::new(".")),
+            repos
+                .first()
+                .map(|(_, p)| p.as_path())
+                .unwrap_or(Path::new(".")),
         ) {
             Ok(m) => {
                 if !m.passed {
@@ -544,8 +842,7 @@ pub fn run_bench_multi(
         .count();
 
     let noise = noise::summarize(&all_walls);
-    let mut stability =
-        crate::stability::from_cells(&cell_reports, &noise, cfg.iterations);
+    let mut stability = crate::stability::from_cells(&cell_reports, &noise, cfg.iterations);
     if unconverged > 0 {
         stability.reason_codes.push("warmup_not_converged".into());
         if stability.stability == "clean" {
@@ -553,7 +850,9 @@ pub fn run_bench_multi(
         }
     }
     if !treatment.valid {
-        stability.reason_codes.push("treatment_delivery_invalid".into());
+        stability
+            .reason_codes
+            .push("treatment_delivery_invalid".into());
         stability.stability = "unstable".into();
     }
 
@@ -568,10 +867,7 @@ pub fn run_bench_multi(
         crate::metric::coverage_from_metrics(&required, m)
     } else {
         let mut available = vec!["wall_us"];
-        if cell_reports
-            .iter()
-            .any(|c| c.cost.cpu_total_us.is_some())
-        {
+        if cell_reports.iter().any(|c| c.cost.cpu_total_us.is_some()) {
             available.push("cpu_total_us");
         }
         if cell_reports
@@ -587,14 +883,9 @@ pub fn run_bench_multi(
     let evaluator = crate::evaluator::current(FffAdapter::id());
     let cell_keys: Vec<String> = cell_reports.iter().map(|c| c.cell_key.clone()).collect();
     let repo_ids: Vec<String> = repos.iter().map(|(id, _)| id.clone()).collect();
-    let plan_digest =
-        crate::evaluator::plan_digest(&cfg.suite, &repo_ids, &cell_keys);
+    let plan_digest = crate::evaluator::plan_digest(&cfg.suite, &repo_ids, &cell_keys);
 
-    let change = capture_patch(
-        &cfg.patch_mode,
-        log_dir.as_deref(),
-        &subject,
-    );
+    let change = capture_patch(&cfg.patch_mode, log_dir.as_deref(), &subject);
 
     let profile = log_dir.as_ref().map(|d| {
         crate::profile_export::try_flamegraph(
@@ -632,6 +923,16 @@ pub fn run_bench_multi(
                 rng_seed: 1,
                 primary_span: cfg.primary_span.clone(),
             },
+            calibration: Some({
+                let c = fff::calibration_snapshot();
+                CalibrationMeta {
+                    logical_cores: c.logical_cores,
+                    physical_cores: c.physical_cores,
+                    llc_bytes: c.llc_bytes,
+                    match_work_per_thread: c.match_work_per_thread,
+                    scan_cap: c.scan_cap,
+                }
+            }),
         },
         gates,
         cells: cell_reports,
@@ -650,6 +951,10 @@ pub fn run_bench_multi(
     };
 
     report.admissible = report.gates.passed;
+
+    if cfg.slim {
+        slim_report(&mut report);
+    }
 
     if let Some(ref d) = log_dir {
         let path = d.join("report.json");
@@ -905,10 +1210,8 @@ fn apply_delta(cost: &mut CostSample, delta: &crate::sensors::SensorDelta, senso
     cost.energy_j = delta.energy_j;
     cost.energy_source = delta.energy_source.clone();
     if sensors.cpu_unmeasured(delta) {
-        cost.unavailable.insert(
-            "cpu_total_us".into(),
-            "sub_resolution_or_unmeasured".into(),
-        );
+        cost.unavailable
+            .insert("cpu_total_us".into(), "sub_resolution_or_unmeasured".into());
     }
     if sensors.power && delta.energy_j.is_none() {
         cost.unavailable
@@ -994,7 +1297,12 @@ pub fn print_table(report: &BenchReport) {
     println!(
         "subject={}@{:?} dirty={}  host={}",
         report.metadata.subject.adapter_id,
-        report.metadata.subject.git_commit.as_deref().map(|c| &c[..c.len().min(7)]),
+        report
+            .metadata
+            .subject
+            .git_commit
+            .as_deref()
+            .map(|c| &c[..c.len().min(7)]),
         report.metadata.subject.git_dirty,
         report.metadata.machine.hostname
     );
@@ -1080,7 +1388,11 @@ pub fn print_table(report: &BenchReport) {
         }
     }
     // Gate-only suites: still show a one-line wall summary from gate cells.
-    if report.cells.iter().all(|c| c.scenario_id.starts_with("gate") || c.family == "quality") {
+    if report
+        .cells
+        .iter()
+        .all(|c| c.scenario_id.starts_with("gate") || c.family == "quality")
+    {
         let walls: Vec<f64> = report
             .cells
             .iter()
@@ -1131,5 +1443,113 @@ pub fn score_exit_code(status: &str) -> u8 {
         "incomparable" => 3,
         "noisy" | "unstable" => 4,
         _ => 1,
+    }
+}
+
+// Slim keeps costs/digests/gates, drops verbose hit details.
+pub fn slim_report(report: &mut BenchReport) {
+    for c in &mut report.cells {
+        c.last_result.top_k.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn block_spec_defaults_match_oneshot_argv() {
+        let spec: BlockSpec =
+            serde_json::from_str(r#"{"suite":"agent-confirm","corpus":"/tmp/c"}"#).unwrap();
+        assert_eq!(spec.iters, 12);
+        assert_eq!(spec.warmup, 3);
+        assert_eq!(spec.load_profile, "quiet_v1");
+        assert_eq!(spec.sample, "mem,cpu");
+        assert!(spec.slim);
+        assert_eq!(spec.patch, "none");
+        assert_eq!(spec.timeout_secs, 600);
+        assert_eq!(spec.repo_id, "default");
+        assert!(!confirmish_suite("ci-gates"));
+        assert!(confirmish_suite("agent-confirm"));
+    }
+
+    fn tiny_corpus(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fff-bench-stream-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["alpha.rs", "beta.rs", "gamma.md"] {
+            std::fs::write(dir.join(name), format!("content of {name}\n")).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn stream_loop_reuses_corpus_across_blocks() {
+        let dir = tiny_corpus("reuse");
+        let hist = std::env::temp_dir().join(format!(
+            "fff-bench-stream-hist-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let input = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "suite": "ci-gates", "corpus": dir, "iters": 1,
+                "warmup": 0, "block_index": 0, "history_dir": hist,
+            }),
+            serde_json::json!({
+                "suite": "ci-gates", "corpus": dir, "iters": 1,
+                "warmup": 0, "block_index": 1, "history_dir": hist,
+            }),
+        );
+        let mut out = Vec::new();
+        let blocks = run_stream_loop(Cursor::new(input), &mut out).unwrap();
+        assert_eq!(blocks, 2);
+        let lines: Vec<&str> = std::str::from_utf8(&out)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        let a: BenchReport = serde_json::from_str(lines[0]).unwrap();
+        let b: BenchReport = serde_json::from_str(lines[1]).unwrap();
+        assert!(!a.cells.is_empty());
+        let ka: Vec<&str> = a.cells.iter().map(|c| c.cell_key.as_str()).collect();
+        let kb: Vec<&str> = b.cells.iter().map(|c| c.cell_key.as_str()).collect();
+        assert_eq!(ka, kb);
+        assert_eq!(a.metadata.run.suite, "ci-gates");
+        assert_ne!(a.metadata.run.run_id, b.metadata.run.run_id);
+        // Slim parity with one-shot children: hit details dropped, costs kept.
+        assert!(a.cells.iter().all(|c| c.last_result.top_k.is_empty()));
+        assert!(a.cells.iter().all(|c| c.cost.wall_us.n > 0));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&hist);
+    }
+
+    #[test]
+    fn stream_loop_reports_bad_corpus_per_block() {
+        let input = serde_json::json!({
+            "suite": "ci-gates",
+            "corpus": "/nonexistent-fff-bench-corpus",
+            "iters": 1, "warmup": 0, "block_index": 7,
+        })
+        .to_string()
+            + "\n";
+        let mut out = Vec::new();
+        let blocks = run_stream_loop(Cursor::new(input), &mut out).unwrap();
+        assert_eq!(blocks, 1);
+        let err: StreamError = serde_json::from_str(std::str::from_utf8(&out).unwrap()).unwrap();
+        assert_eq!(err.block_index, Some(7));
+        assert!(!err.error.is_empty());
     }
 }

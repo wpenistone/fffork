@@ -51,7 +51,13 @@ mod sensors {
 
     unsafe extern "system" {
         fn GetCurrentProcess() -> isize;
-        fn GetProcessTimes(h: isize, c: *mut FileTime, e: *mut FileTime, k: *mut FileTime, u: *mut FileTime) -> i32;
+        fn GetProcessTimes(
+            h: isize,
+            c: *mut FileTime,
+            e: *mut FileTime,
+            k: *mut FileTime,
+            u: *mut FileTime,
+        ) -> i32;
         fn QueryProcessCycleTime(h: isize, cycles: *mut u64) -> i32;
         fn GetProcessIoCounters(h: isize, io: *mut IoCounters) -> i32;
     }
@@ -121,7 +127,13 @@ mod sensors {
         pub rss_mb: f64,
     }
     pub fn snap() -> Snap {
-        Snap { cpu_100ns: 0, cycles: 0, read_bytes: 0, faults: 0, rss_mb: 0.0 }
+        Snap {
+            cpu_100ns: 0,
+            cycles: 0,
+            read_bytes: 0,
+            faults: 0,
+            rss_mb: 0.0,
+        }
     }
 }
 
@@ -210,7 +222,11 @@ fn main() {
             s1.rss_mb
         );
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
             let _ = writeln!(f, "{line}");
         }
     }

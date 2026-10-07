@@ -65,10 +65,7 @@ impl AgentResponse {
             "incomparable" => ExitCode::from(3),
             "unstable" | "noisy" => ExitCode::from(4),
             // screen-only / no confirmed improvement
-            "screen_no_signal"
-            | "equivalent"
-            | "mixed"
-            | "screen_complete"
+            "screen_no_signal" | "equivalent" | "mixed" | "screen_complete"
             | "confirm_complete" => ExitCode::from(5),
             _ => {
                 // Fall back on verdict when status is generic complete-ish
@@ -178,9 +175,7 @@ pub fn baseline_required() -> AgentResponse {
         verdict: None,
         reason_codes: vec!["baseline_required".into()],
         next_action: "measure_baseline".into(),
-        next_command: Some(
-            "fff-bench baseline --subject <baseline-artifact-ref> --json".into(),
-        ),
+        next_command: Some("fff-bench baseline --subject <baseline-artifact-ref> --json".into()),
         agent_recommendations: vec![],
         summary: "No compatible baseline in history. Measure one before check.".into(),
         baseline_run_id: None,
@@ -202,33 +197,13 @@ pub fn from_compare(
     score: Option<ScoreOut>,
 ) -> AgentResponse {
     let (status, next_action, next_command) = match cmp.verdict.as_str() {
-        "improve" => (
-            "improve".into(),
-            "benchmark_complete".into(),
-            None,
-        ),
-        "equivalent" => (
-            "equivalent".into(),
-            "benchmark_complete".into(),
-            None,
-        ),
+        "improve" => ("improve".into(), "benchmark_complete".into(), None),
+        "equivalent" => ("equivalent".into(), "benchmark_complete".into(), None),
         "mixed" => ("mixed".into(), "benchmark_complete".into(), None),
         "regress" => ("regress".into(), "benchmark_complete".into(), None),
-        "inadmissible" => (
-            "inadmissible".into(),
-            "inspect_gates".into(),
-            None,
-        ),
-        "incomparable" => (
-            "incomparable".into(),
-            "repair_comparability".into(),
-            None,
-        ),
-        "unstable" => (
-            "unstable".into(),
-            "retry_once_quiet".into(),
-            None,
-        ),
+        "inadmissible" => ("inadmissible".into(), "inspect_gates".into(), None),
+        "incomparable" => ("incomparable".into(), "repair_comparability".into(), None),
+        "unstable" => ("unstable".into(), "retry_once_quiet".into(), None),
         "promising" => (
             "promising".into(),
             "run_confirmation".into(),
@@ -237,11 +212,7 @@ pub fn from_compare(
                     .into(),
             ),
         ),
-        "screen_no_signal" => (
-            "screen_no_signal".into(),
-            "screen_complete".into(),
-            None,
-        ),
+        "screen_no_signal" => ("screen_no_signal".into(), "screen_complete".into(), None),
         other => (other.into(), "inspect".into(), None),
     };
 

@@ -170,9 +170,14 @@ pub fn probe_packs() -> Vec<PackProbe> {
             fields: filter_present(&[
                 ("cpu_user_us", b.cpu_user_us.is_some()),
                 ("cpu_system_us", b.cpu_system_us.is_some()),
-                ("cpu_delta_nonzero", d.cpu_user_us.is_some() || d.cpu_system_us.is_some()),
+                (
+                    "cpu_delta_nonzero",
+                    d.cpu_user_us.is_some() || d.cpu_system_us.is_some(),
+                ),
             ]),
-            note: Some("GetProcessTimes / proc stat (µs); short ops may be below timer resolution".into()),
+            note: Some(
+                "GetProcessTimes / proc stat (µs); short ops may be below timer resolution".into(),
+            ),
         },
         PackProbe {
             pack: "mem".into(),
@@ -614,8 +619,7 @@ fn windows_snap(snap: &mut SensorSnap, s: &Sensors) {
             info.cb = size_of::<ProcessMemoryCounters>() as u32;
             if GetProcessMemoryInfo(h, &mut info, info.cb) != 0 {
                 snap.rss_mb = Some(info.working_set_size as f64 / (1024.0 * 1024.0));
-                snap.rss_peak_mb =
-                    Some(info.peak_working_set_size as f64 / (1024.0 * 1024.0));
+                snap.rss_peak_mb = Some(info.peak_working_set_size as f64 / (1024.0 * 1024.0));
                 snap.page_faults = Some(info.page_fault_count as u64);
             }
             snap.thread_count = windows_thread_count();

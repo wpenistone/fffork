@@ -189,9 +189,10 @@ mod tests {
         let s = from_cells_with_drift(&[], &noise, 50, Some(&[100.0, 130.0]));
         assert_eq!(s.between_block_drift, "high");
         assert_eq!(s.stability, "unstable");
-        assert!(s
-            .reason_codes
-            .iter()
-            .any(|r| r.contains("between_block_drift")));
+        assert!(
+            s.reason_codes
+                .iter()
+                .any(|r| r.contains("between_block_drift"))
+        );
     }
 }

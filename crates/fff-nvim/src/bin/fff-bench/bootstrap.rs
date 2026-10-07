@@ -113,19 +113,22 @@ mod tests {
 
     #[test]
     fn parity_is_equivalent() {
-        let pairs: Vec<_> = (0..30).map(|i| (100.0, 100.0 + (i % 3) as f64 - 1.0)).collect();
+        let pairs: Vec<_> = (0..30)
+            .map(|i| (100.0, 100.0 + (i % 3) as f64 - 1.0))
+            .collect();
         let ci = ratio_ci95(&pairs, 7, 2000).unwrap();
         let c = classify_ratio(&ci, 0.10);
-        assert!(
-            c == "equivalent" || c == "mixed",
-            "got {c} ci={:?}",
-            ci
-        );
+        assert!(c == "equivalent" || c == "mixed", "got {c} ci={:?}", ci);
     }
 
     #[test]
     fn heterogeneous_pairs_produce_a_nonzero_interval() {
-        let pairs = vec![(100.0, 110.0), (100.0, 120.0), (100.0, 130.0), (100.0, 140.0)];
+        let pairs = vec![
+            (100.0, 110.0),
+            (100.0, 120.0),
+            (100.0, 130.0),
+            (100.0, 140.0),
+        ];
         let ci = ratio_ci95(&pairs, 4195872001, 10_000).unwrap();
         assert!(ci.high > ci.low, "ci={ci:?}");
     }

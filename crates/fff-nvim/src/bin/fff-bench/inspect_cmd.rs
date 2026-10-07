@@ -235,7 +235,11 @@ pub fn lint_suite(suite: &str, repo_id: &str) -> ValidateOut {
         ok,
         status: if ok { "clean".into() } else { "hazards".into() },
         issues,
-        summary: format!("lint suite={suite} cells={} status={}", cells.len(), if ok { "clean" } else { "hazards" }),
+        summary: format!(
+            "lint suite={suite} cells={} status={}",
+            cells.len(),
+            if ok { "clean" } else { "hazards" }
+        ),
     }
 }
 
@@ -361,8 +365,10 @@ pub fn diff_reports(a: &BenchReport, b: &BenchReport) -> DiffOut {
             candidate: serde_json::json!(b.admissible),
         });
     }
-    let a_keys: std::collections::HashSet<_> = a.cells.iter().map(|c| c.cell_key.as_str()).collect();
-    let b_keys: std::collections::HashSet<_> = b.cells.iter().map(|c| c.cell_key.as_str()).collect();
+    let a_keys: std::collections::HashSet<_> =
+        a.cells.iter().map(|c| c.cell_key.as_str()).collect();
+    let b_keys: std::collections::HashSet<_> =
+        b.cells.iter().map(|c| c.cell_key.as_str()).collect();
     if a_keys != b_keys {
         diffs.push(DiffItem {
             kind: "plan".into(),
@@ -388,7 +394,10 @@ pub fn diff_reports(a: &BenchReport, b: &BenchReport) -> DiffOut {
             }
         }
     }
-    let level = if diffs.iter().any(|d| d.kind == "evaluator" || d.kind == "plan") {
+    let level = if diffs
+        .iter()
+        .any(|d| d.kind == "evaluator" || d.kind == "plan")
+    {
         "incomparable"
     } else if diffs.is_empty() {
         "exact"
@@ -427,9 +436,7 @@ pub fn export_csv(report: &BenchReport) -> String {
                 .rss_peak_mb
                 .map(|v| format!("{v:.2}"))
                 .unwrap_or_default(),
-            cycles
-                .map(|d| format!("{:.0}", d.p50))
-                .unwrap_or_default(),
+            cycles.map(|d| format!("{:.0}", d.p50)).unwrap_or_default(),
             c.cost
                 .threads_observed_peak
                 .map(|t| t.to_string())
@@ -472,7 +479,8 @@ pub fn init_pack(dir: &Path) -> Result<PathBuf, String> {
             "record": true
         }
     });
-    fs::write(&manifest, serde_json::to_string_pretty(&body).unwrap()).map_err(|e| e.to_string())?;
+    fs::write(&manifest, serde_json::to_string_pretty(&body).unwrap())
+        .map_err(|e| e.to_string())?;
     let readme = dir.join("README.bench.md");
     let _ = fs::write(
         readme,

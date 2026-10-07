@@ -232,7 +232,10 @@ pub fn setup_manifest(m: &Manifest, fetch: bool) -> SetupResult {
                     ok = false;
                 }
                 if !st.ready && entry.optional {
-                    messages.push(format!("optional repo {} skipped: {:?}", entry.id, st.error));
+                    messages.push(format!(
+                        "optional repo {} skipped: {:?}",
+                        entry.id, st.error
+                    ));
                 }
                 repos.push(st);
             }
@@ -301,7 +304,10 @@ fn setup_one(entry: &RepoEntry, cache: &Path, fetch: bool) -> Result<SetupRepoSt
                 std::env::current_dir().map_err(|e| e.to_string())?
             };
             if !p.exists() {
-                return Err(format!("fixture {fixture_id} path missing: {}", p.display()));
+                return Err(format!(
+                    "fixture {fixture_id} path missing: {}",
+                    p.display()
+                ));
             }
             Ok(SetupRepoStatus {
                 id: entry.id.clone(),

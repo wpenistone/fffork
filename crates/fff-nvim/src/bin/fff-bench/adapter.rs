@@ -3,7 +3,7 @@
 use crate::cost::{OpResultData, ScoreBreakdown, TopHit};
 use crate::manifest::AdapterManifest;
 use fff::file_picker::{FFFMode, FilePicker};
-use fff::grep::{parse_grep_query, GrepMode, GrepSearchOptions};
+use fff::grep::{GrepMode, GrepSearchOptions, parse_grep_query};
 use fff::{
     DirSearchConfig, FileSearchConfig, FuzzySearchOptions, MixedSearchConfig, PaginationArgs,
     QueryParser, SharedFilePicker, SharedFrecency,
@@ -154,11 +154,7 @@ impl FffAdapter {
         Self::open_corpus_watch(path, cfg, false)
     }
 
-    pub fn open_corpus_watch(
-        path: &Path,
-        cfg: AdapterConfig,
-        watch: bool,
-    ) -> Result<Self, String> {
+    pub fn open_corpus_watch(path: &Path, cfg: AdapterConfig, watch: bool) -> Result<Self, String> {
         let path = fff::path_utils::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         if !path.exists() {
             return Err(format!("corpus path does not exist: {}", path.display()));
@@ -189,7 +185,11 @@ impl FffAdapter {
         )
         .map_err(|e| format!("FilePicker init: {e}"))?;
 
-        std::thread::sleep(Duration::from_millis(50));
+        // Let the watcher settle; skipped for one-shot opens where
+        // wait_for_scan below already gates readiness.
+        if watch {
+            std::thread::sleep(Duration::from_millis(50));
+        }
 
         if !shared_picker.wait_for_scan(Duration::from_secs(cfg.timeout_secs)) {
             return Err(format!("scan timed out after {}s", cfg.timeout_secs));
@@ -215,6 +215,21 @@ impl FffAdapter {
             if let Some(p) = g.as_mut() {
                 let _ = p.handle_create_or_modify(path);
             }
+        }
+    }
+
+    /// Drop warm per-query state between stream blocks. Issues misses
+    /// that collapse live-narrow (empty hit set deactivates it).
+    pub fn flush_block_state(&self) {
+        for index in 0..9 {
+            let spec = SearchSpec {
+                query: format!("__fff_bench_cache_evict_{index}"),
+                limit: 10,
+                offset: 0,
+                threads: 1,
+                call: CallKind::File,
+            };
+            let _ = self.call(&spec);
         }
     }
 
@@ -331,7 +346,13 @@ impl FffAdapter {
             .map(|(path, score)| TopHit {
                 path: path.clone(),
                 score: if self.config.score_breakdown {
-                    ScoreBreakdown::from(score)
+                    let mut breakdown = ScoreBreakdown::from(score);
+                    breakdown.vendored_penalty = if fff::path_is_vendored(path) {
+                        fff::VENDORED_PATH_PENALTY
+                    } else {
+                        0
+                    };
+                    breakdown
                 } else {
                     ScoreBreakdown {
                         total: score.total,
@@ -385,10 +406,18 @@ impl FffAdapter {
             .iter()
             .zip(result.scores.iter())
             .take(k)
-            .map(|(path, score)| TopHit {
-                path: path.clone(),
-                score: ScoreBreakdown::from(score),
-                line: None,
+            .map(|(path, score)| {
+                let mut breakdown = ScoreBreakdown::from(score);
+                breakdown.vendored_penalty = if fff::path_is_vendored(path) {
+                    fff::VENDORED_PATH_PENALTY
+                } else {
+                    0
+                };
+                TopHit {
+                    path: path.clone(),
+                    score: breakdown,
+                    line: None,
+                }
             })
             .collect();
         OpResultData {
@@ -438,9 +467,15 @@ impl FffAdapter {
             .zip(result.scores.iter())
             .take(k)
             .map(|(path, score)| {
+                let mut breakdown = ScoreBreakdown::from(score);
+                breakdown.vendored_penalty = if fff::path_is_vendored(path) {
+                    fff::VENDORED_PATH_PENALTY
+                } else {
+                    0
+                };
                 TopHit {
                     path: path.clone(),
-                    score: ScoreBreakdown::from(score),
+                    score: breakdown,
                     line: None,
                 }
             })
@@ -580,5 +615,50 @@ mod tests {
         let c = AdapterConfig::from(&m);
         assert!(c.enable_content_indexing);
         assert_eq!(c.top_k_log, 3);
+    }
+
+    fn tiny_corpus() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "fff-bench-flush-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["alpha.rs", "beta.rs", "gamma.md"] {
+            std::fs::write(dir.join(name), format!("content of {name}\n")).unwrap();
+        }
+        dir
+    }
+
+    fn file_spec(query: &str) -> SearchSpec {
+        SearchSpec {
+            query: query.into(),
+            limit: 10,
+            offset: 0,
+            threads: 1,
+            call: CallKind::File,
+        }
+    }
+
+    #[test]
+    fn flush_block_state_keeps_results_deterministic() {
+        let dir = tiny_corpus();
+        let cfg = AdapterConfig {
+            timeout_secs: 30,
+            ..Default::default()
+        };
+        let adapter = FffAdapter::open_corpus(&dir, cfg).unwrap();
+        let before = adapter.call(&file_spec("alpha")).ordered_digest.clone();
+        // Warm narrow state with a prefix chain, then flush.
+        let _ = adapter.call(&file_spec("a"));
+        let _ = adapter.call(&file_spec("al"));
+        let _ = adapter.call(&file_spec("alp"));
+        adapter.flush_block_state();
+        let after = adapter.call(&file_spec("alpha")).ordered_digest.clone();
+        assert_eq!(before, after);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

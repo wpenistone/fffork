@@ -8,8 +8,8 @@ use crate::identity;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -421,12 +421,13 @@ fn run_loopback_probe(profile: &NetworkProfile) -> Result<serde_json::Value, Str
         .map_err(|e| format!("nodelay: {e}"))?;
     stream
         .set_read_timeout(Some(Duration::from_millis(
-            ((shape.delay_ms + shape.jitter_ms) as u64).saturating_mul(4).max(200) + 500,
+            ((shape.delay_ms + shape.jitter_ms) as u64)
+                .saturating_mul(4)
+                .max(200)
+                + 500,
         )))
         .ok();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(2)))
-        .ok();
+    stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
 
     let mut rtts_ms = Vec::with_capacity(PROBE_ROUNDS);
     let mut failed = 0u64;
@@ -459,11 +460,7 @@ fn run_loopback_probe(profile: &NetworkProfile) -> Result<serde_json::Value, Str
 
     rtts_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = rtts_ms.len();
-    let p50 = if n == 0 {
-        0.0
-    } else {
-        rtts_ms[n / 2]
-    };
+    let p50 = if n == 0 { 0.0 } else { rtts_ms[n / 2] };
     let p95 = if n == 0 {
         0.0
     } else {
@@ -552,10 +549,7 @@ mod tests {
     fn external_is_informational() {
         let ev = activate(&external_shared_v1());
         assert_eq!(ev.decision_grade, "informational");
-        assert!(ev
-            .reason_codes
-            .iter()
-            .any(|r| r.contains("informational")));
+        assert!(ev.reason_codes.iter().any(|r| r.contains("informational")));
     }
 
     #[test]

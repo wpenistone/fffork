@@ -115,12 +115,7 @@ impl CostMetrics {
         let want_cycles = pack_has(packs, "cycles");
         let want_power = pack_has(packs, "power") || pack_has(packs, "energy");
 
-        let wall = MetricSample::measured(
-            s.wall_us as f64,
-            "us",
-            "operation",
-            "harness_monotonic",
-        );
+        let wall = MetricSample::measured(s.wall_us as f64, "us", "operation", "harness_monotonic");
 
         let cpu_user = match s.cpu_user_us {
             Some(v) => Some(MetricSample::measured(
@@ -386,7 +381,11 @@ impl CostMetrics {
         check(&self.rss_end_mb, "rss", &mut out);
         check(&self.rss_peak_mb, "rss_peak_mb", &mut out);
         check(&self.context_switches, "context_switches", &mut out);
-        check(&self.threads_observed_peak, "threads_observed_peak", &mut out);
+        check(
+            &self.threads_observed_peak,
+            "threads_observed_peak",
+            &mut out,
+        );
         check(&self.cpu_cycles, "cpu_cycles", &mut out);
         check(&self.energy_j, "energy_j", &mut out);
         out
@@ -396,7 +395,9 @@ impl CostMetrics {
 fn pack_has(packs: &str, name: &str) -> bool {
     packs == "all"
         || packs.is_empty()
-        || packs.split(',').any(|p| p.trim() == name || p.trim() == "all")
+        || packs
+            .split(',')
+            .any(|p| p.trim() == name || p.trim() == "all")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -466,19 +467,13 @@ mod tests {
         assert_eq!(m.wall_us.as_ref().unwrap().status, "measured");
         assert_eq!(m.wall_us.as_ref().unwrap().value, Some(42.0));
         // zero cpu becomes unavailable after finalize
-        assert_eq!(
-            m.cpu_total_us.as_ref().unwrap().status,
-            "unavailable"
-        );
+        assert_eq!(m.cpu_total_us.as_ref().unwrap().status, "unavailable");
     }
 
     #[test]
     fn not_requested_when_pack_off() {
         let s = CostSample::with_wall(10, 1);
         let m = CostMetrics::from_sample(&s, "mem");
-        assert_eq!(
-            m.cpu_total_us.as_ref().unwrap().status,
-            "not_requested"
-        );
+        assert_eq!(m.cpu_total_us.as_ref().unwrap().status, "not_requested");
     }
 }

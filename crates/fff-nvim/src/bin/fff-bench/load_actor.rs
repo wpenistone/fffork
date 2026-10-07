@@ -11,8 +11,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -367,13 +367,11 @@ fn provider_digest(id: &str) -> ProviderId {
 }
 
 fn requested_busy_cores(req: &serde_json::Value) -> Option<f64> {
-    req.get("busy_cores")
-        .and_then(|v| v.as_f64())
-        .or_else(|| {
-            req.get("workers")
-                .and_then(|v| v.as_u64())
-                .map(|w| w as f64)
-        })
+    req.get("busy_cores").and_then(|v| v.as_f64()).or_else(|| {
+        req.get("workers")
+            .and_then(|v| v.as_u64())
+            .map(|w| w as f64)
+    })
 }
 
 fn requested_workers(req: &serde_json::Value) -> usize {
@@ -784,7 +782,11 @@ impl Treatment {
                             workers.push(WorkerSlot::Thread { handle: h });
                         }
                     }
-                    events.push(ready_event(&profile, actor, serde_json::json!({ "busy_cores": null })));
+                    events.push(ready_event(
+                        &profile,
+                        actor,
+                        serde_json::json!({ "busy_cores": null }),
+                    ));
                 }
                 "builtin.memory-working-set" => {
                     let mb = requested_resident_mb(&actor.requested);
@@ -836,8 +838,7 @@ impl Treatment {
                     if use_proc {
                         let counter = work_dir.join(format!("storage-{}.cnt", actor.id));
                         let arg = format!("{}|{}", root.display(), file_bytes);
-                        let child =
-                            spawn_process_worker("storage", &stop_file, &counter, &arg)?;
+                        let child = spawn_process_worker("storage", &stop_file, &counter, &arg)?;
                         workers.push(WorkerSlot::Process {
                             child,
                             counter,
@@ -849,14 +850,16 @@ impl Treatment {
                         let root_c = root.clone();
                         let h = thread::Builder::new()
                             .name(format!("load-{}", actor.id))
-                            .spawn(move || {
-                                storage_worker_thread(stop_c, ops_c, root_c, file_bytes)
-                            })
+                            .spawn(move || storage_worker_thread(stop_c, ops_c, root_c, file_bytes))
                             .map_err(|e| format!("spawn storage actor: {e}"))?;
                         workers.push(WorkerSlot::Thread { handle: h });
                     }
                     temp_roots.push(root);
-                    events.push(ready_event(&profile, actor, serde_json::json!({ "ops": null })));
+                    events.push(ready_event(
+                        &profile,
+                        actor,
+                        serde_json::json!({ "ops": null }),
+                    ));
                 }
                 "builtin.fs-event-stream" => {
                     let root = work_dir.join(format!("ev-{}", actor.id));
@@ -1133,8 +1136,7 @@ impl Treatment {
         };
 
         let wall = self.started.elapsed().as_secs_f64().max(1e-6);
-        let iters = process_work
-            .saturating_add(self.thread_work.load(Ordering::Relaxed));
+        let iters = process_work.saturating_add(self.thread_work.load(Ordering::Relaxed));
         let io_ops = process_io.saturating_add(self.thread_io.load(Ordering::Relaxed));
         // memory held_bytes stored in process_work for memory kind — separate:
         let held_bytes = self.held_bytes;
@@ -1454,11 +1456,7 @@ mod tests {
         assert!(ev.valid, "{:?}", ev.reason_codes);
         assert_eq!(ev.actors.len(), 3);
         assert!(ev.recovery.is_some());
-        assert!(
-            ev.recovery.as_ref().unwrap().recovered,
-            "{:?}",
-            ev.recovery
-        );
+        assert!(ev.recovery.as_ref().unwrap().recovered, "{:?}", ev.recovery);
     }
 
     #[test]

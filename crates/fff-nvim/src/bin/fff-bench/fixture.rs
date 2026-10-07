@@ -40,11 +40,7 @@ fn write_tree(root: &Path) -> Result<(), String> {
     write_file(root, "src/file_picker.rs", b"pub struct FilePicker;\n")?;
     write_file(root, "src/score.rs", b"pub fn score() -> i32 { 0 }\n")?;
     write_file(root, "src/path_utils.rs", b"pub fn join() {}\n")?;
-    write_file(
-        root,
-        "src/background_watcher.rs",
-        b"pub fn watch() {}\n",
-    )?;
+    write_file(root, "src/background_watcher.rs", b"pub fn watch() {}\n")?;
     // Naming styles
     write_file(root, "src/CamelCaseModule.rs", b"// camel\n")?;
     write_file(root, "src/snake_case_mod.rs", b"// snake\n")?;

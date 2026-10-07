@@ -96,9 +96,17 @@ enum Commands {
     },
     /// Detect semantic benchmark hazards (read-only)
     Lint {
-        #[arg(long, default_value = "agent-confirm", help = "Suite whose cells are linted")]
+        #[arg(
+            long,
+            default_value = "agent-confirm",
+            help = "Suite whose cells are linted"
+        )]
         suite: String,
-        #[arg(long, default_value = "default", help = "Corpus id used when expanding cells")]
+        #[arg(
+            long,
+            default_value = "default",
+            help = "Corpus id used when expanding cells"
+        )]
         repo_id: String,
         #[arg(long, help = "JSON output")]
         json: bool,
@@ -171,7 +179,10 @@ enum Commands {
     },
     /// Measure and record a baseline (one-time; in-process FFF subject)
     Baseline {
-        #[arg(long, help = "Provenance label for the baseline (not an executable path)")]
+        #[arg(
+            long,
+            help = "Provenance label for the baseline (not an executable path)"
+        )]
         subject: Option<String>,
         #[arg(short, long, help = "Corpus root")]
         path: Option<PathBuf>,
@@ -238,10 +249,19 @@ enum Commands {
         iters_per_block: usize,
         #[arg(long, help = "Optional agent_usage JSON attachment (not scored)")]
         agent_usage: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Force legacy one-shot spawns instead of persistent subjects"
+        )]
+        no_persistent_subjects: bool,
     },
     /// Paired confirmation: measure candidate and compare to baseline
     CompareRun {
-        #[arg(long, default_value = "auto", help = "History baseline selector or dual-bin path")]
+        #[arg(
+            long,
+            default_value = "auto",
+            help = "History baseline selector or dual-bin path"
+        )]
         baseline: String,
         #[arg(long, help = "Candidate label or binary path")]
         candidate: Option<String>,
@@ -281,6 +301,11 @@ enum Commands {
         blocks: usize,
         #[arg(long, default_value_t = 12, help = "Iters per block (dual-bin)")]
         iters_per_block: usize,
+        #[arg(
+            long,
+            help = "Force legacy one-shot spawns instead of persistent subjects"
+        )]
+        no_persistent_subjects: bool,
     },
     /// Run gates + cost profiles for one subject measurement
     Run {
@@ -293,7 +318,12 @@ enum Commands {
             help = "Suite override (default: manifest suite or agent-screen): agent-screen | agent-confirm | ci-gates | public-v1 | peak-diagnose | resilience-confirm"
         )]
         suite: Option<String>,
-        #[arg(short = 'n', long, default_value_t = 50, help = "Measured iterations per cell")]
+        #[arg(
+            short = 'n',
+            long,
+            default_value_t = 50,
+            help = "Measured iterations per cell"
+        )]
         iterations: usize,
         #[arg(long, default_value_t = 3, help = "Warmup iterations discarded")]
         warmup: usize,
@@ -331,7 +361,11 @@ enum Commands {
         manifest: Option<PathBuf>,
         #[arg(long, help = "Attempt exterior flamegraph (needs samply/perf)")]
         flamegraph: bool,
-        #[arg(long, default_value = "auto", help = "Profile backend: auto | samply | perf | none")]
+        #[arg(
+            long,
+            default_value = "auto",
+            help = "Profile backend: auto | samply | perf | none"
+        )]
         profile_backend: String,
         #[arg(long, help = "Enable content indexing")]
         content_index: bool,
@@ -347,7 +381,12 @@ enum Commands {
             help = "Network identity: native_local_v1 | loopback_fixture_v1 | external_shared_v1"
         )]
         network_profile: String,
+        #[arg(long, help = "Slim output: skip per-iter logs and top_k hit details")]
+        slim: bool,
     },
+    /// Persistent subject: serve block specs (JSON lines) on stdin, one
+    /// report JSON per block on stdout; corpus stays open across blocks
+    RunStream,
     /// Gates only (same as run with suite=ci-gates)
     Gates {
         #[arg(short, long, help = "Corpus root")]
@@ -490,9 +529,7 @@ fn resolve_baseline(
     exclude_run_id: Option<&str>,
 ) -> Result<runner::BenchReport, String> {
     if spec == "auto" {
-        let hist = history_dir
-            .cloned()
-            .unwrap_or_else(default_history_dir);
+        let hist = history_dir.cloned().unwrap_or_else(default_history_dir);
         // Prefer exact suite, then confirm/screen aliases used as baselines.
         let p = history::latest_comparable_any(
             &hist,
@@ -511,9 +548,7 @@ fn resolve_baseline(
     if p.exists() {
         return load_report(&p);
     }
-    let hist = history_dir
-        .cloned()
-        .unwrap_or_else(default_history_dir);
+    let hist = history_dir.cloned().unwrap_or_else(default_history_dir);
     let p = hist.join("runs").join(spec).join("report.json");
     if p.exists() {
         return load_report(&p);
@@ -688,6 +723,7 @@ fn run_measured_with_load(
         converge_warmup: confirmish,
         load_profile: load_profile.into(),
         network_profile: "native_local_v1".into(),
+        slim: false,
     };
     let mut report = runner::run_bench_multi(&repos, &cfg)?;
     let hist = history_dir.unwrap_or_else(default_history_dir);
@@ -851,9 +887,7 @@ fn real_main() -> ExitCode {
             }
             if require_quiet {
                 if let Err(e) = noise::wait_quiet(5, true) {
-                    let resp = agent::doctor_noisy(
-                        noise::host_cpu_busy_pct().unwrap_or(100.0),
-                    );
+                    let resp = agent::doctor_noisy(noise::host_cpu_busy_pct().unwrap_or(100.0));
                     let mut resp = resp;
                     resp.summary = e;
                     emit_agent(&resp, json);
@@ -910,16 +944,14 @@ fn real_main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            let adapter = match adapter::FffAdapter::open_corpus(
-                &root,
-                adapter::AdapterConfig::default(),
-            ) {
-                Ok(adapter) => adapter,
-                Err(e) => {
-                    eprintln!("corpus error: {e}");
-                    return ExitCode::from(2);
-                }
-            };
+            let adapter =
+                match adapter::FffAdapter::open_corpus(&root, adapter::AdapterConfig::default()) {
+                    Ok(adapter) => adapter,
+                    Err(e) => {
+                        eprintln!("corpus error: {e}");
+                        return ExitCode::from(2);
+                    }
+                };
             let mut paths = adapter.path_list();
             paths.sort_unstable();
             paths.dedup();
@@ -990,10 +1022,7 @@ fn real_main() -> ExitCode {
                     }
                     Err(e) => {
                         if json {
-                            println!(
-                                "{}",
-                                serde_json::json!({ "ok": false, "error": e })
-                            );
+                            println!("{}", serde_json::json!({ "ok": false, "error": e }));
                         } else {
                             eprintln!("fixture error: {e}");
                         }
@@ -1164,7 +1193,9 @@ fn real_main() -> ExitCode {
                 } else {
                     eprintln!(
                         "plan frozen digest={} path={}",
-                        plan.get("plan_digest").and_then(|v| v.as_str()).unwrap_or("?"),
+                        plan.get("plan_digest")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("?"),
                         out.display()
                     );
                 }
@@ -1175,7 +1206,9 @@ fn real_main() -> ExitCode {
                     "suite={} cells={} digest={}",
                     plan.get("suite").and_then(|v| v.as_str()).unwrap_or("?"),
                     plan.get("cell_count").and_then(|v| v.as_u64()).unwrap_or(0),
-                    plan.get("plan_digest").and_then(|v| v.as_str()).unwrap_or("?"),
+                    plan.get("plan_digest")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?"),
                 );
             }
             ExitCode::SUCCESS
@@ -1301,15 +1334,13 @@ fn real_main() -> ExitCode {
             blocks,
             iters_per_block,
             agent_usage,
+            no_persistent_subjects,
         } => {
             let hist = history_dir.unwrap_or_else(default_history_dir);
             let (repos, m) = match resolve_repos(path, &repo_id, manifest_path.as_ref()) {
                 Ok(r) => r,
                 Err(e) => {
-                    let resp = agent::doctor_setup(
-                        &e,
-                        "fff-bench setup --path <corpus> --json",
-                    );
+                    let resp = agent::doctor_setup(&e, "fff-bench setup --path <corpus> --json");
                     emit_agent(&resp, json);
                     return resp.exit_code();
                 }
@@ -1497,17 +1528,18 @@ fn real_main() -> ExitCode {
                     seed: paired::PAIRED_SEED,
                     load_profile: "quiet_v1".into(),
                 };
-                match paired::run_paired(&cfg) {
+                let paired_out = if no_persistent_subjects {
+                    paired::run_paired_oneshot(&cfg)
+                } else {
+                    paired::run_paired(&cfg)
+                };
+                match paired_out {
                     Ok(mut out) => {
                         out.candidate_report.agent_usage = usage;
-                        let _ = history::record(
-                            &hist,
-                            &out.candidate_report,
-                            confirm_log.as_deref(),
-                        );
+                        let _ =
+                            history::record(&hist, &out.candidate_report, confirm_log.as_deref());
                         if let Some(ref o) = output {
-                            let _ =
-                                std::fs::write(o, serde_json::to_string_pretty(&out).unwrap());
+                            let _ = std::fs::write(o, serde_json::to_string_pretty(&out).unwrap());
                         }
                         let mut resp = agent::from_compare(
                             &out.comparison,
@@ -1620,6 +1652,7 @@ fn real_main() -> ExitCode {
             content_index,
             blocks,
             iters_per_block,
+            no_persistent_subjects,
         } => {
             let hist = history_dir.unwrap_or_else(default_history_dir);
             let suite = agent::normalize_suite(&suite);
@@ -1632,21 +1665,20 @@ fn real_main() -> ExitCode {
                 }
             };
             let corpus = repos[0].1.clone();
-            let log = log_dir.unwrap_or_else(|| PathBuf::from(".fff-bench/runs").join("compare-run"));
+            let log =
+                log_dir.unwrap_or_else(|| PathBuf::from(".fff-bench/runs").join("compare-run"));
 
             // Dual-artifact counterbalanced pairing when both bins provided.
             // baseline_bin + candidate_bin (or candidate as path to bin).
             let cand_bin = candidate_bin.or_else(|| {
-                candidate
-                    .as_ref()
-                    .and_then(|c| {
-                        let p = PathBuf::from(c);
-                        if p.exists() && p.is_file() {
-                            Some(p)
-                        } else {
-                            None
-                        }
-                    })
+                candidate.as_ref().and_then(|c| {
+                    let p = PathBuf::from(c);
+                    if p.exists() && p.is_file() {
+                        Some(p)
+                    } else {
+                        None
+                    }
+                })
             });
             let base_bin = baseline_bin.or_else(|| {
                 if baseline != "auto" {
@@ -1694,6 +1726,7 @@ fn real_main() -> ExitCode {
                         converge_warmup: false,
                         load_profile: "quiet_v1".into(),
                         network_profile: "native_local_v1".into(),
+                        slim: false,
                     };
                     let rcfg = resilience::ResilienceConfig {
                         base,
@@ -1754,14 +1787,15 @@ fn real_main() -> ExitCode {
                     seed: paired::PAIRED_SEED,
                     load_profile: load_profile.clone(),
                 };
-                match paired::run_paired(&cfg) {
+                let paired_out = if no_persistent_subjects {
+                    paired::run_paired_oneshot(&cfg)
+                } else {
+                    paired::run_paired(&cfg)
+                };
+                match paired_out {
                     Ok(out) => {
                         if history_record {
-                            let _ = history::record(
-                                &hist,
-                                &out.candidate_report,
-                                Some(&log),
-                            );
+                            let _ = history::record(&hist, &out.candidate_report, Some(&log));
                         }
                         if let Some(ref o) = output {
                             let _ = std::fs::write(o, serde_json::to_string_pretty(&out).unwrap());
@@ -1890,6 +1924,7 @@ fn real_main() -> ExitCode {
             content_index,
             load_profile,
             network_profile,
+            slim,
         } => {
             let n = if peak { iterations.max(50) } else { iterations };
             let mut adapter_cfg = adapter::AdapterConfig::default();
@@ -1924,8 +1959,7 @@ fn real_main() -> ExitCode {
                 m.as_ref().and_then(|m| m.suite.as_deref()),
             );
 
-            let confirmish =
-                suite.contains("confirm") || suite.contains("peak") || suite == "full";
+            let confirmish = suite.contains("confirm") || suite.contains("peak") || suite == "full";
             let is_resilience = suite == agent::RESILIENCE_SUITE || suite == "resilience";
             // Top-level resilience-confirm with default quiet_v1 means sweep all profiles.
             // Explicit profile ids (including quiet_v1 from a parent paired subprocess) stay single.
@@ -1976,6 +2010,7 @@ fn real_main() -> ExitCode {
                     converge_warmup: false,
                     load_profile: "quiet_v1".into(),
                     network_profile: "native_local_v1".into(),
+                    slim: false,
                 };
                 let rcfg = resilience::ResilienceConfig {
                     base,
@@ -1983,8 +2018,7 @@ fn real_main() -> ExitCode {
                         .into_iter()
                         .map(|s| s.to_string())
                         .collect(),
-                    log_dir: log_dir
-                        .unwrap_or_else(|| PathBuf::from(".fff-bench/runs/resilience")),
+                    log_dir: log_dir.unwrap_or_else(|| PathBuf::from(".fff-bench/runs/resilience")),
                     keep_full_reports: json,
                     baseline_bin: None,
                     candidate_bin: None,
@@ -2046,6 +2080,7 @@ fn real_main() -> ExitCode {
                 converge_warmup: confirmish || peak,
                 load_profile,
                 network_profile,
+                slim,
             };
             match runner::run_bench_multi(&repos, &cfg) {
                 Ok(mut report) => {
@@ -2105,6 +2140,19 @@ fn real_main() -> ExitCode {
                 }
             }
         }
+        Commands::RunStream => {
+            let stdin = std::io::stdin();
+            match runner::run_stream_loop(stdin.lock(), std::io::stdout()) {
+                Ok(blocks) => {
+                    eprintln!("stream complete blocks={blocks}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("stream error: {e}");
+                    ExitCode::from(2)
+                }
+            }
+        }
         Commands::Gates {
             path,
             manifest: manifest_path,
@@ -2158,6 +2206,7 @@ fn real_main() -> ExitCode {
                 converge_warmup: false,
                 load_profile: "quiet_v1".into(),
                 network_profile: "native_local_v1".into(),
+                slim: false,
             };
             match runner::run_bench_multi(&repos, &cfg) {
                 Ok(report) => {
@@ -2404,10 +2453,7 @@ fn real_main() -> ExitCode {
         } => {
             let (suite, plan_digest_expect) = if let Some(rpath) = report {
                 match load_report(&rpath) {
-                    Ok(r) => (
-                        r.metadata.run.suite.clone(),
-                        r.plan_digest.clone(),
-                    ),
+                    Ok(r) => (r.metadata.run.suite.clone(), r.plan_digest.clone()),
                     Err(e) => {
                         eprintln!("error: {e}");
                         return ExitCode::from(2);
@@ -2538,5 +2584,48 @@ mod tests {
             "agent-confirm"
         );
         assert_eq!(resolve_run_suite(None, None), "agent-screen");
+    }
+
+    #[test]
+    fn run_stream_subcommand_parses() {
+        let parsed = Cli::try_parse_from(["fff-bench", "run-stream"]).unwrap();
+        assert!(matches!(parsed.cmd, Commands::RunStream));
+    }
+
+    #[test]
+    fn persistent_subjects_default_on_with_opt_out() {
+        let dflt = Cli::try_parse_from(["fff-bench", "compare-run"]).unwrap();
+        let Commands::CompareRun {
+            no_persistent_subjects,
+            ..
+        } = dflt.cmd
+        else {
+            panic!("expected compare-run command");
+        };
+        assert!(!no_persistent_subjects);
+        let off =
+            Cli::try_parse_from(["fff-bench", "compare-run", "--no-persistent-subjects"]).unwrap();
+        let Commands::CompareRun {
+            no_persistent_subjects: off_flag,
+            ..
+        } = off.cmd
+        else {
+            panic!("expected compare-run command");
+        };
+        assert!(off_flag);
+    }
+
+    #[test]
+    fn run_slim_flag_defaults_off_and_parses() {
+        let off = Cli::try_parse_from(["fff-bench", "run"]).unwrap();
+        let Commands::Run { slim: off_slim, .. } = off.cmd else {
+            panic!("expected run command");
+        };
+        assert!(!off_slim);
+        let on = Cli::try_parse_from(["fff-bench", "run", "--slim"]).unwrap();
+        let Commands::Run { slim: on_slim, .. } = on.cmd else {
+            panic!("expected run command");
+        };
+        assert!(on_slim);
     }
 }

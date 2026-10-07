@@ -164,7 +164,11 @@ fn run_cargo_flamegraph(log_dir: &Path, out_svg: &Path, sample_cmd: &[&str]) -> 
         "--".into(),
     ];
     args.extend(sample_cmd.iter().map(|s| s.to_string()));
-    match Command::new("cargo").args(&args).current_dir(log_dir).status() {
+    match Command::new("cargo")
+        .args(&args)
+        .current_dir(log_dir)
+        .status()
+    {
         Ok(st) if st.success() && out_svg.exists() => ProfileArtifacts {
             flamegraph_path: Some(out_svg.display().to_string()),
             backend: Some("cargo-flamegraph".into()),

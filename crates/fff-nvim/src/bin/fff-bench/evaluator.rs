@@ -48,8 +48,7 @@ pub fn current(adapter_id: &str) -> EvaluatorIdentity {
         .into_iter()
         .map(|(id, _)| id)
         .collect();
-    let scenario_pack_digest =
-        identity::sha256_hex(catalog.join("\n").as_bytes());
+    let scenario_pack_digest = identity::sha256_hex(catalog.join("\n").as_bytes());
     let decision_policy_digest = identity::sha256_hex(DECISION_POLICY.as_bytes());
 
     let mut parts = [

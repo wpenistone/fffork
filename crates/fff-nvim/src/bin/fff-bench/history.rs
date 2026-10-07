@@ -54,10 +54,7 @@ pub fn record(
         score: report.score.as_ref().and_then(|s| s.score),
         score_status: report.score.as_ref().map(|s| s.score_status.clone()),
         git_commit: report.metadata.subject.git_commit.clone(),
-        patch_sha256: report
-            .change
-            .as_ref()
-            .and_then(|c| c.patch_sha256.clone()),
+        patch_sha256: report.change.as_ref().and_then(|c| c.patch_sha256.clone()),
         report_path: report_path.display().to_string(),
         integrity: report.noise.integrity.clone(),
     };

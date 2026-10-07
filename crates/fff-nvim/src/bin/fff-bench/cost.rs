@@ -38,11 +38,7 @@ impl Dist {
         let mad = percentile(&abs_dev, 50.0);
         let relative_mad = if p50 > 0.0 { mad / p50 } else { 0.0 };
         // METHODOLOGY: p99 is not decision-grade when n < 200 → store 0 (null-for-decision).
-        let p99 = if n >= 200 {
-            percentile(&v, 99.0)
-        } else {
-            0.0
-        };
+        let p99 = if n >= 200 { percentile(&v, 99.0) } else { 0.0 };
         Self {
             n,
             min: v[0],
@@ -122,10 +118,8 @@ impl CostSample {
                 self.cpu_user_us = None;
                 self.cpu_system_us = None;
                 self.cpu_total_us = None;
-                self.unavailable.insert(
-                    "cpu_total_us".into(),
-                    "sub_resolution_or_zero_delta".into(),
-                );
+                self.unavailable
+                    .insert("cpu_total_us".into(), "sub_resolution_or_zero_delta".into());
             }
             Some(t) => self.cpu_total_us = Some(t),
             None => {}
@@ -236,10 +230,7 @@ impl CostSummary {
             .iter()
             .filter_map(|s| s.rss_peak_mb)
             .fold(0.0_f64, f64::max);
-        let thr_peak = samples
-            .iter()
-            .filter_map(|s| s.threads_observed_peak)
-            .max();
+        let thr_peak = samples.iter().filter_map(|s| s.threads_observed_peak).max();
         let ctxt: Vec<f64> = samples
             .iter()
             .filter_map(|s| s.context_switches.map(|v| v as f64))
@@ -251,10 +242,7 @@ impl CostSummary {
                 .iter()
                 .any(|s| s.unavailable.contains_key("cpu_total_us"))
         {
-            unavailable.insert(
-                "cpu_total_us".into(),
-                "sub_resolution_or_unmeasured".into(),
-            );
+            unavailable.insert("cpu_total_us".into(), "sub_resolution_or_unmeasured".into());
         }
         if cycles.is_empty()
             && samples
@@ -386,6 +374,7 @@ mod tests {
             current_file_penalty: 0,
             combo_match_boost: 7,
             path_alignment_bonus: 2,
+            vendored_penalty: 0,
             exact_match: true,
             match_type: "exact_filename".into(),
         };
@@ -426,6 +415,8 @@ pub struct ScoreBreakdown {
     pub current_file_penalty: i32,
     pub combo_match_boost: i32,
     pub path_alignment_bonus: i32,
+    #[serde(default)]
+    pub vendored_penalty: i32,
     pub exact_match: bool,
     pub match_type: String,
 }
@@ -445,6 +436,7 @@ impl From<&fff::Score> for ScoreBreakdown {
             current_file_penalty: s.current_file_penalty,
             combo_match_boost: s.combo_match_boost,
             path_alignment_bonus: s.path_alignment_bonus,
+            vendored_penalty: 0,
             exact_match: s.exact_match,
             match_type: s.match_type.to_string(),
         }
@@ -473,6 +465,7 @@ pub fn score_components_sum(s: &ScoreBreakdown) -> i32 {
         .saturating_add(s.combo_match_boost)
         .saturating_add(s.path_alignment_bonus)
         .saturating_add(s.evidence_bonus)
+        .saturating_sub(s.vendored_penalty)
 }
 
 /// Composition check when breakdown is populated.

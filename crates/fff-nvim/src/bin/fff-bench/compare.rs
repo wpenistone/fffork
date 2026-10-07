@@ -67,6 +67,11 @@ fn cell_cap_rel(family: &str) -> f64 {
     }
 }
 
+/// Absolute floor for caps: cells faster than this are timer-noise
+/// dominated (scheduling jitter is tens of us), so a relative
+/// regression there is not evidence. Must also exceed the rel cap.
+const CELL_CAP_ABS_FLOOR_US: f64 = 250.0;
+
 pub fn compare(baseline: &BenchReport, current: &BenchReport) -> CompareOut {
     compare_with_grade(baseline, current, "confirm")
 }
@@ -115,8 +120,7 @@ fn compare_with_grade(baseline: &BenchReport, current: &BenchReport, grade: &str
             reasons.push("treatment_delivery_invalid".into());
         }
         if let Some(bt) = &baseline.treatment {
-            let (equiv, mut eq_reasons) =
-                crate::load_actor::treatments_delivery_equivalent(bt, t);
+            let (equiv, mut eq_reasons) = crate::load_actor::treatments_delivery_equivalent(bt, t);
             if !equiv {
                 comparable = false;
                 reasons.append(&mut eq_reasons);
@@ -477,10 +481,7 @@ fn cell_deltas(
                 None
             };
             let wa = Some(c.cost.wall_us.p95 - b.cost.wall_us.p95);
-            let cr = match (
-                c.cost.cpu_total_us.as_ref(),
-                b.cost.cpu_total_us.as_ref(),
-            ) {
+            let cr = match (c.cost.cpu_total_us.as_ref(), b.cost.cpu_total_us.as_ref()) {
                 (Some(cc), Some(bc)) if bc.p95 > 0.0 => Some((cc.p95 - bc.p95) / bc.p95),
                 _ => None,
             };
@@ -496,10 +497,14 @@ fn cell_deltas(
             _ => false,
         };
 
-        let cap = match wall_rel {
-            Some(r) if r > cell_cap_rel(&c.family) => "fail".into(),
-            Some(_) => "pass".into(),
-            None => "skip".into(),
+        let cap = match (wall_rel, wall_abs) {
+            (Some(r), Some(a))
+                if r > cell_cap_rel(&c.family) && a > CELL_CAP_ABS_FLOOR_US =>
+            {
+                "fail".into()
+            }
+            (Some(_), _) => "pass".into(),
+            _ => "skip".into(),
         };
 
         deltas.push(CellDelta {
@@ -651,6 +656,7 @@ mod tests {
                     rng_seed: 1,
                     primary_span: "harness.op_total".into(),
                 },
+                calibration: None,
             },
             gates: GatesReport {
                 passed: admissible,
@@ -748,5 +754,23 @@ mod tests {
         let cur = bare("agent-screen", "b", 98.0, true);
         let out = compare_screen(&base, &cur);
         assert_eq!(out.verdict, "screen_no_signal");
+    }
+
+    #[test]
+    fn sub_floor_rel_regression_passes_cap() {
+        // +58% rel but +38us abs on a 65us cell: timer-noise dominated.
+        let base = bare("agent-confirm", "a", 65.0, true);
+        let cur = bare("agent-confirm", "b", 103.0, true);
+        let out = compare(&base, &cur);
+        assert_eq!(out.cell_deltas[0].cap, "pass");
+    }
+
+    #[test]
+    fn above_floor_rel_regression_fails_cap() {
+        // +58% rel and +580us abs: real evidence.
+        let base = bare("agent-confirm", "a", 1000.0, true);
+        let cur = bare("agent-confirm", "b", 1580.0, true);
+        let out = compare(&base, &cur);
+        assert_eq!(out.cell_deltas[0].cap, "fail");
     }
 }

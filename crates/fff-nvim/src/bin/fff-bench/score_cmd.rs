@@ -97,10 +97,7 @@ pub fn compute(report: &BenchReport, baseline: Option<&BenchReport>) -> ScoreOut
             admissible: false,
             comparable: false,
             integrity,
-            summary_for_agent: format!(
-                "gates failed: {:?} — score null",
-                report.gates.failed
-            ),
+            summary_for_agent: format!("gates failed: {:?} — score null", report.gates.failed),
             breakdown: vec![],
             typical_wall_p95_us: None,
             typical_throughput_qps: None,
@@ -108,8 +105,7 @@ pub fn compute(report: &BenchReport, baseline: Option<&BenchReport>) -> ScoreOut
     }
 
     // Diagnostic walls always computed (even when score is withheld for noise).
-    let typical_wall = mean_p95_family(report, "search")
-        .or_else(|| mean_p95_any_cost(report));
+    let typical_wall = mean_p95_family(report, "search").or_else(|| mean_p95_any_cost(report));
     let typical_tp = mean_throughput(report);
 
     if integrity == "noisy" {
@@ -126,8 +122,7 @@ pub fn compute(report: &BenchReport, baseline: Option<&BenchReport>) -> ScoreOut
             integrity,
             summary_for_agent: format!(
                 "host/iter noise — do not accept as win; diagnostic typical_wall_p95={:?}µs host_cpu={:?}",
-                typical_wall,
-                report.noise.host_cpu_busy_pct
+                typical_wall, report.noise.host_cpu_busy_pct
             ),
             breakdown: build_breakdown(report, None),
             typical_wall_p95_us: typical_wall,
@@ -284,9 +279,9 @@ pub fn compute(report: &BenchReport, baseline: Option<&BenchReport>) -> ScoreOut
     }
 
     let summary = match score_delta {
-        Some(d) if d < -0.01 => format!(
-            "score {score:.4} (Δ {d:.4}) improvement; typical_wall_p95={typical_wall:?}µs"
-        ),
+        Some(d) if d < -0.01 => {
+            format!("score {score:.4} (Δ {d:.4}) improvement; typical_wall_p95={typical_wall:?}µs")
+        }
         Some(d) if d > 0.01 => {
             format!("score {score:.4} (Δ {d:.4}) regression; typical_wall_p95={typical_wall:?}µs")
         }
@@ -399,11 +394,7 @@ fn build_breakdown(report: &BenchReport, baseline: Option<&BenchReport>) -> Vec<
                 s += c.cost.wall_us.p95 / ref_wall;
                 wsum += 1.0;
             }
-            if wsum > 0.0 {
-                s / wsum
-            } else {
-                1.0
-            }
+            if wsum > 0.0 { s / wsum } else { 1.0 }
         });
         out.push(FamilyBreakdown {
             family,
@@ -431,11 +422,7 @@ mod tests {
     fn empty_gates(passed: bool) -> GatesReport {
         GatesReport {
             passed,
-            failed: if passed {
-                vec![]
-            } else {
-                vec!["x".into()]
-            },
+            failed: if passed { vec![] } else { vec!["x".into()] },
             hit_at_1: 1.0,
             hit_at_5: 1.0,
             mrr: 1.0,
@@ -521,6 +508,7 @@ mod tests {
                     rng_seed: 1,
                     primary_span: "harness.op_total".into(),
                 },
+                calibration: None,
             },
             gates: empty_gates(admissible),
             cells: vec![CellReport {
