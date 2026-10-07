@@ -421,6 +421,18 @@ impl BigramIndexBuilder {
             }
         }
         kept.sort_unstable_by_key(|&(_, old_col, _)| old_col);
+        // Rare-column mask for the compound eval path: sparse gap-list
+        // decodes cost more than they filter once common columns ran,
+        // so compound AND/OR skips them (single-pattern query() still
+        // uses every column). Same ~3.1% rule as the encoder below.
+        let mut rare_keys = vec![0u64; BIGRAM_KEY_SLOTS.div_ceil(64)];
+        if min_density_pct.is_none() {
+            for &(slot, _, count) in &kept {
+                if (count as usize) * 4 < dense_bytes {
+                    rare_keys[slot / 64] |= 1 << (slot % 64);
+                }
+            }
+        }
         let column = |old_col: u16| -> &[u64] {
             let start = old_col as usize * words;
             &col_data.as_deref().expect("kept columns imply a slab")[start..start + words]
@@ -486,6 +498,7 @@ impl BigramIndexBuilder {
 
         BigramFilter {
             lookup,
+            rare_keys,
             dense_data,
             dense_count,
             sparse_offsets,
@@ -568,6 +581,8 @@ unsafe impl Send for BigramIndexBuilder {}
 #[derive(Debug)]
 pub struct BigramFilter {
     lookup: Vec<u16>,
+    /// Rare-column mask (see compress): compound eval skips these.
+    rare_keys: Vec<u64>,
     /// Flat buffer of all dense column data laid out at fixed stride `words`.
     /// Column `i` starts at `i * words`.
     dense_data: ColumnSlab, // do not try to change this to u8 it has to be wordsize
@@ -798,14 +813,23 @@ impl BigramFilter {
     /// Total heap bytes used by this index (lookup + dense + sparse + skip).
     pub fn heap_bytes(&self) -> usize {
         let lookup_bytes = self.lookup.len() * std::mem::size_of::<u16>();
-        let dense_bytes = self.dense_data.len() * std::mem::size_of::<u64>();
-        let skip_bytes = self.skip_index.as_ref().map_or(0, |s| s.heap_bytes());
-        lookup_bytes + dense_bytes + self.sparse_bytes() + skip_bytes
+        let dense_bytes = self.dense_data.len() * std::mem::size_of::<u64>();        let skip_bytes = self.skip_index.as_ref().map_or(0, |s| s.heap_bytes());
+        lookup_bytes + self.rare_keys.len() * 8 + dense_bytes + self.sparse_bytes() + skip_bytes
     }
 
     /// Check whether a bigram key is present in this index.
     pub fn has_key(&self, key: u16) -> bool {
         self.column(key) != NO_COLUMN
+    }
+
+    /// True for rare columns (see compress). Compound AND/OR eval skips
+    /// these: their gap-list decode costs more than they filter once
+    /// common columns ran. Single-pattern query() still uses them.
+    pub(crate) fn is_rare(&self, key: u16) -> bool {
+        let slot = key_slot(key);
+        self.rare_keys
+            .get(slot / 64)
+            .is_some_and(|w| w & (1 << (slot % 64)) != 0)
     }
 
     /// Dense column for a printable bigram key, or `u16::MAX` when absent.
@@ -866,6 +890,7 @@ impl BigramFilter {
         };
         Self {
             lookup,
+            rare_keys: Vec::new(),
             dense_data,
             dense_count,
             sparse_offsets: vec![0],
