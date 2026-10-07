@@ -2,9 +2,9 @@ use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
-use fff_search::{FilePickerOptions, SharedFilePicker};
 use fff_search::file_picker::FilePicker;
 use fff_search::grep::{Casing, GrepMode, GrepSearchOptions, parse_grep_query};
+use fff_search::{FilePickerOptions, SharedFilePicker};
 
 /// Poll `cond` against the picker until it holds or the deadline passes.
 ///

@@ -8,7 +8,26 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use zlob::walk::{WalkBuilder, WalkFlags, WalkMetadata, WalkState};
 
-const PROGRESS_STEP: usize = 13;
+const PROGRESS_FLUSH: usize = 512;
+
+#[inline]
+fn is_git_rel(rel: &[u8]) -> bool {
+    if rel == b".git" {
+        return true;
+    }
+    if rel.starts_with(b".git/") {
+        return true;
+    }
+    if rel.len() >= 5 {
+        if memchr::memmem::find(rel, b"/.git/").is_some() {
+            return true;
+        }
+        if rel.ends_with(b"/.git") {
+            return true;
+        }
+    }
+    false
+}
 
 #[tracing::instrument(skip_all, name = "zlob walker", level = "info")]
 pub(crate) fn walk_collect_files(
@@ -46,22 +65,33 @@ pub(crate) fn walk_collect_files(
         tracing::warn!(?e, "zlob extra_ignore rejected; walking without it");
     }
 
-    // Single lock for both collections: every entry is either a file or a
-    // dir, so this keeps one mutex acquisition per entry.
-    let collected = Mutex::new((Vec::new(), Vec::new()));
+    // Per-worker shards indexed by `worker_id`: the lock is never
+    // contended across workers, and progress flushes every 512 files.
+    let workers = builder.max_workers().max(1).min(256);
+    let shards: Vec<Mutex<(Vec<(FileItem, String)>, Vec<String>, usize)>> = (0..workers)
+        .map(|_| Mutex::new((Vec::with_capacity(1024), Vec::with_capacity(64), 0)))
+        .collect();
 
     let outcome = match builder.run(|entry| {
+        let wid = (entry.worker_id() % workers) as usize;
         if !entry.is_file() {
-            // unlike ripgrep walker zlob doesnt show .git files
             if entry.is_dir() {
-                let relative_path = entry.relative_path_lossy();
-                if !relative_path.is_empty() {
-                    let mut relative_path = relative_path.into_owned();
-                    relative_path.push('/');
-                    collected.lock().1.push(relative_path);
+                let rel = entry.relative_path_bytes();
+                if rel.is_empty() {
+                    return WalkState::Continue;
                 }
+                if is_git_rel(rel) {
+                    return WalkState::SkipDir;
+                }
+                let mut rel = entry.relative_path_lossy().into_owned();
+                rel.push('/');
+                shards[wid].lock().1.push(rel);
             }
 
+            return WalkState::Continue;
+        }
+
+        if is_git_rel(entry.relative_path_bytes()) {
             return WalkState::Continue;
         }
 
@@ -84,13 +114,14 @@ pub(crate) fn walk_collect_files(
         let relative_path = entry.relative_path_lossy().into_owned();
         let item = FileItem::new_raw(basename_offset, size, modified, None, is_binary);
 
-        let mut guard = collected.lock();
+        let mut guard = shards[wid].lock();
         guard.0.push((item, relative_path));
-        let n = guard.0.len();
-        drop(guard);
-
-        if n % PROGRESS_STEP == 0 {
-            synced_files_count.store(n, Ordering::Relaxed);
+        guard.2 += 1;
+        if guard.2 >= PROGRESS_FLUSH {
+            let n = guard.2;
+            guard.2 = 0;
+            drop(guard);
+            synced_files_count.fetch_add(n, Ordering::Relaxed);
         }
 
         WalkState::Continue
@@ -104,7 +135,13 @@ pub(crate) fn walk_collect_files(
         }
     };
 
-    let (pairs, dirs) = collected.into_inner();
+    let mut pairs = Vec::new();
+    let mut dirs = Vec::new();
+    for shard in &shards {
+        let mut guard = shard.lock();
+        pairs.append(&mut guard.0);
+        dirs.append(&mut guard.1);
+    }
     // Always report the exact final total regardless of the last step.
     synced_files_count.store(pairs.len(), Ordering::Relaxed);
 
@@ -120,4 +157,20 @@ pub(crate) fn walk_collect_files(
         dirs,
         ignore_rules,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_git_rel;
+
+    #[test]
+    fn git_prefix_prune() {
+        assert!(is_git_rel(b".git"));
+        assert!(is_git_rel(b".git/objects/pack/a.pack"));
+        assert!(is_git_rel(b"sub/.git"));
+        assert!(is_git_rel(b"sub/.git/HEAD"));
+        assert!(!is_git_rel(b".github/workflows/ci.yml"));
+        assert!(!is_git_rel(b"src/main.rs"));
+        assert!(!is_git_rel(b".gitignore"));
+    }
 }

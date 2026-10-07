@@ -34,6 +34,16 @@ impl SwParams {
             matching_case_bonus: if has_uppercase { 4 } else { 0 },
         }
     }
+    pub fn u8_safe(&self, m: usize) -> bool {
+        let per = self.match_score as u32
+            + self.delimiter_bonus as u32
+            + self.capitalization_bonus as u32
+            + self.matching_case_bonus as u32;
+        (m as u32)
+            .saturating_mul(per)
+            .saturating_add(self.prefix_bonus as u32)
+            < 256
+    }
 }
 
 #[inline(always)]
@@ -50,6 +60,54 @@ fn flip_case(b: u8) -> u8 {
     } else {
         b
     }
+}
+
+// Per-worker DP rows for long needles (m > 32). The scores below used to
+// allocate 8 vecs per call; reuse zeroed buffers instead. Same values.
+#[derive(Default)]
+struct LongScratch {
+    h0: Vec<i32>,
+    h1: Vec<i32>,
+    e0: Vec<i32>,
+    e1: Vec<i32>,
+    f0: Vec<i32>,
+    f1: Vec<i32>,
+    m0: Vec<bool>,
+    m1: Vec<bool>,
+}
+
+impl LongScratch {
+    fn ensure(&mut self, n: usize) {
+        for v in [
+            &mut self.h0,
+            &mut self.h1,
+            &mut self.e0,
+            &mut self.e1,
+            &mut self.f0,
+            &mut self.f1,
+        ] {
+            v.resize(n, 0);
+            v.fill(0);
+        }
+        for v in [&mut self.m0, &mut self.m1] {
+            v.resize(n, false);
+            v.fill(false);
+        }
+    }
+}
+
+thread_local! {
+    static LONG_SCRATCH: std::cell::RefCell<LongScratch> =
+        const { std::cell::RefCell::new(LongScratch {
+            h0: Vec::new(),
+            h1: Vec::new(),
+            e0: Vec::new(),
+            e1: Vec::new(),
+            f0: Vec::new(),
+            f1: Vec::new(),
+            m0: Vec::new(),
+            m1: Vec::new(),
+        }) };
 }
 
 /// Scalar reference SW matching frizbee's exact semantics on a TRIMMED haystack.
@@ -69,7 +127,22 @@ pub(crate) fn score_one_scalar_full(
     if m == 0 || n == 0 {
         return (0, 0);
     }
+    // Stack scratch for common lengths: the 8 heap rows below cost more
+    // than the DP itself on short trims. Longer needles keep the Vec path.
+    if m <= 32 {
+        return score_one_scalar_stack(needle, haystack, p, include_prefix);
+    }
+    score_one_scalar_vec(needle, haystack, p, include_prefix)
+}
 
+fn score_one_scalar_vec(
+    needle: &[u8],
+    haystack: &[u8],
+    p: &SwParams,
+    include_prefix: bool,
+) -> (u16, u16) {
+    let m = needle.len();
+    let n = haystack.len();
     // Use i32 DP values to avoid saturation artifacts during computation.
     let gap_open = p.gap_open as i32;
     let gap_extend = p.gap_extend as i32;
@@ -79,14 +152,20 @@ pub(crate) fn score_one_scalar_full(
 
     // match_prev[i]: was (i-1, j-1) a match?  (frizbee's shifted_match_mask)
     // match_curr[i]: is (i-1, j) a match?
-    let mut h_prev = vec![0i32; m + 1];
-    let mut e_prev = vec![0i32; m + 1]; // horizontal gap state
-    let mut f_prev = vec![0i32; m + 1]; // vertical gap state
-    let mut h_curr = vec![0i32; m + 1];
-    let mut e_curr = vec![0i32; m + 1];
-    let mut f_curr = vec![0i32; m + 1];
-    let mut match_prev = vec![false; m + 1];
-    let mut match_curr = vec![false; m + 1];
+    // Rows come from the worker-local scratch (zeroed on acquire).
+    let mut scratch = LONG_SCRATCH.with(|c| {
+        let mut s = c.borrow_mut();
+        s.ensure(m + 1);
+        std::mem::take(&mut *s)
+    });
+    let mut h_prev = std::mem::take(&mut scratch.h0);
+    let mut e_prev = std::mem::take(&mut scratch.e0); // horizontal gap state
+    let mut f_prev = std::mem::take(&mut scratch.f0); // vertical gap state
+    let mut h_curr = std::mem::take(&mut scratch.h1);
+    let mut e_curr = std::mem::take(&mut scratch.e1);
+    let mut f_curr = std::mem::take(&mut scratch.f1);
+    let mut match_prev = std::mem::take(&mut scratch.m0);
+    let mut match_curr = std::mem::take(&mut scratch.m1);
 
     let mut prev_is_lower = false;
     let mut prev_is_delim = false;
@@ -99,11 +178,23 @@ pub(crate) fn score_one_scalar_full(
         let hb_lower = hb.is_ascii_lowercase();
         let hb_delim = is_delimiter(hb);
 
-        let cap_bonus = if hb_upper && prev_is_lower { p.capitalization_bonus as i32 } else { 0 };
+        let cap_bonus = if hb_upper && prev_is_lower {
+            p.capitalization_bonus as i32
+        } else {
+            0
+        };
         // frizbee: delimiter_mask = prev_char_is_delimiter AND NOT curr_char_is_delimiter.
         // prev starts as NOT-delimiter (Mask::zero()).
-        let delim_bonus = if prev_is_delim && !hb_delim { p.delimiter_bonus as i32 } else { 0 };
-        let prefix_bonus = if include_prefix && j == 0 { p.prefix_bonus as i32 } else { 0 };
+        let delim_bonus = if prev_is_delim && !hb_delim {
+            p.delimiter_bonus as i32
+        } else {
+            0
+        };
+        let prefix_bonus = if include_prefix && j == 0 {
+            p.prefix_bonus as i32
+        } else {
+            0
+        };
 
         h_curr[0] = 0;
         e_curr[0] = 0;
@@ -131,14 +222,22 @@ pub(crate) fn score_one_scalar_full(
 
             // E (horizontal gap): frizbee's propagate_horizontal_gaps
             // gap_open ONLY if previous cell (i, j-1) was a match
-            let e_pen = if match_prev[i] { gap_open_only } else { gap_extend };
+            let e_pen = if match_prev[i] {
+                gap_open_only
+            } else {
+                gap_extend
+            };
             let e_new = h_prev[i] - e_pen;
             let e_ext = e_prev[i] - gap_extend;
             e_curr[i] = e_new.max(e_ext);
 
             // F (vertical gap): frizbee's up_scores
             // gap_open ONLY if previous row (i-1, j) was a match
-            let f_pen = if match_curr[i - 1] { gap_open_only } else { gap_extend };
+            let f_pen = if match_curr[i - 1] {
+                gap_open_only
+            } else {
+                gap_extend
+            };
             let f_new = h_curr[i - 1] - f_pen;
             let f_ext = f_curr[i - 1] - gap_extend;
             f_curr[i] = f_new.max(f_ext);
@@ -162,6 +261,113 @@ pub(crate) fn score_one_scalar_full(
         prev_is_delim = hb_delim;
     }
 
+    scratch.h0 = h_prev;
+    scratch.e0 = e_prev;
+    scratch.f0 = f_prev;
+    scratch.h1 = h_curr;
+    scratch.e1 = e_curr;
+    scratch.f1 = f_curr;
+    scratch.m0 = match_prev;
+    scratch.m1 = match_curr;
+    LONG_SCRATCH.with(|c| *c.borrow_mut() = scratch);
+
+    (last_row_max as u16, end_col)
+}
+
+fn score_one_scalar_stack(
+    needle: &[u8],
+    haystack: &[u8],
+    p: &SwParams,
+    include_prefix: bool,
+) -> (u16, u16) {
+    let m = needle.len();
+    let n = haystack.len();
+    let gap_open = p.gap_open as i32;
+    let gap_extend = p.gap_extend as i32;
+    let gap_open_only = gap_open;
+    let match_add = p.match_score as i32;
+    let mismatch_pen = p.mismatch_penalty as i32;
+    let mut h_prev = [0i32; 33];
+    let mut e_prev = [0i32; 33];
+    let mut f_prev = [0i32; 33];
+    let mut h_curr = [0i32; 33];
+    let mut e_curr = [0i32; 33];
+    let mut f_curr = [0i32; 33];
+    let mut match_prev = [false; 33];
+    let mut match_curr = [false; 33];
+    let mut prev_is_lower = false;
+    let mut prev_is_delim = false;
+    let mut last_row_max = 0i32;
+    let mut end_col = 0u16;
+    for j in 0..n {
+        let hb = haystack[j];
+        let hb_lower = hb.is_ascii_lowercase();
+        let hb_delim = is_delimiter(hb);
+        let cap_bonus = if hb.is_ascii_uppercase() && prev_is_lower {
+            p.capitalization_bonus as i32
+        } else {
+            0
+        };
+        let delim_bonus = if prev_is_delim && !hb_delim {
+            p.delimiter_bonus as i32
+        } else {
+            0
+        };
+        let prefix_bonus = if include_prefix && j == 0 {
+            p.prefix_bonus as i32
+        } else {
+            0
+        };
+        h_curr[0] = 0;
+        e_curr[0] = 0;
+        f_curr[0] = 0;
+        match_curr[0] = false;
+        for i in 1..=m {
+            let nc = needle[i - 1];
+            let nc_flip = flip_case(nc);
+            let is_match = hb == nc || hb == nc_flip;
+            let is_exact = hb == nc;
+            match_curr[i] = is_match;
+            let s = if is_match {
+                let mut v = match_add + delim_bonus + cap_bonus + prefix_bonus;
+                if is_exact {
+                    v += p.matching_case_bonus as i32;
+                }
+                v
+            } else {
+                -mismatch_pen
+            };
+            let diag = h_prev[i - 1] + s;
+            let e_pen = if match_prev[i] {
+                gap_open_only
+            } else {
+                gap_extend
+            };
+            let e_new = h_prev[i] - e_pen;
+            let e_ext = e_prev[i] - gap_extend;
+            e_curr[i] = e_new.max(e_ext);
+            let f_pen = if match_curr[i - 1] {
+                gap_open_only
+            } else {
+                gap_extend
+            };
+            let f_new = h_curr[i - 1] - f_pen;
+            let f_ext = f_curr[i - 1] - gap_extend;
+            f_curr[i] = f_new.max(f_ext);
+            let h = diag.max(e_curr[i]).max(f_curr[i]).max(0);
+            h_curr[i] = h;
+        }
+        if h_curr[m] > last_row_max {
+            last_row_max = h_curr[m];
+            end_col = j as u16;
+        }
+        std::mem::swap(&mut h_prev, &mut h_curr);
+        std::mem::swap(&mut e_prev, &mut e_curr);
+        std::mem::swap(&mut f_prev, &mut f_curr);
+        std::mem::swap(&mut match_prev, &mut match_curr);
+        prev_is_lower = hb_lower;
+        prev_is_delim = hb_delim;
+    }
     (last_row_max as u16, end_col)
 }
 
@@ -249,11 +455,20 @@ pub(crate) mod avx2 {
             _mm_storel_epi64(dst as *mut __m128i, r0);
             _mm_storel_epi64(dst.add(dst_stride) as *mut __m128i, _mm_srli_si128(r0, 8));
             _mm_storel_epi64(dst.add(2 * dst_stride) as *mut __m128i, r1);
-            _mm_storel_epi64(dst.add(3 * dst_stride) as *mut __m128i, _mm_srli_si128(r1, 8));
+            _mm_storel_epi64(
+                dst.add(3 * dst_stride) as *mut __m128i,
+                _mm_srli_si128(r1, 8),
+            );
             _mm_storel_epi64(dst.add(4 * dst_stride) as *mut __m128i, r2);
-            _mm_storel_epi64(dst.add(5 * dst_stride) as *mut __m128i, _mm_srli_si128(r2, 8));
+            _mm_storel_epi64(
+                dst.add(5 * dst_stride) as *mut __m128i,
+                _mm_srli_si128(r2, 8),
+            );
             _mm_storel_epi64(dst.add(6 * dst_stride) as *mut __m128i, r3);
-            _mm_storel_epi64(dst.add(7 * dst_stride) as *mut __m128i, _mm_srli_si128(r3, 8));
+            _mm_storel_epi64(
+                dst.add(7 * dst_stride) as *mut __m128i,
+                _mm_srli_si128(r3, 8),
+            );
         }
     }
 
@@ -270,12 +485,7 @@ pub(crate) mod avx2 {
     /// `out.len() >= rows * stride`, and AVX2-capable target is not required
     /// (SSE2 only) but must not race with concurrent aliasing writes.
     #[target_feature(enable = "sse2")]
-    pub(crate) unsafe fn soa_from_stage(
-        stage: &[u8],
-        rows: usize,
-        stride: usize,
-        out: &mut [u8],
-    ) {
+    pub(crate) unsafe fn soa_from_stage(stage: &[u8], rows: usize, stride: usize, out: &mut [u8]) {
         debug_assert_eq!(rows % 8, 0);
         debug_assert_eq!(stride % 8, 0);
         let mut k0 = 0usize;
@@ -354,7 +564,11 @@ pub(crate) mod avx2 {
         let prefix_lanes = {
             let mut arr = [0u16; 16];
             for (i, a) in arr.iter_mut().enumerate() {
-                *a = if include_prefix_mask & (1 << i) != 0 { u16::MAX } else { 0 };
+                *a = if include_prefix_mask & (1 << i) != 0 {
+                    u16::MAX
+                } else {
+                    0
+                };
             }
             _mm256_loadu_si256(arr.as_ptr() as *const __m256i)
         };
@@ -518,7 +732,11 @@ pub(crate) mod avx2 {
         let prefix_lanes = {
             let mut arr = [0u8; 32];
             for (i, a) in arr.iter_mut().enumerate() {
-                *a = if include_prefix_mask & (1u32 << i) != 0 { u8::MAX } else { 0 };
+                *a = if include_prefix_mask & (1u32 << i) != 0 {
+                    u8::MAX
+                } else {
+                    0
+                };
             }
             _mm256_loadu_si256(arr.as_ptr() as *const __m256i)
         };
@@ -546,9 +764,7 @@ pub(crate) mod avx2 {
         for j in 0..n {
             // Saturation check every 4th column (result-identical; last_row_max
             // only grows, so skipping columns is safe).
-            if j & 3 == 0
-                && _mm256_movemask_epi8(_mm256_cmpeq_epi8(last_row_max, ones)) == -1
-            {
+            if j & 3 == 0 && _mm256_movemask_epi8(_mm256_cmpeq_epi8(last_row_max, ones)) == -1 {
                 break;
             }
             // Load 32 bytes at position j
@@ -669,15 +885,18 @@ pub(crate) mod avx2 {
         end_cols: &mut [u16],
     ) {
         let m = needle.len().min(32);
-        match m {
-            5 => score_batch_avx2_u8_const::<5>(needle, soa, max_len, p, include_prefix_mask, out, end_cols),
-            8 => score_batch_avx2_u8_const::<8>(needle, soa, max_len, p, include_prefix_mask, out, end_cols),
-            12 => score_batch_avx2_u8_const::<12>(needle, soa, max_len, p, include_prefix_mask, out, end_cols),
-            16 => score_batch_avx2_u8_const::<16>(needle, soa, max_len, p, include_prefix_mask, out, end_cols),
-            24 => score_batch_avx2_u8_const::<24>(needle, soa, max_len, p, include_prefix_mask, out, end_cols),
-            32 => score_batch_avx2_u8_const::<32>(needle, soa, max_len, p, include_prefix_mask, out, end_cols),
-            _ => score_batch_avx2_u8(needle, soa, max_len, p, include_prefix_mask, out, end_cols),
+        macro_rules! unrolled {
+            ($($v:literal),*) => {
+                match m {
+                    $( $v => score_batch_avx2_u8_const::<$v>(needle, soa, max_len, p, include_prefix_mask, out, end_cols), )*
+                    _ => score_batch_avx2_u8(needle, soa, max_len, p, include_prefix_mask, out, end_cols),
+                }
+            };
         }
+        unrolled!(
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+            25, 26, 27, 28, 29, 30, 31, 32
+        );
     }
 
     /// Same as [`score_batch_avx2_u8`] but with a compile-time needle length so
@@ -727,7 +946,11 @@ pub(crate) mod avx2 {
         let prefix_lanes = {
             let mut arr = [0u8; 32];
             for (i, a) in arr.iter_mut().enumerate() {
-                *a = if include_prefix_mask & (1u32 << i) != 0 { u8::MAX } else { 0 };
+                *a = if include_prefix_mask & (1u32 << i) != 0 {
+                    u8::MAX
+                } else {
+                    0
+                };
             }
             _mm256_loadu_si256(arr.as_ptr() as *const __m256i)
         };
@@ -764,9 +987,7 @@ pub(crate) mod avx2 {
                 }
             }
 
-            if j & 3 == 0
-                && _mm256_movemask_epi8(_mm256_cmpeq_epi8(last_row_max, ones)) == -1
-            {
+            if j & 3 == 0 && _mm256_movemask_epi8(_mm256_cmpeq_epi8(last_row_max, ones)) == -1 {
                 break;
             }
 
@@ -877,9 +1098,8 @@ mod tests {
     /// Compare against frizbee's Matcher (the ground truth) using fff's
     /// scoring config (matching_case_bonus=0 for lowercase queries).
     fn frizbee_score(needle: &str, haystack: &str) -> u16 {
-        
         // Ensure skip_sw is OFF for the ground-truth measurement
-        
+
         let has_upper = needle.chars().any(|c| c.is_uppercase());
         let cfg = neo_frizbee::Config {
             max_typos: Some(6),
@@ -935,17 +1155,16 @@ mod tests {
     #[test]
     fn scalar_matches_frizbee_no_prefix() {
         let p = params();
-        let cases: &[(&str, &str)] = &[
-            ("abc", "abc"),
-            ("bc", "abc"),
-            ("score", "src/score.rs"),
-        ];
+        let cases: &[(&str, &str)] = &[("abc", "abc"), ("bc", "abc"), ("score", "src/score.rs")];
         for &(n, h) in cases {
             let mine = score_one_scalar(n.as_bytes(), h.as_bytes(), &p, false);
             let theirs = frizbee_score(n, h);
             // Without prefix, scores may differ (frizbee always uses include_prefix=true
             // when start_pos==0). Just check non-negative.
-            assert!(mine <= theirs + 12, "needle={n} haystack={h}: mine={mine} theirs={theirs}");
+            assert!(
+                mine <= theirs + 12,
+                "needle={n} haystack={h}: mine={mine} theirs={theirs}"
+            );
         }
     }
 
@@ -964,16 +1183,74 @@ mod tests {
         }
         let p = params();
         let batches: &[&[&str]] = &[
-            &["abc", "aabbcc", "aXc", "xyz", "abcabc", "a", "ab", "a-b-c",
-              "src/score.rs", "foo/bar.txt", "test.rs", "main",
-              "aaa", "bbb", "ccc", "ddd", "eee", "fff", "ggg", "hhh",
-              "iii", "jjj", "kkk", "lll", "mmm", "nnn", "ooo", "ppp",
-              "qqq", "rrr", "sss", "ttt"],
-            &["file_picker", "score", "netedit", "tl",
-              "a", "b", "c", "d", "e", "f", "g", "h",
-              "i", "j", "k", "l", "m", "n", "o", "p",
-              "q", "r", "s", "t", "u", "v", "w", "x",
-              "y", "z", "0", "1"],
+            &[
+                "abc",
+                "aabbcc",
+                "aXc",
+                "xyz",
+                "abcabc",
+                "a",
+                "ab",
+                "a-b-c",
+                "src/score.rs",
+                "foo/bar.txt",
+                "test.rs",
+                "main",
+                "aaa",
+                "bbb",
+                "ccc",
+                "ddd",
+                "eee",
+                "fff",
+                "ggg",
+                "hhh",
+                "iii",
+                "jjj",
+                "kkk",
+                "lll",
+                "mmm",
+                "nnn",
+                "ooo",
+                "ppp",
+                "qqq",
+                "rrr",
+                "sss",
+                "ttt",
+            ],
+            &[
+                "file_picker",
+                "score",
+                "netedit",
+                "tl",
+                "a",
+                "b",
+                "c",
+                "d",
+                "e",
+                "f",
+                "g",
+                "h",
+                "i",
+                "j",
+                "k",
+                "l",
+                "m",
+                "n",
+                "o",
+                "p",
+                "q",
+                "r",
+                "s",
+                "t",
+                "u",
+                "v",
+                "w",
+                "x",
+                "y",
+                "z",
+                "0",
+                "1",
+            ],
         ];
         for batch in batches {
             let max_len = batch.iter().map(|h| h.len()).max().unwrap();
@@ -988,7 +1265,13 @@ mod tests {
             };
             unsafe {
                 super::avx2::score_batch_avx2_u8(
-                    b"abc", &soa, max_len, &p, prefix_mask, &mut simd_out, &mut simd_ecol,
+                    b"abc",
+                    &soa,
+                    max_len,
+                    &p,
+                    prefix_mask,
+                    &mut simd_out,
+                    &mut simd_ecol,
                 );
             }
             for (k, h) in batch.iter().enumerate() {
@@ -1014,13 +1297,12 @@ mod tests {
             return;
         }
         let p = params();
-        for &m in &[5usize, 8, 12, 16, 24, 32] {
+        for m in 1usize..=32 {
             let needle: Vec<u8> = (0..m).map(|i| b'a' + (i % 26) as u8).collect();
             let batch: Vec<String> = (0..32)
                 .map(|i| {
                     let len = 4 + (i * 3 + m) % 40;
-                    let bytes: Vec<u8> =
-                        (0..len).map(|j| b'a' + ((i + j) % 26) as u8).collect();
+                    let bytes: Vec<u8> = (0..len).map(|j| b'a' + ((i + j) % 26) as u8).collect();
                     String::from_utf8(bytes).unwrap()
                 })
                 .collect();
@@ -1033,14 +1315,69 @@ mod tests {
             let mut eco_b = vec![0u16; 32];
             unsafe {
                 super::avx2::score_batch_avx2_u8(
-                    &needle, &soa, max_len, &p, u32::MAX, &mut out_a, &mut eco_a,
+                    &needle,
+                    &soa,
+                    max_len,
+                    &p,
+                    u32::MAX,
+                    &mut out_a,
+                    &mut eco_a,
                 );
                 super::avx2::score_batch_avx2_u8_dispatch(
-                    &needle, &soa, max_len, &p, u32::MAX, &mut out_b, &mut eco_b,
+                    &needle,
+                    &soa,
+                    max_len,
+                    &p,
+                    u32::MAX,
+                    &mut out_b,
+                    &mut eco_b,
                 );
             }
             assert_eq!(out_a, out_b, "m={m} scores differ general vs unrolled");
             assert_eq!(eco_a, eco_b, "m={m} end_cols differ general vs unrolled");
+        }
+    }
+
+    #[test]
+    fn u8_bound_is_sound() {
+        let lo = params();
+        assert!(lo.u8_safe(3));
+        assert!(lo.u8_safe(14));
+        assert!(lo.u8_safe(15));
+        assert!(!lo.u8_safe(16));
+        let hi = SwParams::for_query(true);
+        assert!(hi.u8_safe(3));
+        assert!(hi.u8_safe(8));
+        assert!(!hi.u8_safe(9));
+        assert!(!hi.u8_safe(14));
+    }
+
+    #[test]
+    fn stack_scalar_matches_vec_path() {
+        // Stack (m<=32) must equal Vec path on identical inputs.
+        let p = params();
+        let mut state = 0xBEEFu32;
+        let mut next = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 16) as u8
+        };
+        for m in [1usize, 7, 15, 16, 31, 32, 33, 40, 64, 100] {
+            let needle: Vec<u8> = (0..m)
+                .map(|i| b'a' + (next().wrapping_add(i as u8) % 5))
+                .collect();
+            let hay: Vec<u8> = (0..60).map(|_| b'a' + (next() % 5)).collect();
+            let n = String::from_utf8_lossy(&needle).to_string();
+            let h = String::from_utf8_lossy(&hay).to_string();
+            let stack = if m <= 32 {
+                // Stack path only valid for m<=32 (fixed [T; 33] rows).
+                score_one_scalar_stack(n.as_bytes(), h.as_bytes(), &p, true)
+            } else {
+                // Dispatch routes m>32 to Vec; must equal direct Vec call.
+                score_one_scalar_full(n.as_bytes(), h.as_bytes(), &p, true)
+            };
+            let vec = score_one_scalar_vec(n.as_bytes(), h.as_bytes(), &p, true);
+            assert_eq!(stack.0, vec.0, "score m={m} needle={n:?}");
+            assert_eq!(stack.1, vec.1, "end_col m={m} needle={n:?}");
         }
     }
 
@@ -1077,11 +1414,11 @@ mod tests {
         for &(needle, full) in cases {
             // Get frizbee's prefilter window via skip_sw (hold env lock)
             let skip_matches = {
-                
-                
-                let sm = neo_frizbee::with_skip_sw(|| { let mut m = neo_frizbee::Matcher::new(needle, &cfg); m.match_list(std::slice::from_ref(&full)) });
-                
-                
+                let sm = neo_frizbee::with_skip_sw(|| {
+                    let mut m = neo_frizbee::Matcher::new(needle, &cfg);
+                    m.match_list(std::slice::from_ref(&full))
+                });
+
                 sm
             };
 
@@ -1089,7 +1426,10 @@ mod tests {
             let theirs = frizbee_score(needle, full);
 
             if skip_matches.is_empty() {
-                assert_eq!(theirs, 0, "frizbee rejects {needle:?} on {full:?} but score={theirs}");
+                assert_eq!(
+                    theirs, 0,
+                    "frizbee rejects {needle:?} on {full:?} but score={theirs}"
+                );
                 continue;
             }
             let start_adj = skip_matches[0].score as usize;
@@ -1101,7 +1441,8 @@ mod tests {
 
             let mine = score_one_scalar(needle.as_bytes(), trimmed, &p, include_prefix);
             assert_eq!(
-                mine, theirs,
+                mine,
+                theirs,
                 "needle={needle:?} full={full:?} window=({start_adj},{end_pos}) trimmed={:?} inc_prefix={include_prefix}: mine={mine} frizbee={theirs}",
                 std::str::from_utf8(trimmed).unwrap_or("?")
             );
@@ -1123,12 +1464,42 @@ mod tests {
         }
         let p = params();
         let batches: &[&[&str]] = &[
-            &["abc", "aabbcc", "aXc", "xyz", "abcabc", "a", "ab", "a-b-c",
-              "src/score.rs", "foo/bar.txt", "test.rs", "main",
-              "aaa", "bbb", "ccc", "ddd"],
-            &["file_picker", "score", "netedit", "tl",
-              "a", "b", "c", "d", "e", "f", "g", "h",
-              "i", "j", "k", "l"],
+            &[
+                "abc",
+                "aabbcc",
+                "aXc",
+                "xyz",
+                "abcabc",
+                "a",
+                "ab",
+                "a-b-c",
+                "src/score.rs",
+                "foo/bar.txt",
+                "test.rs",
+                "main",
+                "aaa",
+                "bbb",
+                "ccc",
+                "ddd",
+            ],
+            &[
+                "file_picker",
+                "score",
+                "netedit",
+                "tl",
+                "a",
+                "b",
+                "c",
+                "d",
+                "e",
+                "f",
+                "g",
+                "h",
+                "i",
+                "j",
+                "k",
+                "l",
+            ],
         ];
         for batch in batches {
             let max_len = batch.iter().map(|h| h.len()).max().unwrap();
@@ -1144,7 +1515,13 @@ mod tests {
             };
             unsafe {
                 super::avx2::score_batch_avx2(
-                    b"abc", &soa, max_len, &p, prefix_mask, &mut simd_out, &mut simd_ecol,
+                    b"abc",
+                    &soa,
+                    max_len,
+                    &p,
+                    prefix_mask,
+                    &mut simd_out,
+                    &mut simd_ecol,
                 );
             }
             for (k, h) in batch.iter().enumerate() {
@@ -1197,9 +1574,26 @@ mod tests {
     fn soa_from_stage_matches_build_soa() {
         let cases: &[&[&str]] = &[
             &["a", "", "bb", "ccc", "dddd", "eeeee", "ffffff", "ggggggg"],
-            &["", "x", "yz", "1234", "56789", "abcdef", "ghijklm", "mnopqrs"],
-            &["src/score.rs", "a", "", "very/long/path/name/that/spans/many/chunks/x", "zz"],
-            &["01234567", "8", "89abcdef", "", "foo", "barbaz", "q", "wertyuiop"],
+            &[
+                "", "x", "yz", "1234", "56789", "abcdef", "ghijklm", "mnopqrs",
+            ],
+            &[
+                "src/score.rs",
+                "a",
+                "",
+                "very/long/path/name/that/spans/many/chunks/x",
+                "zz",
+            ],
+            &[
+                "01234567",
+                "8",
+                "89abcdef",
+                "",
+                "foo",
+                "barbaz",
+                "q",
+                "wertyuiop",
+            ],
         ];
         for batch in cases {
             for &stride in &[16usize, 32] {

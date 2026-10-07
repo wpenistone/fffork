@@ -1,5 +1,15 @@
 use super::case::{ascii_swap_case, eq_lowered_case};
 use smallvec::SmallVec;
+use std::sync::OnceLock;
+
+// Cache the CPUID probe: `is_x86_feature_detected!` costs more than a short
+// memmem itself, and grep calls `find` once per file.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn has_avx2() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::is_x86_feature_detected!("avx2"))
+}
 
 // Byte frequency table stolen from memchr
 const BYTE_FREQUENCIES: [u8; 256] = [
@@ -328,7 +338,7 @@ pub fn find(haystack: &[u8], needle_lower: &[u8]) -> Option<usize> {
 
     #[cfg(target_arch = "x86_64")]
     {
-        if std::is_x86_feature_detected!("avx2") {
+        if has_avx2() {
             // Need enough haystack for at least one vector load.
             let max_idx = i1.max(i2);
             if haystack.len() >= max_idx + 32 {

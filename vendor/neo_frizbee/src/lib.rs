@@ -117,12 +117,12 @@ use core::cmp::Ordering;
 use serde::{Deserialize, Serialize};
 
 mod r#const;
-pub mod myers;
 #[cfg(target_arch = "x86_64")]
 mod cpuid;
 pub mod k_merge;
 mod literal;
 mod matcher;
+pub mod myers;
 mod pattern;
 mod prefilter;
 mod smith_waterman;

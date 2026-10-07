@@ -36,11 +36,7 @@ pub const MAX_NEEDLE_BITS: usize = 64;
 /// Case-fold an ASCII byte (uppercase → lowercase).
 #[inline(always)]
 pub fn fold(b: u8) -> u8 {
-    if b.is_ascii_uppercase() {
-        b + 32
-    } else {
-        b
-    }
+    if b.is_ascii_uppercase() { b + 32 } else { b }
 }
 
 /// Per-byte needle mask: bit `i` set iff `fold(needle[i]) == c`.
@@ -56,11 +52,7 @@ pub fn peq_table(needle: &[u8]) -> [u64; 256] {
 #[inline]
 fn bit_mask(m: usize) -> u64 {
     debug_assert!(m > 0 && m <= MAX_NEEDLE_BITS);
-    if m == 64 {
-        u64::MAX
-    } else {
-        (1u64 << m) - 1
-    }
+    if m == 64 { u64::MAX } else { (1u64 << m) - 1 }
 }
 
 /// Exact LCS length (case-folded). Reference and long-needle fallback.
@@ -320,8 +312,8 @@ fn lcs_ge_batch8_scalar(needle: &[u8], hays: [&[u8]; 8], need: usize) -> u8 {
 #[target_feature(enable = "avx2")]
 unsafe fn lcs_ge_batch8_avx2(needle: &[u8], hays: [&[u8]; 8], need: usize) -> u8 {
     use std::arch::x86_64::{
-        __m256i, _mm256_and_si256, _mm256_andnot_si256, _mm256_or_si256, _mm256_set1_epi32,
-        _mm256_set_epi32, _mm256_setzero_si256, _mm256_slli_epi32, _mm256_storeu_si256,
+        __m256i, _mm256_and_si256, _mm256_andnot_si256, _mm256_or_si256, _mm256_set_epi32,
+        _mm256_set1_epi32, _mm256_setzero_si256, _mm256_slli_epi32, _mm256_storeu_si256,
         _mm256_sub_epi32,
     };
 

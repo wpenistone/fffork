@@ -167,8 +167,10 @@ impl ScanJob {
 
         let _scanning = ScanningGuard::new(&signals);
         scanned_files_counter.store(0, Ordering::Relaxed);
+        let t_scan = std::time::Instant::now();
 
         // 1. Walk the file system and collect the list of files
+        let t_walk = std::time::Instant::now();
         let git_workdir = if config.skip_git {
             None
         } else {
@@ -188,6 +190,8 @@ impl ScanJob {
                 return;
             }
         };
+        let walk_us = t_walk.elapsed().as_micros();
+        let n_files = sync.live_count;
 
         // 2. Populate the file list
         let git_status_worker;
@@ -239,6 +243,7 @@ impl ScanJob {
         }
 
         // 3. Runs post scna in parallel with git status collection
+        let t_post = std::time::Instant::now();
         if !signals.cancelled.load(Ordering::Acquire)
             && let Some(snap) = snapshot.as_ref()
         {
@@ -253,8 +258,16 @@ impl ScanJob {
                 .and_then(|g| g.as_ref().map(|p| p.content_mask_store()));
             Self::run_post_scan(&shared_picker, &signals, &config, snap, mask_store.as_ref());
         }
+        let post_us = t_post.elapsed().as_micros();
 
         drop(snapshot); // SNAPSHOT SHOULD NOT BE USED AFTER THIS POINT
+        info!(
+            walk_us,
+            post_us,
+            total_us = t_scan.elapsed().as_micros(),
+            n_files,
+            "SCAN: walk+commit+post-scan done"
+        );
 
         // 5. Install filesystem watcher (initial scan only).
         if config.install_watcher && config.watch && !signals.cancelled.load(Ordering::Acquire) {

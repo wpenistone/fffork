@@ -22,10 +22,10 @@ mod iter;
 #[cfg(all(feature = "std", not(target_family = "wasm")))]
 mod parallel;
 mod resolved;
+pub use algo::with_skip_sw;
 use algo::{MANY_TYPOS, NO_PREFILTER, Specialized};
 use backend::*;
 pub use iter::{FuzzyMatch, FuzzyMatchExt, FuzzyMatchIndices};
-pub use algo::with_skip_sw;
 
 /// Many variants so we use a macro to expand to the correct impl
 macro_rules! dispatch {

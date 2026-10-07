@@ -12,6 +12,20 @@ pub(crate) fn is_map_full(err: &heed::Error) -> bool {
     matches!(err, heed::Error::Mdb(heed::MdbError::MapFull))
 }
 
+/// Chunk size for multi-put write txns (frecency/query batches, GC purges).
+pub(crate) const WRITE_TXN_CHUNK: usize = 5_000;
+
+/// Optional `FFF_LMDB_MAP_SIZE_MB` override for all stores, clamped and
+/// rounded down to a 4K multiple (LMDB requires page multiples).
+fn map_size_override() -> Option<usize> {
+    let mb: usize = std::env::var("FFF_LMDB_MAP_SIZE_MB").ok()?.parse().ok()?;
+    let bytes = mb.checked_mul(1024 * 1024)?;
+    if bytes < 4 * 1024 * 1024 || bytes > 1024 * 1024 * 1024 {
+        return None;
+    }
+    Some(bytes & !(4096 - 1))
+}
+
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DbHealthState {
@@ -139,11 +153,12 @@ pub(crate) trait LmdbStore: Sized + Send + Sync + 'static {
     /// flag is per-env: the GC of the first opener flips it for everyone.
     #[tracing::instrument]
     fn open_env(db_path: &Path) -> Result<(SharedEnv, DbHealth)> {
+        let map_size = map_size_override().unwrap_or(Self::MAP_SIZE);
         let shared = SharedEnv::get_or_open(
             db_path,
             &EnvSpec {
                 label: Self::LABEL,
-                map_size: Self::MAP_SIZE,
+                map_size,
                 max_dbs: Self::MAX_DBS,
                 size_cap_bytes: Self::SIZE_CAP_BYTES,
             },

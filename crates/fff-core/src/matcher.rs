@@ -1,9 +1,47 @@
 //! Match-set plumbing: windows from frizbee skip_sw, path resolve,
 //! candidate gates, and thread dispatch. Score/rank lives in `score`.
 
-use neo_frizbee::Matcher;
+use crate::simd_path::{ArenaPtr, ChunkedString, MAX_FRIZBEE_CHUNKS};
 use crate::types::FileItem;
-use crate::simd_path::{ArenaPtr, MAX_PATH_CHUNKS};
+use neo_frizbee::Matcher;
+
+thread_local! {
+    static RESOLVE_SCRATCH: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Copy a chunked path into 16 B-unit pointers for frizbee's resolved API.
+/// Arena chunks are 32 B deduped, so their sub-slices are not contiguous.
+/// Frizbee gathers synchronously before the next resolve on this thread,
+// one TLS buffer is sound.
+pub(crate) fn resolve_frizbee_bytes(
+    path: &ChunkedString,
+    arena: ArenaPtr,
+    buf: &mut [*const u8; MAX_FRIZBEE_CHUNKS],
+) -> Option<(usize, u16)> {
+    let len = path.byte_len as usize;
+    if len == 0 {
+        return Some((0, 0));
+    }
+    let unit = neo_frizbee::SIMD_CHUNK_BYTES;
+    let n = len.div_ceil(unit);
+    if n > buf.len() {
+        return None;
+    }
+    RESOLVE_SCRATCH.with(|c| {
+        let mut s = c.borrow_mut();
+        let padded = n * unit;
+        if s.len() < padded {
+            s.resize(padded, 0);
+        }
+        path.copy_window_to(arena, 0, len as u32, &mut s[..len]);
+        let base = s.as_ptr();
+        for (slot, k) in buf.iter_mut().zip(0..n) {
+            *slot = unsafe { base.add(k * unit) };
+        }
+        Some((n, len as u16))
+    })
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct MatchWindow {
@@ -62,7 +100,7 @@ pub(crate) fn decode_match_window(m: &neo_frizbee::Match, hay_len: usize) -> Mat
 pub(crate) fn resolve_file_chunks_prefiltered(
     file: &FileItem,
     arena: ArenaPtr,
-    buf: &mut [*const u8; MAX_PATH_CHUNKS],
+    buf: &mut [*const u8; MAX_FRIZBEE_CHUNKS],
     np: &crate::presence::NeedlePresence,
     needle: &[u8],
 ) -> Option<(usize, u16)> {
@@ -77,18 +115,35 @@ pub(crate) fn resolve_file_chunks_prefiltered(
     resolve_file_chunks(file, arena, buf)
 }
 
-/// Build a frizbee `Matcher` for one search. Construction is not free
-/// (prefilter + SW kernels); a thread-local cache would be a typing win but
-/// 0.13.3 matcher reuse changed `total_matched` on linux `score` (checksum
-/// gate). Keep fresh construction until reuse is proven result-identical.
+/// Build a frizbee `Matcher` for one search. Construction parses the
+/// pattern, so a thread-local pristine-template cache clones one per call.
+/// Every call still runs on a fresh-equivalent instance (`new().clone()`),
+/// never on a previously-run matcher, which keeps results identical.
 #[inline]
 pub(crate) fn with_cached_matcher<R>(
     needle: &str,
     options: &neo_frizbee::Config,
     run: impl FnOnce(&mut Matcher) -> R,
 ) -> R {
-    let mut matcher = Matcher::new(needle, options);
-    run(&mut matcher)
+    thread_local! {
+        static CACHE: std::cell::RefCell<Vec<(String, neo_frizbee::Config, Matcher)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if let Some((_, _, t)) = c.iter().find(|(n, o, _)| n == needle && o == options) {
+            let mut inst = t.clone();
+            return run(&mut inst);
+        }
+        let template = Matcher::new(needle, options);
+        let mut inst = template.clone();
+        let r = run(&mut inst);
+        if c.len() >= 4 {
+            c.remove(0);
+        }
+        c.push((needle.to_string(), *options, template));
+        r
+    })
 }
 
 thread_local! {
@@ -122,7 +177,15 @@ pub(crate) fn with_hit_capture<T>(sink: &mut Vec<u32>, f: impl FnOnce() -> T) ->
 /// Max path byte length over a plain slice (tests and non-cached callers).
 #[inline]
 pub(crate) fn max_path_len_of(files: &[FileItem]) -> usize {
-    files.iter().map(|f| f.path.byte_len as usize).max().unwrap_or(0)
+    let mut m = 0usize;
+    for f in files {
+        // Callers clamp to 512, so stop at the cap instead of walking 227k.
+        m = m.max(f.path.byte_len as usize);
+        if m >= 512 {
+            return 512;
+        }
+    }
+    m
 }
 
 pub(crate) enum FileItems<'a> {
@@ -147,16 +210,24 @@ impl<'a> FileItems<'a> {
 
     #[inline]
     pub(crate) fn max_path_len(&self) -> usize {
+        // `effective_match_threads` clamps to 512, so the exact max above
+        // the cap never changes dispatch. Early-out keeps this O(1)-ish.
         let mut m = 0usize;
         match self {
             FileItems::All(s) => {
                 for f in s.iter() {
                     m = m.max(f.path.byte_len as usize);
+                    if m >= 512 {
+                        return 512;
+                    }
                 }
             }
             FileItems::Filtered { base, idx } => {
                 for &i in idx.iter() {
                     m = m.max(base[i as usize].path.byte_len as usize);
+                    if m >= 512 {
+                        return 512;
+                    }
                 }
             }
         }
@@ -187,13 +258,12 @@ impl<'a> FileItems<'a> {
 pub(crate) fn resolve_file_chunks(
     file: &FileItem,
     arena: ArenaPtr,
-    buf: &mut [*const u8; MAX_PATH_CHUNKS],
+    buf: &mut [*const u8; MAX_FRIZBEE_CHUNKS],
 ) -> Option<(usize, u16)> {
     if file.is_deleted() {
         return None;
     }
-    let ptrs = file.path.resolve_ptrs(arena, buf);
-    Some((ptrs.len(), file.path.byte_len))
+    resolve_frizbee_bytes(&file.path, arena, buf)
 }
 
 /// Test-only override so thread scaling is actually measurable. Without it
@@ -233,5 +303,67 @@ pub(crate) fn effective_match_threads(
         .saturating_mul(max_haystack_len.min(512).div_ceil(16).max(1) as u64)
         .saturating_mul(selectivity)
         / 100;
-    (work.div_ceil(crate::machine::match_work_per_thread() as u64) as usize).clamp(1, max_threads.max(1))
+    (work.div_ceil(crate::machine::match_work_per_thread() as u64) as usize)
+        .clamp(1, max_threads.max(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_matcher_agrees_with_fresh() {
+        let paths = ["src/score.rs", "src/gate.rs", "README.md", "src/main.rs"];
+        for needle in ["abc", "score", "src", "UserName", "item.rs"] {
+            for typos in [Some(0u16), Some(2), Some(6)] {
+                let cfg = neo_frizbee::Config {
+                    max_typos: typos,
+                    sort: neo_frizbee::SortStrategy::Unsorted,
+                    ..Default::default()
+                };
+                // Warm the TLS template, then compare a cached run vs fresh.
+                let cached_first: Vec<(u32, u16)> = with_cached_matcher(needle, &cfg, |m| {
+                    m.match_list(&paths)
+                        .into_iter()
+                        .map(|x| (x.index, x.score))
+                        .collect()
+                });
+                let cached_second: Vec<(u32, u16)> = with_cached_matcher(needle, &cfg, |m| {
+                    m.match_list(&paths)
+                        .into_iter()
+                        .map(|x| (x.index, x.score))
+                        .collect()
+                });
+                let mut fresh = Matcher::new(needle, &cfg);
+                let fresh_out: Vec<(u32, u16)> = fresh
+                    .match_list(&paths)
+                    .into_iter()
+                    .map(|x| (x.index, x.score))
+                    .collect();
+                assert_eq!(cached_first, fresh_out, "needle={needle:?} typos={typos:?}");
+                assert_eq!(cached_second, fresh_out, "reuse needle={needle:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn capped_max_path_len_matches_exact_below_cap() {
+        let mk = |len: usize| {
+            let s = "a".repeat(len);
+            let item = FileItem::new_raw(0, 0, 0, None, false);
+            let (store, strings) =
+                crate::simd_path::build_chunked_path_store_from_strings(&[s.clone()], &[item]);
+            let mut file = FileItem::new_raw(0, 0, 0, None, false);
+            file.set_path(strings[0].clone());
+            std::mem::forget(store);
+            (file, len)
+        };
+        let (a, _) = mk(10);
+        let (b, _) = mk(100);
+        let files = [a, b];
+        assert_eq!(max_path_len_of(&files), 100);
+        let (c, _) = mk(600);
+        let files = [c];
+        assert_eq!(max_path_len_of(&files), 512);
+    }
 }

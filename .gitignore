@@ -101,3 +101,24 @@ archive/keepers-scratch-*/
 # arena research lab artifacts
 archive/arena_lab/*.exe
 archive/arena_lab/*.bin
+
+# ─── perf-branch scratch (observed, ignore-only) ──────────────────────────
+# Tracked scratch stays tracked; purge separately with `git rm --cached`.
+/*.log
+/*.err
+/*.txt
+/*.ps1
+!install-mcp.ps1
+/*.jsonl
+/chart.png
+/fff-bench.json
+.fff-bench/*.rs
+.fff-bench/*.ps1
+archive/*.jsonl
+archive/*.png
+archive/*.html
+archive/*.svg
+archive/*.csv
+archive/*.md
+archive/*.py
+archive/*.ps1

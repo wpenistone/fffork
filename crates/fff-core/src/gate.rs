@@ -13,8 +13,8 @@
 //! False accepts are impossible — skip-DP is exact for the typo model
 //! (deletions in the needle = unmatched needle chars).
 
-use crate::types::FileItem;
 use crate::simd_path::ArenaPtr;
+use crate::types::FileItem;
 
 /// Result of a successful gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,11 +28,7 @@ const MAX_SKIPS: usize = 7;
 
 #[inline]
 fn fold_byte(b: u8) -> u8 {
-    if b.is_ascii_uppercase() {
-        b + 32
-    } else {
-        b
-    }
+    if b.is_ascii_uppercase() { b + 32 } else { b }
 }
 
 /// Bitmask of needle bytes (case-folded) — 256 bits as 4×u64.
@@ -103,7 +99,7 @@ fn skip_dp_accept_slow(needle: &[u8], hay: &[u8], max_typos: usize) -> bool {
     const INF: usize = usize::MAX;
     let t = max_typos;
     let mut best = [INF; MAX_SKIPS + 1];
-    let mut nxt = [INF; MAX_SKIPS + 1];
+    let mut nxt: [usize; MAX_SKIPS + 1];
     best[0] = 0;
     for &c in needle {
         nxt = [INF; MAX_SKIPS + 1];
@@ -179,7 +175,9 @@ fn is_subseq_fold(needle: &[u8], hay: &[u8]) -> bool {
 fn needle_byte_mask(chunk: &[u8], distinct: &[u8], span: &NeedleMask) -> u16 {
     #[cfg(target_arch = "x86_64")]
     {
-        if chunk.len() == 16 && !distinct.is_empty() {
+        // One vector compare per distinct byte; past 8 the scalar span
+        // test is cheaper than the compare+or chain. Same bits either way.
+        if chunk.len() == 16 && !distinct.is_empty() && distinct.len() <= 8 {
             // SAFETY: SSE2 is baseline on x86_64; `chunk` is exactly 16 bytes.
             return unsafe { needle_byte_mask_sse2(chunk, distinct) };
         }
@@ -223,6 +221,9 @@ pub struct GateNeedle {
     pm: Box<[u64; 256]>,
     /// Distinct folded needle bytes, for the vectorized membership test.
     distinct: Box<[u8]>,
+    /// Folded needle prefix (first 64 bytes) for the greedy cursor.
+    folded: [u8; 64],
+    folded_len: u8,
     len_mask: u64,
 }
 
@@ -233,9 +234,12 @@ impl GateNeedle {
         let mut pm = Box::new([0u64; 256]);
         let mut seen = [false; 256];
         let mut distinct = Vec::with_capacity(m.min(16));
+        let mut folded = [0u8; 64];
+        let folded_len = m.min(64);
         for (i, &b) in needle.iter().enumerate().take(64) {
             let f = fold_byte(b);
             pm[f as usize] |= 1u64 << i;
+            folded[i] = f;
             if !seen[f as usize] {
                 seen[f as usize] = true;
                 distinct.push(f);
@@ -243,15 +247,13 @@ impl GateNeedle {
         }
         Self {
             span: NeedleMask::new(needle),
-            len_mask: if m >= 64 {
-                u64::MAX
-            } else {
-                (1u64 << m) - 1
-            },
+            len_mask: if m >= 64 { u64::MAX } else { (1u64 << m) - 1 },
             needle: needle.to_vec().into_boxed_slice(),
             typos,
             need: m.saturating_sub(typos),
             pm,
+            folded,
+            folded_len: folded_len as u8,
             distinct: distinct.into_boxed_slice(),
         }
     }
@@ -304,11 +306,7 @@ impl GateNeedle {
     /// Gate a `FileItem` directly: reads its chunk pointers from the arena and
     /// streams the LCS in one pass. No path copy, no per-chunk callback —
     /// the chunk walk is inlined here so the compiler can keep it in registers.
-    pub fn hit_file(
-        &self,
-        file: &FileItem,
-        arena: ArenaPtr,
-    ) -> Option<GateHit> {
+    pub fn hit_file(&self, file: &FileItem, arena: ArenaPtr) -> Option<GateHit> {
         if file.is_deleted() || self.needle.is_empty() {
             return None;
         }
@@ -337,16 +335,8 @@ impl GateNeedle {
             let distinct = &*self.distinct;
             let mask = self.len_mask;
             let greedy = self.typos == 0;
-            // Folded needle, built once per query rather than per candidate
-            // byte: the greedy compare ran `fold_byte(needle[next])` inline.
-            let mut folded_needle = [0u8; 64];
-            let needle_folded = {
-                let n = self.needle.len().min(64);
-                for (i, slot) in folded_needle.iter_mut().enumerate().take(n) {
-                    *slot = fold_byte(self.needle[i]);
-                }
-                &folded_needle[..n]
-            };
+            // Folded needle lives on the query (built in `new`), not per file.
+            let needle_folded = &self.folded[..self.folded_len as usize];
             let mut s = 0u64;
             let mut next_needle = 0usize;
             let mut first = usize::MAX;
@@ -445,6 +435,7 @@ impl GateNeedle {
         if self.needle.len() <= 64 {
             let pm = &*self.pm;
             let mask = self.len_mask;
+            let folded = &self.folded[..self.folded_len as usize];
             let mut s = 0u64;
             let mut next_needle = 0usize; // greedy cursor for the T == 0 path
             let mut first = usize::MAX;
@@ -463,9 +454,7 @@ impl GateNeedle {
                         n += 1;
                     }
                     if self.typos == 0 {
-                        if next_needle < self.needle.len()
-                            && fb == fold_byte(self.needle[next_needle])
-                        {
+                        if next_needle < folded.len() && fb == folded[next_needle] {
                             next_needle += 1;
                         }
                     } else {
@@ -670,8 +659,12 @@ mod tests {
         for _ in 0..3000 {
             let nl = 3 + (next() % 8) as usize;
             let hl = 2 + (next() % 20) as usize;
-            let needle: String = (0..nl).map(|_| (b'a' + (next() % 6) as u8) as char).collect();
-            let hay: String = (0..hl).map(|_| (b'a' + (next() % 6) as u8) as char).collect();
+            let needle: String = (0..nl)
+                .map(|_| (b'a' + (next() % 6) as u8) as char)
+                .collect();
+            let hay: String = (0..hl)
+                .map(|_| (b'a' + (next() % 6) as u8) as char)
+                .collect();
             let t = (next() % 3) as u16;
             let need = nl as i32 - t as i32;
             // LCS
@@ -768,6 +761,43 @@ mod tests {
     }
 
     #[test]
+    fn streamed_and_staged_agree_with_many_distinct_bytes() {
+        // Needles with >8 distinct bytes take the scalar span path in
+        // `hit_file` while `hit` stages flat; windows must still agree.
+        use crate::simd_path::build_chunked_path_store_from_strings;
+        let needles: &[&[u8]] = &[
+            b"abcdefghijklmnop",
+            b"qwertyuiopasdfgh",
+            b"0123456789abcdef",
+        ];
+        let hays: &[&[u8]] = &[
+            b"src/abcdefghijklmnop/mod.rs",
+            b"xxxxxxxxxxxxxxxx",
+            b"a",
+            b"0123456789abcdef0123456789abcdef",
+        ];
+        for needle in needles {
+            for hay in hays {
+                for t in [0u16, 1, 2] {
+                    let rel = String::from_utf8_lossy(hay).to_string();
+                    let files = vec![FileItem::new_raw(0, 0, 0, None, false)];
+                    let (store, strings) = build_chunked_path_store_from_strings(&[rel], &files);
+                    let mut file = files.into_iter().next().unwrap();
+                    file.set_path(strings[0].clone());
+                    file.set_presence(crate::presence::mask_of(hay));
+                    let arena = store.as_arena_ptr();
+                    let g = GateNeedle::new(needle, t);
+                    assert_eq!(
+                        g.hit_file(&file, arena),
+                        g.hit(hay),
+                        "n={needle:?} h={hay:?} t={t}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn differential_long_and_high_bytes() {
         let mut disagree = 0;
         for seed in 0..500u32 {
@@ -810,5 +840,4 @@ mod tests {
         }
         eprintln!("LONG disagree={disagree}");
     }
-
 }

@@ -60,6 +60,9 @@ pub(crate) struct NeedlePresence {
     min_len: usize,
     needle_mask: u64,
     dup: bool,
+    dup_fold: [u8; 32],
+    dup_n: u8,
+    dup_full: bool,
 }
 
 impl NeedlePresence {
@@ -70,6 +73,8 @@ impl NeedlePresence {
         let min_len = need; // LCS ≤ path_len
         let mut needle_mask = 0u64;
         let mut dup = false;
+        let mut dup_fold = [0u8; 32];
+        let mut dup_n = 0u8;
         for &b in needle {
             let bit = 1u64 << fold_bit(b);
             if needle_mask & bit != 0 {
@@ -78,11 +83,22 @@ impl NeedlePresence {
             }
             needle_mask |= bit;
         }
+        // Dup needles re-fold every byte per candidate; cache the folds
+        // once per query (common queries like `test` are all dup).
+        if dup {
+            for &b in needle.iter().take(32) {
+                dup_fold[dup_n as usize] = fold_bit(b) as u8;
+                dup_n += 1;
+            }
+        }
         Self {
             need,
             min_len,
             needle_mask,
             dup,
+            dup_fold,
+            dup_n,
+            dup_full: dup_n as usize == needle.len(),
         }
     }
 
@@ -107,6 +123,18 @@ impl NeedlePresence {
         if !self.dup {
             return (path_mask & self.needle_mask).count_ones() as usize >= self.need;
         }
+        if self.dup_full {
+            let mut hits = 0usize;
+            for &f in &self.dup_fold[..self.dup_n as usize] {
+                if path_mask & (1u64 << f) != 0 {
+                    hits += 1;
+                    if hits >= self.need {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
         let mut hits = 0usize;
         for &b in needle {
             if path_mask & (1u64 << fold_bit(b)) != 0 {
@@ -117,6 +145,17 @@ impl NeedlePresence {
             }
         }
         false
+    }
+
+    #[inline(always)]
+    pub(crate) fn allows_mask(&self, path_mask: u64) -> Option<bool> {
+        if self.need == 0 {
+            return Some(true);
+        }
+        if !self.dup {
+            return Some((path_mask & self.needle_mask).count_ones() as usize >= self.need);
+        }
+        None
     }
 }
 

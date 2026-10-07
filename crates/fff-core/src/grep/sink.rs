@@ -36,6 +36,15 @@ pub(super) fn strip_line_terminators(bytes: &[u8]) -> &[u8] {
     &bytes[..len]
 }
 
+// Borrow when valid UTF-8, allocate via lossy only on error.
+#[inline]
+pub(super) fn lossy_owned(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_owned(),
+        Err(_) => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
 pub(super) struct SinkState {
     pub(super) file_index: usize,
     pub(super) matches: Vec<GrepMatch>,
@@ -121,7 +130,7 @@ impl SinkState {
                     line
                 };
                 let truncated = truncate_display_bytes(line);
-                before.push(String::from_utf8_lossy(truncated).into_owned());
+                before.push(lossy_owned(truncated));
                 pos = line_start;
                 lines_found += 1;
             }
@@ -146,7 +155,7 @@ impl SinkState {
                     line
                 };
                 let truncated = truncate_display_bytes(line);
-                after.push(String::from_utf8_lossy(truncated).into_owned());
+                after.push(lossy_owned(truncated));
                 pos = if line_end < buffer.len() {
                     line_end + 1 // skip past \n
                 } else {
@@ -183,54 +192,50 @@ pub(super) fn split_multiline_blob(display_bytes: &[u8]) -> (&[u8], Vec<String>)
             let first = strip_line_terminators(&display_bytes[..pos + 1]);
             let extra = display_bytes[pos + 1..]
                 .split(|&b| b == b'\n')
-                .map(|l| String::from_utf8_lossy(strip_line_terminators(l)).into_owned())
+                .map(|l| lossy_owned(strip_line_terminators(l)))
                 .collect();
             (first, extra)
         }
     }
 }
 
-/// Convert character-position indices from neo_frizbee into byte-offset
-/// pairs (start, end) suitable for `match_byte_offsets`.
-///
-/// frizbee returns character positions (0-based index into the char
-/// iterator). We need byte ranges because the UI renderer and Lua layer
-/// use byte offsets for extmark highlights.
-///
-/// Each matched character becomes its own (byte_start, byte_end) pair.
-/// Adjacent characters are merged into a single contiguous range.
+// frizbee returns sorted char positions; walk the chars once, converting
+// on the fly and merging runs. Adjacent chars share one byte range.
+// Callers must pass sorted indices (fuzzy does: `sort_unstable` above).
 pub(super) fn char_indices_to_byte_offsets(
     line: &str,
     char_indices: &[u32],
 ) -> SmallVec<[(u32, u32); 4]> {
+    debug_assert!(char_indices.windows(2).all(|w| w[0] <= w[1]));
+    let mut result: SmallVec<[(u32, u32); 4]> = SmallVec::with_capacity(char_indices.len());
     if char_indices.is_empty() {
-        return SmallVec::new();
+        return result;
     }
 
-    // Build a map: char_index -> (byte_start, byte_end) for all chars.
-    // Iterating all chars is O(n) in the line length which is bounded by MAX_LINE_DISPLAY_LEN (512).
-    let char_byte_ranges: Vec<(usize, usize)> = line
-        .char_indices()
-        .map(|(byte_pos, ch)| (byte_pos, byte_pos + ch.len_utf8()))
-        .collect();
-
-    // Convert char indices to byte ranges, merging adjacent ranges
-    let mut result: SmallVec<[(u32, u32); 4]> = SmallVec::with_capacity(char_indices.len());
-
-    for &ci in char_indices {
-        let ci = ci as usize;
-        if ci >= char_byte_ranges.len() {
-            continue; // out of bounds (shouldn't happen with valid data)
+    let mut chars = line.char_indices().enumerate();
+    let mut cur = chars.next();
+    for &w in char_indices {
+        let w = w as usize;
+        while let Some((ci, _)) = cur {
+            if ci >= w {
+                break;
+            }
+            cur = chars.next();
         }
-        let (start, end) = char_byte_ranges[ci];
-        // Merge with previous range if adjacent
-        if let Some(last) = result.last_mut()
-            && last.1 == start as u32
-        {
-            last.1 = end as u32;
+        let Some((ci, (start, ch))) = cur else {
+            continue;
+        };
+        if ci != w {
             continue;
         }
-        result.push((start as u32, end as u32));
+        let (s, e) = (start as u32, start as u32 + ch.len_utf8() as u32);
+        if let Some(last) = result.last_mut()
+            && last.1 == s
+        {
+            last.1 = e;
+            continue;
+        }
+        result.push((s, e));
     }
 
     result

@@ -18,7 +18,29 @@ pub(super) fn prefilter_with_filepath_retry<'a>(
     arena: crate::simd_path::ArenaPtr,
     overflow_arena: crate::simd_path::ArenaPtr,
 ) -> (Vec<&'a FileItem>, usize) {
-    let (files_to_search, filtered_file_count) = prefilter_files(
+    let (indexed, total) = prefilter_with_filepath_retry_indexed(
+        files,
+        constraints,
+        bigram_candidates,
+        base_count,
+        options,
+        arena,
+        overflow_arena,
+    );
+    (indexed.into_iter().map(|(f, _)| f).collect(), total)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prefilter_with_filepath_retry_indexed<'a>(
+    files: &'a [FileItem],
+    constraints: &[Constraint<'_>],
+    bigram_candidates: Option<&[u64]>,
+    base_count: usize,
+    options: &GrepSearchOptions,
+    arena: crate::simd_path::ArenaPtr,
+    overflow_arena: crate::simd_path::ArenaPtr,
+) -> (Vec<(&'a FileItem, usize)>, usize) {
+    let (files_to_search, filtered_file_count) = prefilter_files_indexed(
         files,
         constraints,
         bigram_candidates,
@@ -36,7 +58,7 @@ pub(super) fn prefilter_with_filepath_retry<'a>(
         return (files_to_search, filtered_file_count);
     };
 
-    prefilter_files(
+    prefilter_files_indexed(
         files,
         &stripped,
         bigram_candidates,
@@ -45,6 +67,39 @@ pub(super) fn prefilter_with_filepath_retry<'a>(
         arena,
         overflow_arena,
     )
+}
+
+/// Shared chunk sizing for plain + fuzzy grep. Base stays small for cheap
+/// page-fill exit; max stays large so zero-hit scans still ramp to few
+/// barriers via AIMD. Full scans skip the gate entirely.
+pub(super) fn chunk_plan(
+    num_candidates: usize,
+    total_files: usize,
+    page_limit: usize,
+    threads: usize,
+) -> (usize, usize) {
+    let base = (threads * 4).max(16).min(num_candidates.max(1));
+    if page_limit == usize::MAX {
+        // No early exit possible: one chunk, one barrier.
+        let max = num_candidates.max(base);
+        return (max, max);
+    }
+    let strong = total_files > 0 && num_candidates * 2 < total_files;
+    if strong {
+        return (base, base);
+    }
+    if page_limit > 0 && page_limit <= 256 {
+        // Small pages must not over-read: cap growth at ~16 pages and at
+        // the candidate count so tiny repos stay single-chunk.
+        let max = (base * 4)
+            .max(256)
+            .min(page_limit.saturating_mul(16).max(base))
+            .min(num_candidates.max(base));
+        return (base, max);
+    }
+    // Cap at the candidate count so small repos don't reserve an 8K ceiling.
+    let max = (base * 256).max(8 * 1024).min(num_candidates.max(base));
+    (base, max)
 }
 
 /// Single pass prefilter that doesn't involve file reading
@@ -59,6 +114,29 @@ pub(crate) fn prefilter_files<'a>(
     arena: crate::simd_path::ArenaPtr,
     overflow_arena: crate::simd_path::ArenaPtr,
 ) -> (Vec<&'a FileItem>, usize) {
+    let (indexed, total) = prefilter_files_indexed(
+        files,
+        constraints,
+        bigram_candidates,
+        base_count,
+        options,
+        arena,
+        overflow_arena,
+    );
+    (indexed.into_iter().map(|(f, _)| f).collect(), total)
+}
+
+// Indexed core: carries the original file position so grep can feed the
+// content-mask store without pointer div/mod in the hot parallel loop.
+pub(super) fn prefilter_files_indexed<'a>(
+    files: &'a [FileItem],
+    constraints: &[Constraint<'_>],
+    bigram_candidates: Option<&[u64]>,
+    base_count: usize,
+    options: &GrepSearchOptions,
+    arena: crate::simd_path::ArenaPtr,
+    overflow_arena: crate::simd_path::ArenaPtr,
+) -> (Vec<(&'a FileItem, usize)>, usize) {
     let max_file_size = options.max_file_size;
     let plan = if constraints.is_empty() {
         None
@@ -79,13 +157,13 @@ pub(crate) fn prefilter_files<'a>(
     }
 
     // squeeze as much prefilters into a single loop as possible
-    let mut prefiltered: Vec<&FileItem> = match bigram_candidates {
+    let mut prefiltered: Vec<(&FileItem, usize)> = match bigram_candidates {
         Some(candidates) => {
             let boundary = base_count.min(files.len());
             let (indexed, tail) = files.split_at(boundary);
 
             let cap = BigramFilter::count_candidates(candidates) + tail.len();
-            let mut out: Vec<&FileItem> = Vec::with_capacity(cap);
+            let mut out: Vec<(&FileItem, usize)> = Vec::with_capacity(cap);
 
             let full_words = boundary / 64;
             let last_word_bits = boundary % 64;
@@ -109,7 +187,7 @@ pub(crate) fn prefilter_files<'a>(
                         {
                             continue;
                         }
-                        out.push(f);
+                        out.push((f, file_idx));
                     }
                 }};
             }
@@ -141,7 +219,7 @@ pub(crate) fn prefilter_files<'a>(
                 {
                     continue;
                 }
-                out.push(f);
+                out.push((f, boundary + offset));
             }
 
             out
@@ -150,7 +228,7 @@ pub(crate) fn prefilter_files<'a>(
         // whole array of files but probability in the real repo of NO preflter working is so
         // low that we just ignore that, usually there would be at least a few files excluded
         None => {
-            let mut out: Vec<&FileItem> = Vec::new();
+            let mut out: Vec<(&FileItem, usize)> = Vec::new();
             for (idx, f) in files.iter().enumerate() {
                 if !basic_prefilter(f, max_file_size) {
                     continue;
@@ -160,7 +238,7 @@ pub(crate) fn prefilter_files<'a>(
                 {
                     continue;
                 }
-                out.push(f);
+                out.push((f, idx));
             }
             out
         }
@@ -169,9 +247,9 @@ pub(crate) fn prefilter_files<'a>(
     let total_count = prefiltered.len();
 
     sort_with_buffer(&mut prefiltered, |a, b| {
-        b.total_frecency_score()
-            .cmp(&a.total_frecency_score())
-            .then(b.modified.cmp(&a.modified))
+        b.0.total_frecency_score()
+            .cmp(&a.0.total_frecency_score())
+            .then(b.0.modified.cmp(&a.0.modified))
     });
 
     if options.file_offset > 0 && options.file_offset < total_count {

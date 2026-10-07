@@ -155,20 +155,24 @@ pub mod simd_string_utils;
 mod error;
 mod git_status_worker;
 mod ignore;
-mod scan;
 mod intent;
-pub use intent::{QueryIntent, detect_intent, evidence_for, split_name_ext, split_path_tokens, filename_words, role_of_filename, FileRole, Evidence};
+mod scan;
+pub use intent::{
+    Evidence, FileRole, QueryIntent, detect_intent, evidence_for, filename_words, role_of_filename,
+    split_name_ext, split_path_tokens,
+};
 mod gate;
-pub use gate::{gate_hit, GateHit};
-mod matcher;
-mod score;
-mod sort_buffer;
+pub use gate::{GateHit, gate_hit};
 pub(crate) mod interseq_sw;
+mod matcher;
 pub(crate) mod path_pack;
 pub(crate) mod presence;
+mod score;
+mod sort_buffer;
 
 pub(crate) mod index;
 pub(crate) mod machine;
+pub use machine::{CalibrationSnapshot, calibration_snapshot};
 pub(crate) mod parallelism;
 pub(crate) mod simd_path;
 pub(crate) mod stable_vec;

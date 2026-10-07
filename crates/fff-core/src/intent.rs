@@ -76,11 +76,7 @@ pub struct Evidence {
 }
 
 /// Classify the query. `current_file` is the buffer path if any.
-pub fn detect_intent(
-    raw: &str,
-    current_file: Option<&str>,
-    _has_mru: bool,
-) -> QueryIntent {
+pub fn detect_intent(raw: &str, current_file: Option<&str>, _has_mru: bool) -> QueryIntent {
     let q = raw.trim();
     if q.is_empty() {
         return QueryIntent::WorkingSet;
@@ -127,10 +123,7 @@ pub fn split_name_ext(q: &str) -> Option<NameExt<'_>> {
     if ext.is_empty() || ext.len() > 8 || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
         return None;
     }
-    Some(NameExt {
-        stem,
-        ext: ext_dot,
-    })
+    Some(NameExt { stem, ext: ext_dot })
 }
 
 /// Path tokens: `src/auth/login/` → ["src","auth","login"], ends_with_sep=true.
@@ -166,10 +159,8 @@ pub fn for_each_word<'a>(name: &'a str, mut f: impl FnMut(&'a str)) {
         let is_upper = b.is_ascii_uppercase();
         let is_lower_or_digit = b.is_ascii_lowercase() || b.is_ascii_digit();
         let camel_break = prev_lower_or_digit && is_upper;
-        let acronym_break = prev_upper
-            && is_upper
-            && i + 1 < bytes.len()
-            && bytes[i + 1].is_ascii_lowercase();
+        let acronym_break =
+            prev_upper && is_upper && i + 1 < bytes.len() && bytes[i + 1].is_ascii_lowercase();
         if i > start && (is_sep || camel_break || acronym_break) {
             if !is_sep {
                 if i > start {
@@ -279,8 +270,21 @@ pub fn role_of_filename(fname: &str) -> FileRole {
     if matches_ignore_ascii(
         fname,
         &[
-            "mod.rs", "index.ts", "index.tsx", "index.js", "index.jsx", "main.rs", "main.go",
-            "main.py", "app.rs", "lib.rs", "__init__.py", "main.cpp", "main.c", "main.ts", "main.js",
+            "mod.rs",
+            "index.ts",
+            "index.tsx",
+            "index.js",
+            "index.jsx",
+            "main.rs",
+            "main.go",
+            "main.py",
+            "app.rs",
+            "lib.rs",
+            "__init__.py",
+            "main.cpp",
+            "main.c",
+            "main.ts",
+            "main.js",
         ],
     ) {
         return FileRole::Entrypoint;
@@ -338,28 +342,22 @@ pub fn segment_boundary_evidence(path: &str, q: &PathTokens<'_>) -> (bool, u8, b
         return (false, 0, false);
     }
     let sep = if path.contains('\\') { '\\' } else { '/' };
-    let comps: Vec<&str> = path.split(sep).filter(|s| !s.is_empty()).collect();
     let last_q = q.segments.last().copied().unwrap_or("");
-    let last_match = comps
-        .last()
-        .map(|c| c.eq_ignore_ascii_case(last_q))
-        .unwrap_or(false);
-
-    // Subsequence over components (case-insensitive).
+    // One pass, no component vec: track the subsequence cursor and the
+    // last component for the exact-last-segment test.
     let mut qi = 0usize;
     let mut hits = 0usize;
-    for c in &comps {
+    let mut last = "";
+    for c in path.split(sep).filter(|s| !s.is_empty()) {
+        last = c;
         if qi < q.segments.len() && c.eq_ignore_ascii_case(q.segments[qi]) {
             qi += 1;
             hits += 1;
         }
     }
+    let last_match = !last.is_empty() && last.eq_ignore_ascii_case(last_q);
     let sequence = qi == q.segments.len();
-    let pct = if q.segments.is_empty() {
-        0
-    } else {
-        (hits * 100 / q.segments.len()).min(100) as u8
-    };
+    let pct = (hits * 100 / q.segments.len()).min(100) as u8;
     (last_match, pct, sequence)
 }
 
@@ -374,11 +372,15 @@ pub fn word_coverage(fname: &str, query: &str) -> u8 {
             qn += 1;
         }
     });
-    if qn == 0 {
+    word_coverage_prepared(fname, &qwords[..qn])
+}
+
+pub(crate) fn word_coverage_prepared(fname: &str, qwords: &[&str]) -> u8 {
+    if qwords.is_empty() {
         return 0;
     }
     let mut hits = 0usize;
-    for qw in qwords[..qn].iter() {
+    for qw in qwords.iter() {
         let mut found = false;
         for_each_word(fname, |fw| {
             if found {
@@ -392,7 +394,7 @@ pub fn word_coverage(fname: &str, query: &str) -> u8 {
             hits += 1;
         }
     }
-    (hits * 100 / qn).min(100) as u8
+    (hits * 100 / qwords.len()).min(100) as u8
 }
 
 /// Case-insensitive prefix test without allocating.
@@ -472,11 +474,7 @@ pub fn evidence_bonus(intent: QueryIntent, ev: &Evidence, base: i32) -> i32 {
 
 /// Filename-only evidence (no relative path walk). Same as `evidence_for`
 /// for fields that don't need the path; path/segment/same_dir stay default.
-pub fn evidence_filename_only(
-    filename: &str,
-    query: &str,
-    intent: QueryIntent,
-) -> Evidence {
+pub fn evidence_filename_only(filename: &str, query: &str, intent: QueryIntent) -> Evidence {
     evidence_for("", filename, query, intent, None)
 }
 
@@ -490,6 +488,9 @@ pub struct PreparedQuery<'a> {
     pub name_ext: Option<NameExt<'a>>,
     pub stem_lower: Option<String>,
     pub wants_role: Option<FileRole>,
+    pub qwords: [&'a str; 12],
+    pub qword_count: usize,
+    pub path_tokens: Option<PathTokens<'a>>,
 }
 
 impl<'a> PreparedQuery<'a> {
@@ -497,12 +498,28 @@ impl<'a> PreparedQuery<'a> {
         let query = query.trim();
         let name_ext = split_name_ext(query);
         let stem_lower = name_ext.as_ref().map(|ne| ne.stem.to_ascii_lowercase());
+        let mut qwords: [&'a str; 12] = [""; 12];
+        let mut qword_count = 0usize;
+        for_each_word(query, |w| {
+            if qword_count < qwords.len() {
+                qwords[qword_count] = w;
+                qword_count += 1;
+            }
+        });
+        let path_tokens = if query.contains('/') || query.contains('\\') {
+            Some(split_path_tokens(query))
+        } else {
+            None
+        };
         Self {
             query,
             lower: query.to_ascii_lowercase(),
             name_ext,
             stem_lower,
             wants_role: implied_role_from_query(query),
+            qwords,
+            qword_count,
+            path_tokens,
         }
     }
 }
@@ -534,8 +551,19 @@ pub fn evidence_prepared(
     }
 
     // Proximity / related work even with no query text (working set).
-    if let Some(cur) = current_file {
-        let sep = if relative_path.contains('\\') { '\\' } else { '/' };
+    // Only Concept/Typo/WorkingSet bonuses read these; FileName and Path
+    // never do, so skip the rsplit+compare per candidate there.
+    if let Some(cur) = current_file
+        && matches!(
+            intent,
+            QueryIntent::Concept | QueryIntent::Typo | QueryIntent::WorkingSet
+        )
+    {
+        let sep = if relative_path.contains('\\') {
+            '\\'
+        } else {
+            '/'
+        };
         let cur_dir = cur.rsplit_once(sep).map(|(d, _)| d).unwrap_or("");
         let hit_dir = relative_path.rsplit_once(sep).map(|(d, _)| d).unwrap_or("");
         ev.same_dir = !cur_dir.is_empty() && cur_dir.eq_ignore_ascii_case(hit_dir);
@@ -546,18 +574,22 @@ pub fn evidence_prepared(
         return ev;
     }
 
-    // Name / ext
+    // Name / ext. Path bonuses read ext_match only; exact_filename and
+    // filename_substring are dead there, so skip those scans.
+    let want_name = intent != QueryIntent::Path;
     if let Some(ne) = pq.name_ext.as_ref() {
         ev.ext_match = filename
             .rsplit_once('.')
             .map(|(_, e)| e.eq_ignore_ascii_case(&ne.ext[1..]))
             .unwrap_or(false);
         ev.ext_mismatch = !ev.ext_match && filename.contains('.');
-        let stem_matches = filename_stem(filename).eq_ignore_ascii_case(ne.stem);
-        ev.exact_filename = filename.eq_ignore_ascii_case(q) || (stem_matches && ev.ext_match);
-        ev.filename_substring =
-            contains_ignore_ascii(filename, pq.stem_lower.as_deref().unwrap_or_default());
-    } else {
+        if want_name {
+            let stem_matches = filename_stem(filename).eq_ignore_ascii_case(ne.stem);
+            ev.exact_filename = filename.eq_ignore_ascii_case(q) || (stem_matches && ev.ext_match);
+            ev.filename_substring =
+                contains_ignore_ascii(filename, pq.stem_lower.as_deref().unwrap_or_default());
+        }
+    } else if want_name {
         // Bare name query: stem equality is "this is the file", not just contains.
         let stem = filename_stem(filename);
         ev.exact_filename = filename.eq_ignore_ascii_case(q) || stem.eq_ignore_ascii_case(q);
@@ -566,20 +598,25 @@ pub fn evidence_prepared(
 
     // Path structure
     if intent == QueryIntent::Path {
-        let pt = split_path_tokens(q);
-        let (last_match, pct, sequence) = segment_boundary_evidence(relative_path, &pt);
-        ev.last_segment_match = last_match;
-        ev.segment_boundary_pct = pct;
-        ev.segment_sequence = sequence;
+        if let Some(pt) = pq.path_tokens.as_ref() {
+            let (last_match, pct, sequence) = segment_boundary_evidence(relative_path, pt);
+            ev.last_segment_match = last_match;
+            ev.segment_boundary_pct = pct;
+            ev.segment_sequence = sequence;
+        }
     }
 
-    // Words / camel
-    ev.word_coverage = word_coverage(filename, q);
+    // Words / camel. Only FileName/Concept/Typo bonuses read this.
+    if matches!(
+        intent,
+        QueryIntent::FileName | QueryIntent::Concept | QueryIntent::Typo
+    ) {
+        ev.word_coverage = word_coverage_prepared(filename, &pq.qwords[..pq.qword_count]);
+    }
 
-    // Role
-    let role = role_of_filename(filename);
+    // Role is ~15 substring scans; only pay when the query wants one.
     if let Some(want) = pq.wants_role {
-        ev.role_match = role == want;
+        ev.role_match = role_of_filename(filename) == want;
     } else if intent == QueryIntent::FileName || intent == QueryIntent::Typo {
         ev.role_match = false;
     } else {
@@ -590,32 +627,29 @@ pub fn evidence_prepared(
 }
 
 fn filename_stem(filename: &str) -> &str {
-    filename.rsplit_once('.').map(|(s, _)| s).unwrap_or(filename)
+    filename
+        .rsplit_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(filename)
 }
 
 /// True when `cand` is a conventional sibling of `cur` (same stem, different role).
 pub fn is_related_filename(cand: &str, cur_fname: &str) -> bool {
-    let a = filename_stem(cur_fname).to_ascii_lowercase();
-    let b = filename_stem(cand).to_ascii_lowercase();
-    if a.is_empty() || a == b {
+    let a = filename_stem(cur_fname);
+    let b = filename_stem(cand);
+    if a.is_empty() || a.eq_ignore_ascii_case(b) {
         return false;
     }
-    // Strip common sibling suffixes from cand stem.
-    let b2 = b
-        .trim_end_matches(".test")
-        .trim_end_matches(".spec")
-        .trim_end_matches(".module")
-        .trim_end_matches("_test")
-        .trim_end_matches(".stories")
-        .to_string();
-    let a2 = a
-        .trim_end_matches(".test")
-        .trim_end_matches(".spec")
-        .trim_end_matches(".module")
-        .trim_end_matches("_test")
-        .trim_end_matches(".stories")
-        .to_string();
-    a2 == b2
+    strip_sibling_suffix(a).eq_ignore_ascii_case(strip_sibling_suffix(b))
+}
+
+fn strip_sibling_suffix(mut s: &str) -> &str {
+    for pat in [".test", ".spec", ".module", "_test", ".stories"] {
+        while s.len() >= pat.len() && s[s.len() - pat.len()..].eq_ignore_ascii_case(pat) {
+            s = &s[..s.len() - pat.len()];
+        }
+    }
+    s
 }
 
 #[cfg(test)]
@@ -647,7 +681,10 @@ mod tests {
     fn filename_words_camel_and_snake() {
         assert_eq!(filename_words("user_service"), vec!["user", "service"]);
         assert_eq!(filename_words("UserService"), vec!["User", "Service"]);
-        assert_eq!(filename_words("XMLHttpRequest"), vec!["XML", "Http", "Request"]);
+        assert_eq!(
+            filename_words("XMLHttpRequest"),
+            vec!["XML", "Http", "Request"]
+        );
     }
 
     #[test]
@@ -663,6 +700,47 @@ mod tests {
         assert!(is_related_filename("user.test.ts", "user.ts"));
         assert!(is_related_filename("user.module.css", "user.ts"));
         assert!(!is_related_filename("other.ts", "user.ts"));
+    }
+
+    #[test]
+    fn related_siblings_case_and_repeated_suffix() {
+        assert!(is_related_filename("User.TEST.ts", "user.ts"));
+        assert!(is_related_filename("user.test.test.ts", "user.ts"));
+        assert!(is_related_filename("user.spec.ts", "user.ts"));
+        assert!(is_related_filename("user_test.test.ts", "user.ts"));
+        assert!(!is_related_filename("user.ts", "user.ts"));
+        assert!(!is_related_filename("user.ts", "USER.ts"));
+        assert!(!is_related_filename("other.test.ts", "user.ts"));
+        assert!(!is_related_filename("user.stories.ts", "other.ts"));
+        assert!(is_related_filename("user.stories.ts", "user.ts"));
+    }
+
+    #[test]
+    fn prepared_query_state_matches_inline() {
+        for q in [
+            "user_service",
+            "src/auth/login",
+            "UserService",
+            "a-b-c",
+            "",
+            "x",
+        ] {
+            let pq = PreparedQuery::new(q);
+            assert_eq!(
+                word_coverage_prepared("user_service.rs", &pq.qwords[..pq.qword_count]),
+                word_coverage("user_service.rs", q.trim())
+            );
+            assert_eq!(
+                word_coverage_prepared("OTHER", &pq.qwords[..pq.qword_count]),
+                word_coverage("OTHER", q.trim())
+            );
+            let inline: Option<PathTokens<'_>> = if q.contains('/') || q.contains('\\') {
+                Some(split_path_tokens(q))
+            } else {
+                None
+            };
+            assert_eq!(pq.path_tokens, inline);
+        }
     }
 
     #[test]
@@ -694,5 +772,31 @@ mod tests {
         assert!(seq);
         assert_eq!(pct, 100);
         assert!(!last);
+    }
+
+    #[test]
+    fn segment_evidence_edges() {
+        let q = split_path_tokens("src/auth");
+        assert_eq!(segment_boundary_evidence("", &q), (false, 0, false));
+        assert_eq!(segment_boundary_evidence("/", &q), (false, 0, false));
+        assert_eq!(segment_boundary_evidence("src/auth", &q), (true, 100, true));
+        assert_eq!(
+            segment_boundary_evidence("SRC/AUTH/x.rs", &q),
+            (false, 100, true)
+        );
+        assert_eq!(
+            segment_boundary_evidence("src/other/x.rs", &q),
+            (false, 50, false)
+        );
+        let win = split_path_tokens("src\\auth");
+        assert_eq!(
+            segment_boundary_evidence("src\\auth\\x.rs", &win),
+            (false, 100, true)
+        );
+        let empty = split_path_tokens("/");
+        assert_eq!(
+            segment_boundary_evidence("src/auth", &empty),
+            (false, 0, false)
+        );
     }
 }

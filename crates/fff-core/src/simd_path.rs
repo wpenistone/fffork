@@ -81,6 +81,11 @@ pub use crate::constants::PATH_BUF_SIZE;
 /// Chunk pointer capacity needed for the longest path the platform allows.
 pub(crate) const MAX_PATH_CHUNKS: usize = PATH_BUF_SIZE.div_ceil(SIMD_CHUNK_BYTES);
 
+/// Pointer capacity for frizbee's resolved API, which counts 16 B units.
+/// Keep separate from MAX_PATH_CHUNKS (32 B arena units).
+pub(crate) const MAX_FRIZBEE_CHUNKS: usize =
+    PATH_BUF_SIZE.div_ceil(neo_frizbee::SIMD_CHUNK_BYTES);
+
 /// A path stored as a run of chunk indices in the owning store's flat index
 /// table. 8 bytes; every read needs the store's `ArenaPtr`.
 #[derive(Clone)]
@@ -155,14 +160,55 @@ impl ChunkedString {
                 break;
             }
             let take = SIMD_CHUNK_BYTES.min(total - off);
-            let chunk = unsafe {
-                core::slice::from_raw_parts(arena.chunk_ptr(idx), take)
-            };
+            let chunk = unsafe { core::slice::from_raw_parts(arena.chunk_ptr(idx), take) };
             f(off, chunk);
             off += take;
         }
     }
-/// Filename as `&str`, borrowing from the arena when it fits in one chunk
+
+    #[inline]
+    pub(crate) fn common_suffix_len_ignore_ascii_case(
+        &self,
+        arena: ArenaPtr,
+        other: &[u8],
+    ) -> usize {
+        let indices = self.indices(arena);
+        let mut end = self.byte_len as usize;
+        let mut matched = 0;
+        while end > 0 && matched < other.len() {
+            let chunk = (end - 1) / SIMD_CHUNK_BYTES;
+            let len = end - chunk * SIMD_CHUNK_BYTES;
+            let bytes =
+                unsafe { core::slice::from_raw_parts(arena.chunk_ptr(indices[chunk]), len) };
+            for (&a, &b) in bytes
+                .iter()
+                .rev()
+                .zip(other[..other.len() - matched].iter().rev())
+            {
+                if !a.eq_ignore_ascii_case(&b) {
+                    return matched;
+                }
+                matched += 1;
+            }
+            end -= len;
+        }
+        matched
+    }
+
+    #[inline]
+    pub(crate) fn has_extension(&self, arena: ArenaPtr, extension: &str) -> bool {
+        let filename_len = (self.byte_len - self.filename_offset) as usize;
+        if filename_len <= extension.len() + 1 {
+            return false;
+        }
+        let dot = self.byte_len as usize - extension.len() - 1;
+        let chunk = self.indices(arena)[dot / SIMD_CHUNK_BYTES];
+        let byte = unsafe { *arena.chunk_ptr(chunk).add(dot % SIMD_CHUNK_BYTES) };
+        byte == b'.'
+            && self.common_suffix_len_ignore_ascii_case(arena, extension.as_bytes())
+                == extension.len()
+    }
+    /// Filename as `&str`, borrowing from the arena when it fits in one chunk
     /// and otherwise copying into caller scratch. `filename_cow` heap-allocates
     /// in exactly that second case, which on a repo whose directory prefixes
     /// straddle chunk boundaries (measured: linux-kernel, a 26.6 B prefix in a
@@ -287,10 +333,14 @@ impl ChunkedString {
         let indices = self.indices(arena);
         let start_chunk = start / SIMD_CHUNK_BYTES;
         let offset_in_chunk = start % SIMD_CHUNK_BYTES;
-        let chunks_to_copy = chunks_needed(offset_in_chunk + len).min(indices.len().saturating_sub(start_chunk));
+        let chunks_to_copy =
+            chunks_needed(offset_in_chunk + len).min(indices.len().saturating_sub(start_chunk));
 
         let mut written = 0usize;
-        for (i, &idx) in indices[start_chunk..start_chunk + chunks_to_copy].iter().enumerate() {
+        for (i, &idx) in indices[start_chunk..start_chunk + chunks_to_copy]
+            .iter()
+            .enumerate()
+        {
             let chunk_bytes =
                 unsafe { core::slice::from_raw_parts(arena.chunk_ptr(idx), SIMD_CHUNK_BYTES) };
             let s = if i == 0 { offset_in_chunk } else { 0 };
@@ -518,6 +568,36 @@ pub(crate) fn build_chunked_path_store_from_strings(
 mod tests {
     use super::*;
 
+    #[test]
+    fn chunked_suffix_matches_contiguous_bytes() {
+        let paths = [
+            "",
+            "src/main.rs",
+            "src/components/Controller.tsx",
+            "src/日本語/éController.tsx",
+            "abcdefghijklmnopABCDEFGHIJKLMNOP.rs",
+        ];
+        let (store, strings, _) = build_test_store(&paths);
+        for (path, chunked) in paths.iter().zip(&strings) {
+            for candidate in paths {
+                for start in 0..=candidate.len() {
+                    let suffix = &candidate.as_bytes()[start..];
+                    let expected = path
+                        .as_bytes()
+                        .iter()
+                        .rev()
+                        .zip(suffix.iter().rev())
+                        .take_while(|(a, b)| a.eq_ignore_ascii_case(b))
+                        .count();
+                    assert_eq!(
+                        chunked.common_suffix_len_ignore_ascii_case(store.as_arena_ptr(), suffix),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
     fn make_file_item(path: &str) -> crate::types::FileItem {
         let filename_start = path
             .rfind(std::path::is_separator)
@@ -549,6 +629,42 @@ mod tests {
         let (store, strings, _files) = build_test_store(&[]);
         assert_eq!(strings.len(), 0);
         assert_eq!(store.unique_chunks(), 0);
+    }
+
+    #[test]
+    fn chunked_extensions_match_contiguous_filenames() {
+        let paths = [
+            "",
+            ".rs",
+            "a.",
+            "src/long_directory/main.RS",
+            "src/é.日本語",
+            "dir.rs/file",
+            "abcdefghijklmn.rs",
+            "abcdefghijklmno.rs",
+            "abcdefghijklmnop.rs",
+            "a.tar.gz",
+        ];
+        let (store, strings, _) = build_test_store(&paths);
+        for (path, chunked) in paths.iter().zip(&strings) {
+            let filename = path.rsplit('/').next().unwrap();
+            for extension in [
+                "",
+                "rs",
+                "RS",
+                "gz",
+                "tar.gz",
+                "日本語",
+                "語",
+                "a/more.than.a.chunk",
+            ] {
+                assert_eq!(
+                    chunked.has_extension(store.as_arena_ptr(), extension),
+                    crate::index::constraints::file_has_extension(filename, extension),
+                    "{path}, {extension}"
+                );
+            }
+        }
     }
 
     #[test]

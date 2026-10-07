@@ -78,11 +78,35 @@ pub(crate) fn walk_collect_files(
                     return ignore::WalkState::Continue;
                 }
 
-                let metadata = entry.metadata().ok();
-                let (file_item, rel_path) =
-                    FileItem::new_from_walk(path, &self.base_path, None, metadata.as_ref());
+                // Fast path: `strip_prefix` (no `pathdiff` component walk)
+                // + one `to_string_lossy`; basename offset from the last
+                // slash in the same pass.
+                let rel = path.strip_prefix(&self.base_path).unwrap_or(path);
+                let rel_str =
+                    crate::path_utils::to_canonical_slashes(&rel.to_string_lossy()).into_owned();
+                if rel_str.is_empty() {
+                    return ignore::WalkState::Continue;
+                }
+                let off = rel_str.rfind('/').map(|i| i + 1).unwrap_or(0) as u16;
+                let (size, modified) = match entry.metadata().ok() {
+                    Some(m) => (
+                        m.len(),
+                        m.modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                            .map_or(0, |d| d.as_secs()),
+                    ),
+                    None => (0, 0),
+                };
+                let item = FileItem::new_raw(
+                    off,
+                    size,
+                    modified,
+                    None,
+                    crate::file_picker::is_known_binary_extension(path),
+                );
 
-                self.local_pairs.push((file_item, rel_path));
+                self.local_pairs.push((item, rel_str));
                 self.local_count += 1;
                 // Flush before the local batch grows unbounded under bursty
                 // closed-loop walkers, so the final append is not one huge
@@ -98,8 +122,7 @@ pub(crate) fn walk_collect_files(
                 if is_git_file(path) {
                     return ignore::WalkState::Skip;
                 }
-                if let Ok(rel) = path.strip_prefix(&self.base_path)
-                {
+                if let Ok(rel) = path.strip_prefix(&self.base_path) {
                     let mut rel = crate::path_utils::to_canonical_slashes(&rel.to_string_lossy())
                         .into_owned();
                     rel.push('/');

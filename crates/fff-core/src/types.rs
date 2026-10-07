@@ -53,6 +53,10 @@ impl FileSliceExt for [FileItem] {
     }
 }
 
+/// Ranking demotion applied to files under third-party directories.
+/// Exported so benches and SDKs can reconstruct totals from breakdowns.
+pub const VENDORED_PATH_PENALTY: i32 = 120;
+
 /// Directory names that hold third-party code. Ranking demotes files under
 /// these so a first-party module outranks a dependency with the same name.
 const VENDORED_DIRS: &[&str] = &[
@@ -78,6 +82,17 @@ fn segment_is_vendored(name: &str) -> bool {
 /// True when any segment of the relative directory is a dependency directory.
 pub(crate) fn dir_is_vendored(dir: &str) -> bool {
     dir.split(['/', '\\']).any(segment_is_vendored)
+}
+
+/// True when a relative file path lies under a dependency directory.
+/// Same rule the indexer uses for the VENDORED flag; exported so benches
+/// and SDKs can reconstruct score totals from breakdowns.
+pub fn path_is_vendored(relative_path: &str) -> bool {
+    let dir = relative_path
+        .rsplit_once(['/', '\\'])
+        .map(|(d, _)| d)
+        .unwrap_or("");
+    dir_is_vendored(dir)
 }
 
 pub struct FileItemFlags;
@@ -737,7 +752,8 @@ impl FileItem {
 
     #[inline]
     pub fn set_vendored(&self) {
-        self.flags.fetch_or(FileItemFlags::VENDORED, Ordering::Relaxed);
+        self.flags
+            .fetch_or(FileItemFlags::VENDORED, Ordering::Relaxed);
     }
 
     #[inline]
@@ -958,8 +974,7 @@ impl FileItem {
     /// Get file content for searching — **always returns content** for eligible
     /// files, even when the persistent cache budget is exhausted.
     ///
-    /// The caller provides a reusable `path_buf` (pre-filled with `base_path/`)
-    /// and its `base_len` to avoid allocations when constructing the absolute path.
+    /// The absolute path is built in a stack buffer (no per-file alloc).
     #[inline]
     pub(crate) fn get_content_for_search<'a>(
         &'a self,
@@ -984,11 +999,14 @@ impl FileItem {
             return None;
         }
 
-        let abs = self.absolute_path(arena, base_path);
+        // Stack path buffer: a per-file PathBuf alloc dominates
+        // small-file grep (one alloc + memcpy per open).
+        let mut path_buf = [0u8; PATH_BUF_SIZE];
+        let abs = self.write_absolute_path(arena, base_path, &mut path_buf);
 
         #[cfg(not(target_os = "windows"))]
         if self.size >= FRESH_MMAP_THRESHOLD {
-            let file = std::fs::File::open(&abs).ok()?;
+            let file = std::fs::File::open(abs).ok()?;
             let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
             let stored = mmap_slot.insert(mmap);
             return Some(&stored[..]);
@@ -1001,7 +1019,7 @@ impl FileItem {
         buf.clear();
         buf.reserve(len);
 
-        let mut file = match std::fs::File::open(&abs) {
+        let mut file = match std::fs::File::open(abs) {
             Ok(f) => f,
             Err(_) => return None,
         };
@@ -1029,6 +1047,11 @@ impl Constrainable for FileItem {
     #[inline]
     fn write_file_name(&self, arena: ArenaPtr, out: &mut String) {
         self.path.write_filename_to(arena, out);
+    }
+
+    #[inline]
+    fn has_extension(&self, arena: ArenaPtr, extension: &str, _scratch: &mut String) -> bool {
+        self.path.has_extension(arena, extension)
     }
 
     #[inline]
@@ -1355,8 +1378,8 @@ mod content_mask_tests {
             b"   \n\t  ",
         ];
         let needles: &[&[u8]] = &[
-            b"h", b"ello", b"o w", b"fn", b"main", b"println", b"()",
-            b"struct", b"Foo", b"bar", b"u32", b"aab", b"ab", b"  ", b"xyz",
+            b"h", b"ello", b"o w", b"fn", b"main", b"println", b"()", b"struct", b"Foo", b"bar",
+            b"u32", b"aab", b"ab", b"  ", b"xyz",
         ];
         for c in contents {
             let m = mask_of(c);

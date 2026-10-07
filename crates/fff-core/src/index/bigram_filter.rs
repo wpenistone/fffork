@@ -370,10 +370,10 @@ impl BigramIndexBuilder {
 
     /// Compress the dense builder into a compact `BigramFilter`.
     ///
-    /// Retains columns where the bigram appears in ≥`min_density_pct`% (or
-    /// the default ~3.1% heuristic when `None`) and <90% of indexed files.
-    /// Sparse columns carry too little data to justify their memory;
-    /// ubiquitous columns (≥90%) are nearly all-ones and barely filter.
+    /// Retains every non-ubiquitous column (<90% of indexed files).
+    /// Rare columns encode as gap lists, so keeping them costs bytes
+    /// but buys selectivity. An explicit `min_density_pct` (skip index)
+    /// still drops anything below the cutoff.
     #[inline(always)]
     pub fn compress(self, min_density_pct: Option<u32>) -> BigramFilter {
         let cols = self.columns_used() as usize;
@@ -405,21 +405,15 @@ impl BigramIndexBuilder {
                 let bitset = &col_data[col_start..col_start + words];
                 let popcount: u32 = bitset.iter().map(|w| w.count_ones()).sum();
 
-                // drop bigrams appearing in too few files
-                let not_to_rare = if let Some(min_pct) = min_density_pct {
-                    // Percentage-based: require ≥ min_pct% of populated files.
-                    populated > 0 && (popcount as usize) * 100 >= populated * min_pct as usize
-                } else {
-                    // Default: popcount ≥ words × 2 (~3.1% of files).
-                    (popcount as usize * 4) >= dense_bytes
-                };
-                if !not_to_rare {
-                    continue;
-                }
-
                 // Drop ubiquitous bigrams — columns ≥90% ones carry almost no
                 // filtering power and just waste memory + AND cycles.
+                // Rare columns are kept: they encode as gap lists below.
                 if populated > 0 && (popcount as usize) * 10 >= populated * 9 {
+                    continue;
+                }
+                if let Some(min_pct) = min_density_pct
+                    && (populated == 0 || (popcount as usize) * 100 < populated * min_pct as usize)
+                {
                     continue;
                 }
 
@@ -610,6 +604,26 @@ impl BigramFilter {
             return None;
         }
 
+        let mut keys: [(u16, u32); 512] = [(0, 0); 512];
+        let mut nkeys = 0usize;
+        let mut prev = pattern[0];
+        for &b in &pattern[1..] {
+            if (32..=126).contains(&prev) && (32..=126).contains(&b) {
+                let key = (prev.to_ascii_lowercase() as u16) << 8 | b.to_ascii_lowercase() as u16;
+                if let Some(pop) = self.column_popcount(key) {
+                    if nkeys < keys.len() {
+                        keys[nkeys] = (key, pop);
+                        nkeys += 1;
+                    }
+                }
+            }
+            prev = b;
+        }
+        if nkeys == 0 && self.skip_index.is_none() {
+            return None;
+        }
+        keys[..nkeys].sort_unstable_by_key(|&(_, pop)| pop);
+
         let mut result = vec![u64::MAX; self.words];
         if !self.file_count.is_multiple_of(64) {
             let last = self.words - 1;
@@ -617,17 +631,13 @@ impl BigramFilter {
         }
 
         let mut has_filter = false;
-
-        let mut prev = pattern[0];
-        for &b in &pattern[1..] {
-            if (32..=126).contains(&prev) && (32..=126).contains(&b) {
-                let key = (prev.to_ascii_lowercase() as u16) << 8 | b.to_ascii_lowercase() as u16;
-                if let Some(col) = self.column_ref(key) {
-                    Self::and_column(&mut result, col);
-                    has_filter = true;
+        for &(key, _) in &keys[..nkeys] {
+            if let Some(col) = self.column_ref(key) {
+                if !Self::and_column_checked(&mut result, col) {
+                    return Some(result);
                 }
+                has_filter = true;
             }
-            prev = b;
         }
 
         // strid-1 bigrams
@@ -645,27 +655,41 @@ impl BigramFilter {
     /// Query using stride-2 bigrams from the pattern.
     /// For "ABCDE" queries with keys (A,C), (B,D), (C,E).
     fn query_skip(&self, pattern: &[u8]) -> Option<Vec<u64>> {
+        let mut keys: [(u16, u32); 512] = [(0, 0); 512];
+        let mut nkeys = 0usize;
+        for i in 0..pattern.len().saturating_sub(2) {
+            let a = pattern[i];
+            let b = pattern[i + 2];
+            if (32..=126).contains(&a) && (32..=126).contains(&b) {
+                let key = (a.to_ascii_lowercase() as u16) << 8 | b.to_ascii_lowercase() as u16;
+                if let Some(pop) = self.column_popcount(key) {
+                    if nkeys < keys.len() {
+                        keys[nkeys] = (key, pop);
+                        nkeys += 1;
+                    }
+                }
+            }
+        }
+        if nkeys == 0 {
+            return None;
+        }
+        keys[..nkeys].sort_unstable_by_key(|&(_, pop)| pop);
+
         let mut result = vec![u64::MAX; self.words];
         if !self.file_count.is_multiple_of(64) {
             let last = self.words - 1;
             result[last] = (1u64 << (self.file_count % 64)) - 1;
         }
 
-        let mut has_filter = false;
-
-        for i in 0..pattern.len().saturating_sub(2) {
-            let a = pattern[i];
-            let b = pattern[i + 2];
-            if (32..=126).contains(&a) && (32..=126).contains(&b) {
-                let key = (a.to_ascii_lowercase() as u16) << 8 | b.to_ascii_lowercase() as u16;
-                if let Some(col) = self.column_ref(key) {
-                    Self::and_column(&mut result, col);
-                    has_filter = true;
+        for &(key, _) in &keys[..nkeys] {
+            if let Some(col) = self.column_ref(key) {
+                if !Self::and_column_checked(&mut result, col) {
+                    break;
                 }
             }
         }
 
-        has_filter.then_some(result)
+        Some(result)
     }
 
     /// Resolve a bigram key to its stored column, if the index kept one.
@@ -694,6 +718,30 @@ impl BigramFilter {
         match col {
             ColumnRef::Dense(bits) => bitset_and(result, bits),
             ColumnRef::Sparse(data) => and_sparse_column(result, data),
+        }
+    }
+
+    fn and_column_checked(result: &mut [u64], col: ColumnRef<'_>) -> bool {
+        match col {
+            ColumnRef::Dense(bits) => {
+                let mut any = 0u64;
+                for (r, b) in result.iter_mut().zip(bits.iter()) {
+                    *r &= *b;
+                    any |= *r;
+                }
+                any != 0
+            }
+            ColumnRef::Sparse(data) => {
+                and_sparse_column(result, data);
+                result.iter().any(|&w| w != 0)
+            }
+        }
+    }
+
+    pub(crate) fn column_popcount(&self, key: u16) -> Option<u32> {
+        match self.column_ref(key)? {
+            ColumnRef::Dense(bits) => Some(bits.iter().map(|w| w.count_ones()).sum()),
+            ColumnRef::Sparse(data) => Some(data.iter().filter(|&&b| b & 0x80 == 0).count() as u32),
         }
     }
 
@@ -994,9 +1042,7 @@ pub fn extract_bigrams(content: &[u8]) -> Vec<u16> {
 /// and cleared when the base index is rebuilt.
 #[derive(Debug)]
 pub struct BigramOverlay {
-    /// Per-file bigram sets for files modified since the base was built.
-    /// Key = file index in the base `Vec<FileItem>`.
-    modified: AHashMap<usize, Vec<u16>>,
+    modified: AHashMap<usize, ahash::AHashSet<u16>>,
 
     /// Tombstone bitset — one bit per base file. Set bits are excluded
     /// from base query results.
@@ -1017,7 +1063,8 @@ impl BigramOverlay {
     }
 
     pub(crate) fn modify_file(&mut self, file_idx: usize, content: &[u8]) {
-        self.modified.insert(file_idx, extract_bigrams(content));
+        self.modified
+            .insert(file_idx, extract_bigrams(content).into_iter().collect());
     }
 
     pub(crate) fn delete_file(&mut self, file_idx: usize) {
@@ -1028,8 +1075,6 @@ impl BigramOverlay {
         self.modified.remove(&file_idx);
     }
 
-    /// Return base file indices of modified files whose bigrams match ALL
-    /// of the given `pattern_bigrams`.
     pub(crate) fn query_modified(&self, pattern_bigrams: &[u16]) -> Vec<usize> {
         if pattern_bigrams.is_empty() {
             return self.modified.keys().copied().collect();

@@ -1,11 +1,13 @@
-use super::prefilter::prefilter_with_filepath_retry;
+use super::prefilter::prefilter_with_filepath_retry_indexed;
+use super::prefilter::{chunk_plan, prefilter_with_filepath_retry};
 use super::regex::{RegexMatcher, RegexSink, build_regex};
-use super::sink::{SinkState, debug_assert_newline_terminator};
+use super::sink::{SinkState, debug_assert_newline_terminator, lossy_owned};
 use super::types::{GrepMatch, GrepMode, GrepResult, GrepSearchOptions, PageFillGate};
 use crate::index::{
     BigramFilter, BigramOverlay, bigram_boundary, fuzzy_candidates, literal_candidates,
     regex_candidates,
 };
+use crate::parallelism::search_pool_threads;
 use crate::simd_string_utils::memmem;
 use crate::types::{ContentCacheBudget, FileItem, FileSliceExt, MmapSlot};
 use fff_grep::{
@@ -52,34 +54,35 @@ impl<'a> NeedleFinder<'a> {
     }
 
     /// Compare `haystack` against a slice of the needle with the same case
-    /// semantics as `find`.
+    /// semantics as `find`. Short prefix loop, not a memmem dispatch.
     #[inline]
     fn eq_fold(&self, haystack: &[u8], needle_seg: &[u8]) -> bool {
         match self {
             Self::CaseSensitive(_) => haystack == needle_seg,
-            Self::CaseInsensitive(_) => {
-                haystack.len() == needle_seg.len() && memmem::find(haystack, needle_seg) == Some(0)
-            }
+            Self::CaseInsensitive(_) => haystack.eq_ignore_ascii_case(needle_seg),
         }
     }
 
     /// Collect highlight spans for every needle occurrence within a line.
-    /// The case branch is resolved once per line, not once per occurrence.
+    /// Steps by needle length (non-overlapping); reslicing per hit keeps
+    /// memmem's skip tables effective instead of degrading to pos+1.
     #[inline]
     fn for_each_occurrence(&self, haystack: &[u8], mut on_match: impl FnMut(usize)) {
+        let step = self.needle().len().max(1);
         match self {
             Self::CaseSensitive(finder) => {
-                let mut start_pos = 0usize;
-                while let Some(pos) = finder.find(&haystack[start_pos..]) {
-                    on_match(start_pos + pos);
-                    start_pos += pos + 1;
+                for pos in finder.find_iter(haystack) {
+                    on_match(pos);
                 }
             }
             Self::CaseInsensitive(needle_lower) => {
                 let mut start_pos = 0usize;
                 while let Some(pos) = memmem::find(&haystack[start_pos..], needle_lower) {
                     on_match(start_pos + pos);
-                    start_pos += pos + 1;
+                    start_pos += pos + step;
+                    if start_pos >= haystack.len() {
+                        break;
+                    }
                 }
             }
         }
@@ -134,7 +137,7 @@ impl Sink for PlainTextSink<'_> {
         let (display_bytes, display_len, line_number, byte_offset) =
             SinkState::prepare_line(line_bytes, sink_match);
 
-        let line_content = String::from_utf8_lossy(display_bytes).into_owned();
+        let line_content = lossy_owned(display_bytes);
         let mut match_byte_offsets: SmallVec<[(u32, u32); 4]> = SmallVec::new();
         let mut col = 0usize;
         let mut first = true;
@@ -202,10 +205,12 @@ pub(crate) fn grep_search<'a>(
     overflow_arena: crate::simd_path::ArenaPtr,
     content_masks: Option<&'a crate::file_picker::ContentMaskStore>,
 ) -> GrepResult<'a> {
+    let total_files = files.live_count();
     let result = grep_search_parsed(
         files,
         query,
         options,
+        total_files,
         budget,
         bigram_index,
         bigram_overlay,
@@ -252,6 +257,7 @@ pub(crate) fn grep_search<'a>(
         files,
         &literal_query,
         options,
+        total_files,
         budget,
         bigram_index,
         bigram_overlay,
@@ -275,6 +281,7 @@ fn grep_search_parsed<'a>(
     files: &'a [FileItem],
     query: &FFFQuery<'_>,
     options: &GrepSearchOptions,
+    total_files: usize,
     budget: &ContentCacheBudget,
     bigram_index: Option<&BigramFilter>,
     bigram_overlay: Option<&BigramOverlay>,
@@ -284,7 +291,9 @@ fn grep_search_parsed<'a>(
     overflow_arena: crate::simd_path::ArenaPtr,
     content_masks: Option<&'a crate::file_picker::ContentMaskStore>,
 ) -> GrepResult<'a> {
-    let total_files = files.live_count();
+    // Masks are sized at scan but only filled when content indexing ran.
+    // An empty store rejects nothing yet costs per-file work: drop it.
+    let content_masks = content_masks.filter(|s| s.any_recorded());
     let constraints_from_query = &query.constraints[..];
 
     let grep_text = extract_grep_text(query);
@@ -303,7 +312,7 @@ fn grep_search_parsed<'a>(
         GrepMode::Fuzzy => {
             let bigram_candidates = fuzzy_candidates(bigram_index, bigram_overlay, &grep_text);
 
-            let (files_to_search, filtered_file_count) = prefilter_with_filepath_retry(
+            let (files_to_search, filtered_file_count) = prefilter_with_filepath_retry_indexed(
                 files,
                 constraints_from_query,
                 bigram_candidates.as_deref(),
@@ -329,6 +338,7 @@ fn grep_search_parsed<'a>(
                 base_path,
                 arena,
                 overflow_arena,
+                content_masks,
             );
         }
         GrepMode::Regex => build_regex(&grep_text, casing)
@@ -574,7 +584,7 @@ pub(crate) static CONTENT_MASK_REJECTS: std::sync::atomic::AtomicU64 =
 /// `None` for anything outside the slice keeps the caller safe if that layout
 /// ever changes.
 #[inline]
-fn original_index(files: &[FileItem], f: &FileItem) -> Option<usize> {
+pub(super) fn original_index(files: &[FileItem], f: &FileItem) -> Option<usize> {
     let base = files.as_ptr() as usize;
     let addr = f as *const FileItem as usize;
     let stride = std::mem::size_of::<FileItem>();
@@ -639,63 +649,53 @@ where
     let mut page_filled = false;
     let mut aborted = false;
 
-    // Each chunk is a rayon barrier. A flat small chunk over 500k files = ~7800
-    // barriers; x2 growth makes it logarithmic. But a too-aggressive growth
-    // over-scans: when a page fills mid-chunk, the whole submitted chunk still
-    // runs.
-    //
-    // So only grow when the prefilter is weak (large candidate set);
-    // when bigram cut the set in half, keep fixed small chunks for cheap page-fill termination.
-    let base_chunk = rayon::current_num_threads() * 4;
-    let prefilter_strong = ctx.total_files > 0 && files_to_search.len() * 2 < ctx.total_files;
-    // Early exit only pays once the page can actually fill. With nothing
-    // matched yet there is nothing to terminate against, so a query matching
-    // nothing across the whole corpus would pay the per-chunk cost (barrier,
-    // scratch init, page-fill gate) hundreds of times over for no benefit.
-    let no_early_exit = all_matches.is_empty() && !prefilter_strong;
-    let max_chunk = if no_early_exit {
-        // Nothing to terminate against, so run the tail in few large chunks.
-        files_to_search.len().max(8 * 1024)
-    } else if prefilter_strong {
-        base_chunk
-    } else if page_limit > 0 && page_limit <= 256 {
-        // Weak prefilter + small page: keep chunks modest so a page that fills
-        // early does not still open/read thousands of leftover files in an
-        // oversized chunk (families: io, cpu).
-        (base_chunk * 4).max(256)
-    } else {
-        (base_chunk * 256).max(8 * 1024)
-    };
-    let growth = if prefilter_strong { 1 } else { 2 };
-    let mut chunk_size = if no_early_exit { max_chunk } else { base_chunk };
+    // Small chunks exit early on page fill, large chunks scan sparse
+    // corpora in few barriers. Sized off the search pool, not the ambient
+    // one (which collapses under nested installs).
+    let threads = search_pool_threads();
+    let (base_chunk, max_chunk) =
+        chunk_plan(files_to_search.len(), ctx.total_files, page_limit, threads);
+    let mut chunk_size = base_chunk;
     let mut chunk_start = 0;
 
     while chunk_start < files_to_search.len() {
         let chunk_end = (chunk_start + chunk_size).min(files_to_search.len());
         let chunk = &files_to_search[chunk_start..chunk_end];
         chunk_start = chunk_end;
-        chunk_size = (chunk_size * growth).min(max_chunk);
         let chunk_offset = files_consumed;
 
         // Unless enforced, the budget stays dormant until something matched.
         let budget = time_budget.filter(|_| options.enforce_time_budget || all_matches.len() > 1);
 
-        // Per-chunk page-fill gate: workers skip later files once the ordered
-        // prefix of this chunk already covers the page (see PageFillGate docs).
-        let gate = gate_enabled.then(|| {
-            PageFillGate::new(chunk.len(), all_matches.len(), page_limit)
-        });
+        // Skip the gate for full scans, zero pages, and tiny chunks where
+        // the Vec<AtomicU32> + CAS traffic costs more than it saves.
+        let use_gate = gate_enabled && page_limit != 0 && chunk.len() >= threads.saturating_mul(2);
+        let gate = use_gate.then(|| PageFillGate::new(chunk.len(), all_matches.len(), page_limit));
+
+        // Carry original positions once per chunk so workers skip pointer
+        // div/mod in the hot parallel path. Skipped when masks are off.
+        let mask_on = ctx.content_masks.is_some() && ctx.mask_needle.is_some();
+        let chunk_orig: Vec<Option<usize>> = if mask_on {
+            chunk.iter().map(|f| original_index(ctx.files, f)).collect()
+        } else {
+            Vec::new()
+        };
 
         let chunk_results: Vec<(usize, &'a FileItem, Vec<GrepMatch>, u64, u64)> = chunk
             .par_iter()
             .enumerate()
             .map_init(
-                // Scratch for one file's matches. Capacity is per *chunk*, because map_init
-                // runs once per rayon worker per chunk: at 64K entries this
-                // allocated megabytes per worker per chunk, and a full-corpus
-                // grep runs hundreds of chunks. The vector still grows on
-                // demand, so this only changes how much is reserved up front.
-                || (Vec::with_capacity(1024), MmapSlot::default(), false, 0u64, 0u64),
+                // 8K covers most source files without realloc; the shrink
+                // below caps huge-file residue at 32K instead of 10MB.
+                || {
+                    (
+                        Vec::with_capacity(64 * 1024),
+                        MmapSlot::default(),
+                        false,
+                        0u64,
+                        0u64,
+                    )
+                },
                 |(buf, mmap_slot, aborted, read_ns, scan_ns), (local_idx, file)| {
                     let idx = chunk_offset + local_idx;
                     let found = (|| -> Option<Vec<GrepMatch>> {
@@ -717,19 +717,19 @@ where
                             return None;
                         }
 
+                        // One-chunk lookahead: warm chunk k+1's pages while
+                        // this worker reads its own file. Hint only.
+                        prefetch_ahead(files_to_search, idx, chunk.len(), ctx);
+
                         let t_read = phase_timing.then(std::time::Instant::now);
                         // Content-mask pre-check: skip the open+read entirely for
                         // files whose indexed byte classes cannot contain the
-                        // needle. Reading is ~95% of grep's wall time, so this is
-                        // the one check worth doing before touching the disk.
-                        //
-                        // Uses the file's position in the original slice, not the
-                        // loop index: `files_to_search` is filtered, so `idx` is
-                        // not the mask index.
+                        // needle. Uses the carried original position, not the
+                        // filtered loop index.
                         if let (Some(masks), Some(needle)) = (ctx.content_masks, ctx.mask_needle)
-    && let Some(pos) = original_index(ctx.files, file)
-    && let Some(mask) = masks.get(pos)
-    && needle.allows(mask) == Some(false)
+                            && let Some(pos) = chunk_orig.get(local_idx).copied().flatten()
+                            && let Some(mask) = masks.get(pos)
+                            && needle.allows(mask) == Some(false)
                         {
                             // Diagnostic only, and gated: an unconditional
                             // fetch_add here is a contended atomic on a single
@@ -779,6 +779,12 @@ where
                         Some(file_matches)
                     })();
 
+                    // Cap huge-file residue so one 10MB file doesn't pin RSS
+                    // on this worker for the rest of the scan.
+                    if buf.capacity() > 256 * 1024 {
+                        buf.shrink_to(32 * 1024);
+                    }
+
                     if let Some(g) = &gate {
                         g.record_done(local_idx, found.as_ref().map_or(0, Vec::len));
                     }
@@ -794,6 +800,7 @@ where
         aborted = resume_at != usize::MAX;
         files_consumed = resume_at.min(chunk_offset + chunk.len());
 
+        let before_matches = all_matches.len();
         for (batch_idx, file, file_matches, read_ns, scan_ns) in chunk_results {
             phase_read_ns += read_ns;
             phase_scan_ns += scan_ns;
@@ -824,6 +831,21 @@ where
 
         if page_filled || aborted {
             break;
+        }
+
+        // AIMD: empty chunks double (sparse scan, few barriers); near-page
+        // chunks reset to base so fill doesn't over-read; partial hits grow
+        // additively. Budget pressure clamps back to base scale.
+        let new_in_chunk = all_matches.len() - before_matches;
+        if new_in_chunk == 0 {
+            chunk_size = (chunk_size * 2).min(max_chunk);
+        } else if page_limit != usize::MAX && all_matches.len() * 2 >= page_limit {
+            chunk_size = base_chunk;
+        } else {
+            chunk_size = (chunk_size + base_chunk).min(max_chunk);
+        }
+        if time_budget.is_some_and(|b| search_start.elapsed() * 2 > b) {
+            chunk_size = chunk_size.min(base_chunk * 2);
         }
     }
 
@@ -862,4 +884,50 @@ where
         regex_fallback_error: None,
         literal_fallback: false,
     }
+}
+
+// One-chunk lookahead: posix_fadvise warms chunk k+1's pages while the pool
+// scans chunk k. Pure kernel hint — never changes results, only latency.
+#[cfg(unix)]
+#[inline]
+fn prefetch_ahead(
+    files_to_search: &[&FileItem],
+    idx: usize,
+    stride: usize,
+    ctx: &GrepContext<'_, '_>,
+) {
+    let Some(next) = files_to_search.get(idx.saturating_add(stride)).copied() else {
+        return;
+    };
+    // Same read-only eligibility as get_content_for_search: never warm
+    // pages for files the worker would skip without opening.
+    if next.is_binary() || next.size == 0 || next.size > ctx.budget.max_file_size {
+        return;
+    }
+    if let (Some(masks), Some(needle)) = (ctx.content_masks, ctx.mask_needle)
+        && let Some(pos) = original_index(ctx.files, next)
+        && let Some(mask) = masks.get(pos)
+        && needle.allows(mask) == Some(false)
+    {
+        return;
+    }
+    let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+    let abs = next.write_absolute_path(ctx.arena_for_file(next), ctx.base_path, &mut path_buf);
+    if let Ok(file) = std::fs::File::open(abs) {
+        use std::os::fd::AsRawFd;
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED);
+        }
+    }
+}
+
+// No page-cache hint API; the call site stays platform-independent.
+#[cfg(not(unix))]
+#[inline]
+fn prefetch_ahead(
+    _files_to_search: &[&FileItem],
+    _idx: usize,
+    _stride: usize,
+    _ctx: &GrepContext<'_, '_>,
+) {
 }

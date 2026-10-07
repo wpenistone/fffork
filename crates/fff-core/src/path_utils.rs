@@ -84,66 +84,128 @@ pub fn expand_tilde(path: &str) -> PathBuf {
 ///
 /// Zero-allocation: byte walks both directory part iterators in lockstep.
 pub fn calculate_distance_penalty(current_file: Option<&str>, candidate_dir: &str) -> i32 {
-    let Some(current_path) = current_file else {
-        return 0;
-    };
-    if candidate_dir.is_empty() {
-        return 0;
-    }
+    CurrentDir::new(current_file).penalty_for(candidate_dir)
+}
 
-    let current_bytes = current_path.as_bytes();
-    let cand_bytes = candidate_dir.as_bytes();
+/// Pre-split current file directory, built once per query and reused
+/// across all candidates. Same scoring as `calculate_distance_penalty`.
+pub struct CurrentDir<'a> {
+    parts: Vec<&'a [u8]>,
+}
 
-    let current_dir_bytes = match current_bytes.iter().rposition(|&b| b == b'/' || b == b'\\') {
-        Some(pos) => &current_bytes[..pos],
-        None => b"",
-    };
-    let cand_trimmed = match cand_bytes.iter().rposition(|&b| b != b'/' && b != b'\\') {
-        Some(pos) => &cand_bytes[..=pos],
-        None => b"",
-    };
-
-    if current_dir_bytes == cand_trimmed {
-        return 0;
-    }
-
-    let mut current_parts = current_dir_bytes
-        .split(|&b| b == b'/' || b == b'\\')
-        .filter(|s| !s.is_empty());
-    let mut cand_parts = cand_trimmed
-        .split(|&b| b == b'/' || b == b'\\')
-        .filter(|s| !s.is_empty());
-
-    let mut common_len = 0usize;
-    let mut current_total = 0usize;
-
-    loop {
-        match (current_parts.next(), cand_parts.next()) {
-            (Some(a), Some(b)) => {
-                current_total += 1;
-                if a == b {
-                    common_len += 1;
-                } else {
-                    current_total += current_parts.count();
-                    break;
-                }
-            }
-            (Some(_), None) => {
-                current_total += 1 + current_parts.count();
-                break;
-            }
-            (None, _) => {
-                break;
-            }
+impl<'a> CurrentDir<'a> {
+    pub fn new(current_file: Option<&'a str>) -> Self {
+        let Some(path) = current_file else {
+            return Self { parts: Vec::new() };
+        };
+        let bytes = path.as_bytes();
+        let dir = match bytes.iter().rposition(|&b| b == b'/' || b == b'\\') {
+            Some(pos) => &bytes[..pos],
+            None => b"".as_slice(),
+        };
+        Self {
+            parts: dir
+                .split(|&b| b == b'/' || b == b'\\')
+                .filter(|s| !s.is_empty())
+                .collect(),
         }
     }
 
-    let depth_from_common = current_total - common_len;
-    if depth_from_common == 0 {
-        return 0;
+    pub fn is_empty(&self) -> bool {
+        self.parts.is_empty()
     }
 
-    (-(depth_from_common as i32)).max(-20)
+    pub fn penalty_for(&self, candidate_dir: &str) -> i32 {
+        if self.parts.is_empty() || candidate_dir.is_empty() {
+            return 0;
+        }
+        let cand_bytes = candidate_dir.as_bytes();
+        let cand_trimmed = match cand_bytes.iter().rposition(|&b| b != b'/' && b != b'\\') {
+            Some(pos) => &cand_bytes[..=pos],
+            None => b"".as_slice(),
+        };
+        let mut cand_parts = cand_trimmed
+            .split(|&b| b == b'/' || b == b'\\')
+            .filter(|s| !s.is_empty());
+        let mut common_len = 0usize;
+        let mut current_total = 0usize;
+        let mut ci = 0usize;
+        loop {
+            let cur = self.parts.get(ci).copied();
+            let cand = cand_parts.next();
+            ci += cur.is_some() as usize;
+            match (cur, cand) {
+                (Some(a), Some(b)) => {
+                    current_total += 1;
+                    if a == b {
+                        common_len += 1;
+                    } else {
+                        current_total += self.parts.len() - ci;
+                        break;
+                    }
+                }
+                (Some(_), None) => {
+                    current_total += 1 + (self.parts.len() - ci);
+                    break;
+                }
+                (None, _) => break,
+            }
+        }
+        let depth = current_total.saturating_sub(common_len);
+        if depth == 0 {
+            return 0;
+        }
+        (-(depth as i32)).max(-20)
+    }
+}
+
+/// Memoized distance penalties keyed by `parent_dir_index`. Scoring loops
+/// revisit the same dirs thousands of times per query; this keeps the
+/// first computation and reuses it. Size once per query with the dir count.
+pub struct DirPenaltyMemo {
+    penalties: Vec<i32>,
+}
+
+impl DirPenaltyMemo {
+    pub fn new(dir_count: usize) -> Self {
+        Self {
+            penalties: vec![i32::MAX; dir_count],
+        }
+    }
+
+    pub fn penalty_for(&mut self, cur: &CurrentDir, dir_idx: usize, candidate_dir: &str) -> i32 {
+        if let Some(&p) = self.penalties.get(dir_idx)
+            && p != i32::MAX
+        {
+            return p;
+        }
+        let p = cur.penalty_for(candidate_dir);
+        if dir_idx < self.penalties.len() {
+            self.penalties[dir_idx] = p;
+        }
+        p
+    }
+
+    pub fn get(&self, dir_idx: usize) -> Option<i32> {
+        match self.penalties.get(dir_idx) {
+            Some(&p) if p != i32::MAX => Some(p),
+            _ => None,
+        }
+    }
+
+    pub fn penalty_for_grow(&mut self, cur: &CurrentDir, dir_idx: usize, candidate_dir: &str) -> i32 {
+        if let Some(&p) = self.penalties.get(dir_idx)
+            && p != i32::MAX
+        {
+            return p;
+        }
+        let p = cur.penalty_for(candidate_dir);
+        if dir_idx >= self.penalties.len() {
+            self.penalties.resize(dir_idx + 1, i32::MAX);
+        }
+        self.penalties[dir_idx] = p;
+        p
+    }
 }
 
 #[cfg(test)]
@@ -195,7 +257,10 @@ mod tests {
     fn byte_walk_matches_path_components() {
         let cases: &[(Option<&str>, &str)] = &[
             (Some("examples/user/test/main.rs"), "examples/user/test/"),
-            (Some("examples/user/test/subdir/file.rs"), "examples/user/test/"),
+            (
+                Some("examples/user/test/subdir/file.rs"),
+                "examples/user/test/",
+            ),
             (Some("crates/fff-core/src/score.rs"), "crates/fff-core/src/"),
             (Some("crates/fff-core/src/score.rs"), "score/"),
             (Some("src/score.rs"), "src/"),
@@ -209,6 +274,25 @@ mod tests {
             let b = penalty_via_components(*cur, cand);
             assert_eq!(a, b, "penalty mismatch cur={cur:?} cand={cand:?}");
         }
+    }
+
+    #[test]
+    fn dir_memo_matches_direct_and_reuses() {
+        let cur_file = Some("examples/user/test/subdir/file.rs");
+        let cur = CurrentDir::new(cur_file);
+        let dirs = ["examples/user/test/", "examples/user/", "other/", ""];
+        let mut memo = DirPenaltyMemo::new(dirs.len());
+        for (i, d) in dirs.iter().enumerate() {
+            let a = memo.penalty_for(&cur, i, d);
+            assert_eq!(a, calculate_distance_penalty(cur_file, d));
+            assert_eq!(memo.penalty_for(&cur, i, d), a);
+        }
+        // Out-of-range index computes without caching.
+        let p = memo.penalty_for(&cur, 99, "examples/user/test/");
+        assert_eq!(
+            p,
+            calculate_distance_penalty(cur_file, "examples/user/test/")
+        );
     }
 
     #[test]

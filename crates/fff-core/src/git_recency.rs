@@ -22,6 +22,21 @@ impl Default for GitRecencyConfig {
 
 const MAX_COMMITS_HARD_CAP: usize = 128;
 
+/// Walk multiplier override (`FFF_GIT_RECENCY_WALK_MULT`).
+fn walk_mult_override() -> Option<usize> {
+    std::env::var("FFF_GIT_RECENCY_WALK_MULT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n >= 1)
+}
+
+/// Max commits override (`FFF_GIT_RECENCY_MAX_COMMITS`, 0 disables).
+fn max_commits_override() -> Option<usize> {
+    std::env::var("FFF_GIT_RECENCY_MAX_COMMITS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+}
+
 // Computes per file recency bonuses
 #[tracing::instrument(skip(repo), level = tracing::Level::DEBUG)]
 pub(crate) fn compute_git_recency(
@@ -39,7 +54,9 @@ pub(crate) fn compute_git_recency(
     let head_branch = head_ref.shorthand().ok().map(str::to_owned);
 
     let subdir = base_path_within_repo(repo, base_path);
-    let max_commits = config.max_commits.min(MAX_COMMITS_HARD_CAP);
+    let max_commits = max_commits_override()
+        .unwrap_or(config.max_commits)
+        .min(MAX_COMMITS_HARD_CAP);
 
     let mut revwalk = repo.revwalk().ok()?;
     revwalk.push(head).ok()?;
@@ -55,9 +72,12 @@ pub(crate) fn compute_git_recency(
 
     let mut scores: AHashMap<String, i16> = AHashMap::new();
     let mut qualifying = 0usize;
-    // Bounds total walked commits so histories full of skipped (merge/bulk)
-    // commits can't turn the walk into a full history scan.
-    let walk_budget = (max_commits * 5).max(64);
+    // Adaptive walk budget: bulk/merge-heavy histories skip more commits, so
+    // scale the window with the skip density instead of a fixed `* 5`. Stays
+    // off the searchable path (callers index first, apply recency after).
+    let density_mult = (config.max_files_per_commit / 25).clamp(0, 8);
+    let mult = walk_mult_override().unwrap_or(5 + density_mult);
+    let walk_budget = (max_commits.saturating_mul(mult)).clamp(64, 1024);
 
     for oid in revwalk.take(walk_budget) {
         if qualifying >= max_commits {

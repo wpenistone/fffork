@@ -9,8 +9,7 @@ thread_local! {
 
 fn ensure_capacity(buf: &mut Vec<u8>, required: usize) {
     if buf.capacity() < required {
-        let len = buf.len();
-        buf.reserve(required - len);
+        buf.reserve(required.saturating_sub(buf.len()));
     }
 }
 
@@ -34,27 +33,6 @@ where
     });
 }
 
-pub fn sort_by_key_with_buffer<T, K, F>(slice: &mut [T], key_fn: F)
-where
-    K: Ord,
-    F: FnMut(&T) -> K,
-{
-    TLS_SORT_BUFFER.with(|cell| {
-        let mut buf = cell.borrow_mut();
-        let align = std::mem::align_of::<MaybeUninit<T>>();
-        let size = std::mem::size_of::<MaybeUninit<T>>();
-        let required = slice.len().saturating_mul(size).saturating_add(align);
-        ensure_capacity(&mut buf, required);
-
-        let ptr = buf.as_mut_ptr();
-        let offset = ptr.align_offset(align);
-        let typed = unsafe {
-            std::slice::from_raw_parts_mut(ptr.add(offset) as *mut MaybeUninit<T>, slice.len())
-        };
-        glidesort::sort_with_buffer_by_key(slice, typed, key_fn);
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,7 +47,7 @@ mod tests {
     #[test]
     fn test_sort_by_key_with_buffer() {
         let mut data = vec![(1, 50), (2, 20), (3, 80), (4, 10), (5, 90)];
-        sort_by_key_with_buffer(&mut data, |a| a.1);
+        sort_with_buffer(&mut data, |a, b| a.1.cmp(&b.1));
         assert_eq!(data, vec![(4, 10), (2, 20), (1, 50), (3, 80), (5, 90)]);
     }
 

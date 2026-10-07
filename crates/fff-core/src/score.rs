@@ -1,17 +1,17 @@
 use crate::{
     git::is_modified_status,
     index::constraints::apply_constraints,
-    path_utils::calculate_distance_penalty,
-    simd_path::{ArenaPtr, MAX_PATH_CHUNKS},
-    sort_buffer::{sort_by_key_with_buffer, sort_with_buffer},
-    types::{DirItem, FileItem, Score, ScoringContext},
+    path_utils::{CurrentDir, DirPenaltyMemo, calculate_distance_penalty},
+    simd_path::{ArenaPtr, MAX_FRIZBEE_CHUNKS, MAX_PATH_CHUNKS},
+    sort_buffer::sort_with_buffer,
+    types::{DirItem, FileItem, Score, ScoringContext, VENDORED_PATH_PENALTY},
 };
 use fff_query_parser::{FFFQuery, FuzzyQuery};
-use neo_frizbee::{ Scoring};
+use neo_frizbee::Scoring;
 use rayon::prelude::*;
 use smallvec::SmallVec;
-use std::sync::Arc;
 use std::path::MAIN_SEPARATOR;
+use std::sync::Arc;
 
 /// Raw frizbee match lists are expensive (full corpus Ãƒâ€” needle). Cache them
 /// across identical searches on an unchanged index generation Ã¢â‚¬â€ typing and
@@ -40,7 +40,9 @@ impl RawMatchCache {
     }
 
     fn insert(&mut self, key: RawMatchKey, matches: Arc<Vec<neo_frizbee::Match>>) {
-        let bytes = matches.len().saturating_mul(std::mem::size_of::<neo_frizbee::Match>());
+        let bytes = matches
+            .len()
+            .saturating_mul(std::mem::size_of::<neo_frizbee::Match>());
         if bytes > RAW_MATCH_CACHE_MAX_BYTES {
             return;
         }
@@ -71,8 +73,33 @@ impl RawMatchCache {
     }
 }
 
-pub(crate) use crate::matcher::{capture_hit_indices, with_hit_capture};
 use crate::matcher::*;
+pub(crate) use crate::matcher::{capture_hit_indices, with_hit_capture};
+
+static AVX2_PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static PHASE_TIMING_FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static FORCE_SCALAR_FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+fn phase_timing() -> bool {
+    *PHASE_TIMING_FLAG.get_or_init(|| std::env::var_os("FFF_PHASE_TIMING").is_some())
+}
+
+fn force_scalar() -> bool {
+    *FORCE_SCALAR_FLAG.get_or_init(|| std::env::var_os("FFF_FORCE_SCALAR").is_some())
+}
+
+fn simd_available() -> bool {
+    *AVX2_PROBE.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            is_x86_feature_detected!("avx2") && is_x86_feature_detected!("sse4.1")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    })
+}
 
 fn match_fuzzy_parts(
     fuzzy_parts: &[&str],
@@ -98,13 +125,23 @@ fn match_fuzzy_parts(
     // The cap comes from the machine profile (cores, bounded by LLC), not a
     // literal: `.min(8)` starved 32-core servers and oversubscribed phones.
     let scan_cap = crate::machine::scan_thread_cap();
+    // Two-part narrowing starts from the longer part (rejects more, so
+    // the second pass scans less); each part keeps its own-len typo cap.
+    let reverse_pair = valid_parts.len() == 2 && valid_parts[1].len() > valid_parts[0].len();
+    let first_part: &str = if reverse_pair {
+        valid_parts[1]
+    } else {
+        valid_parts[0]
+    };
+    let mut first_options = *options;
+    first_options.max_typos = options.max_typos.map(|t| t.min(first_part.len() as u16));
     // Thread count comes from the work estimate alone (no size cutoffs); the
     // picker's cached max path length keeps this O(1) per query.
     let threads = effective_match_threads(
         working_files.len(),
-        valid_parts[0].len(),
+        first_part.len(),
         max_path_len,
-        options.max_typos,
+        first_options.max_typos,
         scan_cap.max(max_threads),
     );
 
@@ -112,13 +149,13 @@ fn match_fuzzy_parts(
     // then re-score with validated SW that replicates frizbee's gap model
     // on the SAME trimmed slices with the SAME include_prefix semantics.
     let first_part_matches = {
-        let part_timing = std::env::var_os("FFF_PHASE_TIMING").is_some();
+        let part_timing = phase_timing();
         let t_prefilter = std::time::Instant::now();
         // Phase 1: frizbee prefilter only (skip its SW). The skip_sw path
         // encodes (start_pos_adj, end_pos) in (score, end_col).
         let np = crate::presence::NeedlePresence::new(
-            valid_parts[0].as_bytes(),
-            options.max_typos.unwrap_or(u16::MAX),
+            first_part.as_bytes(),
+            first_options.max_typos.unwrap_or(u16::MAX),
         );
         // Index reject before frizbee: only resolve paths that pass
         // length+presence. Only worth the extra scan when the needle can
@@ -126,7 +163,7 @@ fn match_fuzzy_parts(
         // match almost everything Ã¢â‚¬â€ skip so we don't scan twice.
         let mut cand: Vec<u32> = Vec::new();
         let t_cand = std::time::Instant::now();
-        let try_cand = valid_parts[0].len() >= 6 && working_files.len() >= 8_192;
+        let try_cand = first_part.len() >= 6 && working_files.len() >= 8_192;
         if try_cand {
             // Probe presence selectivity on a small sample first. A full
             // 227k scan is wasted when the needle is too common to reject.
@@ -134,7 +171,7 @@ fn match_fuzzy_parts(
             let stride = (working_files.len() / n_probe).max(1);
             let mut pass = 0usize;
             let mut probed = 0usize;
-            let needle_b = valid_parts[0].as_bytes();
+            let needle_b = first_part.as_bytes();
             for i in (0..working_files.len()).step_by(stride) {
                 let f = working_files.index(i);
                 let mask = f.presence_mask();
@@ -176,9 +213,9 @@ fn match_fuzzy_parts(
         let mut matches = if use_cand {
             let cand = cand.as_slice();
             crate::gate::gate_match_range(
-                valid_parts[0].as_bytes(),
+                first_part.as_bytes(),
                 cand.len(),
-                options.max_typos.unwrap_or(u16::MAX),
+                first_options.max_typos.unwrap_or(u16::MAX),
                 threads,
                 |i| cand[i as usize],
                 |i| working_files.index(cand[i as usize] as usize),
@@ -186,9 +223,9 @@ fn match_fuzzy_parts(
             )
         } else {
             crate::gate::gate_match_range(
-                valid_parts[0].as_bytes(),
+                first_part.as_bytes(),
                 working_files.len(),
-                options.max_typos.unwrap_or(u16::MAX),
+                first_options.max_typos.unwrap_or(u16::MAX),
                 threads,
                 |i| i,
                 |i| working_files.index(i as usize),
@@ -199,20 +236,20 @@ fn match_fuzzy_parts(
         let prefilter_ms = t_prefilter.elapsed().as_secs_f64() * 1e3;
 
         // Phase 2: re-score with inter-sequence SW on trimmed windows.
-        let has_upper = valid_parts[0].chars().any(|c| c.is_uppercase());
+        let has_upper = first_part.chars().any(|c| c.is_uppercase());
         let p = crate::interseq_sw::SwParams::for_query(has_upper);
-        let needle = valid_parts[0].as_bytes();
+        let needle = first_part.as_bytes();
 
         // Query intent: `name.ext` Ã¢â‚¬â€ pin exact filename hits among the match
         // set (not a full-corpus walk; score_one already ranks exact names).
         let looks_like_filename = {
-            let q = valid_parts[0];
+            let q = first_part;
             q.len() >= 4 && q.contains('.') && !q.contains('/')
         };
         let mut exact_name_hits: Vec<u32> = Vec::new();
         let t_exact = std::time::Instant::now();
         if looks_like_filename {
-            let q = valid_parts[0];
+            let q = first_part;
             let qb = q.as_bytes();
             // Reused scratch: `filename_cow` would heap-allocate per candidate
             // whose filename straddles a chunk, and this loop walks every match.
@@ -233,166 +270,222 @@ fn match_fuzzy_parts(
 
         // SW scoring (collapse removed: cheap rank disagreed with SW
         // on real corpora; reordering would be a UX regression).
-        let t_collect = std::time::Instant::now();
         let wins_ms = 0.0f64;
         let samp_ms = 0.0f64;
-        if std::env::var_os("FFF_PHASE_TIMING").is_some() {
-            eprintln!("PHASE cand_ms={cand_ms:.1} wins_ms={wins_ms:.1} samp_ms={samp_ms:.1} collapsed=false n={}", matches.len());
+        if phase_timing() {
+            eprintln!(
+                "PHASE cand_ms={cand_ms:.1} wins_ms={wins_ms:.1} samp_ms={samp_ms:.1} collapsed=false n={}",
+                matches.len()
+            );
         }
         let t_sw = std::time::Instant::now();
         {
-
-        // Chunked scoring: process at most CHUNK matches of metadata at a
-        // time so peak working set stays small (faults/RSS).
-        // 32k Ãƒâ€” ~16 B Ãƒâ€” a few arrays Ã¢â€°Ë† 1 MB peak, vs a full 227k-wide set.
-        const CHUNK: usize = 32 * 1024;
-        thread_local! {
-            static TRIMS: std::cell::RefCell<Vec<crate::matcher::Trim>> =
-                const { std::cell::RefCell::new(Vec::new()) };
-            static SCORES: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
-            static ECOLS: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
-            static ORDER: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
-            static PERM_SCORES: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
-            static PERM_ECOLS: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
-        }
-        fn take_tls<T: Default>(cell: &std::cell::RefCell<Vec<T>>, min_cap: usize) -> Vec<T> {
-            let mut b = cell.borrow_mut();
-            b.clear();
-            if b.capacity() < min_cap {
-                b.reserve(min_cap);
+            // Chunked scoring: process at most CHUNK matches of metadata at a
+            // time so peak working set stays small (faults/RSS).
+            // 32k Ãƒâ€” ~16 B Ãƒâ€” a few arrays Ã¢â€°Ë† 1 MB peak, vs a full 227k-wide set.
+            const CHUNK: usize = 32 * 1024;
+            thread_local! {
+                static TRIMS: std::cell::RefCell<Vec<crate::matcher::Trim>> =
+                    const { std::cell::RefCell::new(Vec::new()) };
+                static SCORES: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
+                static ECOLS: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
+                static ORDER: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+                static PERM_SCORES: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
+                static PERM_ECOLS: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
             }
-            std::mem::take(&mut *b)
-        }
-        fn reclaim<T>(b: &mut Vec<T>, v: Vec<T>) {
-            *b = v;
-            // Cap retained capacity so one huge match set does not pin TLS
-            // forever, but keep a full chunk warm (avoids re-alloc/re-fault).
-            const TLS_RETAIN: usize = CHUNK + 1024;
-            if b.capacity() > TLS_RETAIN {
-                b.shrink_to(TLS_RETAIN);
+            fn take_tls<T: Default>(cell: &std::cell::RefCell<Vec<T>>, min_cap: usize) -> Vec<T> {
+                let mut b = cell.borrow_mut();
+                b.clear();
+                if b.capacity() < min_cap {
+                    b.reserve(min_cap);
+                }
+                std::mem::take(&mut *b)
             }
-        }
+            fn take_tls_cap<T>(cell: &std::cell::RefCell<Vec<T>>, cap: usize) -> Vec<T> {
+                let mut b = cell.borrow_mut();
+                b.clear();
+                if b.capacity() < cap {
+                    b.reserve(cap);
+                }
+                std::mem::take(&mut *b)
+            }
+            // Length without zero-fill: every byte must be overwritten before
+            // any read (all score paths below write their full range; the
+            // max_len==0 batch explicitly fills zeros).
+            fn set_len_uninit<T>(v: &mut Vec<T>, n: usize) {
+                v.reserve(n.saturating_sub(v.capacity()));
+                unsafe { v.set_len(n) };
+            }
+            fn reclaim<T>(b: &mut Vec<T>, v: Vec<T>) {
+                *b = v;
+                // Cap retained capacity so one huge match set does not pin TLS
+                // forever, but keep a full chunk warm (avoids re-alloc/re-fault).
+                const TLS_RETAIN: usize = CHUNK + 1024;
+                if b.capacity() > TLS_RETAIN {
+                    b.shrink_to(TLS_RETAIN);
+                }
+            }
 
-        #[cfg(target_arch = "x86_64")]
-        // Portability: FFF_FORCE_SCALAR=1 skips AVX2 (SSE2/scalar path only).
-        // Used to measure low-spec chips; must stay result-identical.
-        let force_scalar = std::env::var_os("FFF_FORCE_SCALAR").is_some();
-        #[cfg(target_arch = "x86_64")]
-        let avx2_ok = if force_scalar {
-            false
-        } else {
-            is_x86_feature_detected!("avx2") && is_x86_feature_detected!("sse4.1")
-        };
-        #[cfg(not(target_arch = "x86_64"))]
-        let avx2_ok = false;
+            // Portability: FFF_FORCE_SCALAR=1 skips AVX2 (SSE2/scalar path only).
+            // Used to measure low-spec chips; must stay result-identical.
+            let force_scalar = force_scalar();
+            let avx2_ok = if force_scalar {
+                false
+            } else {
+                simd_available()
+            };
 
-        // u8 fast path: 32 lanes, valid when max score < 256.
-        let use_u8 = avx2_ok && needle.len() <= 14;
-        let batch_sz: usize = if use_u8 { 32 } else { 16 };
-        let use_simd = avx2_ok && needle.len() <= 16;
+            // u8 fast path: 32 lanes, valid when the max repr. score < 256
+            // (u8_safe) and the needle fits the kernel's 32-row domain.
+            let use_u8 = avx2_ok && needle.len() <= 32 && p.u8_safe(needle.len());
+            let batch_sz: usize = if use_u8 { 32 } else { 16 };
+            let use_simd = avx2_ok && needle.len() <= 16;
 
-        // Sub-phase accounting, accumulated across rayon workers.
-        let t_collect_us = std::sync::atomic::AtomicU64::new(0);
-        let t_batch_us = std::sync::atomic::AtomicU64::new(0);
-        let t_assemble_us = std::sync::atomic::AtomicU64::new(0);
-        let collect_ms = 0.0f64;
-        let batch_ms = 0.0f64;
-        let assemble_ms = 0.0f64;
-        let timing = part_timing;
+            // Sub-phase accounting, accumulated across rayon workers.
+            let t_collect_us = std::sync::atomic::AtomicU64::new(0);
+            let t_batch_us = std::sync::atomic::AtomicU64::new(0);
+            let t_assemble_us = std::sync::atomic::AtomicU64::new(0);
+            let timing = part_timing;
 
-        // Chunks are disjoint slices of `matches` and every scratch buffer is
-        // thread-local, so this fans out safely.
-        //
-        // Only fan out when there is more than one chunk: a single chunk has
-        // nothing to split, and the fork/join alone measured ~8x the whole
-        // serial body on a few-hundred-match corpus (782us vs 97us).
-        let sw_body = |matches_chunk: &mut [neo_frizbee::Match]| {
-            let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-            let t_chunk = std::time::Instant::now();
-            let n_matches = matches_chunk.len();
-            let mut trims = TRIMS.with(|c| take_tls(c, n_matches));
-            trims.clear();
-            {
-                for (mi, m) in matches_chunk.iter().enumerate() {
-                    let file = working_files.index(m.index as usize);
-                    // Prefetch next FileItem (sequential over this chunk).
-                    #[cfg(target_arch = "x86_64")]
-                    if mi + 1 < n_matches {
-                        let nf = working_files.index(matches_chunk[mi + 1].index as usize);
-                        unsafe {
-                            std::arch::x86_64::_mm_prefetch(
-                                (nf as *const crate::types::FileItem).cast::<i8>(),
-                                std::arch::x86_64::_MM_HINT_T0,
-                            );
+            // Chunks are disjoint slices of `matches` and every scratch buffer is
+            // thread-local, so this fans out safely.
+            //
+            // Only fan out when there is more than one chunk: a single chunk has
+            // nothing to split, and the fork/join alone measured ~8x the whole
+            // serial body on a few-hundred-match corpus (782us vs 97us).
+            let sw_body = |matches_chunk: &mut [neo_frizbee::Match]| {
+                let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+                let t_chunk = std::time::Instant::now();
+                let n_matches = matches_chunk.len();
+                let mut trims = TRIMS.with(|c| take_tls(c, n_matches));
+                trims.clear();
+                {
+                    for (mi, m) in matches_chunk.iter().enumerate() {
+                        let file = working_files.index(m.index as usize);
+                        // Prefetch next FileItem (sequential over this chunk).
+                        #[cfg(target_arch = "x86_64")]
+                        if mi + 1 < n_matches {
+                            let nf = working_files.index(matches_chunk[mi + 1].index as usize);
+                            unsafe {
+                                std::arch::x86_64::_mm_prefetch(
+                                    (nf as *const crate::types::FileItem).cast::<i8>(),
+                                    std::arch::x86_64::_MM_HINT_T0,
+                                );
+                            }
+                        }
+                        let w = decode_match_window(m, file.path.byte_len as usize);
+                        trims.push(crate::matcher::Trim::from_window(w));
+                    }
+                }
+                let _ = t_chunk;
+                if timing {
+                    t_collect_us.fetch_add(
+                        t_chunk.elapsed().as_micros() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+
+                let t_batch = std::time::Instant::now();
+                // 64-byte align the batch output buffers: batch_sz=32 u16 is
+                // exactly one cache line, so aligned batches do not false-share
+                // at par_chunks boundaries (MESI line ping-pong). Lengths are
+                // set without zero-fill; every lane is written before any read.
+                let mut scores = SCORES.with(|c| take_tls_cap(c, n_matches + 32));
+                set_len_uninit(&mut scores, n_matches + 32);
+                let mut end_cols = ECOLS.with(|c| take_tls_cap(c, n_matches + 32));
+                set_len_uninit(&mut end_cols, n_matches + 32);
+
+                // Scalar lanes skip staging/SoA/order/par entirely: one serial
+                // pass over the trims with a reused window buffer. Same bytes in.
+                let scalar_direct = !use_simd;
+                if scalar_direct {
+                    thread_local! {
+                        static SWIN: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+                    }
+                    let mut max_trim = 0usize;
+                    for t in trims.iter() {
+                        max_trim = max_trim.max((t.end - t.start) as usize);
+                    }
+                    let mut win = SWIN.with(|c| take_tls_cap(c, max_trim));
+                    set_len_uninit(&mut win, max_trim);
+                    for (i, t) in trims.iter().enumerate() {
+                        let wlen = (t.end - t.start) as usize;
+                        if wlen == 0 {
+                            scores[i] = 0;
+                            end_cols[i] = 0;
+                            continue;
+                        }
+                        let file = working_files.index(t.file_idx as usize);
+                        file.path.copy_window_to(
+                            arena,
+                            t.start as u32,
+                            t.end as u32,
+                            &mut win[..wlen],
+                        );
+                        let (sc, ec) = crate::interseq_sw::score_one_scalar_full(
+                            needle,
+                            &win[..wlen],
+                            &p,
+                            t.include_prefix(),
+                        );
+                        scores[i] = sc;
+                        end_cols[i] = ec;
+                    }
+                    SWIN.with(|c| reclaim(&mut c.borrow_mut(), win));
+                    if timing {
+                        t_batch_us.fetch_add(
+                            t_batch.elapsed().as_micros() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                } else {
+                    // Length-ordered batches within the chunk so per-batch max_len
+                    // stays close to the lanes' own lengths.
+                    let mut order = ORDER.with(|c| take_tls_cap(c, n_matches));
+                    set_len_uninit(&mut order, n_matches);
+                    // Counting sort by trim length (stable, O(n)). Batch grouping only
+                    // affects SIMD max_len, not per-match scores. A single batch is
+                    // already one group, so identity order is the same grouping.
+                    if n_matches > batch_sz {
+                        let mut cnt = [0u32; 129];
+                        for i in 0..n_matches {
+                            let (s, e) = (trims[i].start, trims[i].end);
+                            let l = (e - s).min(128) as usize;
+                            cnt[l] += 1;
+                        }
+                        let mut start = [0u32; 129];
+                        let mut acc = 0u32;
+                        for l in 0..129 {
+                            start[l] = acc;
+                            acc += cnt[l];
+                        }
+                        for i in 0..n_matches {
+                            let (s, e) = (trims[i].start, trims[i].end);
+                            let l = (e - s).min(128) as usize;
+                            order[start[l] as usize] = i as u32;
+                            start[l] += 1;
+                        }
+                    } else {
+                        for i in 0..n_matches {
+                            order[i] = i as u32;
                         }
                     }
-                    let w = decode_match_window(m, file.path.byte_len as usize);
-                    trims.push(crate::matcher::Trim::from_window(w));
-                }
-            }
-            let _ = t_chunk;
-            if timing { t_collect_us.fetch_add(t_chunk.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); }
+                    let mut perm_scores = PERM_SCORES.with(|c| take_tls_cap(c, n_matches + 32));
+                    set_len_uninit(&mut perm_scores, n_matches + 32);
+                    let mut perm_ecols = PERM_ECOLS.with(|c| take_tls_cap(c, n_matches + 32));
+                    set_len_uninit(&mut perm_ecols, n_matches + 32);
 
-            let t_batch = std::time::Instant::now();
-            // 64-byte align the batch output buffers: batch_sz=32 u16 is
-            // exactly one cache line, so aligned batches do not false-share
-            // at par_chunks boundaries (MESI line ping-pong).
-            let mut scores = SCORES.with(|c| take_tls(c, n_matches + 32));
-            scores.clear();
-            scores.resize(n_matches + 32, 0);
-            let mut end_cols = ECOLS.with(|c| take_tls(c, n_matches + 32));
-            end_cols.clear();
-            end_cols.resize(n_matches + 32, 0);
+                    fn align64_u16(buf: &mut [u16], n: usize) -> &mut [u16] {
+                        let addr = buf.as_ptr() as usize;
+                        let pad = ((64 - (addr % 64)) % 64) / 2;
+                        &mut buf[pad..pad + n]
+                    }
+                    let ps_aligned = align64_u16(&mut perm_scores, n_matches);
+                    let pe_aligned = align64_u16(&mut perm_ecols, n_matches);
 
-            // Length-ordered batches within the chunk so per-batch max_len
-            // stays close to the lanes' own lengths.
-            let mut order = ORDER.with(|c| take_tls(c, n_matches));
-            order.clear();
-            // Counting sort by trim length (stable, O(n)). Batch grouping only
-            // affects SIMD max_len, not per-match scores.
-            {
-                let mut cnt = [0u32; 129];
-                for i in 0..n_matches {
-                    let (s, e) = (trims[i].start, trims[i].end);
-                    let l = (e - s).min(128) as usize;
-                    cnt[l] += 1;
-                }
-                let mut start = [0u32; 129];
-                let mut acc = 0u32;
-                for l in 0..129 {
-                    start[l] = acc;
-                    acc += cnt[l];
-                }
-                order.resize(n_matches, 0);
-                for i in 0..n_matches {
-                    let (s, e) = (trims[i].start, trims[i].end);
-                    let l = (e - s).min(128) as usize;
-                    order[start[l] as usize] = i as u32;
-                    start[l] += 1;
-                }
-            }
-            let mut perm_scores = PERM_SCORES.with(|c| take_tls(c, n_matches + 32));
-            perm_scores.clear();
-            perm_scores.resize(n_matches + 32, 0);
-            let mut perm_ecols = PERM_ECOLS.with(|c| take_tls(c, n_matches + 32));
-            perm_ecols.clear();
-            perm_ecols.resize(n_matches + 32, 0);
-
-            fn align64_u16(buf: &mut [u16], n: usize) -> &mut [u16] {
-                let addr = buf.as_ptr() as usize;
-                let pad = ((64 - (addr % 64)) % 64) / 2;
-                &mut buf[pad..pad + n]
-            }
-            let ps_aligned = align64_u16(&mut perm_scores, n_matches);
-            let pe_aligned = align64_u16(&mut perm_ecols, n_matches);
-
-            crate::parallelism::run_on_bg_pool(|| {
-                use rayon::prelude::*;
-                order
-                    .par_chunks(batch_sz)
-                    .zip(ps_aligned.par_chunks_mut(batch_sz))
-                    .zip(pe_aligned.par_chunks_mut(batch_sz))
-                    .for_each(|((ord, sc_out), ec_out)| {
+                    // One batch = one (ord, out) triple. A pure indexed map, so
+                    // serial and parallel runs write bit-identical outputs.
+                    let score_batch = |ord: &[u32], sc_out: &mut [u16], ec_out: &mut [u16]| {
                         let n = ord.len();
                         let mut max_len = 0usize;
                         for &oi in ord.iter() {
@@ -416,22 +509,24 @@ fn match_fuzzy_parts(
                             std::mem::take(&mut *b)
                         });
                         stage.truncate(buf_len);
-                        // Zero only the padding lanes.
-                        for k in n..batch_sz {
-                            stage[k * rows..(k + 1) * rows].fill(0);
+                        // Zero only the padding lanes (SIMD path reads them).
+                        if n > 8 {
+                            for k in n..batch_sz {
+                                stage[k * rows..(k + 1) * rows].fill(0);
+                            }
                         }
 
                         let mut prefix_mask: u32 = 0;
                         let mut next_ptrs = [std::ptr::null::<u8>(); MAX_PATH_CHUNKS];
                         for (k, &oi) in ord.iter().enumerate() {
                             let t = trims[oi as usize];
-                            let (fi, s, e, inc_prefix) = (t.file_idx, t.start, t.end, t.include_prefix());
+                            let (fi, s, e, inc_prefix) =
+                                (t.file_idx, t.start, t.end, t.include_prefix());
                             let file = working_files.index(fi as usize);
                             #[cfg(target_arch = "x86_64")]
                             if k + 1 < n {
-                                let nf = working_files.index(
-                                    trims[ord[k + 1] as usize].file_idx as usize,
-                                );
+                                let nf = working_files
+                                    .index(trims[ord[k + 1] as usize].file_idx as usize);
                                 let nptrs = nf.path.resolve_ptrs(arena, &mut next_ptrs);
                                 for &p in nptrs.iter().take(4) {
                                     unsafe {
@@ -446,10 +541,31 @@ fn match_fuzzy_parts(
                             let dst = &mut stage[k * rows..k * rows + wlen];
                             file.path.copy_window_to(arena, s as u32, e as u32, dst);
                             // Pad the rest of this lane to zeros (SoA expects it).
-                            stage[k * rows + wlen..(k + 1) * rows].fill(0);
+                            // Scalar path never reads the tail; skip the memset.
+                            if n > 8 {
+                                stage[k * rows + wlen..(k + 1) * rows].fill(0);
+                            }
                             if inc_prefix {
                                 prefix_mask |= 1u32 << k;
                             }
+                        }
+
+                        // Tiny trailing chunks cannot amortize a 32-wide
+                        // transpose + kernel; score them scalar from stage.
+                        if n <= 8 {
+                            for (k, &oi) in ord.iter().enumerate() {
+                                let tw = trims[oi as usize];
+                                let (s, e, inc_prefix) =
+                                    (tw.start, tw.end, tw.include_prefix());
+                                let src = &stage[k * rows..k * rows + (e - s) as usize];
+                                let (sc, ec) = crate::interseq_sw::score_one_scalar_full(
+                                    needle, src, &p, inc_prefix,
+                                );
+                                sc_out[k] = sc;
+                                ec_out[k] = ec;
+                            }
+                            STAGE.with(|c| *c.borrow_mut() = stage);
+                            return;
                         }
 
                         #[cfg(target_arch = "x86_64")]
@@ -464,13 +580,10 @@ fn match_fuzzy_parts(
                             soa.truncate(buf_len);
                             unsafe {
                                 crate::interseq_sw::avx2::soa_from_stage(
-                                    &stage,
-                                    rows,
-                                    batch_sz,
-                                    &mut soa,
+                                    &stage, rows, batch_sz, &mut soa,
                                 );
                                 if use_u8 {
-                                    crate::interseq_sw::avx2::score_batch_avx2_u8(
+                                    crate::interseq_sw::avx2::score_batch_avx2_u8_dispatch(
                                         needle,
                                         &soa,
                                         max_len,
@@ -479,6 +592,24 @@ fn match_fuzzy_parts(
                                         &mut sc_out[..n],
                                         &mut ec_out[..n],
                                     );
+                                    // Dead net while u8_safe holds: any
+                                    // saturated lane is rescored scalar.
+                                    if sc_out[..n].contains(&255) {
+                                        for (k, &oi) in ord.iter().enumerate() {
+                                            let tw = trims[oi as usize];
+                                            let wlen = (tw.end - tw.start) as usize;
+                                            let src = &stage[k * rows..k * rows + wlen];
+                                            let (sc, ec) =
+                                                crate::interseq_sw::score_one_scalar_full(
+                                                    needle,
+                                                    src,
+                                                    &p,
+                                                    tw.include_prefix(),
+                                                );
+                                            sc_out[k] = sc;
+                                            ec_out[k] = ec;
+                                        }
+                                    }
                                 } else {
                                     crate::interseq_sw::avx2::score_batch_avx2(
                                         needle,
@@ -496,78 +627,112 @@ fn match_fuzzy_parts(
                             return;
                         }
                         for (k, &oi) in ord.iter().enumerate() {
-                            let tw = trims[oi as usize]; let (s, e, inc_prefix) = (tw.start, tw.end, tw.include_prefix());
+                            let tw = trims[oi as usize];
+                            let (s, e, inc_prefix) = (tw.start, tw.end, tw.include_prefix());
                             let src = &stage[k * rows..k * rows + (e - s) as usize];
-                            let (sc, ec) =
-                                crate::interseq_sw::score_one_scalar_full(needle, src, &p, inc_prefix);
+                            let (sc, ec) = crate::interseq_sw::score_one_scalar_full(
+                                needle, src, &p, inc_prefix,
+                            );
                             sc_out[k] = sc;
                             ec_out[k] = ec;
                         }
                         STAGE.with(|c| *c.borrow_mut() = stage);
-                    });
-            });
+                    };
+                    // Fewer than 4 batches cannot amortize a fork/join; run them
+                    // inline instead of fanning out through the pool.
+                    if order.len() < 4 * batch_sz {
+                        for ((ord, sc_out), ec_out) in order
+                            .chunks(batch_sz)
+                            .zip(ps_aligned.chunks_mut(batch_sz))
+                            .zip(pe_aligned.chunks_mut(batch_sz))
+                        {
+                            score_batch(ord, sc_out, ec_out);
+                        }
+                    } else {
+                        crate::parallelism::run_on_bg_pool(|| {
+                            use rayon::prelude::*;
+                            order
+                                .par_chunks(batch_sz)
+                                .zip(ps_aligned.par_chunks_mut(batch_sz))
+                                .zip(pe_aligned.par_chunks_mut(batch_sz))
+                                .for_each(|((ord, sc_out), ec_out)| {
+                                    score_batch(ord, sc_out, ec_out);
+                                });
+                        });
+                    }
 
-            // Inverse order map into the chunk-local score arrays.
-            // Read from the 64-byte-aligned batch outputs (true per-line).
-            for (i, &oi) in order.iter().enumerate() {
-                scores[oi as usize] = ps_aligned[i];
-                end_cols[oi as usize] = pe_aligned[i];
+                    // Inverse order map into the chunk-local score arrays.
+                    // Read from the 64-byte-aligned batch outputs (true per-line).
+                    for (i, &oi) in order.iter().enumerate() {
+                        scores[oi as usize] = ps_aligned[i];
+                        end_cols[oi as usize] = pe_aligned[i];
+                    }
+                    if timing {
+                        t_batch_us.fetch_add(
+                            t_batch.elapsed().as_micros() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                    ORDER.with(|c| reclaim(&mut c.borrow_mut(), order));
+                    PERM_SCORES.with(|c| reclaim(&mut c.borrow_mut(), perm_scores));
+                    PERM_ECOLS.with(|c| reclaim(&mut c.borrow_mut(), perm_ecols));
+                }
+
+                // Assemble this chunk into the match structs (no full-size hold).
+                let t_asm = std::time::Instant::now();
+                for (i, m) in matches_chunk.iter_mut().enumerate() {
+                    let t = trims[i];
+                    let (fi, start_adj, end_pos, include_exact) =
+                        (t.file_idx, t.start as u32, t.end as u32, t.include_exact());
+                    let exact = include_exact && {
+                        let file = working_files.index(fi as usize);
+                        let hay = file.path.read_to_buf(arena, &mut path_buf);
+                        needle.eq_ignore_ascii_case(hay.as_bytes())
+                            && (end_pos as usize) == hay.len()
+                    };
+                    let bonus = if exact { 8u16 } else { 0 };
+                    m.score = scores[i].saturating_add(bonus);
+                    m.end_col = end_cols[i].saturating_add(start_adj.min(u16::MAX as u32) as u16);
+                    m.exact = exact;
+                }
+                if timing {
+                    t_assemble_us.fetch_add(
+                        t_asm.elapsed().as_micros() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
+
+                TRIMS.with(|c| reclaim(&mut c.borrow_mut(), trims));
+                SCORES.with(|c| reclaim(&mut c.borrow_mut(), scores));
+                ECOLS.with(|c| reclaim(&mut c.borrow_mut(), end_cols));
+            };
+            if matches.len() <= CHUNK || max_threads == 1 {
+                for chunk in matches.chunks_mut(CHUNK) {
+                    sw_body(chunk);
+                }
+            } else {
+                use rayon::prelude::*;
+                matches.par_chunks_mut(CHUNK).for_each(sw_body);
             }
-            if timing { t_batch_us.fetch_add(t_batch.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); }
 
-            // Assemble this chunk into the match structs (no full-size hold).
-            let t_asm = std::time::Instant::now();
-            for (i, m) in matches_chunk.iter_mut().enumerate() {
-                let t = trims[i];
-                let (fi, start_adj, end_pos, include_exact) = (t.file_idx, t.start as u32, t.end as u32, t.include_exact());
-                let exact = include_exact && {
-                    let file = working_files.index(fi as usize);
-                    let hay = file.path.read_to_buf(arena, &mut path_buf);
-                    needle.eq_ignore_ascii_case(hay.as_bytes())
-                        && (end_pos as usize) == hay.len()
-                };
-                let bonus = if exact { 8u16 } else { 0 };
-                m.score = scores[i].saturating_add(bonus);
-                m.end_col = end_cols[i]
-                    .saturating_add(start_adj.min(u16::MAX as u32) as u16);
-                m.exact = exact;
+            let sw_us = t_sw.elapsed().as_micros();
+            let collect_ms = t_collect_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
+            let batch_ms = t_batch_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
+            let assemble_ms = t_assemble_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
+            if part_timing {
+                eprintln!(
+                    "PHASE parts gate_us={gate_us} exact_us={exact_us} sw_us={sw_us} threads={threads} n={}",
+                    matches.len()
+                );
             }
-            if timing { t_assemble_us.fetch_add(t_asm.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed); }
-
-            TRIMS.with(|c| reclaim(&mut c.borrow_mut(), trims));
-            SCORES.with(|c| reclaim(&mut c.borrow_mut(), scores));
-            ECOLS.with(|c| reclaim(&mut c.borrow_mut(), end_cols));
-            ORDER.with(|c| reclaim(&mut c.borrow_mut(), order));
-            PERM_SCORES.with(|c| reclaim(&mut c.borrow_mut(), perm_scores));
-            PERM_ECOLS.with(|c| reclaim(&mut c.borrow_mut(), perm_ecols));
-        };
-        if matches.len() <= CHUNK {
-            for chunk in matches.chunks_mut(CHUNK) {
-                sw_body(chunk);
+            if phase_timing() {
+                eprintln!(
+                    "PHASE interseq prefilter_ms={prefilter_ms:.1} collect_ms={collect_ms:.1} batch_ms={batch_ms:.1} assemble_ms={assemble_ms:.1} n={}",
+                    matches.len()
+                );
             }
-        } else {
-            use rayon::prelude::*;
-            matches.par_chunks_mut(CHUNK).for_each(sw_body);
-        }
-
-        let sw_us = t_sw.elapsed().as_micros();
-        let collect_ms = t_collect_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
-        let batch_ms = t_batch_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
-        let assemble_ms = t_assemble_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
-        if part_timing {
-            eprintln!(
-                "PHASE parts gate_us={gate_us} exact_us={exact_us} sw_us={sw_us} threads={threads} n={}",
-                matches.len()
-            );
-        }
-        if std::env::var_os("FFF_PHASE_TIMING").is_some() {
-            eprintln!(
-                "PHASE interseq prefilter_ms={prefilter_ms:.1} collect_ms={collect_ms:.1} batch_ms={batch_ms:.1} assemble_ms={assemble_ms:.1} n={}",
-                matches.len()
-            );
-        }
             if !exact_name_hits.is_empty() {
-                let pinned = exact_name_hits.as_slice();
+                let pinned: ahash::AHashSet<u32> = exact_name_hits.iter().copied().collect();
                 for m in matches.iter_mut() {
                     if pinned.contains(&m.index) {
                         m.score = m.score.max(200);
@@ -585,7 +750,14 @@ fn match_fuzzy_parts(
 
     let total_parts = valid_parts.len() as u32;
     let mut matches = first_part_matches;
-    for part in valid_parts[1..].iter() {
+    // Narrowing order only affects speed. When the longer part ran first,
+    // narrow with the query-order first part and keep its end_col.
+    let rest: &[&str] = if reverse_pair {
+        &valid_parts[..1]
+    } else {
+        &valid_parts[1..]
+    };
+    for part in rest.iter() {
         let mut part_options = *options;
         part_options.max_typos = options.max_typos.map(|t| t.min(part.len() as u16));
 
@@ -611,15 +783,9 @@ fn match_fuzzy_parts(
         let sub_matches = with_cached_matcher(part, &part_options, |matcher| {
             matcher.match_range_parallel_resolved(
                 survivors.len(),
-                &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+                &|index, buf: &mut [*const u8; MAX_FRIZBEE_CHUNKS]| {
                     let file = working_files.index(survivors[index as usize].index as usize);
-                    resolve_file_chunks_prefiltered(
-                        file,
-                        arena,
-                        buf,
-                        &sub_np,
-                        part.as_bytes(),
-                    )
+                    resolve_file_chunks_prefiltered(file, arena, buf, &sub_np, part.as_bytes())
                 },
                 sub_threads,
             )
@@ -640,7 +806,8 @@ fn match_fuzzy_parts(
                 neo_frizbee::Match {
                     index: prev.index,
                     score: avg.min(u16::MAX as u32) as u16,
-                    end_col: prev.end_col, // keep first part's position for filename bonus
+                    // Query-order first part's position for filename bonus.
+                    end_col: if reverse_pair { sm.end_col } else { prev.end_col },
                     exact: prev.exact && sm.exact,
                 }
             })
@@ -766,7 +933,7 @@ fn fuzzy_match_and_score_files_impl<'a>(
 
     let t_sort = std::time::Instant::now();
     let out = sort_and_paginate(results, context, total_matched);
-    if std::env::var_os("FFF_PHASE_TIMING").is_some() {
+    if phase_timing() {
         eprintln!(
             "PHASE paginate_us={} n={}",
             t_sort.elapsed().as_micros(),
@@ -808,7 +975,8 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
         let want = item.path.byte_len as usize;
         let start = flat.len();
         flat.resize(start + want, 0);
-        item.path.copy_window_to(arena, 0, want as u32, &mut flat[start..]);
+        item.path
+            .copy_window_to(arena, 0, want as u32, &mut flat[start..]);
         spans.push((start as u32, want as u32));
     }
     // SAFETY: arena path bytes are valid UTF-8, the same assumption
@@ -840,9 +1008,8 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
             part_config.max_typos = config.max_typos.map(|t| t.min(part.len() as u16));
         }
 
-        let matched_list = with_cached_matcher(part, &part_config, |m| {
-            m.match_list_indices(&path_strs)
-        });
+        let matched_list =
+            with_cached_matcher(part, &part_config, |m| m.match_list_indices(&path_strs));
         for mut matched in matched_list {
             let item_idx = matched.index as usize;
             let Some(path) = path_strs.get(item_idx) else {
@@ -931,15 +1098,14 @@ fn resolve_dir_chunks(
     dir: &DirItem,
     arena: ArenaPtr,
     overflow_arena: ArenaPtr,
-    buf: &mut [*const u8; MAX_PATH_CHUNKS],
+    buf: &mut [*const u8; MAX_FRIZBEE_CHUNKS],
 ) -> Option<(usize, u16)> {
     let arena = if dir.is_overflow() {
         overflow_arena
     } else {
         arena
     };
-    let ptrs = dir.path.resolve_ptrs(arena, buf);
-    Some((ptrs.len(), dir.path.byte_len))
+    crate::matcher::resolve_frizbee_bytes(&dir.path, arena, buf)
 }
 
 /// Run SIMD fuzzy match across directory items, narrowing the candidate set
@@ -976,7 +1142,7 @@ fn match_fuzzy_parts_dirs(
     let first_part_matches = with_cached_matcher(valid_parts[0], options, |matcher| {
         matcher.match_range_parallel_resolved(
             working_dirs.len(),
-            &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+            &|index, buf: &mut [*const u8; MAX_FRIZBEE_CHUNKS]| {
                 resolve_dir_chunks(working_dirs[index as usize], arena, overflow_arena, buf)
             },
             dir_threads,
@@ -1006,7 +1172,7 @@ fn match_fuzzy_parts_dirs(
         let sub_matches = with_cached_matcher(part, &part_options, |matcher| {
             matcher.match_range_parallel_resolved(
                 survivors.len(),
-                &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
+                &|index, buf: &mut [*const u8; MAX_FRIZBEE_CHUNKS]| {
                     let dir = working_dirs[survivors[index as usize].index as usize];
                     resolve_dir_chunks(dir, arena, overflow_arena, buf)
                 },
@@ -1283,9 +1449,8 @@ fn match_and_score_in_arena<'a>(
                         let idx: Vec<u32> = filtered
                             .iter()
                             .map(|f| {
-                                let off = unsafe {
-                                    (*f as *const FileItem).offset_from(all.as_ptr())
-                                };
+                                let off =
+                                    unsafe { (*f as *const FileItem).offset_from(all.as_ptr()) };
                                 debug_assert!(off >= 0);
                                 off as u32
                             })
@@ -1340,7 +1505,7 @@ fn match_and_score_in_arena<'a>(
         max_typos: context.max_typos,
         file_count: working_files.len(),
     });
-    let phase_timing = std::env::var_os("FFF_PHASE_TIMING").is_some();
+    let phase_timing = phase_timing();
     let phase_sink = std::env::var("FFF_PHASE_TIMING").unwrap_or_default();
     let phase_log = |msg: String| {
         if phase_timing {
@@ -1348,14 +1513,16 @@ fn match_and_score_in_arena<'a>(
                 eprintln!("{msg}");
             } else {
                 use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&phase_sink)
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&phase_sink)
                 {
                     let _ = writeln!(f, "{msg}");
                 }
             }
         }
     };
-    let t_fn = std::time::Instant::now();
     let t_match = std::time::Instant::now();
     let path_matches: Arc<Vec<neo_frizbee::Match>> = raw_cache
         .zip(cache_key.as_ref())
@@ -1392,7 +1559,7 @@ fn match_and_score_in_arena<'a>(
         working_files.len()
     ));
 
-    // Expose file indices for typing live-narrow (Match(longer,T) Ã¢Å â€ 
+    // Expose file indices for typing live-narrow (Match(longer,T) Ã¢Å â€
     // Match(shorter,T) when T is unchanged).
     let t_capture = std::time::Instant::now();
     crate::score::capture_hit_indices(
@@ -1409,6 +1576,14 @@ fn match_and_score_in_arena<'a>(
     let mut fallback_indices: Vec<u32> = Vec::new();
     let filename_fallback_matches = if query_contains_path_separator || path_matches.len() > 15_000
     {
+        vec![]
+    } else if !path_matches.iter().any(|path_match| {
+        // Fallback only matters when the path hit ends before the
+        // filename; all filename hits means no fallback can fire.
+        let file = working_files.index(path_match.index as usize);
+        let filename_start = file.filename_offset_in_relative_path() as u16;
+        path_match.end_col.saturating_sub(main_needle_len - 1) < filename_start
+    }) {
         vec![]
     } else {
         // One reused buffer for all fallback filenames instead of a `Cow` per
@@ -1461,23 +1636,23 @@ fn match_and_score_in_arena<'a>(
                 options.max_typos,
                 crate::machine::scan_thread_cap().max(context.max_threads),
             );
-            let mut matches = with_cached_matcher(fuzzy_parts[0], &options, |matcher| {
+            let matches = with_cached_matcher(fuzzy_parts[0], &options, |matcher| {
                 matcher.match_list_parallel(&filename_strs, fb_threads)
             });
-
-            sort_by_key_with_buffer(&mut matches, |m| fallback_indices[m.index as usize]);
             matches
         }
     };
 
-    // Map filename-fallback hits by path-match index so the scoring loop can
-    // run without a sequential cursor. `fallback_indices` is strictly
-    // increasing (build order); the fallback match list is sorted by it.
+    // Map filename-fallback hits by path-match index for O(1) lookup
+    // in the scoring loop. Match-list order is irrelevant to the table.
     // Skip the table entirely when nothing fell back Ã¢â‚¬â€ common on filename-hit
     // queries like `file_picker_`.
     let fallback_us = t_fallback.elapsed().as_micros();
     if phase_timing {
-        phase_log(format!("PHASE capture_us={capture_us} fallback_us={fallback_us} n={}", path_matches.len()));
+        phase_log(format!(
+            "PHASE capture_us={capture_us} fallback_us={fallback_us} n={}",
+            path_matches.len()
+        ));
     }
 
     let fallback_hit: Vec<Option<(bool, i32)>> = if filename_fallback_matches.is_empty() {
@@ -1494,10 +1669,9 @@ fn match_and_score_in_arena<'a>(
     };
 
     // Ranking demotion for files under a third-party dependency directory.
-// Sized to outrank the bonuses a vendored namesake can accumulate
-// (filename + evidence + path alignment) without displacing a genuinely
-// better first-party match.
-const VENDORED_PATH_PENALTY: i32 = 120;
+    // Sized to outrank the bonuses a vendored namesake can accumulate
+    // (filename + evidence + path alignment) without displacing a genuinely
+    // better first-party match (see VENDORED_PATH_PENALTY).
 
     // Rayon dispatch + per-worker 4KB scratch costs more than scoring itself
     // below a few thousand matches (file_picker_-class queries). Short
@@ -1511,12 +1685,14 @@ const VENDORED_PATH_PENALTY: i32 = 120;
         String,
         [u8; crate::simd_path::PATH_BUF_SIZE],
         [u8; crate::simd_path::PATH_BUF_SIZE],
+        DirPenaltyMemo,
     );
     let make_scratch = || {
         (
             String::with_capacity(64),
             [0u8; crate::simd_path::PATH_BUF_SIZE],
             [0u8; crate::simd_path::PATH_BUF_SIZE],
+            DirPenaltyMemo::new(0),
         )
     };
 
@@ -1534,245 +1710,252 @@ const VENDORED_PATH_PENALTY: i32 = 120;
             && path_matches.len() * 100 >= n_files * 85
             && main_needle_len <= 8
     };
-    let query_intent = crate::intent::detect_intent(
-        context.effective_query(),
-        context.current_file,
-        true,
-    );
+    let query_intent =
+        crate::intent::detect_intent(context.effective_query(), context.current_file, true);
     let main_needle_as_str = context.effective_query();
     // Query-constant evidence state, built once instead of per candidate.
     let prepared_query = crate::intent::PreparedQuery::new(main_needle_as_str);
+    // Combo target bytes are query-constant; hoist the view out of the
+    // per-candidate closure instead of re-deriving it per file.
+    let combo_last: Option<&[u8]> = context
+        .last_same_query_match
+        .as_ref()
+        .map(|m| m.file_path.as_os_str().as_encoded_bytes());
+
+    // Current-file dir split once per query; penalties memoized per
+    // parent dir in thread-local scratch (dirs repeat across candidates).
+    let cur_dir = CurrentDir::new(context.current_file);
+    // Pure query constants; hoisted out of the per-candidate closure.
+    let need_rel_q = (query_contains_path_separator && main_needle.len() > 10)
+        || context.last_same_query_match.is_some()
+        || (!rank_collapsed
+            && (query_intent == crate::intent::QueryIntent::Path
+                || context.current_file.is_some()));
 
     let score_one = |scratch: &mut ScoreScratch,
                      match_idx: usize,
                      path_match: &neo_frizbee::Match|
      -> (&'a FileItem, Score) {
-        let (dir_buf, path_buf, fname_buf) = scratch;
-            let file_idx = path_match.index as usize;
-            let file = working_files.index(file_idx);
+        let (dir_buf, path_buf, fname_buf, dir_memo) = scratch;
+        let file_idx = path_match.index as usize;
+        let file = working_files.index(file_idx);
 
-            let base_score = path_match.score as i32;
-            let frecency_boost = base_score.saturating_mul(file.total_frecency_score()) / 100;
+        let base_score = path_match.score as i32;
+        let frecency_boost = base_score.saturating_mul(file.total_frecency_score()) / 100;
 
-            let git_status_boost = if file.git_status().is_some_and(is_modified_status) {
-                base_score * 15 / 100
-            } else {
-                0
-            };
-            let git_recency_boost = file.git_recency_score as i32;
+        let git_status_boost = if file.git_status().is_some_and(is_modified_status) {
+            base_score * 15 / 100
+        } else {
+            0
+        };
+        let git_recency_boost = file.git_recency_score as i32;
 
-            if context.current_file.is_some() {
-                file.write_dir_str(arena, dir_buf);
+        let distance_penalty = if context.current_file.is_some() {
+            let dir_idx = file.parent_dir_index as usize;
+            match dir_memo.get(dir_idx) {
+                Some(p) => p,
+                None => {
+                    file.write_dir_str(arena, dir_buf);
+                    dir_memo.penalty_for_grow(&cur_dir, dir_idx, dir_buf)
+                }
             }
+        } else {
+            0
+        };
 
-            let distance_penalty = if context.current_file.is_some() {
-                calculate_distance_penalty(context.current_file, dir_buf)
+        let filename_start = file.filename_offset_in_relative_path() as u16;
+        let match_start_approx = path_match.end_col.saturating_sub(main_needle_len - 1);
+
+        let end_col_filename_match = match_start_approx >= filename_start;
+        let simd_filename_match = if !end_col_filename_match {
+            fallback_hit.get(match_idx).copied().flatten()
+        } else {
+            None
+        };
+
+        let is_filename_match = end_col_filename_match || simd_filename_match.is_some();
+        let fname_off = file.path.filename_offset as usize;
+        let fname_len = file.path.byte_len as usize - fname_off;
+        // The full relative path is needed by the path-alignment suffix
+        // test, by the intent evidence (path intent or an open file) and by
+        // the combo test. Materialize it once and slice the filename out
+        // of it, instead of each consumer re-reading the path and the
+        // filename going through filename_cow (which heap-allocates
+        // whenever the filename straddles a chunk boundary).
+        // Only the suffix test, the combo test and path-shaped evidence
+        // need the full path; collapsed queries with just an open file skip it.
+        let need_rel = need_rel_q;
+        // When nothing else needs the path, borrow the filename straight
+        // out of the arena when it fits a chunk and copy into the scratch
+        // buffer otherwise. `filename_cow` heap-allocated on that second
+        // path, which for a repo whose prefixes straddle chunks is every
+        // candidate - 47ns/candidate on linux-kernel vs 8ns on sumo.
+        let rel: Option<&str> = if need_rel {
+            Some(file.path.read_to_buf(arena, path_buf))
+        } else {
+            None
+        };
+        // When nothing else needs the path, borrow the filename straight
+        // out of the arena when it fits a chunk and copy into scratch
+        // otherwise. `filename_cow` heap-allocated on that second path,
+        // which for a repo whose prefixes straddle chunk boundaries is every
+        // candidate - 47ns/candidate on linux-kernel vs 8ns on sumo.
+        let fname: Option<&str> = if rank_collapsed {
+            None
+        } else if let Some(r) = rel {
+            Some(&r[fname_off..fname_off + fname_len])
+        } else {
+            Some(file.path.filename_ref(arena, fname_buf))
+        };
+
+        let is_exact_filename = !rank_collapsed
+            && (simd_filename_match.is_some_and(|(exact, _)| exact)
+                || (end_col_filename_match
+                    && main_needle_len as usize == fname_len
+                    && main_needle.eq_ignore_ascii_case(fname.as_ref().unwrap().as_bytes())));
+
+        let mut has_special_filename_bonus = false;
+        let filename_bonus = if rank_collapsed {
+            0
+        } else if is_exact_filename {
+            base_score / 5 * 2 // 40% bonus for exact filename match
+        } else if is_filename_match {
+            let max_bonus = (base_score / 6).min(30);
+            if let Some((_, fm_score)) = simd_filename_match {
+                let max_possible = main_needle_len as i32 * 16;
+                let quality = fm_score.min(max_possible);
+                max_bonus * quality / max_possible
+            } else {
+                max_bonus
+            }
+        } else if !is_filename_match && (5..=11).contains(&fname_len) {
+            if is_special_entry_point_bytes(fname.as_ref().unwrap().as_bytes()) {
+                has_special_filename_bonus = true;
+                base_score * 5 / 100
             } else {
                 0
-            };
+            }
+        } else {
+            0
+        };
 
-            let filename_start = file.filename_offset_in_relative_path() as u16;
-            let match_start_approx = path_match.end_col.saturating_sub(main_needle_len - 1);
+        let current_file_penalty =
+            calculate_current_file_penalty(file, base_score / 4, context, arena);
+        let combo_match_boost = {
+            let last_same_query_match = context.last_same_query_match.as_ref().filter(|_| {
+                let total_len = file.path.byte_len as usize;
+                combo_last.is_some_and(|last| {
+                    last.len() >= total_len && last.ends_with(rel.unwrap_or("").as_bytes())
+                })
+            });
 
-            let end_col_filename_match = match_start_approx >= filename_start;
-            let simd_filename_match = if !end_col_filename_match {
-                fallback_hit.get(match_idx).copied().flatten()
+            match last_same_query_match {
+                Some(_) if context.min_combo_count == 0 => 1000,
+                Some(combo_match) if combo_match.open_count >= context.min_combo_count => {
+                    combo_match.open_count as i32 * context.combo_boost_score_multiplier
+                }
+                Some(combo_match) => combo_match.open_count as i32 * 5,
+                _ => 0,
+            }
+        };
+
+        // Path alignment bonus: when the query looks like a file path,
+        // reward candidates whose path closely matches the typed query.
+        // Uses suffix overlap Ã¢â‚¬â€ bytes matching from the end. A full prefix
+        // match is just the 100% coverage case, so no separate branch needed.
+        let path_alignment_bonus = if query_contains_path_separator && main_needle.len() > 10 {
+            let path_bytes = rel.unwrap_or("").as_bytes();
+            let common_suffix = main_needle
+                .iter()
+                .rev()
+                .zip(path_bytes.iter().rev())
+                .take_while(|(n, p): &(&u8, &u8)| n.eq_ignore_ascii_case(p))
+                .count();
+
+            let needle_len = main_needle.len();
+            if common_suffix > 10 && needle_len > 0 {
+                let coverage = common_suffix * 100 / needle_len;
+                if coverage >= 30 {
+                    base_score * coverage as i32 / 100
+                } else {
+                    0
+                }
             } else {
-                None
-            };
-
-            let is_filename_match = end_col_filename_match || simd_filename_match.is_some();
-            let fname_off = file.path.filename_offset as usize;
-            let fname_len = file.path.byte_len as usize - fname_off;
-            // The full relative path is needed by the path-alignment suffix
-            // test, by the intent evidence (path intent or an open file) and by
-            // the combo test. Materialize it once and slice the filename out
-            // of it, instead of each consumer re-reading the path and the
-            // filename going through filename_cow (which heap-allocates
-            // whenever the filename straddles a chunk boundary).
-            let need_rel = query_contains_path_separator
-                || context.current_file.is_some()
-                || query_intent == crate::intent::QueryIntent::Path
-                || context.last_same_query_match.is_some();
-            // When nothing else needs the path, borrow the filename straight
-            // out of the arena when it fits a chunk and copy into the scratch
-            // buffer otherwise. `filename_cow` heap-allocated on that second
-            // path, which for a repo whose prefixes straddle chunks is every
-            // candidate - 47ns/candidate on linux-kernel vs 8ns on sumo.
-            let rel: Option<&str> = if need_rel {
-                Some(file.path.read_to_buf(arena, path_buf))
-            } else {
-                None
-            };
-            // When nothing else needs the path, borrow the filename straight
-            // out of the arena when it fits a chunk and copy into scratch
-            // otherwise. `filename_cow` heap-allocated on that second path,
-            // which for a repo whose prefixes straddle chunk boundaries is every
-            // candidate - 47ns/candidate on linux-kernel vs 8ns on sumo.
-            let fname: Option<&str> = if rank_collapsed {
-                None
-            } else if let Some(r) = rel {
-                Some(&r[fname_off..fname_off + fname_len])
-            } else {
-                Some(file.path.filename_ref(arena, fname_buf))
-            };
-
-            let is_exact_filename = !rank_collapsed
-                && (simd_filename_match.is_some_and(|(exact, _)| exact)
-                    || (end_col_filename_match
-                        && main_needle_len as usize == fname_len
-                        && main_needle.eq_ignore_ascii_case(
-                            fname.as_ref().unwrap().as_bytes(),
-                        )));
-
-            let mut has_special_filename_bonus = false;
-            let filename_bonus = if rank_collapsed {
                 0
-            } else if is_exact_filename {
-                base_score / 5 * 2 // 40% bonus for exact filename match
+            }
+        } else {
+            0
+        };
+
+        // Intent evidence: filename/ext/segments/role mixed per job.
+        let evidence_bonus = if rank_collapsed {
+            0
+        } else {
+            let fname_ref = fname.as_ref().unwrap();
+            let need_path =
+                query_intent == crate::intent::QueryIntent::Path || context.current_file.is_some();
+            let ev = if need_path {
+                crate::intent::evidence_prepared(
+                    &prepared_query,
+                    rel.unwrap_or(""),
+                    fname_ref,
+                    query_intent,
+                    context.current_file,
+                )
+            } else {
+                crate::intent::evidence_prepared(&prepared_query, "", fname_ref, query_intent, None)
+            };
+            crate::intent::evidence_bonus(query_intent, &ev, base_score)
+        };
+
+        let vendored_penalty = if file.is_vendored() {
+            VENDORED_PATH_PENALTY
+        } else {
+            0
+        };
+
+        let total = base_score
+            .saturating_add(frecency_boost)
+            .saturating_add(git_status_boost)
+            .saturating_add(git_recency_boost)
+            .saturating_add(distance_penalty)
+            .saturating_add(filename_bonus)
+            .saturating_add(evidence_bonus)
+            .saturating_add(current_file_penalty)
+            .saturating_add(combo_match_boost)
+            .saturating_add(path_alignment_bonus)
+            .saturating_sub(vendored_penalty);
+
+        let score = Score {
+            total,
+            base_score,
+            current_file_penalty,
+            filename_bonus,
+            special_filename_bonus: if has_special_filename_bonus {
+                filename_bonus
+            } else {
+                0
+            },
+            frecency_boost,
+            git_status_boost,
+            git_recency_boost,
+            distance_penalty,
+            combo_match_boost,
+            path_alignment_bonus,
+            evidence_bonus,
+            exact_match: is_exact_filename || path_match.exact,
+            match_type: if is_exact_filename {
+                "exact_filename"
             } else if is_filename_match {
-                let max_bonus = (base_score / 6).min(30);
-                if let Some((_, fm_score)) = simd_filename_match {
-                    let max_possible = main_needle_len as i32 * 16;
-                    let quality = fm_score.min(max_possible);
-                    max_bonus * quality / max_possible
-                } else {
-                    max_bonus
-                }
-            } else if !is_filename_match && (5..=11).contains(&fname_len) {
-                if is_special_entry_point_bytes(fname.as_ref().unwrap().as_bytes()) {
-                    has_special_filename_bonus = true;
-                    base_score * 5 / 100
-                } else {
-                    0
-                }
+                "fuzzy_filename"
+            } else if path_match.exact {
+                "exact_path"
             } else {
-                0
-            };
+                "fuzzy_path"
+            },
+        };
 
-            let current_file_penalty =
-                calculate_current_file_penalty(file, base_score / 4, context, arena);
-            let combo_match_boost = {
-                let last_same_query_match = context.last_same_query_match.as_ref().filter(|m| {
-                    // to_string_lossy once per scoring pass via outer cache would
-                    // need a lifetime; compare via bytes on the Path instead.
-                    let last_bytes = m.file_path.as_os_str().as_encoded_bytes();
-                    let total_len = file.path.byte_len as usize;
-                    if last_bytes.len() < total_len {
-                        return false;
-                    }
-                    last_bytes.ends_with(rel.unwrap_or("").as_bytes())
-                });
-
-                match last_same_query_match {
-                    Some(_) if context.min_combo_count == 0 => 1000,
-                    Some(combo_match) if combo_match.open_count >= context.min_combo_count => {
-                        combo_match.open_count as i32 * context.combo_boost_score_multiplier
-                    }
-                    Some(combo_match) => combo_match.open_count as i32 * 5,
-                    _ => 0,
-                }
-            };
-
-            // Path alignment bonus: when the query looks like a file path,
-            // reward candidates whose path closely matches the typed query.
-            // Uses suffix overlap Ã¢â‚¬â€ bytes matching from the end. A full prefix
-            // match is just the 100% coverage case, so no separate branch needed.
-            let path_alignment_bonus = if query_contains_path_separator {
-                let path_bytes = rel.unwrap_or("").as_bytes();
-                let common_suffix = main_needle
-                    .iter()
-                    .rev()
-                    .zip(path_bytes.iter().rev())
-                    .take_while(|(n, p): &(&u8, &u8)| n.eq_ignore_ascii_case(p))
-                    .count();
-
-                let needle_len = main_needle.len();
-                if common_suffix > 10 && needle_len > 0 {
-                    let coverage = common_suffix * 100 / needle_len;
-                    if coverage >= 30 {
-                        base_score * coverage as i32 / 100
-                    } else {
-                        0
-                    }
-                } else {
-                    0
-                }
-            } else {
-                0
-            };
-
-            // Intent evidence: filename/ext/segments/role mixed per job.
-            let evidence_bonus = if rank_collapsed {
-                0
-            } else {
-                let fname_ref = fname.as_ref().unwrap();
-                let need_path = query_intent == crate::intent::QueryIntent::Path
-                    || context.current_file.is_some();
-                let ev = if need_path {
-                    crate::intent::evidence_prepared(
-                        &prepared_query,
-                        rel.unwrap_or(""),
-                        fname_ref,
-                        query_intent,
-                        context.current_file,
-                    )
-                } else {
-                    crate::intent::evidence_prepared(
-                        &prepared_query,
-                        "",
-                        fname_ref,
-                        query_intent,
-                        None,
-                    )
-                };
-                crate::intent::evidence_bonus(query_intent, &ev, base_score)
-            };
-
-            let vendored_penalty = if file.is_vendored() { VENDORED_PATH_PENALTY } else { 0 };
-
-            let total = base_score
-                .saturating_add(frecency_boost)
-                .saturating_add(git_status_boost)
-                .saturating_add(git_recency_boost)
-                .saturating_add(distance_penalty)
-                .saturating_add(filename_bonus)
-                .saturating_add(evidence_bonus)
-                .saturating_add(current_file_penalty)
-                .saturating_add(combo_match_boost)
-                .saturating_add(path_alignment_bonus)
-                .saturating_sub(vendored_penalty);
-
-            let score = Score {
-                total,
-                base_score,
-                current_file_penalty,
-                filename_bonus,
-                special_filename_bonus: if has_special_filename_bonus {
-                    filename_bonus
-                } else {
-                    0
-                },
-                frecency_boost,
-                git_status_boost,
-                git_recency_boost,
-                distance_penalty,
-                combo_match_boost,
-                path_alignment_bonus,
-                evidence_bonus,
-                exact_match: is_exact_filename || path_match.exact,
-                match_type: if is_exact_filename {
-                    "exact_filename"
-                } else if is_filename_match {
-                    "fuzzy_filename"
-                } else if path_match.exact {
-                    "exact_path"
-                } else {
-                    "fuzzy_path"
-                },
-            };
-
-            (file, score)
+        (file, score)
     };
 
     // Keep only the best `offset+limit` scored rows in a min-heap so we never
@@ -1787,22 +1970,10 @@ const VENDORED_PATH_PENALTY: i32 = 120;
             usize::MAX / 4
         })
         .saturating_add(1);
-    // Top-k only pays for itself when the match set is large. Below that,
-    // `run_on_bg_pool` does a `pool.install`, and the fixed cost of handing
-    // work to the pool and waiting exceeds the scoring itself (the same
-    // failure the SW chunk loop had: 782us of pool time for 97us of work).
-    // The work estimate already answers "is there enough to fan out?", and it
-    // is calibrated per machine, so reuse it instead of another constant.
-    let topk_threads = effective_match_threads(
-        path_matches.len(),
-        context.effective_query().len().max(1),
-        max_path_len,
-        Some(context.max_typos),
-        context.max_threads,
-    );
-    let use_topk = page_cap < path_matches.len()
-        && path_matches.len() > 256
-        && topk_threads > 1;
+    // Top-k only pays for itself when the match set is large. Threading
+    // is decided at each dispatch site (serial for max_threads == 1);
+    // the heap algorithm wins on work alone for page-bounded queries.
+    let use_topk = page_cap < path_matches.len() && path_matches.len() > 256;
     let t_score = std::time::Instant::now();
     let score_entrance_count = path_matches.len();
 
@@ -1861,7 +2032,7 @@ const VENDORED_PATH_PENALTY: i32 = 120;
                 heap.push(Reverse(entry));
             }
         };
-        if path_matches.len() < PARALLEL_SCORE_MIN {
+        if path_matches.len() < PARALLEL_SCORE_MIN || context.max_threads == 1 {
             let mut scratch = make_scratch();
             for (match_idx, path_match) in path_matches.iter().enumerate() {
                 if prunable && heap.len() >= page_cap {
@@ -1916,10 +2087,7 @@ const VENDORED_PATH_PENALTY: i32 = 120;
                             };
                             if h.len() < page_cap {
                                 h.push(Reverse(entry));
-                            } else if h
-                                .peek()
-                                .is_some_and(|Reverse(w)| entry.total > w.total)
-                            {
+                            } else if h.peek().is_some_and(|Reverse(w)| entry.total > w.total) {
                                 h.pop();
                                 h.push(Reverse(entry));
                             }
@@ -1952,7 +2120,7 @@ const VENDORED_PATH_PENALTY: i32 = 120;
         return (results, path_matches.len());
     }
 
-    let results: Vec<_> = if path_matches.len() < PARALLEL_SCORE_MIN {
+    let results: Vec<_> = if path_matches.len() < PARALLEL_SCORE_MIN || context.max_threads == 1 {
         let mut scratch = make_scratch();
         path_matches
             .iter()
@@ -2018,6 +2186,9 @@ fn score_filtered_by_frecency<'a>(
     context: &ScoringContext,
     arena: ArenaPtr,
 ) -> Vec<(&'a FileItem, Score)> {
+    // Working-set queries are constant (""); build the query state once
+    // instead of per file inside `evidence_for`.
+    let pq = crate::intent::PreparedQuery::new("");
     let score_file = |file: &'a FileItem| {
         let total_frecency_score = file.access_frecency_score as i32
             + (file.modification_frecency_score as i32).saturating_mul(4);
@@ -2039,19 +2210,16 @@ fn score_filtered_by_frecency<'a>(
             let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
             let rel = file.path.read_to_buf(arena, &mut path_buf);
             let fname = file.path.filename_cow(arena);
-            let ev = crate::intent::evidence_for(
+            let ev = crate::intent::evidence_prepared(
+                &pq,
                 rel.as_ref(),
                 fname.as_ref(),
-                "",
                 crate::intent::QueryIntent::WorkingSet,
                 Some(cur),
             );
             let base = total_frecency_score.max(8);
-            evidence_bonus = crate::intent::evidence_bonus(
-                crate::intent::QueryIntent::WorkingSet,
-                &ev,
-                base,
-            );
+            evidence_bonus =
+                crate::intent::evidence_bonus(crate::intent::QueryIntent::WorkingSet, &ev, base);
         }
 
         let total = total_frecency_score
@@ -2130,7 +2298,7 @@ fn calculate_current_file_penalty(
 /// The UI layer handles rendering order based on prompt position.
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 fn sort_and_paginate<'a>(
-    mut results: Vec<(&'a FileItem, Score)>,
+    results: Vec<(&'a FileItem, Score)>,
     context: &ScoringContext,
     total_matched: usize,
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
@@ -2159,35 +2327,43 @@ fn sort_and_paginate<'a>(
     let items_needed = offset.saturating_add(limit).min(total_matched);
     // Use partial sort if we need less than half the results and dataset is large
     let use_partial_sort = items_needed < total_matched / 2 && total_matched > 100;
+    // Rank on lightweight indices so the sort never moves fat Scores;
+    // same (total, modified) keys, so ordering is bit-identical.
+    let mut order: Vec<u32> = (0..results.len() as u32).collect();
+    let mut cmp_idx = |a: &u32, b: &u32| {
+        let (fa, sa) = &results[*a as usize];
+        let (fb, sb) = &results[*b as usize];
+        sb.total
+            .cmp(&sa.total)
+            .then_with(|| fb.modified.cmp(&fa.modified))
+    };
     // Always sort in descending order (best scores first)
     if use_partial_sort {
         // Partition at position (items_needed - 1) with descending comparator
         // This puts the highest N needed items at the front
-        results.select_nth_unstable_by(items_needed - 1, |a, b| {
-            b.1.total
-                .cmp(&a.1.total)
-                .then_with(|| b.0.modified.cmp(&a.0.modified))
-        });
-        results.truncate(items_needed);
+        order.select_nth_unstable_by(items_needed - 1, &mut cmp_idx);
+        order.truncate(items_needed);
     }
 
     // select nth does not sort the results, we have to sort accordingly anyway
-    sort_with_buffer(&mut results, |a, b| {
-        b.1.total
-            .cmp(&a.1.total)
-            .then_with(|| b.0.modified.cmp(&a.0.modified))
-    });
+    sort_with_buffer(&mut order, &mut cmp_idx);
 
     // in the best scenario truncation happened in the select_nth step
-    if results.len() > limit {
-        let page_end = std::cmp::min(offset + limit, results.len());
+    if order.len() > limit {
+        let page_end = std::cmp::min(offset + limit, order.len());
         let page_size = page_end - offset;
 
-        results.drain(0..offset);
-        results.truncate(page_size);
+        order.drain(0..offset);
+        order.truncate(page_size);
     }
 
-    let (items, scores): (Vec<&FileItem>, Vec<Score>) = results.into_iter().unzip();
+    let mut items = Vec::with_capacity(order.len());
+    let mut scores = Vec::with_capacity(order.len());
+    for i in order {
+        let (file, score) = &results[i as usize];
+        items.push(*file);
+        scores.push(score.clone());
+    }
     (items, scores, total_matched)
 }
 
@@ -2234,7 +2410,7 @@ mod tests {
                     match_type: "test",
                     combo_match_boost: 0,
                     path_alignment_bonus: 0,
-                evidence_bonus: 0,
+                    evidence_bonus: 0,
                 };
                 (file, score_obj)
             })
@@ -2395,6 +2571,136 @@ mod tests {
         assert_eq!(items[1].relative_path(arena), "file1.rs");
         assert_eq!(items[2].relative_path(arena), "file3.rs");
     }
+
+    #[test]
+    fn two_part_narrowing_order_independent_sets() {
+        let (test_data, arena) = make_test_files(&[
+            ("src/models/user_service.rs", 10, 1),
+            ("src/models/mod.rs", 10, 2),
+            ("src/auth/login.rs", 10, 3),
+            ("src/api/user_handler.rs", 10, 4),
+            ("tests/user_test.rs", 10, 5),
+            ("README.md", 10, 6),
+        ]);
+        let files: Vec<FileItem> =
+            test_data.iter().map(|(file, _)| file.clone()).collect();
+        let options = neo_frizbee::Config {
+            max_typos: Some(2),
+            sort: neo_frizbee::SortStrategy::Unsorted,
+            ..Default::default()
+        };
+        // Sorted (index, score) pairs per query order. end_col stays
+        // query-order-first by design, so it is excluded here.
+        let run = |parts: &[&str]| {
+            let mut pairs: Vec<(u32, u16)> = match_fuzzy_parts(
+                parts,
+                &crate::matcher::FileItems::All(&files),
+                &options,
+                1,
+                arena,
+                crate::matcher::max_path_len_of(&files),
+            )
+            .iter()
+            .map(|m| (m.index, m.score))
+            .collect();
+            pairs.sort_unstable();
+            pairs
+        };
+        let short_first = run(&["mo", "models"]);
+        let long_first = run(&["models", "mo"]);
+        assert!(
+            !short_first.is_empty(),
+            "sample must match at least one file"
+        );
+        assert_eq!(
+            short_first, long_first,
+            "narrowing order must not change the match set"
+        );
+    }
+
+    #[test]
+    fn sort_and_paginate_matches_legacy_path() {
+        let owned: Vec<(String, i32, u64)> = (0..150)
+            .map(|i| (format!("src/file{i:03}.rs"), (i % 10) as i32, (i % 4) as u64))
+            .collect();
+        let refs: Vec<(&str, i32, u64)> =
+            owned.iter().map(|(p, s, m)| (p.as_str(), *s, *m)).collect();
+        let (test_data, arena) = make_test_files(&refs);
+        let results: Vec<(&FileItem, Score)> =
+            test_data.iter().map(|(file, score)| (file, score.clone())).collect();
+
+        let query_str = "test";
+        let parser = QueryParser::default();
+        let query = parser.parse(query_str);
+        for (offset, limit) in [(0, 10), (5, 20), (0, 100), (30, 100), (0, 0), (140, 50), (150, 10), (200, 10)] {
+            let context = ScoringContext {
+                query: &query,
+                max_threads: 1,
+                max_typos: 2,
+                current_file: None,
+                last_same_query_match: None,
+                project_path: None,
+                combo_boost_score_multiplier: 100,
+                min_combo_count: 3,
+                pagination: PaginationArgs { offset, limit },
+            };
+            let n = results.len();
+            let (items, scores, total) = sort_and_paginate(results.clone(), &context, n);
+            let (exp_items, exp_scores, exp_total) =
+                legacy_sort_and_paginate(results.clone(), &context, n);
+            assert_eq!(total, exp_total, "total_matched offset={offset} limit={limit}");
+            let paths: Vec<_> = items.iter().map(|f| f.relative_path(arena)).collect();
+            let exp_paths: Vec<_> = exp_items.iter().map(|f| f.relative_path(arena)).collect();
+            assert_eq!(paths, exp_paths, "ordering offset={offset} limit={limit}");
+            assert_eq!(
+                format!("{scores:?}"),
+                format!("{exp_scores:?}"),
+                "scores offset={offset} limit={limit}"
+            );
+        }
+    }
+
+    fn legacy_sort_and_paginate<'a>(
+        mut results: Vec<(&'a FileItem, Score)>,
+        context: &ScoringContext,
+        total_matched: usize,
+    ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
+        if total_matched == 0 {
+            return (vec![], vec![], 0);
+        }
+        let offset = context.pagination.offset;
+        let limit = if context.pagination.limit > 0 {
+            context.pagination.limit
+        } else {
+            total_matched
+        };
+        if offset >= total_matched {
+            return (vec![], vec![], total_matched);
+        }
+        let items_needed = offset.saturating_add(limit).min(total_matched);
+        let use_partial_sort = items_needed < total_matched / 2 && total_matched > 100;
+        if use_partial_sort {
+            results.select_nth_unstable_by(items_needed - 1, |a, b| {
+                b.1.total
+                    .cmp(&a.1.total)
+                    .then_with(|| b.0.modified.cmp(&a.0.modified))
+            });
+            results.truncate(items_needed);
+        }
+        sort_with_buffer(&mut results, |a, b| {
+            b.1.total
+                .cmp(&a.1.total)
+                .then_with(|| b.0.modified.cmp(&a.0.modified))
+        });
+        if results.len() > limit {
+            let page_end = std::cmp::min(offset + limit, results.len());
+            let page_size = page_end - offset;
+            results.drain(0..offset);
+            results.truncate(page_size);
+        }
+        let (items, scores): (Vec<&FileItem>, Vec<Score>) = results.into_iter().unzip();
+        (items, scores, total_matched)
+    }
 }
 
 #[cfg(test)]
@@ -2417,7 +2723,7 @@ mod filename_bonus_tests {
         let mut result: Vec<FileItem> = items;
         for (i, file) in result.iter_mut().enumerate() {
             file.set_path(strings[i].clone());
-                file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
+            file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
         }
         std::mem::forget(store);
         (result, arena)
@@ -2438,7 +2744,7 @@ mod filename_bonus_tests {
         let mut result: Vec<FileItem> = items;
         for (i, file) in result.iter_mut().enumerate() {
             file.set_path(strings[i].clone());
-                file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
+            file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
             file.access_frecency_score = specs[i].1;
         }
         std::mem::forget(store);
@@ -2471,8 +2777,14 @@ mod filename_bonus_tests {
                 limit: 100,
             },
         };
-        let (items, scores, _) =
-            fuzzy_match_and_score_files(files, &ctx, files.len(), arena, arena, max_path_len_of(&files));
+        let (items, scores, _) = fuzzy_match_and_score_files(
+            files,
+            &ctx,
+            files.len(),
+            arena,
+            arena,
+            max_path_len_of(&files),
+        );
         items
             .iter()
             .zip(scores.iter())
@@ -2690,7 +3002,7 @@ mod git_recency_scoring_tests {
         let mut result: Vec<FileItem> = items;
         for (i, file) in result.iter_mut().enumerate() {
             file.set_path(strings[i].clone());
-                file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
+            file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
             file.git_recency_score = specs[i].1;
         }
         std::mem::forget(store);
@@ -2714,8 +3026,14 @@ mod git_recency_scoring_tests {
                 limit: 100,
             },
         };
-        let (items, scores, _) =
-            fuzzy_match_and_score_files(files, &ctx, files.len(), arena, arena, max_path_len_of(&files));
+        let (items, scores, _) = fuzzy_match_and_score_files(
+            files,
+            &ctx,
+            files.len(),
+            arena,
+            arena,
+            max_path_len_of(&files),
+        );
         items
             .iter()
             .zip(scores)
@@ -2776,7 +3094,7 @@ mod typo_resistance_tests {
         let mut result: Vec<FileItem> = items;
         for (i, file) in result.iter_mut().enumerate() {
             file.set_path(strings[i].clone());
-                file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
+            file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
         }
         std::mem::forget(store);
         (result, arena)
@@ -2804,7 +3122,14 @@ mod typo_resistance_tests {
                 limit: 100,
             },
         };
-        let (items, _, _) = fuzzy_match_and_score_files(files, &ctx, files.len(), arena, arena, max_path_len_of(&files));
+        let (items, _, _) = fuzzy_match_and_score_files(
+            files,
+            &ctx,
+            files.len(),
+            arena,
+            arena,
+            max_path_len_of(&files),
+        );
         items.iter().map(|f| f.relative_path(arena)).collect()
     }
 
@@ -2890,7 +3215,7 @@ mod constraint_only_query_tests {
         let mut files: Vec<FileItem> = items;
         for (i, file) in files.iter_mut().enumerate() {
             file.set_path(strings[i].clone());
-                file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
+            file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
         }
         files[0].set_git_status(Some(git2::Status::WT_MODIFIED));
         files[1].set_git_status(Some(git2::Status::CURRENT));
@@ -2914,8 +3239,14 @@ mod constraint_only_query_tests {
             },
         };
 
-        let (items, _scores, total_matched) =
-            fuzzy_match_and_score_files(&files, &ctx, files.len(), arena, arena, max_path_len_of(&files));
+        let (items, _scores, total_matched) = fuzzy_match_and_score_files(
+            &files,
+            &ctx,
+            files.len(),
+            arena,
+            arena,
+            max_path_len_of(&files),
+        );
 
         assert_eq!(
             total_matched, 1,
@@ -2942,7 +3273,7 @@ mod constraint_only_query_tests {
         let mut files: Vec<FileItem> = items;
         for (i, file) in files.iter_mut().enumerate() {
             file.set_path(strings[i].clone());
-                file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
+            file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
         }
         files[0].set_git_status(Some(git2::Status::WT_MODIFIED));
         files[1].set_git_status(Some(git2::Status::CURRENT));
@@ -2966,8 +3297,14 @@ mod constraint_only_query_tests {
             },
         };
 
-        let (items, _scores, total_matched) =
-            fuzzy_match_and_score_files(&files, &ctx, files.len(), arena, arena, max_path_len_of(&files));
+        let (items, _scores, total_matched) = fuzzy_match_and_score_files(
+            &files,
+            &ctx,
+            files.len(),
+            arena,
+            arena,
+            max_path_len_of(&files),
+        );
 
         assert_eq!(total_matched, 1);
         assert_eq!(items[0].relative_path(arena), "a.rs");
@@ -3033,15 +3370,21 @@ mod ranking_policy_tests {
                 limit: 100,
             },
         };
-        let (items, _scores, _) =
-            fuzzy_match_and_score_files(files, &ctx, files.len(), arena, arena, max_path_len_of(&files));
+        let (items, _scores, _) = fuzzy_match_and_score_files(
+            files,
+            &ctx,
+            files.len(),
+            arena,
+            arena,
+            max_path_len_of(&files),
+        );
         items.iter().map(|f| f.relative_path(arena)).collect()
     }
 
     #[test]
     fn exact_filename_beats_fuzzy_filename_beats_path_only() {
         let (files, arena) = make(&[
-            ("src/username/handler.rs", 0), // path-only
+            ("src/username/handler.rs", 0),  // path-only
             ("src/username/username.rs", 0), // fuzzy/exact filename
             ("other/username", 0),           // exact filename
         ]);
@@ -3056,20 +3399,14 @@ mod ranking_policy_tests {
 
     #[test]
     fn frecency_breaks_ties_at_equal_match_quality() {
-        let (files, arena) = make(&[
-            ("src/a/user_service.rs", 10),
-            ("src/b/user_service.rs", 90),
-        ]);
+        let (files, arena) = make(&[("src/a/user_service.rs", 10), ("src/b/user_service.rs", 90)]);
         let order = rank(&files, "user_service", arena);
         assert_eq!(order[0], "src/b/user_service.rs", "higher frecency first");
     }
 
     #[test]
     fn special_entry_point_beats_ordinary_path_only() {
-        let (files, arena) = make(&[
-            ("src/deep/mod.rs", 0),
-            ("src/deep/helper_mod.rs", 0),
-        ]);
+        let (files, arena) = make(&[("src/deep/mod.rs", 0), ("src/deep/helper_mod.rs", 0)]);
         let order = rank(&files, "mod", arena);
         assert_eq!(
             order[0], "src/deep/mod.rs",
@@ -3086,16 +3423,16 @@ mod ranking_policy_tests {
             ("src/other.rs", 0),
         ]);
         let order = rank(&files, "user_service.rs", arena);
-        assert_eq!(order[0], "src/user_service.rs", "matching ext first, got {order:?}");
+        assert_eq!(
+            order[0], "src/user_service.rs",
+            "matching ext first, got {order:?}"
+        );
     }
 
     /// Job: "I know the path" Ã¢â‚¬â€ segment hits beat scattered letters.
     #[test]
     fn path_intent_prefers_segment_sequence() {
-        let (files, arena) = make(&[
-            ("xsrc/xauth/xlogin.rs", 0),
-            ("src/auth/login.rs", 0),
-        ]);
+        let (files, arena) = make(&[("xsrc/xauth/xlogin.rs", 0), ("src/auth/login.rs", 0)]);
         let order = rank(&files, "src/auth", arena);
         assert_eq!(
             order[0], "src/auth/login.rs",
@@ -3106,21 +3443,18 @@ mod ranking_policy_tests {
     /// Job: "I know the concept" Ã¢â‚¬â€ filename words beat path-only scatter.
     #[test]
     fn concept_intent_prefers_filename_words() {
-        let (files, arena) = make(&[
-            ("src/hidden/handler_util.rs", 0),
-            ("src/api/handler.rs", 0),
-        ]);
+        let (files, arena) = make(&[("src/hidden/handler_util.rs", 0), ("src/api/handler.rs", 0)]);
         let order = rank(&files, "handler", arena);
-        assert_eq!(order[0], "src/api/handler.rs", "filename word hit first, got {order:?}");
+        assert_eq!(
+            order[0], "src/api/handler.rs",
+            "filename word hit first, got {order:?}"
+        );
     }
 
     /// Job: "I want the test for this role" Ã¢â‚¬â€ role keyword ranks test files up.
     #[test]
     fn concept_test_role_ranks_test_files() {
-        let (files, arena) = make(&[
-            ("src/user.rs", 0),
-            ("src/user_test.rs", 0),
-        ]);
+        let (files, arena) = make(&[("src/user.rs", 0), ("src/user_test.rs", 0)]);
         let order = rank(&files, "test", arena);
         assert_eq!(
             order[0], "src/user_test.rs",
@@ -3149,5 +3483,4 @@ mod ranking_policy_tests {
         let o = rank(&files, "test", arena);
         assert!(o[0].contains("test"), "role=test {o:?}");
     }
-
 }

@@ -3,9 +3,10 @@ use super::env_pool::SharedEnv;
 use crate::error::{Error, Result};
 use crate::file_picker::FFFMode;
 use crate::git::is_modified_status;
-use crate::lmdb::{DbHealth, LmdbStore, is_map_full};
+use crate::lmdb::{DbHealth, LmdbStore, WRITE_TXN_CHUNK, is_map_full};
 use heed::Database;
 use heed::types::{Bytes, SerdeBincode};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::VecDeque, path::Path};
 
@@ -23,6 +24,10 @@ pub struct FrecencyTracker {
     env: SharedEnv,
     db: Database<Bytes, SerdeBincode<VecDeque<u64>>>,
     health: DbHealth,
+    // 2 = unknown, 1 = non-empty, 0 = empty. Avoids a read txn per scan.
+    // Stale-1 after a GC purge only costs one wasted hydration pass; writes
+    // always set 1, so stale-0 (skipped hydration with data) is impossible.
+    empty_hint: AtomicU8,
 }
 
 const MODIFICATION_THRESHOLDS: [(i64, u64); 5] = [
@@ -74,9 +79,9 @@ impl LmdbStore for FrecencyTracker {
     // leaves ~18× headroom while capping runaway growth (see GH issue #437).
     const MAP_SIZE: usize = 10 * 1024 * 1024;
     const MAX_DBS: u32 = 0;
-    // Nuke the db when it exceeds 8 MiB on disk — leaves a small margin under
-    // MAP_SIZE so we don't hit MDB_MAP_FULL before the open-time erase fires.
-    const SIZE_CAP_BYTES: u64 = 12 * 1024 * 1024;
+    // Erase on disk when over 8 MiB — under MAP_SIZE so the open-time erase
+    // fires before MDB_MAP_FULL can.
+    const SIZE_CAP_BYTES: u64 = 8 * 1024 * 1024;
 
     fn shared_env(&self) -> &SharedEnv {
         &self.env
@@ -107,7 +112,12 @@ impl FrecencyTracker {
         let (env, health) = Self::open_env(db_path)?;
 
         let db = Self::open_database_safe(&env, None)?;
-        Ok(FrecencyTracker { db, env, health })
+        Ok(FrecencyTracker {
+            db,
+            env,
+            health,
+            empty_hint: AtomicU8::new(2),
+        })
     }
 
     #[deprecated(
@@ -142,6 +152,8 @@ impl FrecencyTracker {
             db: Self::LABEL,
             source,
         })?;
+        // Cursor order: single forward pass, then chunked write txns so a
+        // large purge never holds one huge txn (MDB_MAP_FULL/abort risk).
         for result in iter {
             let (key, accesses) = result.map_err(|source| Error::DbRead {
                 db: Self::LABEL,
@@ -165,31 +177,45 @@ impl FrecencyTracker {
             return Ok((0, 0));
         }
 
-        let mut wtxn = env.write_txn().map_err(|source| Error::DbStartWriteTxn {
-            db: Self::LABEL,
-            source,
-        })?;
-
-        for key in &to_delete {
-            db.delete(&mut wtxn, key).map_err(|source| Error::DbWrite {
+        // Chunked commits bound each write txn; values drain as we go.
+        const PURGE_CHUNK: usize = 1_024;
+        let n_delete = to_delete.len();
+        let n_update = to_update.len();
+        for chunk in to_delete.chunks(PURGE_CHUNK) {
+            let mut wtxn = env.write_txn().map_err(|source| Error::DbStartWriteTxn {
+                db: Self::LABEL,
+                source,
+            })?;
+            for key in chunk {
+                db.delete(&mut wtxn, key).map_err(|source| Error::DbWrite {
+                    db: Self::LABEL,
+                    source,
+                })?;
+            }
+            wtxn.commit().map_err(|source| Error::DbCommit {
+                db: Self::LABEL,
+                source,
+            })?;
+        }
+        for chunk in to_update.chunks(PURGE_CHUNK) {
+            let mut wtxn = env.write_txn().map_err(|source| Error::DbStartWriteTxn {
+                db: Self::LABEL,
+                source,
+            })?;
+            for (key, accesses) in chunk {
+                db.put(&mut wtxn, key, accesses)
+                    .map_err(|source| Error::DbWrite {
+                        db: Self::LABEL,
+                        source,
+                    })?;
+            }
+            wtxn.commit().map_err(|source| Error::DbCommit {
                 db: Self::LABEL,
                 source,
             })?;
         }
 
-        for (key, accesses) in &to_update {
-            db.put(&mut wtxn, key, accesses)
-                .map_err(|source| Error::DbWrite {
-                    db: Self::LABEL,
-                    source,
-                })?;
-        }
-        wtxn.commit().map_err(|source| Error::DbCommit {
-            db: Self::LABEL,
-            source,
-        })?;
-
-        Ok((to_delete.len(), to_update.len()))
+        Ok((n_delete, n_update))
     }
 
     fn get_accesses(&self, path: &Path) -> Result<Option<VecDeque<u64>>> {
@@ -202,19 +228,31 @@ impl FrecencyTracker {
                 db: Self::LABEL,
                 source,
             })?;
-        let result = self.db.get(&rtxn, &key_hash).map_err(|source| Error::DbRead {
-            db: Self::LABEL,
-            source,
-        })?;
+        let result = self
+            .db
+            .get(&rtxn, &key_hash)
+            .map_err(|source| Error::DbRead {
+                db: Self::LABEL,
+                source,
+            })?;
         drop(rtxn);
 
         Ok(result)
     }
 
     pub fn is_empty(&self) -> bool {
-        let Ok(rtxn) = self.env.read_txn() else { return true; };
-        let Ok(stat) = self.db.stat(&rtxn) else { return true; };
-        stat.entries == 0
+        if self.empty_hint.load(Ordering::Relaxed) == 1 {
+            return false;
+        }
+        let Ok(rtxn) = self.env.read_txn() else {
+            return true;
+        };
+        let Ok(stat) = self.db.stat(&rtxn) else {
+            return true;
+        };
+        let empty = stat.entries == 0;
+        self.empty_hint.store(u8::from(!empty), Ordering::Relaxed);
+        empty
     }
 
     fn get_now(&self) -> u64 {
@@ -236,6 +274,22 @@ impl FrecencyTracker {
         let path: &Path = canonical.as_deref().unwrap_or(path);
 
         Self::path_hash_raw(path)
+    }
+
+    /// Hash many paths in parallel on the bg pool. Scan hydration hashes
+    /// thousands of absolute paths; serial blake3 before the single read txn
+    /// was a visible slice of that phase on 200k trees.
+    pub fn path_hashes_parallel(paths: &[&Path]) -> Vec<[u8; 32]> {
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        crate::parallelism::run_on_bg_pool(|| {
+            use rayon::prelude::*;
+            paths
+                .par_iter()
+                .map(|p| Self::path_hash_raw(p).unwrap_or([0u8; 32]))
+                .collect()
+        })
     }
 
     /// Hash a path without canonicalize. For scan-built absolute paths that
@@ -319,7 +373,92 @@ impl FrecencyTracker {
             .map_err(|source| Error::DbCommit {
                 db: Self::LABEL,
                 source,
-            })
+            })?;
+        self.empty_hint.store(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Batch variant: one read txn for all lookups, then chunked write txns
+    /// of `WRITE_TXN_CHUNK` puts. Replaces N×(read+write) with 1 read + N/5k
+    /// writes for bulk imports / watcher replays.
+    pub fn track_accesses(&self, paths: &[&Path]) -> Result<usize> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        let hashes: Vec<[u8; 32]> = crate::parallelism::run_on_bg_pool(|| {
+            use rayon::prelude::*;
+            paths
+                .par_iter()
+                .map(|p| Self::path_to_hash_bytes(p).unwrap_or([0u8; 32]))
+                .collect()
+        });
+        let now = self.get_now();
+        let cutoff_time = now.saturating_sub((MAX_HISTORY_DAYS * SECONDS_PER_DAY) as u64);
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|source| Error::DbStartReadTxn {
+                db: Self::LABEL,
+                source,
+            })?;
+        let mut pending: Vec<([u8; 32], VecDeque<u64>)> = Vec::with_capacity(hashes.len());
+        for hash in &hashes {
+            let mut accesses: VecDeque<u64> = self
+                .db
+                .get(&rtxn, hash)
+                .map_err(|source| Error::DbRead {
+                    db: Self::LABEL,
+                    source,
+                })?
+                .unwrap_or_default();
+            while let Some(&front) = accesses.front() {
+                if front < cutoff_time || accesses.len() >= MAX_TIMESTAMPS_PER_FILE {
+                    accesses.pop_front();
+                } else {
+                    break;
+                }
+            }
+            accesses.push_back(now);
+            pending.push((*hash, accesses));
+        }
+        drop(rtxn);
+        let mut done = 0usize;
+        for chunk in pending.chunks(WRITE_TXN_CHUNK) {
+            let mut wtxn = self
+                .env
+                .write_txn()
+                .map_err(|source| Error::DbStartWriteTxn {
+                    db: Self::LABEL,
+                    source,
+                })?;
+            for (hash, accesses) in chunk {
+                if let Err(e) = self.db.put(&mut wtxn, hash, accesses) {
+                    if is_map_full(&e) {
+                        self.health.mark_unhealthy("MDB_MAP_FULL on batch put");
+                        return Ok(done);
+                    }
+                    return Err(Error::DbWrite {
+                        db: Self::LABEL,
+                        source: e,
+                    });
+                }
+                done += 1;
+            }
+            if let Err(e) = wtxn.commit() {
+                if is_map_full(&e) {
+                    self.health.mark_unhealthy("MDB_MAP_FULL on batch commit");
+                    return Ok(done);
+                }
+                return Err(Error::DbCommit {
+                    db: Self::LABEL,
+                    source: e,
+                });
+            }
+        }
+        if done > 0 {
+            self.empty_hint.store(1, Ordering::Relaxed);
+        }
+        Ok(done)
     }
 
     pub fn copy_history(&self, from: &Path, to: &Path) -> Result<bool> {
@@ -539,6 +678,33 @@ mod tests {
         assert!(batch[0] > 0);
         assert_eq!(batch[1], 0);
         let _ = now;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn batch_track_matches_single_writes() {
+        let dir = std::env::temp_dir().join(format!("fff-frecency-batchw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracker = FrecencyTracker::open(&dir).unwrap();
+        assert!(tracker.is_empty());
+
+        let a = Path::new("/tmp/fff_batchw_a.rs");
+        let b = Path::new("/tmp/fff_batchw_b.rs");
+        let n = tracker.track_accesses(&[a, b]).unwrap();
+        assert_eq!(n, 2);
+        assert!(!tracker.is_empty());
+        // Cached hint avoids a second read txn.
+        assert!(!tracker.is_empty());
+        assert_eq!(tracker.access_count(a).unwrap(), 1);
+        assert_eq!(tracker.access_count(b).unwrap(), 1);
+        assert_eq!(
+            FrecencyTracker::path_hashes_parallel(&[a, b]),
+            vec![
+                FrecencyTracker::path_hash_raw(a).unwrap(),
+                FrecencyTracker::path_hash_raw(b).unwrap(),
+            ]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

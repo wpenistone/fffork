@@ -596,7 +596,9 @@ fn plain_page_full_early_stop_preserves_first_page() {
             .matches
             .iter()
             .map(|m| {
-                let path = result.files[m.file_index].relative_path(&picker).to_string();
+                let path = result.files[m.file_index]
+                    .relative_path(&picker)
+                    .to_string();
                 (path, m.line_number, m.col, m.line_content.clone())
             })
             .collect()
@@ -647,7 +649,9 @@ fn fuzzy_page_full_early_stop_preserves_first_page() {
             .matches
             .iter()
             .map(|m| {
-                let path = result.files[m.file_index].relative_path(&picker).to_string();
+                let path = result.files[m.file_index]
+                    .relative_path(&picker)
+                    .to_string();
                 (path, m.line_number, m.col, m.line_content.clone())
             })
             .collect()

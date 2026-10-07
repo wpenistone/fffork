@@ -63,7 +63,7 @@ use std::thread::JoinHandle;
 use std::time::SystemTime;
 use tracing::{Level, debug, error, info, warn};
 
-use crate::parallelism::{BACKGROUND_THREAD_POOL, SEARCH_THREAD_POOL};
+use crate::parallelism::BACKGROUND_THREAD_POOL;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FFFMode {
@@ -147,12 +147,16 @@ pub(crate) struct ContentMaskStore {
     /// lock-free on grep's per-file path. Uninitialised means 'no masks yet'
     /// and every lookup misses, which is safe.
     slots: std::sync::OnceLock<Vec<std::sync::atomic::AtomicU64>>,
+    /// Set once any non-empty mask lands. Lets grep skip mask work
+    /// entirely when content indexing never ran (all lookups would miss).
+    has_data: AtomicBool,
 }
 
 impl ContentMaskStore {
     pub(crate) fn with_capacity(n: usize) -> Self {
         let s = Self {
             slots: std::sync::OnceLock::new(),
+            has_data: AtomicBool::new(false),
         };
         s.ensure_capacity(n);
         s
@@ -174,8 +178,19 @@ impl ContentMaskStore {
         if let Some(slots) = self.slots.get()
             && let Some(slot) = slots.get(index)
         {
-            slot.store(mask.get(), Ordering::Relaxed);
+            let raw = mask.get();
+            slot.store(raw, Ordering::Relaxed);
+            if raw != 0 {
+                self.has_data.store(true, Ordering::Relaxed);
+            }
         }
+    }
+
+    /// True once any mask was recorded. False means every lookup misses,
+    /// so callers can skip mask work (and its per-file bookkeeping).
+    #[inline]
+    pub(crate) fn any_recorded(&self) -> bool {
+        self.has_data.load(Ordering::Relaxed)
     }
 
     /// `None` when the index is out of range or no mask was recorded.
@@ -480,8 +495,7 @@ impl PathLenCache {
     }
 
     pub(crate) fn observe(&self, byte_len: u16) {
-        self.value
-            .fetch_max(byte_len as u32, Ordering::Relaxed);
+        self.value.fetch_max(byte_len as u32, Ordering::Relaxed);
     }
 
     pub(crate) fn forget(&self, byte_len: u16) {
@@ -509,12 +523,10 @@ impl PathLenCache {
         }
         let mut cur = self.value.load(Ordering::Relaxed);
         while cur > m {
-            match self.value.compare_exchange_weak(
-                cur,
-                m,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .value
+                .compare_exchange_weak(cur, m, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => break,
                 Err(actual) => cur = actual,
             }
@@ -1090,6 +1102,8 @@ impl FilePicker {
     /// what you are doing. This won't spawn the backgraound watcher and won't walk the file tree.
     pub fn new(options: FilePickerOptions) -> Result<Self, Error> {
         crate::git::tune_libgit2_for_local_reads();
+        // Probes cost ~30ms on first touch; pay at open, never on a keystroke.
+        crate::machine::warm_calibration();
 
         let path = PathBuf::from(&options.base_path);
         if !path.exists() {
@@ -1313,7 +1327,6 @@ impl FilePicker {
     ) -> SearchResult<'_> {
         let files = self.get_files();
 
-
         let total_files = self.live_file_count();
         let location = query.location;
 
@@ -1369,9 +1382,7 @@ impl FilePicker {
                 crate::machine::match_work_per_thread(),
                 crate::machine::scan_thread_cap(),
             );
-            if arena_stats
-                && let Some(store) = self.sync_data.chunked_paths.as_ref()
-            {
+            if arena_stats && let Some(store) = self.sync_data.chunked_paths.as_ref() {
                 let slots: usize = self
                     .sync_data
                     .files
@@ -1482,9 +1493,7 @@ impl FilePicker {
                 let can_narrow = live.active
                     && live.max_typos == max_typos
                     && context.effective_query().len() > live.query.len()
-                    && context
-                        .effective_query()
-                        .starts_with(live.query.as_str())
+                    && context.effective_query().starts_with(live.query.as_str())
                     && live.generation == self.index_generation();
                 if can_narrow {
                     // Presence-index prune of the previous hit set before the
@@ -1535,18 +1544,16 @@ impl FilePicker {
                     hit_buf.extend_from_slice(&local_hits);
                     out
                 }
-                NarrowPlan::Full => {
-                    crate::score::with_hit_capture(&mut hit_buf, || {
-                        fuzzy_match_and_score_files(
-                            files,
-                            &context,
-                            self.sync_data.base_count,
-                            base_arena,
-                            overflow_arena,
-                            self.max_path_len(),
-                        )
-                    })
-                }
+                NarrowPlan::Full => crate::score::with_hit_capture(&mut hit_buf, || {
+                    fuzzy_match_and_score_files(
+                        files,
+                        &context,
+                        self.sync_data.base_count,
+                        base_arena,
+                        overflow_arena,
+                        self.max_path_len(),
+                    )
+                }),
             }
         };
 
@@ -1840,7 +1847,7 @@ impl FilePicker {
         if rayon::current_thread_index().is_some() {
             run_grep()
         } else {
-            SEARCH_THREAD_POOL.install(run_grep)
+            crate::parallelism::run_on_search_pool(run_grep)
         }
     }
 
@@ -1859,7 +1866,7 @@ impl FilePicker {
             .as_deref()
             .unwrap_or(&self.signals.cancelled);
 
-        SEARCH_THREAD_POOL.install(|| {
+        crate::parallelism::run_on_search_pool(|| {
             multi_grep_search(
                 self.get_files(),
                 patterns,
@@ -2503,9 +2510,10 @@ impl FileSync {
         // change hidden/gitignore indexing vs a Temp freeze. Prefer the
         // repo at base_path itself; otherwise keep monorepo-subdir behavior.
         if base_path.join(".git").exists() {
-            return Repository::open(base_path)
-                .ok()
-                .and_then(|r| r.workdir().map(|w| crate::path_utils::normalize(w.to_path_buf())));
+            return Repository::open(base_path).ok().and_then(|r| {
+                r.workdir()
+                    .map(|w| crate::path_utils::normalize(w.to_path_buf()))
+            });
         }
         let git_workdir = Repository::discover(base_path)
             .ok()
@@ -2548,9 +2556,7 @@ impl FileSync {
         let is_git_repo = git_workdir.is_some();
         // Limit walk parallelism: the ignore walker spawns its own workers and
         // coexisting with the BG pool inflates scan peak RSS on flat corpora.
-        let bg_threads = BACKGROUND_THREAD_POOL
-            .current_num_threads()
-            .min(4);
+        let bg_threads = BACKGROUND_THREAD_POOL.current_num_threads().min(4);
 
         let WalkOutput {
             dirs: mut walked_dirs,
@@ -2582,7 +2588,8 @@ impl FileSync {
         walked_dirs.dedup();
 
         let mut builder = crate::simd_path::ChunkedPathStoreBuilder::new(pairs.len());
-        let (mut files, dirs) = populates_dirs_files_chunked_storage(pairs, &walked_dirs, &mut builder);
+        let (mut files, dirs) =
+            populates_dirs_files_chunked_storage(pairs, &walked_dirs, &mut builder);
         drop(walked_dirs);
         let chunked_paths = builder.finish();
         let arena = chunked_paths.as_arena_ptr();
@@ -2616,10 +2623,8 @@ impl FileSync {
                 let scores = frecency.get_access_scores_for_hashes(&hashes, mode);
                 let dirs_ref = &dirs;
                 crate::parallelism::run_on_bg_pool(|| {
-                    files[offset..end]
-                        .par_iter_mut()
-                        .zip(scores)
-                        .for_each(|(file, access_score)| {
+                    files[offset..end].par_iter_mut().zip(scores).for_each(
+                        |(file, access_score)| {
                             file.set_access_frecency_score(access_score);
                             file.set_modification_frecency_score(frecency, mode);
                             let score = file.access_frecency_score as i32;
@@ -2629,7 +2634,8 @@ impl FileSync {
                                     dir.update_frecency_if_larger(score);
                                 }
                             }
-                        });
+                        },
+                    );
                 });
                 offset = end;
             }
@@ -2664,10 +2670,7 @@ impl FileSync {
         let file_item_size = std::mem::size_of::<FileItem>();
         let files_vec_bytes = files.len() * file_item_size;
         let dir_table_bytes = dirs.len() * std::mem::size_of::<DirItem>()
-            + dirs
-                .iter()
-                .map(|d| d.path.byte_len as usize)
-                .sum::<usize>();
+            + dirs.iter().map(|d| d.path.byte_len as usize).sum::<usize>();
 
         let total_time = scan_start.elapsed();
         info!(

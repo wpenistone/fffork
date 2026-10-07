@@ -85,52 +85,131 @@ impl BigramQuery {
     }
 
     pub(crate) fn evaluate(&self, index: &BigramFilter) -> Option<Vec<u64>> {
-        self.evaluate_cow(index).map(Cow::into_owned)
-    }
-
-    fn evaluate_cow<'a>(&self, index: &'a BigramFilter) -> Option<Cow<'a, [u64]>> {
         match self {
             BigramQuery::Any => None,
+            BigramQuery::Consec(key) => index.column_bitset(*key).map(Cow::into_owned),
+            BigramQuery::Skip1(key) => index.skip_index()?.column_bitset(*key).map(Cow::into_owned),
+            BigramQuery::And(children) => Self::eval_and(children, index),
+            BigramQuery::Or(children) => Self::eval_or(children, index),
+        }
+    }
 
-            BigramQuery::Consec(key) => index.column_bitset(*key),
+    fn child_rank(child: &BigramQuery, index: &BigramFilter) -> u32 {
+        match child {
+            BigramQuery::Consec(k) => index.column_popcount(*k).unwrap_or(u32::MAX),
+            BigramQuery::Skip1(k) => index
+                .skip_index()
+                .and_then(|s| s.column_popcount(*k))
+                .unwrap_or(u32::MAX),
+            BigramQuery::And(inner) => inner.iter().map(|c| Self::child_rank(c, index)).sum(),
+            BigramQuery::Or(_) => u32::MAX - 1,
+            BigramQuery::Any => u32::MAX,
+        }
+    }
 
-            BigramQuery::Skip1(key) => index.skip_index()?.column_bitset(*key),
-
-            BigramQuery::And(children) => {
-                let mut result: Option<Vec<u64>> = None;
-                for child in children {
-                    if let Some(child_bits) = child.evaluate_cow(index) {
-                        result = Some(match result {
-                            None => child_bits.into_owned(),
-                            Some(mut r) => {
-                                bitset_and(&mut r, &child_bits);
-                                r
-                            }
-                        });
-                    }
+    fn eval_and(children: &[BigramQuery], index: &BigramFilter) -> Option<Vec<u64>> {
+        let mut order: [usize; 64] = [0; 64];
+        let n = children.len().min(64);
+        for (i, o) in order[..n].iter_mut().enumerate() {
+            *o = i;
+        }
+        order[..n].sort_unstable_by_key(|&i| Self::child_rank(&children[i], index));
+        // One result buffer for every child: leaves AND straight from the
+        // column (no per-child Cow), rarest-first, early exit on empty.
+        let mut result = vec![u64::MAX; index.words()];
+        if !index.file_count().is_multiple_of(64) {
+            let last = index.words() - 1;
+            result[last] = (1u64 << (index.file_count() % 64)).wrapping_sub(1);
+        }
+        let mut any = false;
+        let and_child = |result: &mut Vec<u64>, child: &BigramQuery| {
+            match child {
+                BigramQuery::Consec(k) => {
+                    let col = index.column_ref(*k)?;
+                    BigramFilter::and_column(result, col);
                 }
-                result.map(Cow::Owned)
+                BigramQuery::Skip1(k) => {
+                    let col = index.skip_index()?.column_ref(*k)?;
+                    BigramFilter::and_column(result, col);
+                }
+                _ => bitset_and(result, &child.evaluate(index)?),
             }
-
-            BigramQuery::Or(children) => {
-                if children.is_empty() {
-                    return None;
+            Some(())
+        };
+        for &i in &order[..n] {
+            if and_child(&mut result, &children[i]).is_some() {
+                any = true;
+                if result.iter().all(|&w| w == 0) {
+                    break;
                 }
-                let mut result: Option<Vec<u64>> = None;
-                for child in children {
-                    // Any branch can't be filtered -> whole OR can't be filtered
-                    let child_bits = child.evaluate_cow(index)?;
-                    result = Some(match result {
-                        None => child_bits.into_owned(),
-                        Some(mut r) => {
-                            bitset_or(&mut r, &child_bits);
-                            r
-                        }
-                    });
-                }
-                result.map(Cow::Owned)
             }
         }
+        for child in children.iter().skip(n) {
+            if and_child(&mut result, child).is_some() {
+                any = true;
+                if result.iter().all(|&w| w == 0) {
+                    break;
+                }
+            }
+        }
+        any.then_some(result)
+    }
+
+    fn eval_or(children: &[BigramQuery], index: &BigramFilter) -> Option<Vec<u64>> {
+        if children.is_empty() {
+            return None;
+        }
+        let mut result: Option<Vec<u64>> = None;
+        let mut scratch = Vec::new();
+        for child in children {
+            if let BigramQuery::And(inner) = child
+                && inner.iter().all(|c| matches!(c, BigramQuery::Consec(_)))
+            {
+                scratch.clear();
+                scratch.resize(index.words(), u64::MAX);
+                if !index.file_count().is_multiple_of(64) {
+                    let last = index.words() - 1;
+                    scratch[last] = (1u64 << (index.file_count() % 64)).wrapping_sub(1);
+                }
+                let mut ok = false;
+                for c in inner {
+                    if let BigramQuery::Consec(k) = c
+                        && let Some(col) = index.column_ref(*k)
+                    {
+                        BigramFilter::and_column(&mut scratch, col);
+                        ok = true;
+                        if scratch.iter().all(|&w| w == 0) {
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    return None;
+                }
+                if scratch.iter().all(|&w| w == 0) {
+                    continue;
+                }
+                result = Some(match result {
+                    None => scratch.clone(),
+                    Some(mut r) => {
+                        bitset_or(&mut r, &scratch);
+                        r
+                    }
+                });
+            } else {
+                let Some(bits) = child.evaluate(index) else {
+                    return None;
+                };
+                result = Some(match result {
+                    None => bits,
+                    Some(mut r) => {
+                        bitset_or(&mut r, &bits);
+                        r
+                    }
+                });
+            }
+        }
+        result
     }
 }
 
@@ -184,8 +263,9 @@ pub(crate) fn fuzzy_to_bigram_query(query: &str, num_probes: usize) -> BigramQue
         );
     }
 
-    // Pick evenly-spaced probe bigrams.
-    let n = num_probes.min(bigram_keys.len());
+    // Pick evenly-spaced probe bigrams, capped so C(n, required)
+    // stays small (C(5,3)=10 max). Fewer probes only widens the filter.
+    let n = num_probes.min(bigram_keys.len()).min(5);
     if n <= max_typos {
         // Too few probes to require anything useful.
         return simplify_or(
@@ -214,10 +294,14 @@ pub(crate) fn fuzzy_to_bigram_query(query: &str, num_probes: usize) -> BigramQue
         return simplify_and(probes.iter().map(|&k| BigramQuery::Consec(k)).collect());
     }
 
-    // Generate all C(n, required) subsets as OR(AND(subset), ...)
+    // Generate all C(n, required) subsets as OR(AND(subset), ...).
+    // n <= 5 bounds this at 10 branches; more would just burn bitset ANDs.
     let mut branches = Vec::new();
     let mut combo = vec![0u16; required];
     combine(&probes, required, 0, 0, &mut combo, &mut branches);
+    if branches.len() > 10 {
+        return simplify_or(probes.iter().map(|&k| BigramQuery::Consec(k)).collect());
+    }
 
     simplify_or(branches)
 }

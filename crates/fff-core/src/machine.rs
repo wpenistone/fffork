@@ -112,15 +112,20 @@ impl Machine {
     ///
     /// This one genuinely cannot be derived from topology - it depends on the
     /// memory controller and on what else the machine is doing - so it is
-    /// measured, but cheaply: one buffer sized from the LLC (never more than
-    /// 32 MB), filled once, sampled at three thread counts. The previous
+    /// measured, but cheaply: one buffer sized past the LLC (never more
+    /// than 32 MB), filled once, sampled at {1,2,4,max} with median-of-3
+    /// per count. The previous
     /// implementation allocated and LCG-filled a fresh multi-hundred-MB buffer
     /// per sample, and separately had a bug that made it return 2 on every
     /// machine because it compared each sample against a running peak.
     fn bandwidth_knee(&self) -> usize {
         static KNEE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *KNEE.get_or_init(|| {
-            let by_cores = self.physical_cores.max(1);
+            let mut by_cores = self.physical_cores.max(1);
+            #[cfg(target_os = "linux")]
+            if let Some(cap) = crate::parallelism::cgroup_cpu_count() {
+                by_cores = by_cores.min(cap).max(1);
+            }
             if by_cores < 4 || std::env::var_os("FFF_NO_PROBE").is_some() {
                 return by_cores;
             }
@@ -130,19 +135,45 @@ impl Machine {
                 16 << 20
             }
             .clamp(4 << 20, 32 << 20);
+            // Must exceed the LLC: a contained buffer measures cache
+            // scaling, which knees later and over-threads DRAM-bound scans.
+            if self.llc_bytes > 0 && want <= self.llc_bytes {
+                want = (self.llc_bytes + (8 << 20)).min(32 << 20);
+            }
             if let Some(limit) = cgroup_memory_limit() {
                 want = want.min(limit / 8).max(4 << 20);
             }
             let mut buf = vec![0u64; want / 8];
             let mut x: u64 = 0x243f_6a88_85a3_08d3;
             for v in buf.iter_mut() {
-                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 *v = x;
             }
-            let samples: Vec<(usize, f64)> = [2usize, 4, 8]
+            // Sample {1,4,max}: the knee needs the curve shape (first
+            // count at 90% of peak); median-of-3 rejects a bad run.
+            let mut counts: Vec<usize> = vec![1, 2, 4, by_cores];
+            counts.retain(|t| *t <= by_cores);
+            counts.sort_unstable();
+            counts.dedup();
+            #[cfg(target_os = "linux")]
+            let allowed = crate::parallelism::cpuset_cpus();
+            let samples: Vec<(usize, f64)> = counts
                 .into_iter()
-                .filter(|t| *t <= by_cores)
-                .map(|t| (t, parallel_read_bw(&buf, t)))
+                .map(|t| {
+                    #[cfg(target_os = "linux")]
+                    let allowed = allowed.as_deref();
+                    #[cfg(not(target_os = "linux"))]
+                    let allowed: Option<&[usize]> = None;
+                    let mut reps = [
+                        parallel_read_bw(&buf, t, allowed),
+                        parallel_read_bw(&buf, t, allowed),
+                        parallel_read_bw(&buf, t, allowed),
+                    ];
+                    reps.sort_by(|a, b| a.total_cmp(b));
+                    (t, reps[1])
+                })
                 .collect();
             let peak = samples.iter().map(|(_, b)| *b).fold(0.0f64, f64::max);
             if peak <= 0.0 {
@@ -159,27 +190,70 @@ impl Machine {
 
 /// Aggregate read bandwidth in bytes/ns with `threads` threads over one shared
 /// buffer, used only to locate the memory-scaling knee.
-fn parallel_read_bw(buf: &[u64], threads: usize) -> f64 {
+fn parallel_read_bw(buf: &[u64], threads: usize, allowed: Option<&[usize]>) -> f64 {
+    // One padded slot per thread: joining adjacent `u64` results would ping-pong
+    // a single cache line between cores (false sharing) and under-report.
+    #[repr(align(128))]
+    struct Padded(std::sync::atomic::AtomicU64);
+    let slots: Vec<Padded> = (0..threads)
+        .map(|_| Padded(std::sync::atomic::AtomicU64::new(0)))
+        .collect();
     let n_bytes = buf.len() * 8;
-    let mut total = 0u64;
     let t0 = std::time::Instant::now();
     std::thread::scope(|s| {
-        let per = buf.len() / threads;
-        for t in 0..threads {
-            let slice = &buf[t * per..(t + 1) * per];
-            let h = s.spawn(move || {
+        let per = buf.len().div_ceil(threads);
+        for (t, slot) in slots.iter().enumerate() {
+            let lo = (t * per).min(buf.len());
+            let hi = ((t + 1) * per).min(buf.len());
+            let slice = &buf[lo..hi];
+            s.spawn(move || {
+                pin_thread_to_core(t, allowed);
                 let mut acc: u64 = 0;
-                for i in (0..slice.len()).step_by(8) {
-                    acc = acc.wrapping_add(slice[i]);
+                for &v in slice.iter() {
+                    acc = acc.wrapping_add(v);
                 }
-                acc
+                slot.0.store(acc, std::sync::atomic::Ordering::Relaxed);
             });
-            total = total.wrapping_add(h.join().unwrap_or(0));
         }
     });
+    let mut total = 0u64;
+    for slot in &slots {
+        total = total.wrapping_add(slot.0.load(std::sync::atomic::Ordering::Relaxed));
+    }
     std::hint::black_box(total);
     n_bytes as f64 / t0.elapsed().as_nanos().max(1) as f64
 }
+
+#[cfg(target_os = "linux")]
+fn pin_thread_to_core(t: usize, allowed: Option<&[usize]>) {
+    // Pin inside the cgroup-allowed set when present: `t % host_ncpu` can
+    // address a forbidden core (affinity call then fails, losing pinning).
+    let cpu = match allowed {
+        Some(list) if !list.is_empty() => list[t % list.len()],
+        _ => {
+            let ncpu = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            if ncpu <= 1 {
+                return;
+            }
+            t % ncpu
+        }
+    };
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(cpu, &mut set);
+        libc::pthread_setaffinity_np(
+            libc::pthread_self(),
+            std::mem::size_of::<libc::cpu_set_t>(),
+            &set,
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_thread_to_core(_t: usize, _allowed: Option<&[usize]>) {}
+
 /// rayon fork/join dispatch cost. A property of the scheduler, not of any corpus.
 const FORK_JOIN_NS: usize = 25_000;
 
@@ -211,6 +285,29 @@ pub(crate) fn match_work_per_thread() -> usize {
     *W
 }
 
+/// Point-in-time calibration values for bench metadata. Lets paired
+/// runs attribute thread-count differences instead of inferring them.
+#[derive(Debug, Clone, Copy)]
+pub struct CalibrationSnapshot {
+    pub logical_cores: usize,
+    pub physical_cores: usize,
+    pub llc_bytes: usize,
+    pub match_work_per_thread: usize,
+    pub scan_cap: usize,
+}
+
+/// Capture current calibration (runs probes on first call).
+pub fn calibration_snapshot() -> CalibrationSnapshot {
+    let m = machine();
+    CalibrationSnapshot {
+        logical_cores: m.logical_cores,
+        physical_cores: m.physical_cores,
+        llc_bytes: m.llc_bytes,
+        match_work_per_thread: match_work_per_thread(),
+        scan_cap: scan_thread_cap(),
+    }
+}
+
 pub(crate) fn scan_thread_cap() -> usize {
     static C: LazyLock<usize> = LazyLock::new(|| {
         std::env::var("FFF_SCAN_THREAD_CAP")
@@ -220,6 +317,12 @@ pub(crate) fn scan_thread_cap() -> usize {
             .unwrap_or_else(|| machine().scan_thread_cap())
     });
     *C
+}
+
+/// Run probe + derived caps now (open path). Lazy statics would otherwise
+/// fire inside the first query (~30ms of buffers and bandwidth samples).
+pub(crate) fn warm_calibration() {
+    let _ = (match_work_per_thread(), scan_thread_cap());
 }
 impl Machine {
     fn probe() -> Self {
@@ -366,13 +469,78 @@ fn cpuid_max_freq_mhz() -> Option<f64> {
     if mhz == 0 { None } else { Some(mhz as f64) }
 }
 
-/// Count cores via the APIC-ID x2APIC enumeration in leaf 0xB.
+// Physical cores from the leaf-0xB x2APIC walk. This is what lets
+// `scan_thread_cap` discount SMT siblings on Windows (no sysfs there).
 #[cfg(target_arch = "x86_64")]
 fn cpuid_physical_cores() -> Option<usize> {
-    // Without a full topology walk this is not reliably derivable, and a wrong
-    // guess is worse than none: `scan_thread_cap` already falls back to the
-    // logical count, and sysfs gives the real answer on Linux.
-    None
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    if unsafe { __cpuid(0) }.eax < 0xB {
+        return None;
+    }
+    let mut subleaves = [(0u32, 0u32, 0u32); 4];
+    let mut n = 0usize;
+    for sub in 0..4u32 {
+        let r = unsafe { __cpuid_count(0xB, sub) };
+        subleaves[n] = (r.eax, r.ebx, r.ecx);
+        n += 1;
+        if r.ebx & 0xffff == 0 || (r.ecx >> 8) & 0xff == 0 {
+            break;
+        }
+    }
+    cores_from_leaf_b(&subleaves[..n])
+}
+
+// Cores-per-package from raw (eax, ebx, ecx) leaf-0xB subleaves: subleaf
+// 0 is the SMT level, subleaf 1 the core level. None if inconsistent.
+#[cfg(target_arch = "x86_64")]
+fn cores_from_leaf_b(subleaves: &[(u32, u32, u32)]) -> Option<usize> {
+    let mut smt_threads: Option<u32> = None;
+    let mut smt_shift = 0u32;
+    let mut pkg_threads: Option<u32> = None;
+    let mut pkg_shift = 0u32;
+    for &(eax, ebx, ecx) in subleaves {
+        let logical = ebx & 0xffff;
+        let level_type = (ecx >> 8) & 0xff;
+        if logical == 0 || level_type == 0 {
+            break;
+        }
+        let shift = eax & 0x1f;
+        match level_type {
+            1 => {
+                if smt_threads.is_some() {
+                    return None;
+                }
+                smt_threads = Some(logical);
+                smt_shift = shift;
+            }
+            2 => {
+                if pkg_threads.is_some() {
+                    return None;
+                }
+                pkg_threads = Some(logical);
+                pkg_shift = shift;
+            }
+            _ => return None,
+        }
+    }
+    let pkg = pkg_threads?;
+    if pkg == 0 || pkg_shift > 31 || pkg > (1u32 << pkg_shift) {
+        return None;
+    }
+    match smt_threads {
+        Some(smt) => {
+            if smt == 0 || smt > pkg || pkg % smt != 0 {
+                return None;
+            }
+            // Thread-id bits must nest strictly below the package bits.
+            if smt_shift >= pkg_shift || smt > (1u32 << smt_shift) {
+                return None;
+            }
+            Some((pkg / smt) as usize)
+        }
+        // No SMT level: one thread per core.
+        None => Some(pkg as usize),
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -462,7 +630,9 @@ fn linux_topology(t: &mut Topology) {
     }
     // Fall back to the reported clock when CPUID had none.
     if t.clock_hz == 0.0 {
-        if let Ok(s) = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq") {
+        if let Ok(s) =
+            std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+        {
             if let Ok(khz) = s.trim().parse::<f64>() {
                 t.clock_hz = khz * 1e3;
             }
@@ -517,7 +687,7 @@ fn measure_latency_ns(cache_sizes: &[usize; 2]) -> f64 {
     // of the next, so the chase walks the entire allocation. A previous version
     // indexed the first 128KB directly and therefore measured L2 latency
     // (24.9ns here) while claiming to measure memory.
-    const SLOTS: usize = 16384;
+    const SLOTS: usize = 8192;
     if want < (SLOTS + 1) * 64 {
         return 0.0;
     }
@@ -558,7 +728,8 @@ fn measure_latency_ns(cache_sizes: &[usize; 2]) -> f64 {
     std::hint::black_box(acc);
     unsafe {
         std::alloc::dealloc(buf.as_mut_ptr(), layout);
-    }    if std::env::var_os("FFF_LATENCY_DEBUG").is_some() {
+    }
+    if std::env::var_os("FFF_LATENCY_DEBUG").is_some() {
         eprintln!("LATENCY raw_ns={ns:.2} want={want} slots={SLOTS}");
     }
     // Plausible range guards against a descheduled thread inflating the mean.
@@ -567,17 +738,36 @@ fn measure_latency_ns(cache_sizes: &[usize; 2]) -> f64 {
     // thread was descheduled mid-probe, too fast means the chase stayed in cache
     // (measured 9.7ns on a box whose real DRAM latency is ~80ns, which inflated
     // work_per_thread 8x). The documented default is safer than either tail.
-    if (40.0..2000.0).contains(&ns) { ns } else { 0.0 }
+    if (40.0..2000.0).contains(&ns) {
+        ns
+    } else {
+        0.0
+    }
 }
 
 #[cfg(target_os = "linux")]
 fn cgroup_memory_limit() -> Option<usize> {
-    let raw = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?;
-    let s = raw.trim();
-    if s == "max" {
-        return None;
+    // v2 first, then v1. Values near u64::MAX mean "no limit".
+    for path in [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+        "/sys/fs/cgroup/memory.limit_in_bytes",
+    ] {
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let s = raw.trim();
+        if s == "max" || s.is_empty() {
+            continue;
+        }
+        if let Ok(n) = s.parse::<u64>()
+            && n > 0
+            && n < (512 << 30)
+        {
+            return usize::try_from(n).ok();
+        }
     }
-    s.parse::<usize>().ok()
+    None
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -628,7 +818,11 @@ mod tests {
     #[test]
     fn small_llc_throttles() {
         let tiny = m(8, 8, 2 << 20, 1);
-        assert!(tiny.scan_thread_cap() <= 1, "got {}", tiny.scan_thread_cap());
+        assert!(
+            tiny.scan_thread_cap() <= 1,
+            "got {}",
+            tiny.scan_thread_cap()
+        );
     }
 
     /// Unknown LLC must not divide by zero or fall through to core count.
@@ -670,7 +864,11 @@ mod tests {
         let cap = real.scan_thread_cap();
         assert!((1..=64).contains(&cap), "cap {cap}");
         assert!(cap <= real.logical_cores.max(1), "cap exceeds cores");
-        assert!(real.physical_cores >= 1, "physical_cores {}", real.physical_cores);
+        assert!(
+            real.physical_cores >= 1,
+            "physical_cores {}",
+            real.physical_cores
+        );
         assert!(real.physical_cores <= real.logical_cores.max(1));
         assert!((16..=256).contains(&real.cache_line));
     }
@@ -682,5 +880,35 @@ mod tests {
         assert_eq!(parse_cache_size("1024K"), Some(1024 * 1024));
         assert_eq!(parse_cache_size("48M"), Some(48 * 1024 * 1024));
         assert_eq!(parse_cache_size("bogus"), None);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn leaf_b_smt_pair_decodes_cores() {
+        // 4 cores x 2 threads: SMT level, core level, terminator.
+        let levels = [(1, 2, 0x100), (3, 8, 0x201), (0, 0, 0)];
+        assert_eq!(cores_from_leaf_b(&levels), Some(4));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn leaf_b_bare_core_level_is_cores() {
+        // No SMT level: one thread per core.
+        assert_eq!(cores_from_leaf_b(&[(2, 4, 0x200)]), Some(4));
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn leaf_b_garbage_is_none() {
+        assert_eq!(cores_from_leaf_b(&[]), None);
+        assert_eq!(cores_from_leaf_b(&[(0, 0, 0)]), None);
+        // Core count not divisible by threads-per-core.
+        assert_eq!(cores_from_leaf_b(&[(1, 2, 0x100), (3, 7, 0x201)]), None);
+        // Unknown level type.
+        assert_eq!(cores_from_leaf_b(&[(1, 2, 0x300)]), None);
+        // Thread bits not nested below package bits.
+        assert_eq!(cores_from_leaf_b(&[(3, 2, 0x100), (1, 8, 0x201)]), None);
+        // Doubled SMT level.
+        assert_eq!(cores_from_leaf_b(&[(1, 2, 0x100), (1, 2, 0x100)]), None);
     }
 }

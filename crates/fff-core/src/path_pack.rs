@@ -7,13 +7,11 @@
 //! substring (pieces stay in order across indels, but existence is enough
 //! for a reject). OR of memmem hits is a necessary condition.
 
-/// Flat table of packed relative paths (lowercase ASCII mirror optional).
+/// Flat table of packed relative paths (lowercase only).
 pub(crate) struct PackedPaths {
-    /// Concatenated path bytes (original case).
-    bytes: Vec<u8>,
-    /// Lowercased copy of `bytes` for case-insensitive needle search.
+    /// Concatenated lowercased path bytes.
     lower: Vec<u8>,
-    /// Byte offset of path `i` in `bytes`/`lower` (`i` in `0..count`).
+    /// Byte offset of path `i` in `lower` (`i` in `0..count`).
     starts: Vec<u32>,
     /// Length of path `i`.
     lens: Vec<u16>,
@@ -44,12 +42,18 @@ impl PackedPaths {
     }
 }
 
+fn pack_lower(raw: &[u8], lower: &mut Vec<u8>) {
+    lower.extend(
+        raw.iter()
+            .map(|&b| if b.is_ascii_uppercase() { b + 32 } else { b }),
+    );
+}
+
 /// Pack paths from a (FileItem, index) iterator.
 pub(crate) fn pack_from_iter<'a>(
     items: impl Iterator<Item = (usize, &'a crate::types::FileItem)>,
     arena: crate::simd_path::ArenaPtr,
 ) -> PackedPaths {
-    let mut bytes = Vec::new();
     let mut lower = Vec::new();
     let mut starts = Vec::new();
     let mut lens = Vec::new();
@@ -65,20 +69,16 @@ pub(crate) fn pack_from_iter<'a>(
         if raw.is_empty() {
             continue;
         }
-        starts.push(bytes.len() as u32);
+        starts.push(lower.len() as u32);
         lens.push(raw.len() as u16);
         file_idx.push(fi as u32);
-        bytes.extend_from_slice(raw);
-        for &b in raw {
-            lower.push(if b.is_ascii_uppercase() { b + 32 } else { b });
-        }
+        pack_lower(raw, &mut lower);
     }
-    starts.push(bytes.len() as u32);
+    starts.push(lower.len() as u32);
     lens.push(0);
     file_idx.push(u32::MAX);
     let count = lens.len().saturating_sub(1);
     PackedPaths {
-        bytes,
         lower,
         starts,
         lens,
@@ -93,44 +93,10 @@ pub(crate) fn pack_paths(
     arena: crate::simd_path::ArenaPtr,
     limit: usize,
 ) -> PackedPaths {
-    let mut bytes = Vec::new();
-    let mut lower = Vec::new();
-    let mut starts = Vec::new();
-    let mut lens = Vec::new();
-    let mut file_idx = Vec::new();
-    let mut buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-
-    for (fi, file) in files.iter().enumerate().take(limit) {
-        if file.is_deleted() {
-            continue;
-        }
-        let path = file.path.read_to_buf(arena, &mut buf);
-        let raw = path.as_bytes();
-        if raw.is_empty() {
-            continue;
-        }
-        starts.push(bytes.len() as u32);
-        lens.push(raw.len() as u16);
-        file_idx.push(fi as u32);
-        bytes.extend_from_slice(raw);
-        for &b in raw {
-            lower.push(if b.is_ascii_uppercase() { b + 32 } else { b });
-        }
-    }
-    // pad so slice end is always in range
-    starts.push(bytes.len() as u32);
-    lens.push(0);
-    file_idx.push(u32::MAX);
-    let count = lens.len().saturating_sub(1);
-
-    PackedPaths {
-        bytes,
-        lower,
-        starts,
-        lens,
-        file_idx,
-        count,
-    }
+    pack_from_iter(
+        files.iter().enumerate().take(limit).map(|(fi, f)| (fi, f)),
+        arena,
+    )
 }
 
 /// Split `needle` into `k+1` contiguous lowercase pieces (pigeonhole).
@@ -173,21 +139,9 @@ fn contains_lower(hay: &[u8], needle: &[u8]) -> bool {
         return false;
     }
     if needle.len() == 1 {
-        return hay.contains(&needle[0]);
+        return memchr::memchr(needle[0], hay).is_some();
     }
-    // Two-byte memchr-style scan, then confirm.
-    let first = needle[0];
-    let second = needle[1];
-    let nlen = needle.len();
-    let mut i = 0usize;
-    let end = hay.len() - nlen + 1;
-    while i < end {
-        if hay[i] == first && hay[i + 1] == second && hay[i..i + nlen] == *needle {
-            return true;
-        }
-        i += 1;
-    }
-    false
+    memchr::memmem::find(hay, needle).is_some()
 }
 
 /// Candidate file indices: packed slots whose path contains at least one
@@ -224,11 +178,7 @@ pub(crate) fn pigeonhole_candidates(
 
 #[inline]
 fn fold(b: u8) -> u8 {
-    if b.is_ascii_uppercase() {
-        b + 32
-    } else {
-        b
-    }
+    if b.is_ascii_uppercase() { b + 32 } else { b }
 }
 
 /// Fold a needle into `out`, returning its length. Caps at 64 (bit-parallel
@@ -411,11 +361,7 @@ pub(crate) fn lcs_len(needle: &[u8], hay: &[u8]) -> usize {
 /// through [`neo_frizbee::myers::lcs_ge_batch8`] (AVX2 8×u32 successor
 /// bit-vectors). Remainder lanes use the scalar bit-vector. No per-path
 /// allocation; O(path_len) word ops per path.
-pub(crate) fn lcs_candidates(
-    packed: &PackedPaths,
-    needle: &[u8],
-    max_typos: u16,
-) -> Vec<u32> {
+pub(crate) fn lcs_candidates(packed: &PackedPaths, needle: &[u8], max_typos: u16) -> Vec<u32> {
     let m = needle.len();
     let need = m.saturating_sub(max_typos as usize);
     let mut out = Vec::with_capacity(packed.len() / 4);
@@ -430,11 +376,7 @@ pub(crate) fn lcs_candidates(
     } else {
         0
     };
-    let needle_folded: &[u8] = if m <= 64 {
-        &folded[..nfold]
-    } else {
-        needle
-    };
+    let needle_folded: &[u8] = if m <= 64 { &folded[..nfold] } else { needle };
 
     let n = packed.len();
     let mut i = 0usize;
@@ -481,12 +423,12 @@ mod tests {
         let cases: &[(&[u8], &[u8], usize, bool)] = &[
             (b"abc", b"abc", 3, true),
             (b"abc", b"abc", 2, true),
-            (b"abc", b"axc", 2, true),   // 1 mismatch/deletion
+            (b"abc", b"axc", 2, true), // 1 mismatch/deletion
             (b"abc", b"axc", 3, false),
-            (b"abc", b"ac", 2, true),    // 1 deletion in needle
+            (b"abc", b"ac", 2, true), // 1 deletion in needle
             (b"abc", b"ac", 3, false),
-            (b"abc", b"abbc", 3, true),  // insertion in hay is free
-            (b"abc", b"cba", 1, true),   // LCS=1
+            (b"abc", b"abbc", 3, true), // insertion in hay is free
+            (b"abc", b"cba", 1, true),  // LCS=1
             (b"abc", b"cba", 2, false),
             (b"abcde", b"ace", 3, true), // LCS=3
             (b"abcde", b"ace", 4, false),
@@ -502,8 +444,15 @@ mod tests {
         ];
         for &(n, h, need, expect) in cases {
             let got = lcs_ge(n, h, need);
-            assert_eq!(got, expect, "lcs_ge({n:?}, {h:?}, {need}) = {got}, want {expect}");
-            assert_eq!(got, lcs_ge_ref(n, h, need), "ref mismatch for {n:?} {h:?} {need}");
+            assert_eq!(
+                got, expect,
+                "lcs_ge({n:?}, {h:?}, {need}) = {got}, want {expect}"
+            );
+            assert_eq!(
+                got,
+                lcs_ge_ref(n, h, need),
+                "ref mismatch for {n:?} {h:?} {need}"
+            );
         }
     }
 
@@ -512,7 +461,9 @@ mod tests {
         // Deterministic LCG — no external rng dependency.
         let mut seed = 0x9e3779b97f4a7c15u64;
         let mut next = move || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 33) as usize
         };
         for _ in 0..2000 {
@@ -565,7 +516,6 @@ mod tests {
     fn lcs_candidates_returns_file_indices() {
         // Minimal packed table: two paths "aa" and "zz".
         let packed = PackedPaths {
-            bytes: b"aazz".to_vec(),
             lower: b"aazz".to_vec(),
             starts: vec![0, 2, 4],
             lens: vec![2, 2, 0],
