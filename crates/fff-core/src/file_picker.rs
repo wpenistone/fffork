@@ -1125,9 +1125,8 @@ impl FilePicker {
             error!("Refusing to index filesystem root: {}", path.display());
             return Err(Error::FilesystemRoot(path));
         }
-        if !options.enable_home_dir_scanning
-            && Some(path.as_os_str()) == dirs::home_dir().as_ref().map(|p| p.as_os_str())
-        {
+        // Path equality compares components, so "~/" (as git root discovery returns it) matches too.
+        if !options.enable_home_dir_scanning && dirs::home_dir().is_some_and(|home| path == home) {
             error!("Refusing to index home directory: {}", path.display());
             return Err(Error::FilesystemRoot(path));
         }
@@ -1831,6 +1830,7 @@ impl FilePicker {
         let run_grep = || {
             grep_search(
                 self.get_files(),
+                self.live_file_count(),
                 query,
                 options,
                 self.cache_budget(),
@@ -3000,6 +3000,23 @@ pub(crate) fn hint_allocator_collect() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refuses_home_dir_with_trailing_separator() {
+        let Some(home) = dirs::home_dir() else { return };
+        for base in [home.clone(), home.join("")] {
+            let result = FilePicker::new(FilePickerOptions {
+                base_path: base.to_string_lossy().into_owned(),
+                watch: false,
+                ..Default::default()
+            });
+            assert!(
+                matches!(result, Err(Error::FilesystemRoot(_))),
+                "home dir accepted as {}",
+                base.display()
+            );
+        }
+    }
 
     /// The watcher must watch every ancestor directory up to `base_path`,
     /// not just the immediate parents of indexed files. The dir table is

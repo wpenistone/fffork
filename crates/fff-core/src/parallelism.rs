@@ -1,8 +1,3 @@
-//! Dedicated rayon pools. The global pool spans every logical core, which
-//! oversubscribes asymmetric chips (Apple P+E): E-cores are ~2× slower and
-//! `open()` contends on a per-VFS lock past P-core count, so a larger pool is
-//! slower on file-heavy work.
-
 use std::sync::LazyLock;
 
 /// Override for background pool size (`FFF_BG_THREADS`).
@@ -55,20 +50,10 @@ pub static BACKGROUND_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|
 pub fn effective_core_count() -> usize {
     #[cfg(target_os = "macos")]
     {
-        let mut count: libc::c_int = 0;
-        let mut size = std::mem::size_of::<libc::c_int>();
-        let name = c"hw.perflevel0.physicalcpu";
-        let ok = unsafe {
-            libc::sysctlbyname(
-                name.as_ptr(),
-                &mut count as *mut _ as *mut libc::c_void,
-                &mut size,
-                std::ptr::null_mut(),
-                0,
-            )
-        };
-        if ok == 0 && count > 0 {
-            return count as usize;
+        // Walk every perf level and exclude Efficiency cores: level 0
+        // alone undercounts on chips with named Super/Performance tiers.
+        if let Some(n) = non_efficiency_core_count() {
+            return n;
         }
     }
     let base = std::thread::available_parallelism()
@@ -237,6 +222,89 @@ where
     }
 }
 
+#[cfg(target_os = "macos")]
+fn non_efficiency_core_count() -> usize {
+    let detected = sysctl_count(c"hw.nperflevels").and_then(|levels| {
+        count_non_efficiency_cores((0..levels).map(|level| {
+            let name = std::ffi::CString::new(format!("hw.perflevel{level}.name")).ok()?;
+            let count = std::ffi::CString::new(format!("hw.perflevel{level}.physicalcpu")).ok()?;
+            Some((sysctl_name(&name)?, sysctl_count(&count)?))
+        }))
+    });
+
+    // Unknown topology falls back to all logical cores, never to a single thread.
+    detected
+        .or_else(|| sysctl_count(c"hw.perflevel0.physicalcpu").filter(|&count| count > 0))
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(4)
+        })
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn count_non_efficiency_cores(
+    levels: impl IntoIterator<Item = Option<(String, usize)>>,
+) -> Option<usize> {
+    let count = levels.into_iter().try_fold(0usize, |total, level| {
+        let (name, count) = level?;
+        if name.eq_ignore_ascii_case("Efficiency") {
+            Some(total)
+        } else if ["Super", "Performance", "Standard"]
+            .iter()
+            .any(|known| name.eq_ignore_ascii_case(known))
+        {
+            total.checked_add(count)
+        } else {
+            None
+        }
+    })?;
+    (count > 0).then_some(count)
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_count(name: &std::ffi::CStr) -> Option<usize> {
+    let mut value: libc::c_int = 0;
+    let mut size = std::mem::size_of_val(&value);
+    let status = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut value as *mut _ as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status != 0 || size != std::mem::size_of_val(&value) {
+        return None;
+    }
+    usize::try_from(value).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_name(name: &std::ffi::CStr) -> Option<String> {
+    let mut value = [0u8; 64];
+    let mut size = value.len();
+    let status = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status != 0 || size > value.len() {
+        return None;
+    }
+    std::ffi::CStr::from_bytes_with_nul(&value[..size])
+        .ok()?
+        .to_str()
+        .ok()
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,5 +342,54 @@ mod tests {
         assert_eq!(cpuset_cpus_inner(""), None);
         assert_eq!(cpuset_cpus_inner("bogus"), None);
         assert_eq!(cpuset_cpus_inner("3-0"), None);
+    }
+
+    #[test]
+    fn includes_super_and_performance_cores() {
+        assert_eq!(count(&[("Super", 6), ("Performance", 12)]), Some(18));
+        assert_eq!(count(&[("Performance", 12), ("Super", 6)]), Some(18));
+    }
+
+    #[test]
+    fn excludes_efficiency_cores_in_every_position() {
+        assert_eq!(count(&[("Performance", 12), ("Efficiency", 4)]), Some(12));
+        assert_eq!(count(&[("Efficiency", 4), ("Performance", 4)]), Some(4));
+        assert_eq!(
+            count(&[("Super", 6), ("Efficiency", 4), ("Performance", 12)]),
+            Some(18)
+        );
+        assert_eq!(count(&[("Performance", 8), ("efficiency", 4)]), Some(8));
+    }
+
+    #[test]
+    fn accepts_standard_cores() {
+        assert_eq!(count(&[("Performance", 8)]), Some(8));
+        assert_eq!(count(&[("Standard", 8)]), Some(8));
+    }
+
+    #[test]
+    fn unknown_core_types_fall_back() {
+        assert_eq!(count(&[("Faster", 6), ("Performance", 12)]), None);
+        assert_eq!(count(&[("Super", 6), ("PowerSaving", 4)]), None);
+    }
+
+    #[test]
+    fn incomplete_or_unusable_topology_falls_back() {
+        assert_eq!(count(&[]), None);
+        assert_eq!(count(&[("Efficiency", 4)]), None);
+        assert_eq!(count(&[("Performance", 0)]), None);
+        assert_eq!(
+            count_non_efficiency_cores([Some(("Super".into(), 6)), None]),
+            None
+        );
+        assert_eq!(count(&[("Super", usize::MAX), ("Performance", 1)]), None);
+    }
+
+    fn count(levels: &[(&str, usize)]) -> Option<usize> {
+        count_non_efficiency_cores(
+            levels
+                .iter()
+                .map(|&(name, count)| Some((name.to_owned(), count))),
+        )
     }
 }

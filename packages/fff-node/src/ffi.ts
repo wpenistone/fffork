@@ -625,7 +625,7 @@ const FFF_GREP_MATCH_STRUCT = {
   match_ranges_count: DataType.U32,
   context_before_count: DataType.U32,
   context_after_count: DataType.U32,
-  fuzzy_score: DataType.U16,
+  fuzzy_score: DataType.I16, // u16 in C; ffi-rs has no U16, so read I16 and mask (#888)
   has_fuzzy_score: DataType.U8,
   is_binary: DataType.U8,
   is_definition: DataType.U8,
@@ -846,7 +846,7 @@ function readGrepMatchFromRaw(raw: FffGrepMatchRaw): GrepMatch {
   };
 
   if (raw.has_fuzzy_score !== 0) {
-    match.fuzzyScore = raw.fuzzy_score;
+    match.fuzzyScore = raw.fuzzy_score & 0xffff;
   }
   if (raw.context_before_count > 0) {
     match.contextBefore = readCStringArray(raw.context_before, raw.context_before_count);

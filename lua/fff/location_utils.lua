@@ -2,6 +2,7 @@ local M = {}
 
 -- NOTE: preview highlights must be verified with prompt_position="top" and
 -- "bottom" (reversed layout); keep location_utils_spec covering both.
+local set_cursor_line_mark
 
 --- Jump to a location in the current buffer
 --- @param location table|nil Location data from search results
@@ -54,11 +55,12 @@ function M.highlight_location(bufnr, location, namespace)
       local line_content = vim.api.nvim_buf_get_lines(bufnr, target_line - 1, target_line, false)[1] or ''
       local end_col = math.min(target_col + 1, #line_content)
 
+      local line_ok, line_mark_id = set_cursor_line_mark(bufnr, namespace, target_line - 1)
+      if line_ok then table.insert(extmarks, { id = line_mark_id, line = target_line - 1 }) end
+
       local ok, mark_id = pcall(vim.api.nvim_buf_set_extmark, bufnr, namespace, target_line - 1, target_col, {
         end_col = end_col,
         hl_group = 'IncSearch', -- inc search are better visible for a single chars
-        line_hl_group = 'CursorLine',
-        number_hl_group = 'CursorLineNr',
         priority = 1000,
       })
 
@@ -85,11 +87,12 @@ function M.highlight_location(bufnr, location, namespace)
         local line_content = vim.api.nvim_buf_get_lines(bufnr, start_line - 1, start_line, false)[1] or ''
         end_col = math.min(end_col, #line_content)
 
+        local line_ok, line_mark_id = set_cursor_line_mark(bufnr, namespace, start_line - 1)
+        if line_ok then table.insert(extmarks, { id = line_mark_id, line = start_line - 1 }) end
+
         local ok, mark_id = pcall(vim.api.nvim_buf_set_extmark, bufnr, namespace, start_line - 1, start_col, {
           end_col = end_col,
           hl_group = 'IncSearch',
-          line_hl_group = 'CursorLine',
-          number_hl_group = 'CursorLineNr',
           priority = 1000,
         })
 
@@ -159,11 +162,7 @@ function M.highlight_grep_matches(bufnr, location, namespace)
   -- the preview viewport with <C-d>/<C-u>.
   if location.line then
     local target_line = math.max(1, math.min(location.line, line_count))
-    local ok, mark_id = pcall(vim.api.nvim_buf_set_extmark, bufnr, namespace, target_line - 1, 0, {
-      line_hl_group = 'CursorLine',
-      number_hl_group = 'CursorLineNr',
-      priority = 999,
-    })
+    local ok, mark_id = set_cursor_line_mark(bufnr, namespace, target_line - 1)
     if ok then table.insert(extmarks, { id = mark_id, line = target_line - 1 }) end
   end
 
@@ -295,6 +294,23 @@ function M.format_location(location)
   end
 
   return ''
+end
+
+--- Pin a row with a full-width CursorLine range, above syntax but below matches
+--- (`line_hl_group` bg would override every `hl_group` bg regardless of priority)
+--- @param bufnr number Buffer number
+--- @param namespace number Namespace for extmarks
+--- @param row number 0-based row to highlight
+--- @return boolean ok, number|string mark_id_or_err pcall result of nvim_buf_set_extmark
+set_cursor_line_mark = function(bufnr, namespace, row)
+  return pcall(vim.api.nvim_buf_set_extmark, bufnr, namespace, row, 0, {
+    end_row = row + 1,
+    end_col = 0,
+    hl_eol = true,
+    hl_group = 'CursorLine',
+    number_hl_group = 'CursorLineNr',
+    priority = 999,
+  })
 end
 
 return M

@@ -556,10 +556,6 @@ impl FileItem {
         s
     }
 
-    pub(crate) fn write_relative_path_from_arena(&self, arena: ArenaPtr, out: &mut String) {
-        self.path.write_to_string(arena, out);
-    }
-
     pub fn relative_path_len(&self) -> usize {
         self.path.byte_len as usize
     }
@@ -569,12 +565,7 @@ impl FileItem {
     }
 
     pub(crate) fn relative_path_eq(&self, arena: ArenaPtr, other: &str) -> bool {
-        if other.len() != self.path.byte_len as usize {
-            return false;
-        }
-        let mut buf = [0u8; PATH_BUF_SIZE];
-        let mine = self.path.read_to_buf(arena, &mut buf);
-        mine == other
+        self.path.equals(arena, other)
     }
 
     pub(crate) fn relative_path_starts_with(&self, arena: ArenaPtr, prefix: &str) -> bool {
@@ -974,7 +965,8 @@ impl FileItem {
     /// Get file content for searching — **always returns content** for eligible
     /// files, even when the persistent cache budget is exhausted.
     ///
-    /// The absolute path is built in a stack buffer (no per-file alloc).
+    /// Open goes through `open_for_search` (openat on Unix); the
+    /// absolute path is built in a stack buffer (no per-file alloc).
     #[inline]
     pub(crate) fn get_content_for_search<'a>(
         &'a self,
@@ -983,6 +975,7 @@ impl FileItem {
         arena: ArenaPtr,
         base_path: &Path,
         budget: &ContentCacheBudget,
+        base_dir: Option<&std::fs::File>,
     ) -> Option<&'a [u8]> {
         #[cfg(not(target_os = "windows"))]
         {
@@ -999,14 +992,10 @@ impl FileItem {
             return None;
         }
 
-        // Stack path buffer: a per-file PathBuf alloc dominates
-        // small-file grep (one alloc + memcpy per open).
-        let mut path_buf = [0u8; PATH_BUF_SIZE];
-        let abs = self.write_absolute_path(arena, base_path, &mut path_buf);
+        let mut file = self.open_for_search(arena, base_path, base_dir)?;
 
         #[cfg(not(target_os = "windows"))]
         if self.size >= FRESH_MMAP_THRESHOLD {
-            let file = std::fs::File::open(abs).ok()?;
             let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
             let stored = mmap_slot.insert(mmap);
             return Some(&stored[..]);
@@ -1019,10 +1008,6 @@ impl FileItem {
         buf.clear();
         buf.reserve(len);
 
-        let mut file = match std::fs::File::open(abs) {
-            Ok(f) => f,
-            Err(_) => return None,
-        };
         // SAFETY: read_exact writes every reserved byte or we truncate.
         unsafe {
             buf.set_len(len);
@@ -1032,6 +1017,43 @@ impl FileItem {
             return None;
         }
         Some(buf.as_slice())
+    }
+
+    fn open_for_search(
+        &self,
+        arena: ArenaPtr,
+        base_path: &Path,
+        #[cfg_attr(not(unix), allow(unused_variables))] base_dir: Option<&std::fs::File>,
+    ) -> Option<std::fs::File> {
+        let mut path_buf = [0u8; PATH_BUF_SIZE];
+        #[cfg(unix)]
+        if let Some(dir) = base_dir
+            && self.relative_path_len() < path_buf.len()
+        {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            let path = self.write_relative_cstr(arena, &mut path_buf);
+            // The directory FD stays borrowed; a successful openat returns an owned FD.
+            loop {
+                let fd = unsafe {
+                    libc::openat(
+                        dir.as_raw_fd(),
+                        path.as_ptr(),
+                        libc::O_RDONLY | libc::O_CLOEXEC,
+                    )
+                };
+                if fd >= 0 {
+                    return Some(unsafe { std::fs::File::from_raw_fd(fd) });
+                }
+                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    return None;
+                }
+            }
+        }
+        if base_path.as_os_str().len() + self.relative_path_len() + 1 < path_buf.len() {
+            std::fs::File::open(self.write_absolute_path(arena, base_path, &mut path_buf)).ok()
+        } else {
+            std::fs::File::open(self.absolute_path(arena, base_path)).ok()
+        }
     }
 }
 
@@ -1284,6 +1306,42 @@ impl Default for ContentCacheBudget {
 #[cfg(test)]
 mod content_cache_budget_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn uncached_search_reads_relative_and_absolute_paths() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("nested")).unwrap();
+        let path = "nested/é file.txt";
+        let directory = std::fs::File::open(root.path()).unwrap();
+        let budget = ContentCacheBudget::with_max_files(0);
+        for size in [17, FRESH_MMAP_THRESHOLD as usize + 17] {
+            let contents = vec![b'x'; size];
+            std::fs::write(root.path().join(path), &contents).unwrap();
+            let mut file = FileItem::new_raw(7, size as u64, 0, None, false);
+            let (store, strings) = crate::simd_path::build_chunked_path_store_from_strings(
+                &[path.to_string()],
+                std::slice::from_ref(&file),
+            );
+            file.set_path(strings.into_iter().next().unwrap());
+            for base_dir in [Some(&directory), None] {
+                let mut buf = Vec::new();
+                let mut mmap = MmapSlot::default();
+                let actual = file
+                    .get_content_for_search(
+                        &mut buf,
+                        &mut mmap,
+                        store.as_arena_ptr(),
+                        root.path(),
+                        &budget,
+                        base_dir,
+                    )
+                    .unwrap();
+                assert_eq!(actual, contents);
+                assert_eq!(budget.cached_count.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
 
     #[test]
     fn vendored_dirs_are_matched_per_segment() {

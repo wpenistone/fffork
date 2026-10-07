@@ -194,6 +194,7 @@ impl Sink for PlainTextSink<'_> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn grep_search<'a>(
     files: &'a [FileItem],
+    total_files: usize,
     query: &FFFQuery<'_>,
     options: &GrepSearchOptions,
     budget: &ContentCacheBudget,
@@ -205,7 +206,6 @@ pub(crate) fn grep_search<'a>(
     overflow_arena: crate::simd_path::ArenaPtr,
     content_masks: Option<&'a crate::file_picker::ContentMaskStore>,
 ) -> GrepResult<'a> {
-    let total_files = files.live_count();
     let result = grep_search_parsed(
         files,
         query,
@@ -391,7 +391,10 @@ fn grep_search_parsed<'a>(
     );
 
     if files_to_search.is_empty() {
-        return GrepResult::empty(total_files, filtered_file_count);
+        return GrepResult {
+            regex_fallback_error,
+            ..GrepResult::empty(total_files, filtered_file_count)
+        };
     }
 
     // `PlainTextMatcher` is used by the grep-searcher engine for line detection.
@@ -631,6 +634,12 @@ where
     };
 
     let search_start = std::time::Instant::now();
+    // Directory FD for openat reads on Unix; None elsewhere and on
+    // open failure (callers fall back to absolute-path opens).
+    #[cfg(unix)]
+    let base_dir = std::fs::File::open(ctx.base_path).ok();
+    #[cfg(not(unix))]
+    let base_dir: Option<std::fs::File> = None;
     let phase_timing = std::env::var_os("FFF_PHASE_TIMING").is_some();
     // Per-phase nanos, summed across chunk iterations. Cheap: two adds per file.
     let mut phase_read_ns = 0u64;
@@ -747,6 +756,7 @@ where
                             ctx.arena_for_file(file),
                             ctx.base_path,
                             ctx.budget,
+                            base_dir.as_ref(),
                         )?;
                         if let Some(t) = t_read {
                             *read_ns += t.elapsed().as_nanos() as u64;

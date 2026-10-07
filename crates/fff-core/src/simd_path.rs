@@ -136,6 +136,21 @@ impl ChunkedString {
     }
 
     #[inline]
+    pub(crate) fn equals(&self, arena: ArenaPtr, other: &str) -> bool {
+        if other.len() != self.byte_len as usize {
+            return false;
+        }
+        self.indices(arena)
+            .iter()
+            .zip(other.as_bytes().chunks(SIMD_CHUNK_BYTES))
+            .all(|(&index, expected)| {
+                let actual =
+                    unsafe { core::slice::from_raw_parts(arena.chunk_ptr(index), expected.len()) };
+                actual == expected
+            })
+    }
+
+    #[inline]
     pub fn resolve_ptrs<'a>(&self, arena: ArenaPtr, buf: &'a mut [*const u8]) -> &'a [*const u8] {
         let indices = self.indices(arena);
         let count = indices.len().min(buf.len());

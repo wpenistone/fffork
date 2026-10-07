@@ -175,8 +175,8 @@ export interface Score {
   currentFilePenalty: number;
   /** Boost from query history combo matching */
   comboMatchBoost: number;
-  /** Bonus for path alignment (absent on older natives) */
-  pathAlignmentBonus?: number;
+  /** Bonus for query segments aligning with path segments */
+  pathAlignmentBonus: number;
   /**
    * Intent-evidence mix (filename/ext/segments/role/proximity).
    * Reserved: the frozen FffScore ABI has no field for it yet, so FFI

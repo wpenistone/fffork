@@ -109,6 +109,10 @@ pub(super) fn fuzzy_grep_search<'a>(
         None
     };
     let search_start = std::time::Instant::now();
+    #[cfg(unix)]
+    let base_dir = std::fs::File::open(base_path).ok();
+    #[cfg(not(unix))]
+    let base_dir: Option<std::fs::File> = None;
     // Lowest index an abort skipped, i.e. the resume point; usize::MAX means no abort.
     let first_skipped = AtomicUsize::new(usize::MAX);
     let max_matches_per_file = options.max_matches_per_file;
@@ -178,7 +182,12 @@ pub(super) fn fuzzy_grep_search<'a>(
                         };
 
                         let file_bytes = file.get_content_for_search(
-                            buf, mmap_slot, file_arena, base_path, budget,
+                            buf,
+                            mmap_slot,
+                            file_arena,
+                            base_path,
+                            budget,
+                            base_dir.as_ref(),
                         )?;
 
                         if min_chars_required > 0 {
