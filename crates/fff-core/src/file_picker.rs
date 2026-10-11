@@ -1487,6 +1487,9 @@ impl FilePicker {
             enum NarrowPlan {
                 Full,
                 Narrow { orig: Vec<u32> },
+                // Previous hits narrow to nothing: Match(new) is a subset
+                // of old hits (same typos+generation), so it is empty too.
+                Empty,
             }
             let plan = {
                 let live = self.live.lock();
@@ -1517,8 +1520,18 @@ impl FilePicker {
                             orig.len()
                         );
                     }
-                    if orig.len() < live.candidates.len() && !orig.is_empty() {
+                    // Narrow on any non-empty subset: even unpruned, the
+                    // subset scorer covers fewer files than a full scan.
+                    // Empty narrows to empty (sound per above); anything
+                    // else falls back to the full corpus scan.
+                    if orig.is_empty() {
+                        NarrowPlan::Empty
+                    } else if orig.len() < live.candidates.len() {
                         NarrowPlan::Narrow { orig }
+                    } else if live.candidates.len() < files.len() {
+                        NarrowPlan::Narrow {
+                            orig: live.candidates.clone(),
+                        }
                     } else {
                         NarrowPlan::Full
                     }
@@ -1527,6 +1540,7 @@ impl FilePicker {
                 }
             };
             match plan {
+                NarrowPlan::Empty => (vec![], vec![], 0),
                 NarrowPlan::Narrow { orig } => {
                     let mut local_hits: Vec<u32> = Vec::new();
                     let out = crate::score::with_hit_capture(&mut local_hits, || {
@@ -3339,6 +3353,66 @@ mod tests {
         let (total, names) = names_of(&picker, "alpha");
         assert_eq!(total, 2);
         assert!(!names.iter().any(|n| n.ends_with("alpha_3.rs")), "{names:?}");
+    }
+
+    /// Extended queries narrow the previous hit set instead of rescanning,
+    /// and must agree with a fresh full-corpus search (same files, same
+    /// order, same totals) — including the empty extension.
+    #[test]
+    fn live_narrow_extension_matches_full_search() {
+        use crate::types::PaginationArgs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_buf = crate::path_utils::canonicalize(dir.path()).unwrap();
+        let base = base_buf.as_path();
+        for rel in ["src/alpha_1.rs", "src/alpha_2.rs", "src/beta.rs"] {
+            let path = base.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+        let mut fresh = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        fresh.collect_files().unwrap();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+
+        let opts = || FuzzySearchOptions {
+            max_threads: 1,
+            current_file: None,
+            project_path: None,
+            combo_boost_score_multiplier: 0,
+            min_combo_count: 0,
+            pagination: PaginationArgs { offset: 0, limit: 50 },
+        };
+        let parser = fff_query_parser::QueryParser::default();
+        let run = |picker: &FilePicker, text: &str| {
+            let parsed = parser.parse(text);
+            let out = picker.fuzzy_search(&parsed, None, opts());
+            let names: Vec<String> =
+                out.items.iter().map(|f| f.relative_path(picker)).collect();
+            let totals: Vec<i32> = out.scores.iter().map(|s| s.total).collect();
+            (out.total_matched, names, totals)
+        };
+
+        // Prime the live set, then extend (narrow) and dead-end (empty).
+        let _ = run(&picker, "alph");
+        assert!(picker.live.lock().active);
+        for text in ["alpha", "alpha_", "alphzzz"] {
+            assert_eq!(
+                run(&picker, text),
+                run(&fresh, text),
+                "narrow diverged for {text:?}"
+            );
+        }
     }
 
     /// Binary sniff reads a bounded prefix: early NULs flag binary, late

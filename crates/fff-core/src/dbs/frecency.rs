@@ -385,11 +385,13 @@ impl FrecencyTracker {
         if paths.is_empty() {
             return Ok(0);
         }
+        // Unhashable (non-UTF8) paths cannot round-trip through reads
+        // either; skip them rather than colliding on the zero key.
         let hashes: Vec<[u8; 32]> = crate::parallelism::run_on_bg_pool(|| {
             use rayon::prelude::*;
             paths
                 .par_iter()
-                .map(|p| Self::path_to_hash_bytes(p).unwrap_or([0u8; 32]))
+                .filter_map(|p| Self::path_to_hash_bytes(p).ok())
                 .collect()
         });
         let now = self.get_now();

@@ -155,6 +155,10 @@ pub(super) fn fuzzy_grep_search<'a>(
                     let idx = chunk_offset + local_idx;
                     let found = (|| -> Option<Vec<GrepMatch>> {
                         if gate.as_ref().is_some_and(|g| g.is_full()) {
+                            // Page filled mid-chunk: files from here on are
+                            // unsearched, so mark the resume point (same as
+                            // the abort path) instead of losing it.
+                            first_skipped.fetch_min(idx, Ordering::Relaxed);
                             return None;
                         }
                         // File 0 is never skipped so a page always consumes at least one

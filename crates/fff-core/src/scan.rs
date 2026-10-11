@@ -217,7 +217,14 @@ impl ScanJob {
 
         // Spawn the git status worker once. BUG PINNNING. If the user initiated git in the folder
         // which is a real use case we need to have a way to start the git worker background thread dynamically
-        if git_workdir.is_some() && !signals.cancelled.load(Ordering::Acquire) {
+        // Same auto-skip as the sync path: huge trees skip the worker
+        // unless forced (threshold still uncalibrated; see P1-2).
+        let skip_git = crate::file_picker::should_skip_git(
+            config.skip_git,
+            n_files,
+            crate::file_picker::git_force(),
+        );
+        if git_workdir.is_some() && !skip_git && !signals.cancelled.load(Ordering::Acquire) {
             git_status_worker.spawn_once(shared_picker.weaken(), shared_frecency.clone());
             git_status_worker.request_full_rescan(); // this runs anyway
         }

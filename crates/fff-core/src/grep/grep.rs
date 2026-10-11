@@ -904,9 +904,10 @@ where
     }
 }
 
-// One-chunk lookahead: posix_fadvise warms chunk k+1's pages while the pool
+// One-chunk lookahead: fadvise warms chunk k+1's pages while the pool
 // scans chunk k. Pure kernel hint — never changes results, only latency.
-#[cfg(unix)]
+// Linux-only: Darwin has no posix_fadvise; macOS uses the no-op below.
+#[cfg(all(unix, not(target_vendor = "apple")))]
 #[inline]
 fn prefetch_ahead(
     files_to_search: &[&FileItem],
@@ -940,7 +941,7 @@ fn prefetch_ahead(
 }
 
 // No page-cache hint API; the call site stays platform-independent.
-#[cfg(not(unix))]
+#[cfg(any(not(unix), target_vendor = "apple"))]
 #[inline]
 fn prefetch_ahead(
     _files_to_search: &[&FileItem],

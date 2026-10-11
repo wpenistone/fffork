@@ -62,19 +62,14 @@ pub fn path_ends_with_suffix(path: &str, suffix: &str) -> bool {
         return false;
     }
 
-    // Exact or preceded by a separator. Scan backward past any multi-byte
-    // continuation bytes to find the preceding ASCII byte.
+    // Exact or preceded by a separator. Only the byte directly before
+    // `start` matters: separators are single-byte ASCII, so a non-ASCII
+    // byte there (lead or continuation) means no boundary. Scanning
+    // further back skips whole non-ASCII words and false-matches.
     if start == 0 {
         return true;
     }
-    let mut i = start;
-    while i > 0 {
-        i -= 1;
-        if path_bytes[i] < 128 {
-            return is_path_sep(path_bytes[i]);
-        }
-    }
-    false
+    is_path_sep(path_bytes[start - 1])
 }
 
 #[inline]
@@ -725,6 +720,15 @@ mod tests {
         // Simple path
         assert!(path_ends_with_suffix("src/main.rs", "src/main.rs"));
         assert!(path_ends_with_suffix("crates/src/main.rs", "src/main.rs"));
+
+        // Non-ASCII word directly before the suffix is not a boundary,
+        // even though scanning further back would find a separator.
+        assert!(!path_ends_with_suffix(
+            "abc/приветfoo/bar.txt",
+            "foo/bar.txt"
+        ));
+        assert!(path_ends_with_suffix("abc/привет/foo/bar.txt", "foo/bar.txt"));
+        assert!(path_ends_with_suffix("привет/bar.txt", "bar.txt"));
     }
 
     #[cfg(windows)]
