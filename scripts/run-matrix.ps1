@@ -2,7 +2,7 @@
 # Multi-corpus / query-class A/B vs upstream. Total_matched + wall.
 param(
   [string]$Opt = "D:/fff-target-keepers/release/fff-profile-driver.exe",
-  [string]$Up = "C:/Users/kanal/Projects/fff-upstream/archive/bench-binaries/fff-profile-driver-upstream.exe",
+  [string]$Up = "C:/Users/kanal/Projects/fff-upstream/scratch/archive/bench-binaries/fff-profile-driver-upstream.exe",
   [int]$Iters = 8
 )
 $corpora = @(

@@ -70,6 +70,7 @@ htmlcov/
 # ─── local perf/bench scratch ───────────────────────────────────────────
 # Bench corpora and run logs are machine-local state, not reviewable. They
 # also drown real hits in the picker when left inside the worktree.
+.fff-bench/
 .fff-bench/cache/
 .fff-bench/runs/
 .fff-bench/history/
@@ -79,16 +80,16 @@ htmlcov/
 .fff-bench/*.py
 .fff-bench/profile-driver/Cargo.lock
 .fff-bench/profile-driver/probes-bak/
-archive/bench-binaries/
-archive/charts/
-archive/dot-fff-bench-runs/
-archive/*.json
-archive/*.log
-archive/*.out
-archive/_*.py
-archive/_*.ps1
+scratch/archive/bench-binaries/
+scratch/archive/charts/
+scratch/archive/dot-fff-bench-runs/
+scratch/archive/*.json
+scratch/archive/*.log
+scratch/archive/*.out
+scratch/archive/_*.py
+scratch/archive/_*.ps1
 
-# One-off probes / throwaway harnesses (kept under archive/keepers-scratch-*)
+# One-off probes / throwaway harnesses (kept under scratch/archive/keepers-scratch-*)
 _head_*.rs
 _ff_*.rs
 _macro_test*
@@ -98,12 +99,12 @@ _sz_probe.rs
 *.pid
 
 # Review/measurement evidence and moved scratch (machine-local)
-archive/keepers-review-*/
-archive/keepers-scratch-*/
+scratch/archive/keepers-review-*/
+scratch/archive/keepers-scratch-*/
 
 # arena research lab artifacts
-archive/arena_lab/*.exe
-archive/arena_lab/*.bin
+scratch/archive/arena_lab/*.exe
+scratch/archive/arena_lab/*.bin
 
 # ─── perf-branch scratch (observed, ignore-only) ──────────────────────────
 # Tracked scratch stays tracked; purge separately with `git rm --cached`.
@@ -117,11 +118,11 @@ archive/arena_lab/*.bin
 /fff-bench.json
 .fff-bench/*.rs
 .fff-bench/*.ps1
-archive/*.jsonl
-archive/*.png
-archive/*.html
-archive/*.svg
-archive/*.csv
-archive/*.md
-archive/*.py
-archive/*.ps1
+scratch/archive/*.jsonl
+scratch/archive/*.png
+scratch/archive/*.html
+scratch/archive/*.svg
+scratch/archive/*.csv
+scratch/archive/*.md
+scratch/archive/*.py
+scratch/archive/*.ps1
