@@ -1225,9 +1225,9 @@ pub(crate) fn build_bigram_index(
     let skip_index = skip_builder.compress(Some(SKIP_INDEX_MIN_DENSITY_PCT));
     index.set_skip_index(skip_index);
 
-    // in progress bigram walk + rust's ignore crate allocates shit ton of garbage memory
-    // all custom allocators would think this is available resource while we do not allocate
-    // after the sync, so it's very important to let the unused memory go back to the OS
+    // Concurrent bigram walk and glob matching hold large transient
+    // buffers; return unused memory to the OS since little is allocated
+    // after the sync and allocators would otherwise retain the peak.
     crate::file_picker::hint_allocator_collect();
 
     index
