@@ -148,6 +148,12 @@ impl NeedlePresence {
     }
 }
 
+/// Sound pretest for one file: unknown masks (0) always scan.
+#[inline]
+pub(crate) fn allows_or_unknown(np: &NeedlePresence, path_mask: u64, needle: &[u8]) -> bool {
+    path_mask == 0 || np.allows(path_mask, needle)
+}
+
 /// Sound necessary condition for `LCS(needle, path) >= |needle| - max_typos`.
 ///
 /// Counts needle bytes (with multiplicity) whose folded bit is set in the

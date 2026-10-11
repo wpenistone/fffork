@@ -93,7 +93,7 @@ fn match_fuzzy_parts(
     let first_part_matches = {
         let part_timing = phase_timing();
         let t_prefilter = std::time::Instant::now();
-        // Phase 1: frizbee prefilter only (skip its SW). The skip_sw path
+        // Phase 1: gate match-set + windows. The skip_sw path
         // encodes (start_pos_adj, end_pos) in (score, end_col).
         let np = crate::presence::NeedlePresence::new(
             first_part.as_bytes(),
@@ -151,30 +151,16 @@ fn match_fuzzy_parts(
         let use_cand = try_cand && cand.len() * 2 < working_files.len() && !cand.is_empty();
         // TISG gate (span + skip-DP) Ã¢â‚¬â€ match-set + window without frizbee.
         // Emits the same skip_sw Match encoding the pipeline already decodes.
-        let t_gate = std::time::Instant::now();
-        let mut matches = if use_cand {
-            let cand = cand.as_slice();
-            crate::gate::gate_match_range(
-                first_part.as_bytes(),
-                cand.len(),
-                first_options.max_typos.unwrap_or(u16::MAX),
-                threads,
-                |i| cand[i as usize],
-                |i| working_files.index(cand[i as usize] as usize),
-                arena,
-            )
-        } else {
-            crate::gate::gate_match_range(
-                first_part.as_bytes(),
-                working_files.len(),
-                first_options.max_typos.unwrap_or(u16::MAX),
-                threads,
-                |i| i,
-                |i| working_files.index(i as usize),
-                arena,
-            )
-        };
-        let gate_us = t_gate.elapsed().as_micros();
+        // Shared per-query gate state for the fused group pass below.
+        // `gate_n` is the gate's index space (candidates when the
+        // prefilter fired); groups partition it in file order.
+        let gate_n = if use_cand { cand.len() } else { working_files.len() };
+        let gate_typos = first_options.max_typos.unwrap_or(u16::MAX);
+        let gate_state = crate::gate::GateNeedle::new(first_part.as_bytes(), gate_typos);
+        let check_presence = np.should_check();
+        let t_gate_us = std::sync::atomic::AtomicU64::new(0);
+        let t_exact_us = std::sync::atomic::AtomicU64::new(0);
+        let t_swslice_us = std::sync::atomic::AtomicU64::new(0);
         let prefilter_ms = t_prefilter.elapsed().as_secs_f64() * 1e3;
 
         // Phase 2: re-score with inter-sequence SW on trimmed windows.
@@ -188,41 +174,34 @@ fn match_fuzzy_parts(
             let q = first_part;
             q.len() >= 4 && q.contains('.') && !q.contains('/')
         };
-        let mut exact_name_hits: Vec<u32> = Vec::new();
-        let t_exact = std::time::Instant::now();
-        if looks_like_filename {
-            let q = first_part;
-            let qb = q.as_bytes();
-            // Reused scratch: `filename_cow` would heap-allocate per candidate
-            // whose filename straddles a chunk, and this loop walks every match.
-            let mut name_scratch = [0u8; crate::simd_path::PATH_BUF_SIZE];
-            for m in matches.iter() {
-                let f = working_files.index(m.index as usize);
-                let flen = f.path.byte_len as usize - f.path.filename_offset as usize;
-                if flen == qb.len() {
-                    let fname = f.path.filename_ref(arena, &mut name_scratch);
-                    if fname.eq_ignore_ascii_case(q) {
-                        exact_name_hits.push(m.index);
+        let exact_for = |chunk_matches: &[neo_frizbee::Match]| {
+            let mut hits: Vec<u32> = Vec::new();
+            if looks_like_filename {
+                let qb = first_part.as_bytes();
+                // Reused scratch: `filename_cow` would heap-allocate per candidate
+                // whose filename straddles a chunk, and this loop walks every match.
+                let mut name_scratch = [0u8; crate::simd_path::PATH_BUF_SIZE];
+                for m in chunk_matches.iter() {
+                    let f = working_files.index(m.index as usize);
+                    let flen = f.path.byte_len as usize - f.path.filename_offset as usize;
+                    if flen == qb.len() {
+                        let fname = f.path.filename_ref(arena, &mut name_scratch);
+                        if fname.eq_ignore_ascii_case(first_part) {
+                            hits.push(m.index);
+                        }
                     }
                 }
             }
-        }
-
-        let exact_us = t_exact.elapsed().as_micros();
-        // Sorted for binary search in the assemble pass below, which
-        // applies the bump inline (no second pass, no hash set).
-        exact_name_hits.sort_unstable();
+            // Sorted for binary search in the assemble pass below, which
+            // applies the bump inline (no second pass, no hash set).
+            hits.sort_unstable();
+            hits
+        };
 
         // SW scoring (collapse removed: cheap rank disagreed with SW
         // on real corpora; reordering would be a UX regression).
-        let wins_ms = 0.0f64;
-        let samp_ms = 0.0f64;
-        if phase_timing() {
-            eprintln!(
-                "PHASE cand_ms={cand_ms:.1} wins_ms={wins_ms:.1} samp_ms={samp_ms:.1} collapsed=false n={}",
-                matches.len()
-            );
-        }
+        // (Phase counters print after the fused pass below, once the
+        // match count is known.)
         let t_sw = std::time::Instant::now();
         {
             // Chunked scoring: process at most CHUNK matches of metadata at a
@@ -282,7 +261,7 @@ fn match_fuzzy_parts(
             // Only fan out when there is more than one chunk: a single chunk has
             // nothing to split, and the fork/join alone measured ~8x the whole
             // serial body on a few-hundred-match corpus (782us vs 97us).
-            let sw_body = |matches_chunk: &mut [neo_frizbee::Match]| {
+            let sw_body = |matches_chunk: &mut [neo_frizbee::Match], exact_hits: &[u32]| {
                 let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
                 let t_chunk = std::time::Instant::now();
                 let n_matches = matches_chunk.len();
@@ -679,9 +658,7 @@ fn match_fuzzy_parts(
                     m.score = scores[i].saturating_add(bonus);
                     m.end_col = end_cols[i].saturating_add(start_adj.min(u16::MAX as u32) as u16);
                     m.exact = exact;
-                    if !exact_name_hits.is_empty()
-                        && exact_name_hits.binary_search(&m.index).is_ok()
-                    {
+                    if !exact_hits.is_empty() && exact_hits.binary_search(&m.index).is_ok() {
                         m.score = m.score.max(200);
                         m.exact = true;
                     }
@@ -697,13 +674,89 @@ fn match_fuzzy_parts(
                 SCORES.with(|c| reclaim(&mut c.borrow_mut(), scores));
                 ECOLS.with(|c| reclaim(&mut c.borrow_mut(), end_cols));
             };
-            if matches.len() <= CHUNK || max_threads == 1 {
-                for chunk in matches.chunks_mut(CHUNK) {
-                    sw_body(chunk);
+            // Fused groups: gate, exact, and SW per file chunk while the
+            // chunk's bytes are hot. Concatenated in file order; outputs
+            // are per-index, so the size cannot change results.
+            // Test-tunable (`FFF_SW_CHUNK`); production sizes chunks so
+            // each pool worker gets one: candidate/file density varies per
+            // chunk, and coarse fixed chunks strand stragglers (measured
+            // +73% wall on selective queries). Floor keeps tiny inputs
+            // serial and per-chunk fixed costs negligible.
+            let workers = crate::parallelism::effective_core_count().max(1);
+            let file_chunk: usize = std::env::var("FFF_SW_CHUNK")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|&n| n >= 1)
+                .unwrap_or((gate_n.div_ceil(workers)).max(1024));
+            let n_groups = gate_n.div_ceil(file_chunk);
+            let one_group = |g: usize| {
+                let lo = g * file_chunk;
+                let hi = ((g + 1) * file_chunk).min(gate_n);
+                let t = std::time::Instant::now();
+                let mut m: Vec<neo_frizbee::Match> = Vec::new();
+                for k in lo..hi {
+                    let (idx, file) = if use_cand {
+                        let ci = cand[k];
+                        (ci, working_files.index(ci as usize))
+                    } else {
+                        (k as u32, working_files.index(k))
+                    };
+                    if check_presence
+                        && !crate::presence::allows_or_unknown(
+                            &np,
+                            file.presence_mask(),
+                            first_part.as_bytes(),
+                        )
+                    {
+                        continue;
+                    }
+                    if k + 1 < gate_n {
+                        let nf = if use_cand {
+                            working_files.index(cand[k + 1] as usize)
+                        } else {
+                            working_files.index(k + 1)
+                        };
+                        nf.path.prefetch(arena);
+                    }
+                    if let Some(hit) = gate_state.hit_file(file, arena) {
+                        m.push(neo_frizbee::Match {
+                            score: hit.start as u16,
+                            index: idx,
+                            exact: false,
+                            end_col: hit.end as u16,
+                        });
+                    }
+                }
+                t_gate_us.fetch_add(
+                    t.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                let t = std::time::Instant::now();
+                let exact = exact_for(&m);
+                t_exact_us.fetch_add(
+                    t.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                let t = std::time::Instant::now();
+                sw_body(&mut m, &exact);
+                t_swslice_us.fetch_add(
+                    t.elapsed().as_micros() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                m
+            };
+            let mut matches: Vec<neo_frizbee::Match> = Vec::new();
+            if gate_n <= file_chunk {
+                for g in 0..n_groups {
+                    matches.extend(one_group(g));
                 }
             } else {
                 use rayon::prelude::*;
-                matches.par_chunks_mut(CHUNK).for_each(sw_body);
+                let scored: Vec<Vec<neo_frizbee::Match>> =
+                    (0..n_groups).into_par_iter().map(one_group).collect();
+                for v in scored {
+                    matches.extend(v);
+                }
             }
 
             let sw_us = t_sw.elapsed().as_micros();
@@ -716,9 +769,18 @@ fn match_fuzzy_parts(
             let scalar_ms = t_scalar_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
             let prep_ms = t_prep_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
             let scatter_ms = t_scatter_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
+            if phase_timing() {
+                eprintln!(
+                    "PHASE cand_ms={cand_ms:.1} wins_ms=0.0 samp_ms=0.0 collapsed=false n={}",
+                    matches.len()
+                );
+            }
+            let gate_us = t_gate_us.load(std::sync::atomic::Ordering::Relaxed);
+            let exact_us = t_exact_us.load(std::sync::atomic::Ordering::Relaxed);
+            let swslice_us = t_swslice_us.load(std::sync::atomic::Ordering::Relaxed);
             if part_timing {
                 eprintln!(
-                    "PHASE parts gate_us={gate_us} exact_us={exact_us} sw_us={sw_us} threads={threads} n={}",
+                    "PHASE parts gate_us={gate_us} exact_us={exact_us} swslice_us={swslice_us} fuse_us={sw_us} threads={threads} n={}",
                     matches.len()
                 );
             }
@@ -3926,6 +3988,33 @@ mod topk_prune_tests {
                 assert_eq!(on_items, off_items, "items differ for {q:?} t={threads}");
                 let totals = |s: Vec<Score>| s.into_iter().map(|x| x.total).collect::<Vec<_>>();
                 assert_eq!(totals(on_scores), totals(off_scores), "totals differ");
+            }
+        }
+    }
+
+    #[test]
+    fn fused_groups_match_regardless_of_size() {
+        // Group outputs are per-index, so group size cannot change results.
+        // Size 8 also covers the scalar lane path. Same race-safety
+        // argument as the hatch test above.
+        let paths: Vec<String> = (0..1500)
+            .map(|i| format!("src/mod{}/Handler_{}.rs", i % 37, i % 50))
+            .collect();
+        let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        let (files, arena) = make_paths(&refs);
+        for q in ["handler", "mod handler", "handler_"] {
+            for threads in [1usize, 4] {
+                let (base_items, base_scores) = search_with(&files, q, arena, threads, None);
+                unsafe {
+                    std::env::set_var("FFF_SW_CHUNK", "8");
+                }
+                let (tiny_items, tiny_scores) = search_with(&files, q, arena, threads, None);
+                unsafe {
+                    std::env::remove_var("FFF_SW_CHUNK");
+                }
+                assert_eq!(base_items, tiny_items, "items differ for {q:?} t={threads}");
+                let totals = |s: Vec<Score>| s.into_iter().map(|x| x.total).collect::<Vec<_>>();
+                assert_eq!(totals(base_scores), totals(tiny_scores), "totals differ");
             }
         }
     }

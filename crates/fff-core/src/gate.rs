@@ -451,7 +451,7 @@ where
         let file = file_at(i);
         if check_presence {
             let mask = file.presence_mask();
-            if mask != 0 && !presence.allows(mask, needle) {
+            if !crate::presence::allows_or_unknown(&presence, mask, needle) {
                 return None;
             }
         }
