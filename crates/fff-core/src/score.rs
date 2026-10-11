@@ -10,68 +10,9 @@ use fff_query_parser::{FFFQuery, FuzzyQuery};
 use neo_frizbee::Scoring;
 use rayon::prelude::*;
 use smallvec::SmallVec;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::path::MAIN_SEPARATOR;
-use std::sync::Arc;
-
-/// Raw frizbee match lists are expensive (full corpus Ãƒâ€” needle). Cache them
-/// across identical searches on an unchanged index generation Ã¢â‚¬â€ typing and
-/// the profile-driver warm loop otherwise re-pay matching every op.
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub(crate) struct RawMatchKey {
-    generation: u64,
-    partition: u8,
-    query: String,
-    max_typos: u16,
-    file_count: usize,
-}
-
-const RAW_MATCH_CACHE_MAX_BYTES: usize = 4 * 1024 * 1024;
-const RAW_MATCH_CACHE_MAX_ENTRIES: usize = 8;
-
-#[derive(Default)]
-pub(crate) struct RawMatchCache {
-    map: ahash::AHashMap<RawMatchKey, Arc<Vec<neo_frizbee::Match>>>,
-    bytes: usize,
-}
-
-impl RawMatchCache {
-    fn get(&self, key: &RawMatchKey) -> Option<Arc<Vec<neo_frizbee::Match>>> {
-        self.map.get(key).cloned()
-    }
-
-    fn insert(&mut self, key: RawMatchKey, matches: Arc<Vec<neo_frizbee::Match>>) {
-        let bytes = matches
-            .len()
-            .saturating_mul(std::mem::size_of::<neo_frizbee::Match>());
-        if bytes > RAW_MATCH_CACHE_MAX_BYTES {
-            return;
-        }
-        if let Some(old) = self.map.remove(&key) {
-            self.bytes = self
-                .bytes
-                .saturating_sub(old.len() * std::mem::size_of::<neo_frizbee::Match>());
-        }
-        while self.map.len() >= RAW_MATCH_CACHE_MAX_ENTRIES
-            || self.bytes.saturating_add(bytes) > RAW_MATCH_CACHE_MAX_BYTES
-        {
-            let Some(first_key) = self.map.keys().next().cloned() else {
-                break;
-            };
-            if let Some(old) = self.map.remove(&first_key) {
-                self.bytes = self
-                    .bytes
-                    .saturating_sub(old.len() * std::mem::size_of::<neo_frizbee::Match>());
-            }
-        }
-        self.bytes = self.bytes.saturating_add(bytes);
-        self.map.insert(key, matches);
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.map.clear();
-        self.bytes = 0;
-    }
-}
 
 use crate::matcher::*;
 pub(crate) use crate::matcher::{capture_hit_indices, with_hit_capture};
@@ -297,29 +238,6 @@ fn match_fuzzy_parts(
                 static PERM_SCORES: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
                 static PERM_ECOLS: std::cell::RefCell<Vec<u16>> = const { std::cell::RefCell::new(Vec::new()) };
             }
-            fn take_tls<T: Default>(cell: &std::cell::RefCell<Vec<T>>, min_cap: usize) -> Vec<T> {
-                let mut b = cell.borrow_mut();
-                b.clear();
-                if b.capacity() < min_cap {
-                    b.reserve(min_cap);
-                }
-                std::mem::take(&mut *b)
-            }
-            fn take_tls_cap<T>(cell: &std::cell::RefCell<Vec<T>>, cap: usize) -> Vec<T> {
-                let mut b = cell.borrow_mut();
-                b.clear();
-                if b.capacity() < cap {
-                    b.reserve(cap);
-                }
-                std::mem::take(&mut *b)
-            }
-            // Length without zero-fill: every byte must be overwritten before
-            // any read (all score paths below write their full range; the
-            // max_len==0 batch explicitly fills zeros).
-            fn set_len_uninit<T>(v: &mut Vec<T>, n: usize) {
-                v.reserve(n.saturating_sub(v.capacity()));
-                unsafe { v.set_len(n) };
-            }
             fn reclaim<T>(b: &mut Vec<T>, v: Vec<T>) {
                 *b = v;
                 // Cap retained capacity so one huge match set does not pin TLS
@@ -349,6 +267,13 @@ fn match_fuzzy_parts(
             let t_collect_us = std::sync::atomic::AtomicU64::new(0);
             let t_batch_us = std::sync::atomic::AtomicU64::new(0);
             let t_assemble_us = std::sync::atomic::AtomicU64::new(0);
+            // Diagnostic split of batch_ms; each add is timing-gated.
+            let t_stage_us = std::sync::atomic::AtomicU64::new(0);
+            let t_xpose_us = std::sync::atomic::AtomicU64::new(0);
+            let t_kernel_us = std::sync::atomic::AtomicU64::new(0);
+            let t_scalar_us = std::sync::atomic::AtomicU64::new(0);
+            let t_prep_us = std::sync::atomic::AtomicU64::new(0);
+            let t_scatter_us = std::sync::atomic::AtomicU64::new(0);
             let timing = part_timing;
 
             // Chunks are disjoint slices of `matches` and every scratch buffer is
@@ -394,9 +319,9 @@ fn match_fuzzy_parts(
                 // exactly one cache line, so aligned batches do not false-share
                 // at par_chunks boundaries (MESI line ping-pong). Lengths are
                 // set without zero-fill; every lane is written before any read.
-                let mut scores = SCORES.with(|c| take_tls_cap(c, n_matches + 32));
+                let mut scores = SCORES.with(|c| take_tls(c, n_matches + 32));
                 set_len_uninit(&mut scores, n_matches + 32);
-                let mut end_cols = ECOLS.with(|c| take_tls_cap(c, n_matches + 32));
+                let mut end_cols = ECOLS.with(|c| take_tls(c, n_matches + 32));
                 set_len_uninit(&mut end_cols, n_matches + 32);
 
                 // Scalar lanes skip staging/SoA/order/par entirely: one serial
@@ -406,11 +331,12 @@ fn match_fuzzy_parts(
                     thread_local! {
                         static SWIN: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
                     }
+                    let t_scalar = std::time::Instant::now();
                     let mut max_trim = 0usize;
                     for t in trims.iter() {
                         max_trim = max_trim.max((t.end - t.start) as usize);
                     }
-                    let mut win = SWIN.with(|c| take_tls_cap(c, max_trim));
+                    let mut win = SWIN.with(|c| take_tls(c, max_trim));
                     set_len_uninit(&mut win, max_trim);
                     for (i, t) in trims.iter().enumerate() {
                         let wlen = (t.end - t.start) as usize;
@@ -437,6 +363,10 @@ fn match_fuzzy_parts(
                     }
                     SWIN.with(|c| reclaim(&mut c.borrow_mut(), win));
                     if timing {
+                        t_scalar_us.fetch_add(
+                            t_scalar.elapsed().as_micros() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         t_batch_us.fetch_add(
                             t_batch.elapsed().as_micros() as u64,
                             std::sync::atomic::Ordering::Relaxed,
@@ -445,7 +375,8 @@ fn match_fuzzy_parts(
                 } else {
                     // Length-ordered batches within the chunk so per-batch max_len
                     // stays close to the lanes' own lengths.
-                    let mut order = ORDER.with(|c| take_tls_cap(c, n_matches));
+                    let t_prep = std::time::Instant::now();
+                    let mut order = ORDER.with(|c| take_tls(c, n_matches));
                     set_len_uninit(&mut order, n_matches);
                     // Counting sort by trim length (stable, O(n)). Batch grouping only
                     // affects SIMD max_len, not per-match scores. A single batch is
@@ -474,9 +405,9 @@ fn match_fuzzy_parts(
                             order[i] = i as u32;
                         }
                     }
-                    let mut perm_scores = PERM_SCORES.with(|c| take_tls_cap(c, n_matches + 32));
+                    let mut perm_scores = PERM_SCORES.with(|c| take_tls(c, n_matches + 32));
                     set_len_uninit(&mut perm_scores, n_matches + 32);
-                    let mut perm_ecols = PERM_ECOLS.with(|c| take_tls_cap(c, n_matches + 32));
+                    let mut perm_ecols = PERM_ECOLS.with(|c| take_tls(c, n_matches + 32));
                     set_len_uninit(&mut perm_ecols, n_matches + 32);
 
                     fn align64_u16(buf: &mut [u16], n: usize) -> &mut [u16] {
@@ -486,6 +417,12 @@ fn match_fuzzy_parts(
                     }
                     let ps_aligned = align64_u16(&mut perm_scores, n_matches);
                     let pe_aligned = align64_u16(&mut perm_ecols, n_matches);
+                    if timing {
+                        t_prep_us.fetch_add(
+                            t_prep.elapsed().as_micros() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
 
                     // One batch = one (ord, out) triple. A pure indexed map, so
                     // serial and parallel runs write bit-identical outputs.
@@ -505,6 +442,7 @@ fn match_fuzzy_parts(
                             static STAGE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
                         }
                         let buf_len = rows * batch_sz;
+                        let t_stage = std::time::Instant::now();
                         let mut stage = STAGE.with(|c| {
                             let mut b = c.borrow_mut();
                             if b.len() < buf_len {
@@ -553,14 +491,20 @@ fn match_fuzzy_parts(
                                 prefix_mask |= 1u32 << k;
                             }
                         }
+                        if timing {
+                            t_stage_us.fetch_add(
+                                t_stage.elapsed().as_micros() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
 
                         // Tiny trailing chunks cannot amortize a 32-wide
                         // transpose + kernel; score them scalar from stage.
                         if n <= 8 {
+                            let t_scalar = std::time::Instant::now();
                             for (k, &oi) in ord.iter().enumerate() {
                                 let tw = trims[oi as usize];
-                                let (s, e, inc_prefix) =
-                                    (tw.start, tw.end, tw.include_prefix());
+                                let (s, e, inc_prefix) = (tw.start, tw.end, tw.include_prefix());
                                 let src = &stage[k * rows..k * rows + (e - s) as usize];
                                 let (sc, ec) = crate::interseq_sw::score_one_scalar_full(
                                     needle, src, &p, inc_prefix,
@@ -568,12 +512,19 @@ fn match_fuzzy_parts(
                                 sc_out[k] = sc;
                                 ec_out[k] = ec;
                             }
+                            if timing {
+                                t_scalar_us.fetch_add(
+                                    t_scalar.elapsed().as_micros() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
                             STAGE.with(|c| *c.borrow_mut() = stage);
                             return;
                         }
 
                         #[cfg(target_arch = "x86_64")]
                         if use_simd {
+                            let t_xpose = std::time::Instant::now();
                             let mut soa = SOA.with(|c| {
                                 let mut b = c.borrow_mut();
                                 if b.len() < buf_len {
@@ -586,6 +537,15 @@ fn match_fuzzy_parts(
                                 crate::interseq_sw::avx2::soa_from_stage(
                                     &stage, rows, batch_sz, &mut soa,
                                 );
+                            }
+                            if timing {
+                                t_xpose_us.fetch_add(
+                                    t_xpose.elapsed().as_micros() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                            let t_kernel = std::time::Instant::now();
+                            unsafe {
                                 if use_u8 {
                                     crate::interseq_sw::avx2::score_batch_avx2_u8_dispatch(
                                         needle,
@@ -626,10 +586,18 @@ fn match_fuzzy_parts(
                                     );
                                 }
                             }
+                            if timing {
+                                t_kernel_us.fetch_add(
+                                    t_kernel.elapsed().as_micros() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
                             SOA.with(|c| *c.borrow_mut() = soa);
                             STAGE.with(|c| *c.borrow_mut() = stage);
                             return;
                         }
+                        // Scalar fallback when SIMD is unavailable for this query.
+                        let t_scalar = std::time::Instant::now();
                         for (k, &oi) in ord.iter().enumerate() {
                             let tw = trims[oi as usize];
                             let (s, e, inc_prefix) = (tw.start, tw.end, tw.include_prefix());
@@ -639,6 +607,12 @@ fn match_fuzzy_parts(
                             );
                             sc_out[k] = sc;
                             ec_out[k] = ec;
+                        }
+                        if timing {
+                            t_scalar_us.fetch_add(
+                                t_scalar.elapsed().as_micros() as u64,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
                         }
                         STAGE.with(|c| *c.borrow_mut() = stage);
                     };
@@ -667,9 +641,16 @@ fn match_fuzzy_parts(
 
                     // Inverse order map into the chunk-local score arrays.
                     // Read from the 64-byte-aligned batch outputs (true per-line).
+                    let t_scatter = std::time::Instant::now();
                     for (i, &oi) in order.iter().enumerate() {
                         scores[oi as usize] = ps_aligned[i];
                         end_cols[oi as usize] = pe_aligned[i];
+                    }
+                    if timing {
+                        t_scatter_us.fetch_add(
+                            t_scatter.elapsed().as_micros() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                     }
                     if timing {
                         t_batch_us.fetch_add(
@@ -722,13 +703,23 @@ fn match_fuzzy_parts(
                 }
             } else {
                 use rayon::prelude::*;
-                matches.par_chunks_mut(CHUNK).for_each(sw_body);
+                // Size chunks so each pool worker gets one; small inputs
+                // stay serial. Partitioning does not affect output.
+                let workers = crate::parallelism::effective_core_count().max(1);
+                let adaptive = matches.len().div_ceil(workers).max(4096);
+                matches.par_chunks_mut(adaptive).for_each(sw_body);
             }
 
             let sw_us = t_sw.elapsed().as_micros();
             let collect_ms = t_collect_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
             let batch_ms = t_batch_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
             let assemble_ms = t_assemble_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
+            let stage_ms = t_stage_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
+            let xpose_ms = t_xpose_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
+            let kernel_ms = t_kernel_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
+            let scalar_ms = t_scalar_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
+            let prep_ms = t_prep_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
+            let scatter_ms = t_scatter_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
             if part_timing {
                 eprintln!(
                     "PHASE parts gate_us={gate_us} exact_us={exact_us} sw_us={sw_us} threads={threads} n={}",
@@ -737,7 +728,7 @@ fn match_fuzzy_parts(
             }
             if phase_timing() {
                 eprintln!(
-                    "PHASE interseq prefilter_ms={prefilter_ms:.1} collect_ms={collect_ms:.1} batch_ms={batch_ms:.1} assemble_ms={assemble_ms:.1} n={}",
+                    "PHASE interseq prefilter_ms={prefilter_ms:.1} collect_ms={collect_ms:.1} batch_ms={batch_ms:.1} assemble_ms={assemble_ms:.1} n={} stage_ms={stage_ms:.1} xpose_ms={xpose_ms:.1} kernel_ms={kernel_ms:.1} scalar_ms={scalar_ms:.1} prep_ms={prep_ms:.1} scatter_ms={scatter_ms:.1}",
                     matches.len()
                 );
             }
@@ -808,7 +799,11 @@ fn match_fuzzy_parts(
                     index: prev.index,
                     score: avg.min(u16::MAX as u32) as u16,
                     // Query-order first part's position for filename bonus.
-                    end_col: if reverse_pair { sm.end_col } else { prev.end_col },
+                    end_col: if reverse_pair {
+                        sm.end_col
+                    } else {
+                        prev.end_col
+                    },
                     exact: prev.exact && sm.exact,
                 }
             })
@@ -833,7 +828,6 @@ pub(crate) fn fuzzy_match_and_score_subset<'a>(
         FileItems::Filtered { base, idx },
         context,
         _base_arena,
-        None,
         max_path_len,
     );
     let mut out = sort_and_paginate(results, context, total);
@@ -857,32 +851,6 @@ pub(crate) fn fuzzy_match_and_score_files<'a>(
         base_count,
         base_arena,
         overflow_arena,
-        None,
-        0,
-        max_path_len,
-    )
-}
-
-/// Same as [`fuzzy_match_and_score_files`] but stores/loads raw frizbee
-/// matches in `cache` keyed by (generation, partition, query, typos, count).
-pub(crate) fn fuzzy_match_and_score_files_cached<'a>(
-    files: &'a [FileItem],
-    context: &ScoringContext,
-    base_count: usize,
-    base_arena: ArenaPtr,
-    overflow_arena: ArenaPtr,
-    cache: &parking_lot::Mutex<RawMatchCache>,
-    generation: u64,
-    max_path_len: usize,
-) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
-    fuzzy_match_and_score_files_impl(
-        files,
-        context,
-        base_count,
-        base_arena,
-        overflow_arena,
-        Some(cache),
-        generation,
         max_path_len,
     )
 }
@@ -893,8 +861,6 @@ fn fuzzy_match_and_score_files_impl<'a>(
     base_count: usize,
     base_arena: ArenaPtr,
     overflow_arena: ArenaPtr,
-    cache: Option<&parking_lot::Mutex<RawMatchCache>>,
-    generation: u64,
     max_path_len: usize,
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
     // Process overflow files first: newly added files (created after the
@@ -908,7 +874,6 @@ fn fuzzy_match_and_score_files_impl<'a>(
             FileItems::All(&files[base_count..]),
             context,
             overflow_arena,
-            cache.map(|c| (c, generation, 1u8)),
             max_path_len,
         );
 
@@ -916,7 +881,6 @@ fn fuzzy_match_and_score_files_impl<'a>(
             FileItems::All(&files[..base_count]),
             context,
             base_arena,
-            cache.map(|c| (c, generation, 0u8)),
             max_path_len,
         );
         results.extend(base_results);
@@ -927,7 +891,6 @@ fn fuzzy_match_and_score_files_impl<'a>(
             FileItems::All(files),
             context,
             base_arena,
-            cache.map(|c| (c, generation, 0u8)),
             max_path_len,
         )
     };
@@ -1426,7 +1389,6 @@ fn match_and_score_in_arena<'a>(
     files: FileItems<'a>,
     context: &ScoringContext,
     arena: ArenaPtr,
-    raw_cache: Option<(&parking_lot::Mutex<RawMatchCache>, u64, u8)>,
     max_path_len: usize,
 ) -> (Vec<(&'a FileItem, Score)>, usize) {
     if files.len() == 0 {
@@ -1474,8 +1436,7 @@ fn match_and_score_in_arena<'a>(
         FuzzyQuery::Text(t) if t.len() >= 2 => std::slice::from_ref(t),
         FuzzyQuery::Parts(parts) if !parts.is_empty() => parts.as_slice(),
         _ => {
-            let scored = score_filtered_by_frecency(&working_files, context, arena);
-            let n = scored.len();
+            let (scored, n) = score_filtered_by_frecency(&working_files, context, arena);
             return (scored, n);
         }
     };
@@ -1501,13 +1462,6 @@ fn match_and_score_in_arena<'a>(
         ..Default::default()
     };
 
-    let cache_key = raw_cache.map(|(_, generation, partition)| RawMatchKey {
-        generation,
-        partition,
-        query: context.query.raw_query.to_string(),
-        max_typos: context.max_typos,
-        file_count: working_files.len(),
-    });
     let phase_timing = phase_timing();
     let phase_sink = std::env::var("FFF_PHASE_TIMING").unwrap_or_default();
     let phase_log = |msg: String| {
@@ -1527,33 +1481,14 @@ fn match_and_score_in_arena<'a>(
         }
     };
     let t_match = std::time::Instant::now();
-    let path_matches: Arc<Vec<neo_frizbee::Match>> = raw_cache
-        .zip(cache_key.as_ref())
-        .and_then(|((cache, _, _), key)| cache.try_lock().and_then(|g| g.get(key)))
-        .unwrap_or_else(|| {
-            let t_call = std::time::Instant::now();
-            let matches = match_fuzzy_parts(
-                fuzzy_parts,
-                &working_files,
-                &options,
-                context.max_threads,
-                arena,
-                max_path_len,
-            );
-            let call_us = t_call.elapsed().as_micros();
-            let t_arc = std::time::Instant::now();
-            let matches_arc = Arc::new(matches);
-            if let Some(((cache, _, _), key)) = raw_cache.zip(cache_key) {
-                if let Some(mut guard) = cache.try_lock() {
-                    guard.insert(key, Arc::clone(&matches_arc));
-                }
-            }
-            let arc_us = t_arc.elapsed().as_micros();
-            if phase_timing {
-                eprintln!("PHASE mmcall call_us={call_us} arc_us={arc_us}");
-            }
-            matches_arc
-        });
+    let path_matches = match_fuzzy_parts(
+        fuzzy_parts,
+        &working_files,
+        &options,
+        context.max_threads,
+        arena,
+        max_path_len,
+    );
     let match_elapsed = t_match.elapsed();
     if phase_timing {
         phase_log(format!(
@@ -1577,9 +1512,19 @@ fn match_and_score_in_arena<'a>(
     let t_fallback = std::time::Instant::now();
     let main_needle = fuzzy_parts[0].as_bytes(); // safe
     let main_needle_len = main_needle.len() as u16;
+    // Collapsed queries force filename/evidence bonuses to 0, so the
+    // fallback matcher is skipped without changing ranking.
+    let rank_collapsed = {
+        let n_files = working_files.len().max(1);
+        path_matches.len() >= 4096
+            && path_matches.len() * 100 >= n_files * 85
+            && main_needle_len <= 8
+    };
 
     let mut fallback_indices: Vec<u32> = Vec::new();
-    let filename_fallback_matches = if query_contains_path_separator || path_matches.len() > 15_000
+    let filename_fallback_matches = if query_contains_path_separator
+        || path_matches.len() > 15_000
+        || rank_collapsed
     {
         vec![]
     } else if !path_matches.iter().any(|path_match| {
@@ -1709,12 +1654,6 @@ fn match_and_score_in_arena<'a>(
     // cannot discriminate the top
     // page, so the 25-40 ns each costs buys nothing. Measured: 7.9 ns/candidate
     // collapsed vs 37.9 ns uncollapsed. The cliff between them is the cost.
-    let rank_collapsed = {
-        let n_files = working_files.len().max(1);
-        path_matches.len() >= 4096
-            && path_matches.len() * 100 >= n_files * 85
-            && main_needle_len <= 8
-    };
     let query_intent =
         crate::intent::detect_intent(context.effective_query(), context.current_file, true);
     let main_needle_as_str = context.effective_query();
@@ -1982,57 +1921,35 @@ fn match_and_score_in_arena<'a>(
     let t_score = std::time::Instant::now();
     let score_entrance_count = path_matches.len();
 
-    struct Ranked<'a> {
-        total: i32,
-        stamp: u64,
-        file: &'a FileItem,
-        score: Score,
-    }
-    impl PartialEq for Ranked<'_> {
-        fn eq(&self, other: &Self) -> bool {
-            self.total == other.total && self.stamp == other.stamp
+    let combo_max: i32 = match context.last_same_query_match.as_ref() {
+        None => 0,
+        Some(_) if context.min_combo_count == 0 => 1000,
+        Some(m) if m.open_count >= context.min_combo_count => {
+            (m.open_count as i64 * context.combo_boost_score_multiplier as i64).min(i32::MAX as i64)
+                as i32
         }
-    }
-    impl Eq for Ranked<'_> {}
-    impl PartialOrd for Ranked<'_> {
-        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-            Some(self.cmp(other))
-        }
-    }
-    impl Ord for Ranked<'_> {
-        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-            self.total
-                .cmp(&other.total)
-                .then_with(|| self.file.modified.cmp(&other.file.modified))
-                .then_with(|| self.stamp.cmp(&other.stamp))
-        }
-    }
-
-    // Cheap upper bound on `Score.total` when combo/current_file/path-align
-    // are all inert. filename Ã¢â€°Â¤ 40% base, git_status Ã¢â€°Â¤ 15% base, frecency is
-    // `base * freq / 100`. Skip `score_one` when this bound cannot beat the
-    // current kth best. Ranking stays exact.
-    let prunable = context.current_file.is_none()
-        && context.last_same_query_match.is_none()
-        && !query_contains_path_separator;
+        Some(m) => (m.open_count as i32).saturating_mul(5),
+    };
+    let path_align_on = query_contains_path_separator && main_needle.len() > 10;
+    let q_intent = query_intent;
+    let q_collapsed = rank_collapsed;
+    // Read per query; both settings rank identically.
+    let no_prune = std::env::var_os("FFF_NO_PRUNE").is_some();
+    let mut skipped_topk = 0u64;
 
     if use_topk {
-        use std::cmp::Reverse;
-        use std::collections::BinaryHeap;
         let mut heap: BinaryHeap<Reverse<Ranked<'a>>> = BinaryHeap::new();
-        let mut stamp = 0u64;
         let mut consider = |heap: &mut BinaryHeap<Reverse<Ranked<'a>>>,
                             item: (&'a FileItem, Score)| {
             let entry = Ranked {
                 total: item.1.total,
-                stamp,
+                stamp: path_rank(item.0),
                 file: item.0,
                 score: item.1,
             };
-            stamp = stamp.wrapping_add(1);
             if heap.len() < page_cap {
                 heap.push(Reverse(entry));
-            } else if heap.peek().is_some_and(|Reverse(w)| entry.total > w.total) {
+            } else if heap.peek().is_some_and(|Reverse(w)| entry > *w) {
                 heap.pop();
                 heap.push(Reverse(entry));
             }
@@ -2040,16 +1957,20 @@ fn match_and_score_in_arena<'a>(
         if path_matches.len() < PARALLEL_SCORE_MIN || context.max_threads == 1 {
             let mut scratch = make_scratch();
             for (match_idx, path_match) in path_matches.iter().enumerate() {
-                if prunable && heap.len() >= page_cap {
+                if !no_prune && heap.len() >= page_cap {
                     let file = working_files.index(path_match.index as usize);
                     let base = path_match.score as i32;
-                    let freq = file.total_frecency_score().max(0);
-                    let ub = base
-                        .saturating_add(base.saturating_mul(freq) / 100)
-                        .saturating_add(base * 2 / 5)
-                        .saturating_add(base * 15 / 100)
-                        .saturating_add(file.git_recency_score.max(0) as i32);
+                    let ub = ub_total_for(
+                        base,
+                        file.total_frecency_score().max(0),
+                        file.git_recency_score.max(0) as i32,
+                        q_intent,
+                        q_collapsed,
+                        path_align_on,
+                        combo_max,
+                    );
                     if heap.peek().is_some_and(|Reverse(w)| ub < w.total) {
+                        skipped_topk += 1;
                         continue;
                     }
                 }
@@ -2062,45 +1983,60 @@ fn match_and_score_in_arena<'a>(
             // keep the top 100. Ranking stays exact (same comparator).
             // scratch stays per-thread via map_init Ã¢â‚¬â€ do NOT carry it in the
             // fold accumulator (4 KB Ãƒâ€” rayon tree overflowed the worker stack).
-            type Heap<'a> = BinaryHeap<Reverse<Ranked<'a>>>;
-            fn merge<'a>(mut a: Heap<'a>, b: Heap<'a>, page_cap: usize) -> Heap<'a> {
-                for Reverse(r) in b {
-                    if a.len() < page_cap {
-                        a.push(Reverse(r));
-                    } else if a.peek().is_some_and(|Reverse(w)| r.total > w.total) {
-                        a.pop();
-                        a.push(Reverse(r));
-                    }
-                }
-                a
-            }
-            heap = crate::parallelism::run_on_bg_pool(|| {
-                path_matches
-                    .par_iter()
-                    .enumerate()
-                    .map_init(make_scratch, |scratch, (match_idx, path_match)| {
-                        score_one(scratch, match_idx, path_match)
-                    })
-                    .fold(
-                        || Heap::new(),
-                        |mut h, item| {
+            let (par_heap, par_skipped) = crate::parallelism::run_on_bg_pool(|| {
+                use rayon::prelude::*;
+                const SCORE_CHUNK: usize = 8192;
+                let n = path_matches.len();
+                let n_chunks = n.div_ceil(SCORE_CHUNK);
+                (0..n_chunks)
+                    .into_par_iter()
+                    .map_init(make_scratch, |scratch, chunk_idx| {
+                        let mut h: Heap<'_> = Heap::new();
+                        let mut skipped = 0u64;
+                        let lo = chunk_idx * SCORE_CHUNK;
+                        let hi = (lo + SCORE_CHUNK).min(n);
+                        for match_idx in lo..hi {
+                            let path_match = &path_matches[match_idx];
+                            if !no_prune && h.len() >= page_cap {
+                                let file = working_files.index(path_match.index as usize);
+                                let base = path_match.score as i32;
+                                let ub = ub_total_for(
+                                    base,
+                                    file.total_frecency_score().max(0),
+                                    file.git_recency_score.max(0) as i32,
+                                    q_intent,
+                                    q_collapsed,
+                                    path_align_on,
+                                    combo_max,
+                                );
+                                if h.peek().is_some_and(|Reverse(w)| ub < w.total) {
+                                    skipped += 1;
+                                    continue;
+                                }
+                            }
+                            let item = score_one(scratch, match_idx, path_match);
                             let entry = Ranked {
                                 total: item.1.total,
-                                stamp: 0,
+                                stamp: path_rank(item.0),
                                 file: item.0,
                                 score: item.1,
                             };
                             if h.len() < page_cap {
                                 h.push(Reverse(entry));
-                            } else if h.peek().is_some_and(|Reverse(w)| entry.total > w.total) {
+                            } else if h.peek().is_some_and(|Reverse(w)| entry > *w) {
                                 h.pop();
                                 h.push(Reverse(entry));
                             }
-                            h
-                        },
+                        }
+                        (h, skipped)
+                    })
+                    .reduce(
+                        || (Heap::new(), 0u64),
+                        |a, b| (merge(a.0, b.0, page_cap), a.1 + b.1),
                     )
-                    .reduce(|| Heap::new(), |a, b| merge(a, b, page_cap))
             });
+            heap = par_heap;
+            skipped_topk = par_skipped;
         }
         let mut results: Vec<(&'a FileItem, Score)> = heap
             .into_iter()
@@ -2117,9 +2053,10 @@ fn match_and_score_in_arena<'a>(
         });
         if phase_timing {
             eprintln!(
-                "PHASE score_us={} (topk) n={}",
+                "PHASE score_us={} (topk) n={} skipped={}",
                 t_score.elapsed().as_micros(),
-                score_entrance_count
+                score_entrance_count,
+                skipped_topk,
             );
         }
         return (results, path_matches.len());
@@ -2154,12 +2091,121 @@ fn match_and_score_in_arena<'a>(
     (results, n)
 }
 
+/// Heap entry for page-bounded top-k: full `Ord` (total, modified, stamp)
+/// makes the kept set exact and deterministic; `stamp` is `path_rank`.
+struct Ranked<'a> {
+    total: i32,
+    stamp: u64,
+    file: &'a FileItem,
+    score: Score,
+}
+impl PartialEq for Ranked<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.total == other.total && self.stamp == other.stamp
+    }
+}
+impl Eq for Ranked<'_> {}
+impl PartialOrd for Ranked<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Ranked<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.total
+            .cmp(&other.total)
+            .then_with(|| self.file.modified.cmp(&other.file.modified))
+            .then_with(|| self.stamp.cmp(&other.stamp))
+    }
+}
+
+type Heap<'a> = BinaryHeap<Reverse<Ranked<'a>>>;
+
+fn merge<'a>(mut a: Heap<'a>, b: Heap<'a>, page_cap: usize) -> Heap<'a> {
+    for Reverse(r) in b {
+        if a.len() < page_cap {
+            a.push(Reverse(r));
+        } else if a.peek().is_some_and(|Reverse(w)| r > *w) {
+            a.pop();
+            a.push(Reverse(r));
+        }
+    }
+    a
+}
+
+// Take a thread-local scratch buffer, sized for at least min_cap.
+fn take_tls<T: Default>(cell: &std::cell::RefCell<Vec<T>>, min_cap: usize) -> Vec<T> {
+    let mut b = cell.borrow_mut();
+    b.clear();
+    if b.capacity() < min_cap {
+        b.reserve(min_cap);
+    }
+    std::mem::take(&mut *b)
+}
+
+// Length without zero-fill (release): the caller must overwrite every lane
+// before any read. Debug builds zero-fill instead, so a missed write skews
+// parity tests rather than reading garbage.
+fn set_len_uninit<T: Default>(v: &mut Vec<T>, n: usize) {
+    debug_assert!(v.is_empty());
+    v.reserve(n.saturating_sub(v.capacity()));
+    debug_assert!(v.capacity() >= n);
+    #[cfg(debug_assertions)]
+    v.resize_with(n, T::default);
+    #[cfg(not(debug_assertions))]
+    unsafe {
+        v.set_len(n);
+    }
+}
+
 /// Stable tie-break key for equal scores. `sort_unstable_by` gives no order
 /// among equals, so without this the parallel path emitted different orderings
 /// run to run (observed: two files at 144 swapping between runs of one binary).
 #[inline]
 fn path_rank(file: &FileItem) -> u64 {
     file.path.rank_key()
+}
+
+#[inline]
+fn evidence_ub_for(base: i32, intent: crate::intent::QueryIntent, collapsed: bool) -> i32 {
+    if collapsed {
+        return 0;
+    }
+    // evidence_bonus floors base at 1; mirror it or base=0 undercounts by 1.
+    let base = base.max(1);
+    match intent {
+        crate::intent::QueryIntent::FileName => {
+            // exact_filename (+b) and filename_substring (+b/3) are
+            // if/else in evidence_bonus, so the exact branch dominates.
+            base + base / 5 + base / 4
+        }
+        crate::intent::QueryIntent::Path => base / 2 + base / 5 + base / 10 + base / 2,
+        crate::intent::QueryIntent::Concept | crate::intent::QueryIntent::Typo => {
+            base / 2 + base * 40 / 100 + base / 4 + base / 6 + base / 4
+        }
+        crate::intent::QueryIntent::WorkingSet => base / 5 + base / 8,
+    }
+}
+
+#[inline]
+fn ub_total_for(
+    base: i32,
+    freq: i32,
+    git_recency: i32,
+    intent: crate::intent::QueryIntent,
+    collapsed: bool,
+    path_on: bool,
+    combo: i32,
+) -> i32 {
+    let filename = if collapsed { 0 } else { base * 2 / 5 };
+    let path = if path_on && !collapsed { base } else { 0 };
+    base.saturating_add(base.saturating_mul(freq) / 100)
+        .saturating_add(filename)
+        .saturating_add(base * 15 / 100)
+        .saturating_add(git_recency)
+        .saturating_add(evidence_ub_for(base, intent, collapsed))
+        .saturating_add(path)
+        .saturating_add(combo)
 }
 
 /// Byte compare avoids materializing a `String` per scored match.
@@ -2190,7 +2236,7 @@ fn score_filtered_by_frecency<'a>(
     files: &FileItems<'a>,
     context: &ScoringContext,
     arena: ArenaPtr,
-) -> Vec<(&'a FileItem, Score)> {
+) -> (Vec<(&'a FileItem, Score)>, usize) {
     // Working-set queries are constant (""); build the query state once
     // instead of per file inside `evidence_for`.
     let pq = crate::intent::PreparedQuery::new("");
@@ -2253,31 +2299,179 @@ fn score_filtered_by_frecency<'a>(
         (file, score)
     };
 
-    match files {
-        // Small indexes cannot amortize Rayon scheduling for this cheap pass.
-        FileItems::All(s) if s.len() >= 32_768 && context.max_threads > 1 => s
-            .par_iter()
-            .filter_map(|f| {
-                let live = !f.is_deleted();
-                live.then_some(score_file(f))
-            })
-            .collect(),
-        FileItems::All(s) => s
-            .iter()
-            .filter_map(|f| {
-                let live = !f.is_deleted();
-                live.then_some(score_file(f))
-            })
-            .collect(),
-        FileItems::Filtered { base, idx } => idx
-            .iter()
-            .filter_map(|&i| {
-                let f = &base[i as usize];
-                let live = !f.is_deleted();
-                live.then_some(score_file(f))
-            })
-            .collect(),
+    // Sound upper bound from register-resident fields only: no arena
+    // walk, no path materialization. Penalties are <= 0, so ignoring them
+    // keeps the bound above every actual total (ranking stays exact).
+    let has_current = context.current_file.is_some();
+    let ub_file = |file: &FileItem| {
+        let freq = file.access_frecency_score as i32
+            + (file.modification_frecency_score as i32).saturating_mul(4);
+        let status = if file.git_status().is_some_and(is_modified_status) {
+            freq * 15 / 100
+        } else {
+            0
+        };
+        let evidence = if has_current {
+            evidence_ub_for(
+                freq.max(8),
+                crate::intent::QueryIntent::WorkingSet,
+                false,
+            )
+        } else {
+            0
+        };
+        freq.saturating_add(status)
+            .saturating_add(file.git_recency_score as i32)
+            .saturating_add(evidence)
+    };
+
+    // Page-bounded top-k like the fuzzy path: never materialize n Scores
+    // for a 100-item page. `total` still counts every live file.
+    let page_cap = context
+        .pagination
+        .offset
+        .saturating_add(if context.pagination.limit > 0 {
+            context.pagination.limit
+        } else {
+            usize::MAX / 4
+        })
+        .saturating_add(1);
+    let use_topk = page_cap < files.len() && files.len() > 256;
+    let no_prune = std::env::var_os("FFF_NO_PRUNE").is_some();
+
+    if !use_topk {
+        let scored: Vec<(&'a FileItem, Score)> = match files {
+            // Below 32768 Rayon scheduling costs more than this pass.
+            FileItems::All(s) if s.len() >= 32_768 && context.max_threads > 1 => s
+                .par_iter()
+                .filter_map(|f| {
+                    let live = !f.is_deleted();
+                    live.then_some(score_file(f))
+                })
+                .collect(),
+            FileItems::All(s) => s
+                .iter()
+                .filter_map(|f| {
+                    let live = !f.is_deleted();
+                    live.then_some(score_file(f))
+                })
+                .collect(),
+            FileItems::Filtered { base, idx } => idx
+                .iter()
+                .filter_map(|&i| {
+                    let f = &base[i as usize];
+                    let live = !f.is_deleted();
+                    live.then_some(score_file(f))
+                })
+                .collect(),
+        };
+        let n = scored.len();
+        return (scored, n);
     }
+
+    fn insert_ranked<'a>(heap: &mut Heap<'a>, page_cap: usize, item: (&'a FileItem, Score)) {
+        let entry = Ranked {
+            total: item.1.total,
+            stamp: path_rank(item.0),
+            file: item.0,
+            score: item.1,
+        };
+        if heap.len() < page_cap {
+            heap.push(Reverse(entry));
+        } else if heap.peek().is_some_and(|Reverse(w)| entry > *w) {
+            heap.pop();
+            heap.push(Reverse(entry));
+        }
+    }
+
+    // Filtered views are constrained subsets: serial heap, same prune.
+    if let FileItems::Filtered { base, idx } = files {
+        let mut heap: Heap<'_> = Heap::new();
+        let mut total = 0usize;
+        for &i in idx.iter() {
+            let f = &base[i as usize];
+            if f.is_deleted() {
+                continue;
+            }
+            total += 1;
+            if !no_prune
+                && has_current
+                && heap.len() >= page_cap
+                && heap.peek().is_some_and(|Reverse(w)| ub_file(f) < w.total)
+            {
+                continue;
+            }
+            insert_ranked(&mut heap, page_cap, score_file(f));
+        }
+        return (
+            heap.into_iter().map(|Reverse(r)| (r.file, r.score)).collect(),
+            total,
+        );
+    }
+
+    let FileItems::All(s) = files else {
+        unreachable!("Filtered handled above")
+    };
+    // Below 32768 Rayon scheduling costs more than this pass.
+    if s.len() < 32_768 || context.max_threads == 1 {
+        let mut heap: Heap<'_> = Heap::new();
+        let mut total = 0usize;
+        for f in s.iter() {
+            if f.is_deleted() {
+                continue;
+            }
+            total += 1;
+            if !no_prune
+                && has_current
+                && heap.len() >= page_cap
+                && heap.peek().is_some_and(|Reverse(w)| ub_file(f) < w.total)
+            {
+                continue;
+            }
+            insert_ranked(&mut heap, page_cap, score_file(f));
+        }
+        return (
+            heap.into_iter().map(|Reverse(r)| (r.file, r.score)).collect(),
+            total,
+        );
+    }
+
+    const FRE_CHUNK: usize = 8192;
+    let n = s.len();
+    let n_chunks = n.div_ceil(FRE_CHUNK);
+    let (heap, total) = crate::parallelism::run_on_bg_pool(|| {
+        use rayon::prelude::*;
+        (0..n_chunks)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let mut h: Heap<'_> = Heap::new();
+                let mut t = 0usize;
+                let hi = ((chunk_idx + 1) * FRE_CHUNK).min(n);
+                for f in &s[chunk_idx * FRE_CHUNK..hi] {
+                    if f.is_deleted() {
+                        continue;
+                    }
+                    t += 1;
+                    if !no_prune
+                        && has_current
+                        && h.len() >= page_cap
+                        && h.peek().is_some_and(|Reverse(w)| ub_file(f) < w.total)
+                    {
+                        continue;
+                    }
+                    insert_ranked(&mut h, page_cap, score_file(f));
+                }
+                (h, t)
+            })
+            .reduce(
+                || (Heap::new(), 0usize),
+                |(ha, ta), (hb, tb)| (merge(ha, hb, page_cap), ta + tb),
+            )
+    });
+    (
+        heap.into_iter().map(|Reverse(r)| (r.file, r.score)).collect(),
+        total,
+    )
 }
 
 #[inline]
@@ -2587,8 +2781,7 @@ mod tests {
             ("tests/user_test.rs", 10, 5),
             ("README.md", 10, 6),
         ]);
-        let files: Vec<FileItem> =
-            test_data.iter().map(|(file, _)| file.clone()).collect();
+        let files: Vec<FileItem> = test_data.iter().map(|(file, _)| file.clone()).collect();
         let options = neo_frizbee::Config {
             max_typos: Some(2),
             sort: neo_frizbee::SortStrategy::Unsorted,
@@ -2626,18 +2819,35 @@ mod tests {
     #[test]
     fn sort_and_paginate_matches_legacy_path() {
         let owned: Vec<(String, i32, u64)> = (0..150)
-            .map(|i| (format!("src/file{i:03}.rs"), (i % 10) as i32, (i % 4) as u64))
+            .map(|i| {
+                (
+                    format!("src/file{i:03}.rs"),
+                    (i % 10) as i32,
+                    (i % 4) as u64,
+                )
+            })
             .collect();
         let refs: Vec<(&str, i32, u64)> =
             owned.iter().map(|(p, s, m)| (p.as_str(), *s, *m)).collect();
         let (test_data, arena) = make_test_files(&refs);
-        let results: Vec<(&FileItem, Score)> =
-            test_data.iter().map(|(file, score)| (file, score.clone())).collect();
+        let results: Vec<(&FileItem, Score)> = test_data
+            .iter()
+            .map(|(file, score)| (file, score.clone()))
+            .collect();
 
         let query_str = "test";
         let parser = QueryParser::default();
         let query = parser.parse(query_str);
-        for (offset, limit) in [(0, 10), (5, 20), (0, 100), (30, 100), (0, 0), (140, 50), (150, 10), (200, 10)] {
+        for (offset, limit) in [
+            (0, 10),
+            (5, 20),
+            (0, 100),
+            (30, 100),
+            (0, 0),
+            (140, 50),
+            (150, 10),
+            (200, 10),
+        ] {
             let context = ScoringContext {
                 query: &query,
                 max_threads: 1,
@@ -2653,7 +2863,10 @@ mod tests {
             let (items, scores, total) = sort_and_paginate(results.clone(), &context, n);
             let (exp_items, exp_scores, exp_total) =
                 legacy_sort_and_paginate(results.clone(), &context, n);
-            assert_eq!(total, exp_total, "total_matched offset={offset} limit={limit}");
+            assert_eq!(
+                total, exp_total,
+                "total_matched offset={offset} limit={limit}"
+            );
             let paths: Vec<_> = items.iter().map(|f| f.relative_path(arena)).collect();
             let exp_paths: Vec<_> = exp_items.iter().map(|f| f.relative_path(arena)).collect();
             assert_eq!(paths, exp_paths, "ordering offset={offset} limit={limit}");
@@ -3487,5 +3700,498 @@ mod ranking_policy_tests {
         assert_eq!(o[0], "src/auth/login.rs", "path {o:?}");
         let o = rank(&files, "test", arena);
         assert!(o[0].contains("test"), "role=test {o:?}");
+    }
+}
+
+#[cfg(test)]
+mod topk_prune_tests {
+    use super::*;
+    use crate::types::PaginationArgs;
+    use fff_query_parser::QueryParser;
+
+    fn make_paths(paths: &[&str]) -> (Vec<FileItem>, ArenaPtr) {
+        let path_strings: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+        let items: Vec<FileItem> = paths
+            .iter()
+            .map(|p| {
+                let fname = p.rfind(std::path::is_separator).map(|i| i + 1).unwrap_or(0) as u16;
+                FileItem::new_raw(fname, 0, 0, None, false)
+            })
+            .collect();
+        let (store, strings) =
+            crate::simd_path::build_chunked_path_store_from_strings(&path_strings, &items);
+        let arena = store.as_arena_ptr();
+        let mut result = items;
+        for (i, file) in result.iter_mut().enumerate() {
+            file.set_path(strings[i].clone());
+            file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
+            file.parent_dir_index = 0;
+        }
+        std::mem::forget(store);
+        (result, arena)
+    }
+
+    // Frecency corpus with distinct totals (no ties): unique access scores,
+    // zero modification/git, identical mtimes. Empty query ranks by score.
+    fn make_frecency(n: usize) -> (Vec<FileItem>, ArenaPtr) {
+        let paths: Vec<String> =
+            (0..n).map(|i| format!("src/g{i}/data_{i}.log")).collect();
+        let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        let (mut files, arena) = make_paths(&refs);
+        for (i, file) in files.iter_mut().enumerate() {
+            file.access_frecency_score = i as i16;
+        }
+        (files, arena)
+    }
+
+    fn search_with(
+        files: &[FileItem],
+        query: &str,
+        arena: ArenaPtr,
+        threads: usize,
+        current: Option<&str>,
+    ) -> (Vec<String>, Vec<Score>) {
+        let (items, scores, _) = search_limit(files, query, arena, threads, current, 50);
+        (items, scores)
+    }
+
+    fn search_limit(
+        files: &[FileItem],
+        query: &str,
+        arena: ArenaPtr,
+        threads: usize,
+        current: Option<&str>,
+        limit: usize,
+    ) -> (Vec<String>, Vec<Score>, usize) {
+        let parser = QueryParser::default();
+        let parsed = parser.parse(query);
+        let ctx = ScoringContext {
+            query: &parsed,
+            max_threads: threads,
+            max_typos: 2,
+            current_file: current,
+            last_same_query_match: None,
+            project_path: None,
+            combo_boost_score_multiplier: 100,
+            min_combo_count: 3,
+            pagination: PaginationArgs { offset: 0, limit },
+        };
+        let (items, scores, total) = fuzzy_match_and_score_files(
+            files,
+            &ctx,
+            files.len(),
+            arena,
+            arena,
+            max_path_len_of(files),
+        );
+        (
+            items.iter().map(|f| f.relative_path(arena)).collect(),
+            scores,
+            total,
+        )
+    }
+
+    #[test]
+    fn ub_covers_actual_total() {
+        use crate::intent::{Evidence, QueryIntent};
+        let mut state = 0x12345678u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 16) as u32
+        };
+        let intents = [
+            QueryIntent::FileName,
+            QueryIntent::Path,
+            QueryIntent::Concept,
+            QueryIntent::Typo,
+            QueryIntent::WorkingSet,
+        ];
+        for _ in 0..20_000 {
+            let base = (next() % 400) as i32;
+            let freq = (next() % 200) as i32;
+            let rec = (next() % 50) as i32;
+            let intent = intents[(next() as usize) % intents.len()];
+            let collapsed = next() % 2 == 0;
+            let path_on = next() % 2 == 0;
+            let combo = (next() % 1000) as i32;
+            // The bound must cover every intent, including all-positive.
+            let bits = next();
+            let ev = Evidence {
+                exact_filename: bits & 1 != 0,
+                filename_substring: bits & 2 != 0,
+                ext_match: bits & 4 != 0,
+                ext_mismatch: bits & 8 != 0,
+                last_segment_match: bits & 16 != 0,
+                segment_sequence: bits & 32 != 0,
+                segment_boundary_pct: (next() % 101) as u8,
+                word_coverage: (next() % 101) as u8,
+                same_dir: bits & 64 != 0,
+                related: bits & 128 != 0,
+                role_match: bits & 256 != 0,
+            };
+            let real_ev = crate::intent::evidence_bonus(intent, &ev, base);
+            if !collapsed {
+                assert!(
+                    real_ev <= evidence_ub_for(base, intent, false),
+                    "evidence bound unsound: intent={intent:?} base={base} real={real_ev} bound={} ev={ev:?}",
+                    evidence_ub_for(base, intent, false),
+                );
+            }
+            let ub = ub_total_for(base, freq, rec, intent, collapsed, path_on, combo);
+            assert!(ub >= base, "UB must cover base alone");
+        }
+    }
+
+    #[test]
+    fn parallel_topk_matches_serial_with_current_file() {
+        let mut paths = Vec::new();
+        for i in 0..6000 {
+            paths.push(format!("src/mod{i}/handler_{}.rs", i % 50));
+        }
+        let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        let (files, arena) = make_paths(&refs);
+        for q in ["handler", "mod handler", "src/mod"] {
+            let (s_items, s_scores) = search_with(&files, q, arena, 1, Some("src/mod7/handler.rs"));
+            let (p_items, p_scores) = search_with(&files, q, arena, 4, Some("src/mod7/handler.rs"));
+            assert_eq!(s_items, p_items, "page items differ for {q:?}");
+            assert_eq!(
+                s_scores.iter().map(|s| s.total).collect::<Vec<_>>(),
+                p_scores.iter().map(|s| s.total).collect::<Vec<_>>(),
+                "page totals differ for {q:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn collapsed_skips_filename_bonus() {
+        // Collapsed (>=4096 matches at >=85% rate, needle <=8) forces
+        // filename/evidence bonuses to 0, so the fallback skip is exact.
+        let mut paths = Vec::new();
+        for i in 0..5000 {
+            paths.push(format!("src/ab/file_{i}.rs"));
+        }
+        let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        let (files, arena) = make_paths(&refs);
+        let (items, scores) = {
+            let parser = QueryParser::default();
+            let parsed = parser.parse("ab");
+            let ctx = ScoringContext {
+                query: &parsed,
+                max_threads: 1,
+                max_typos: 2,
+                current_file: None,
+                last_same_query_match: None,
+                project_path: None,
+                combo_boost_score_multiplier: 100,
+                min_combo_count: 3,
+                pagination: PaginationArgs { offset: 0, limit: 50 },
+            };
+            let (items, scores, total) = fuzzy_match_and_score_files(
+                &files,
+                &ctx,
+                files.len(),
+                arena,
+                arena,
+                max_path_len_of(&files),
+            );
+            assert!(total >= 4096, "fixture must trigger collapse, got {total}");
+            (
+                items.iter().map(|f| f.relative_path(arena)).collect::<Vec<_>>(),
+                scores,
+            )
+        };
+        assert_eq!(items.len(), 50);
+        for s in &scores {
+            assert_eq!(s.filename_bonus, 0, "collapsed must zero filename bonus");
+            assert_eq!(s.evidence_bonus, 0, "collapsed must zero evidence bonus");
+        }
+    }
+
+    #[test]
+    fn no_prune_hatch_ranks_identically() {
+        // Both settings rank identically, so toggling mid-process is safe.
+        let mut paths = Vec::new();
+        for i in 0..6000 {
+            paths.push(format!("src/mod{i}/handler_{}.rs", i % 50));
+        }
+        let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        let (files, arena) = make_paths(&refs);
+        for q in ["handler", "mod handler"] {
+            for threads in [1usize, 4] {
+                let (on_items, on_scores) = search_with(&files, q, arena, threads, None);
+                // Both paths rank identically (asserted below).
+                unsafe {
+                    std::env::set_var("FFF_NO_PRUNE", "1");
+                }
+                let (off_items, off_scores) = search_with(&files, q, arena, threads, None);
+                unsafe {
+                    std::env::remove_var("FFF_NO_PRUNE");
+                }
+                assert_eq!(on_items, off_items, "items differ for {q:?} t={threads}");
+                let totals = |s: Vec<Score>| s.into_iter().map(|x| x.total).collect::<Vec<_>>();
+                assert_eq!(totals(on_scores), totals(off_scores), "totals differ");
+            }
+        }
+    }
+
+    #[test]
+    fn frecency_topk_matches_full_ranking() {
+        // Empty query takes the frecency path. Heap page (limit 50) must
+        // equal the full-ranking prefix (limit 0), on both thread counts,
+        // with and without a current file (evidence on/off).
+        let (files, arena) = make_frecency(6000);
+        for threads in [1usize, 4] {
+            let (items, scores, total) = search_limit(&files, "", arena, threads, None, 50);
+            let (full_items, full_scores, full_total) =
+                search_limit(&files, "", arena, threads, None, 0);
+            assert_eq!(total, 6000);
+            assert_eq!(total, full_total);
+            assert_eq!(items.len(), 50);
+            assert_eq!(items, &full_items[..50]);
+            assert_eq!(
+                scores.iter().map(|s| s.total).collect::<Vec<_>>(),
+                full_scores.iter().take(50).map(|s| s.total).collect::<Vec<_>>(),
+            );
+        }
+        // With a current file, evidence can tie totals; compare as sets.
+        for threads in [1usize, 4] {
+            let (items, scores, total) =
+                search_limit(&files, "", arena, threads, Some("src/g7/other.rs"), 50);
+            let (full_items, full_scores, full_total) =
+                search_limit(&files, "", arena, threads, Some("src/g7/other.rs"), 0);
+            assert_eq!(total, 6000);
+            assert_eq!(total, full_total);
+            let mut page: Vec<(&str, i32)> = items
+                .iter()
+                .zip(scores.iter())
+                .map(|(p, s)| (p.as_str(), s.total))
+                .collect();
+            let mut full: Vec<(&str, i32)> = full_items
+                .iter()
+                .zip(full_scores.iter())
+                .take(50)
+                .map(|(p, s)| (p.as_str(), s.total))
+                .collect();
+            page.sort_unstable();
+            full.sort_unstable();
+            assert_eq!(page, full);
+        }
+    }
+
+    // Heap page must equal full-ranking page across queries, threads,
+    // pagination, current file, and corpus sizes above/below top-k cutoff.
+    #[test]
+    fn ranking_parity_across_shapes_and_configs() {
+        fn page_as_set(
+            files: &[FileItem],
+            query: &str,
+            arena: ArenaPtr,
+            threads: usize,
+            current: Option<&str>,
+            offset: usize,
+            limit: usize,
+        ) -> (Vec<(String, i32, u64)>, usize) {
+            let parser = QueryParser::default();
+            let parsed = parser.parse(query);
+            let ctx = ScoringContext {
+                query: &parsed,
+                max_threads: threads,
+                max_typos: 2,
+                current_file: current,
+                last_same_query_match: None,
+                project_path: None,
+                combo_boost_score_multiplier: 100,
+                min_combo_count: 3,
+                pagination: PaginationArgs { offset, limit },
+            };
+            let (items, scores, total) = fuzzy_match_and_score_files(
+                files,
+                &ctx,
+                files.len(),
+                arena,
+                arena,
+                max_path_len_of(files),
+            );
+            let mut pairs: Vec<(String, i32, u64)> = items
+                .iter()
+                .zip(scores.iter())
+                .map(|(f, s)| (f.relative_path(arena), s.total, f.modified))
+                .collect();
+            // Order by (total, modified); path breaks full ties.
+            pairs.sort_by(|a, b| {
+                b.1.cmp(&a.1)
+                    .then_with(|| b.2.cmp(&a.2))
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            (pairs, total)
+        }
+        for n in [200usize, 1500] {
+            let paths: Vec<String> = (0..n)
+                .map(|i| format!("src/mod{}/Handler_{}.rs", i % 37, i % 50))
+                .collect();
+            let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+            let (mut files, arena) = make_paths(&refs);
+            // Unique mtimes make (total, modified) a strict order.
+            for (i, file) in files.iter_mut().enumerate() {
+                file.modified = 1_700_000_000 + i as u64;
+            }
+            for query in ["handler", "Handler", "src/mod", "MOD Handler", "handler_", ""] {
+                for threads in [0usize, 1, 4] {
+                    for current in [None, Some("src/mod7/other.rs")] {
+                        let (full, full_total) =
+                            page_as_set(&files, query, arena, threads, current, 0, 0);
+                        for (offset, limit) in [(0usize, 50usize), (20, 30)] {
+                            let (page, total) = page_as_set(
+                                &files, query, arena, threads, current, offset, limit,
+                            );
+                            assert_eq!(total, full_total, "totals n={n} q={query:?}");
+                            // Canonical order is total: upstream rank order
+                            // restricted to a strict key, so the page must be
+                            // the full list's slice.
+                            let want = full
+                                .iter()
+                                .skip(offset)
+                                .take(page.len())
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            assert_eq!(
+                                page, want,
+                                "page n={n} q={query:?} t={threads} cur={current:?} off={offset} lim={limit}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Partial sort of hand-built unique-key input must equal full prefix.
+    #[test]
+    fn same_config_repeats_identically() {
+        // Unique-key input; identical totals ordered by modified alone.
+        let paths: Vec<String> =
+            (0..200).map(|i| format!("src/mod{}/f{i}.rs", i % 37)).collect();
+        let items: Vec<FileItem> = paths
+            .iter()
+            .map(|p| {
+                let fname = p.rfind(std::path::is_separator).map(|i| i + 1).unwrap_or(0) as u16;
+                FileItem::new_raw(fname, 0, 0, None, false)
+            })
+            .collect();
+        let (store, strings) =
+            crate::simd_path::build_chunked_path_store_from_strings(&paths, &items);
+        let arena = store.as_arena_ptr();
+        let mut files = items;
+        for (i, file) in files.iter_mut().enumerate() {
+            file.set_path(strings[i].clone());
+            file.set_presence(crate::presence::mask_of(paths[i].as_bytes()));
+            file.modified = 1_700_000_000 + i as u64;
+        }
+        std::mem::forget(store);
+        let results: Vec<(&FileItem, Score)> = files
+            .iter()
+            .map(|f| {
+                (
+                    f,
+                    Score {
+                        total: 151,
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let parser = QueryParser::default();
+        let parsed = parser.parse("handler");
+        let ctx = |limit: usize| ScoringContext {
+            query: &parsed,
+            max_threads: 1,
+            max_typos: 2,
+            current_file: None,
+            last_same_query_match: None,
+            project_path: None,
+            combo_boost_score_multiplier: 100,
+            min_combo_count: 3,
+            pagination: PaginationArgs { offset: 0, limit },
+        };
+        let (items50, _, total50) =
+            sort_and_paginate(results.clone(), &ctx(50), results.len());
+        let (items0, _, total0) =
+            sort_and_paginate(results.clone(), &ctx(0), results.len());
+        let names = |items: Vec<&FileItem>| {
+            items.iter().map(|f| f.relative_path(arena)).collect::<Vec<_>>()
+        };
+        let n50 = names(items50);
+        let n0 = names(items0);
+        assert_eq!(total50, total0);
+        assert_eq!(n50, &n0[..50]);
+    }
+
+    #[test]
+    fn parallel_topk_deterministic_across_runs() {
+        let mut paths = Vec::new();
+        for i in 0..2000 {
+            paths.push(format!("src/a/file_{}.rs", i % 100));
+        }
+        let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        let (files, arena) = make_paths(&refs);
+        let first = search_with(&files, "file", arena, 4, None).0;
+        for _ in 0..10 {
+            let again = search_with(&files, "file", arena, 4, None).0;
+            assert_eq!(first, again, "parallel top-k must be deterministic");
+        }
+    }
+}
+
+#[cfg(test)]
+mod scratch_reuse_tests {
+    use super::*;
+
+    #[test]
+    fn take_setlen_cycle_keeps_allocation() {
+        let cell = std::cell::RefCell::new(Vec::<u16>::new());
+        // Odd sizes around lane/batch boundaries, plus empty.
+        for n in [0usize, 1, 7, 8, 9, 31, 32, 33, 129, 1000] {
+            let mut v = take_tls(&cell, n);
+            assert!(v.capacity() >= n);
+            set_len_uninit(&mut v, n);
+            assert_eq!(v.len(), n);
+            // Mirror the production contract: overwrite every lane.
+            for (i, s) in v.iter_mut().enumerate() {
+                *s = (i % 251) as u16;
+            }
+            for (i, s) in v.iter().enumerate() {
+                assert_eq!(*s, (i % 251) as u16);
+            }
+            let cap = v.capacity();
+            *cell.borrow_mut() = v;
+            // Re-take below capacity: same allocation, length reset.
+            // At or above the stored capacity the buffer may grow instead.
+            let want = n / 2 + 1;
+            let w = take_tls(&cell, want);
+            assert_eq!(w.len(), 0);
+            if cap >= want {
+                assert_eq!(w.capacity(), cap);
+            } else {
+                assert!(w.capacity() >= want);
+            }
+            *cell.borrow_mut() = w;
+        }
+    }
+
+    #[test]
+    fn helpers_cover_all_scratch_types() {
+        // Every T in set_len_uninit's call sites must satisfy the bound.
+        let trim_cell = std::cell::RefCell::new(Vec::<crate::matcher::Trim>::new());
+        let mut t = take_tls(&trim_cell, 4);
+        set_len_uninit(&mut t, 4);
+        assert_eq!(t.len(), 4);
+        let u32_cell = std::cell::RefCell::new(Vec::<u32>::new());
+        let mut u = take_tls(&u32_cell, 4);
+        set_len_uninit(&mut u, 4);
+        assert_eq!(u.len(), 4);
+        let u8_cell = std::cell::RefCell::new(Vec::<u8>::new());
+        let mut b = take_tls(&u8_cell, 4);
+        set_len_uninit(&mut b, 4);
+        assert_eq!(b.len(), 4);
     }
 }

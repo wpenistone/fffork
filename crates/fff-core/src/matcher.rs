@@ -174,7 +174,9 @@ pub(crate) fn with_hit_capture<T>(sink: &mut Vec<u32>, f: impl FnOnce() -> T) ->
     t
 }
 
-/// Max path byte length over a plain slice (tests and non-cached callers).
+/// Max path byte length over a plain slice. Test helper; production uses
+/// the incremental `PathLenCache`.
+#[cfg(test)]
 #[inline]
 pub(crate) fn max_path_len_of(files: &[FileItem]) -> usize {
     let mut m = 0usize;

@@ -94,4 +94,25 @@ mod tests {
         assert_eq!(data[1], 200);
         assert_eq!(data[2], 100);
     }
+
+    #[test]
+    fn test_descending_tiebreak_large() {
+        // 200 tied primaries with unique secondaries: exercises both the
+        // small-sort and merge paths of the backend.
+        for n in [10usize, 50, 100, 101, 150, 200, 500] {
+            let mut data: Vec<(i32, u64)> =
+                (0..n).map(|i| (0, (i * 7919 % (n.max(1))) as u64)).collect();
+            sort_with_buffer(&mut data, |a, b| {
+                b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1))
+            });
+            for w in data.windows(2) {
+                assert!(
+                    w[0].1 >= w[1].1,
+                    "tie order broken at n={n}: {:?} before {:?}",
+                    w[0],
+                    w[1]
+                );
+            }
+        }
+    }
 }

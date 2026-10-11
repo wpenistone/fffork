@@ -409,127 +409,6 @@ impl GateNeedle {
         HAY.with(|c| *c.borrow_mut() = hay);
         hit
     }
-
-    /// Gate a path visited in 16-byte chunks (no caller buffer, no truncation).
-    ///
-    /// Single streaming pass for the common case (`needle.len() <= 64`): the
-    /// bit-parallel LCS state and the needle-byte span are tracked together, so
-    /// the path is never copied into a scratch buffer. Bytes outside the span
-    /// carry no needle byte and cannot join an LCS alignment, so streaming the
-    /// whole path yields the same LCS as scoring the span alone.
-    pub fn hit_chunks(
-        &self,
-        byte_len: usize,
-        mut visit: impl FnMut(&mut dyn FnMut(usize, &[u8])),
-    ) -> Option<GateHit> {
-        if self.needle.is_empty() || byte_len == 0 {
-            return None;
-        }
-        if self.need == 0 {
-            return Some(GateHit {
-                start: 0,
-                end: byte_len.min(u16::MAX as usize) as u32,
-                include_prefix: true,
-            });
-        }
-        if self.needle.len() <= 64 {
-            let pm = &*self.pm;
-            let mask = self.len_mask;
-            let folded = &self.folded[..self.folded_len as usize];
-            let mut s = 0u64;
-            let mut next_needle = 0usize; // greedy cursor for the T == 0 path
-            let mut first = usize::MAX;
-            let mut last = 0usize;
-            let mut n = 0usize;
-            visit(&mut |off, chunk| {
-                let end = (off + chunk.len()).min(byte_len);
-                let slice = &chunk[..end - off];
-                for (i, &b) in slice.iter().enumerate() {
-                    let fb = fold_byte(b);
-                    if self.span.contains(b) {
-                        if n == 0 {
-                            first = off + i;
-                        }
-                        last = off + i;
-                        n += 1;
-                    }
-                    if self.typos == 0 {
-                        if next_needle < folded.len() && fb == folded[next_needle] {
-                            next_needle += 1;
-                        }
-                    } else {
-                        let x = s | pm[fb as usize];
-                        let y = (s << 1) | 1;
-                        s = x & (x ^ x.wrapping_sub(y));
-                    }
-                }
-            });
-            let lcs = if self.typos == 0 {
-                if next_needle == self.needle.len() {
-                    self.needle.len()
-                } else {
-                    next_needle
-                }
-            } else {
-                (s & mask).count_ones() as usize
-            };
-            if lcs < self.need || first == usize::MAX {
-                return None;
-            }
-            return Some(GateHit {
-                start: first as u32,
-                end: (last + 1).min(byte_len) as u32,
-                include_prefix: first == 0,
-            });
-        }
-        // Long needles: keep the buffered path (skip-DP needs random access).
-        thread_local! {
-            static HAY: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-        }
-        let mut hay = HAY.with(|c| {
-            let mut b = c.borrow_mut();
-            if b.len() < byte_len {
-                b.resize(byte_len, 0);
-            } else {
-                // Overwrite without zeroing — chunks fill every byte we read.
-                unsafe { b.set_len(byte_len) };
-            }
-            std::mem::take(&mut *b)
-        });
-        let mut first = 0usize;
-        let mut last = 0usize;
-        let mut n = 0usize;
-        visit(&mut |off, chunk| {
-            let end = (off + chunk.len()).min(byte_len);
-            if off < end {
-                hay[off..end].copy_from_slice(&chunk[..end - off]);
-            }
-            for (i, &b) in chunk.iter().enumerate() {
-                if self.span.contains(b) {
-                    if n == 0 {
-                        first = off + i;
-                    }
-                    last = off + i;
-                    n += 1;
-                }
-            }
-        });
-        let ok = if n < self.need {
-            false
-        } else {
-            let hi = (last + 1).min(byte_len);
-            hi.saturating_sub(first) >= self.need && self.decide(&hay[first..hi])
-        };
-        HAY.with(|c| *c.borrow_mut() = hay);
-        if !ok {
-            return None;
-        }
-        Some(GateHit {
-            start: first as u32,
-            end: (last + 1).min(byte_len) as u32,
-            include_prefix: first == 0,
-        })
-    }
 }
 
 /// Single-haystack gate. `None` = not a match under the typo model.
@@ -557,13 +436,26 @@ where
     // Needle state (span mask + bit-parallel position masks) is per query, so
     // Built once per query and shared by every path.
     let state = GateNeedle::new(needle, max_typos);
+    // Presence pretest: paths missing more needle bytes than the typo
+    // budget allows cannot match. Skipped below need 3.
+    // `FFF_NO_GATE_PREFILTER=1` disables it for benchmarking.
+    let presence = crate::presence::NeedlePresence::new(needle, max_typos);
+    let check_presence = presence.should_check()
+        && std::env::var_os("FFF_NO_GATE_PREFILTER").is_none();
     let scan = |i: u32| -> Option<neo_frizbee::Match> {
         // Warm the next candidate's path chunks: the gate is bound by arena
         // load latency, not by the LCS arithmetic.
         if i + 1 < n as u32 {
             file_at(i + 1).path.prefetch(arena);
         }
-        let hit = state.hit_file(file_at(i), arena)?;
+        let file = file_at(i);
+        if check_presence {
+            let mask = file.presence_mask();
+            if mask != 0 && !presence.allows(mask, needle) {
+                return None;
+            }
+        }
+        let hit = state.hit_file(file, arena)?;
         Some(neo_frizbee::Match {
             score: hit.start as u16,
             index: file_index(i),
@@ -839,5 +731,62 @@ mod tests {
             }
         }
         eprintln!("LONG disagree={disagree}");
+    }
+
+    #[test]
+    fn presence_pretest_never_changes_gate_results() {
+        // Masks must not change gate results, at any thread count.
+        use crate::simd_path::build_chunked_path_store_from_strings;
+        let rels: Vec<String> = (0..300)
+            .map(|i| match i % 6 {
+                0 => format!("src/mod{i}/handler_file.rs"),
+                1 => format!("test/xyz_{i}.py"),
+                2 => format!("docs/readme_{i}.md"),
+                3 => format!("a/b/c/d/e/f/g_{i}.xml"),
+                4 => format!("src/tttt_{i}.rs"),
+                _ => format!("q_{i}.txt"),
+            })
+            .collect();
+        let run = |masked: bool, needle: &[u8], typos: u16, threads: usize| {
+            let raws: Vec<FileItem> = rels
+                .iter()
+                .map(|_| FileItem::new_raw(0, 0, 0, None, false))
+                .collect();
+            let (store, strings) = build_chunked_path_store_from_strings(&rels, &raws);
+            let mut files = raws;
+            for (i, file) in files.iter_mut().enumerate() {
+                file.set_path(strings[i].clone());
+                file.set_presence(if masked {
+                    crate::presence::mask_of(rels[i].as_bytes())
+                } else {
+                    0
+                });
+            }
+            let arena = store.as_arena_ptr();
+            let out = gate_match_range(
+                needle,
+                files.len(),
+                typos,
+                threads,
+                |i| i,
+                |i| &files[i as usize],
+                arena,
+            );
+            std::mem::forget(store);
+            out.into_iter()
+                .map(|m| (m.index, m.score, m.end_col, m.exact))
+                .collect::<Vec<_>>()
+        };
+        for needle in [&b"handler"[..], b"test", b"src/mod", b"xyz", b"tt", b"qq"] {
+            for typos in [0u16, 2] {
+                for threads in [1usize, 4] {
+                    assert_eq!(
+                        run(true, needle, typos, threads),
+                        run(false, needle, typos, threads),
+                        "pretest changed results n={needle:?} t={typos}"
+                    );
+                }
+            }
+        }
     }
 }

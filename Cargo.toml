@@ -67,6 +67,14 @@ lto = "thin"
 [profile.bench]
 inherits = "release"
 
+# Fast iteration for bench-loop development: thin LTO + relaxed codegen
+# build in roughly half the time. Never use for ship numbers; release
+# codegen (fat LTO, single unit) inlines the SIMD kernels differently.
+[profile.perf-quick]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+
 # For Instruments / xctrace: release-level optimization but keep debuginfo
 # and symbols so sampled frames resolve to real Rust names.
 [profile.prof]

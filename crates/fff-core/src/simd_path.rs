@@ -541,6 +541,9 @@ impl ChunkedPathStoreBuilder {
 
     pub fn add_file_immediate(&mut self, rel_path: &str, filename_offset: u16) -> ChunkedString {
         let path_bytes = rel_path.as_bytes();
+        // Platform paths never approach u16::MAX (Linux 4K, Windows 32K),
+        // so the `as u16` below is exact, never a wrap.
+        debug_assert!(path_bytes.len() <= u16::MAX as usize);
         let index_offset = self.indices.len() as u32;
 
         for chunk in path_bytes.chunks(SIMD_CHUNK_BYTES) {
@@ -909,6 +912,21 @@ mod tests {
             cs.read_to_buf(arena, &mut buf1),
             cs2.read_to_buf(arena, &mut buf2)
         );
+    }
+
+    #[test]
+    fn long_path_keeps_exact_byte_len() {
+        // 5000 B exceeds PATH_BUF_SIZE but not u16::MAX: byte_len must be
+        // exact and the full window readable (read_to_buf would truncate).
+        let path = format!("d/{}/file.rs", "x".repeat(4990));
+        assert!(path.len() > crate::constants::PATH_BUF_SIZE);
+        let (store, strings, _) = build_test_store(&[path.as_str()]);
+        let arena = store.as_arena_ptr();
+        let cs = &strings[0];
+        assert_eq!(cs.byte_len as usize, path.len());
+        let mut buf = vec![0u8; path.len()];
+        cs.copy_window_to(arena, 0, path.len() as u32, &mut buf);
+        assert_eq!(buf, path.as_bytes());
     }
 
     #[test]

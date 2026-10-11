@@ -363,6 +363,8 @@ pub fn segment_boundary_evidence(path: &str, q: &PathTokens<'_>) -> (bool, u8, b
 
 /// Word coverage: percent of query tokens found in filename words.
 /// No heap allocs — query tokens fit a small stack array.
+/// Test-only helper: production uses the prepared-query variant below.
+#[cfg(test)]
 pub fn word_coverage(fname: &str, query: &str) -> u8 {
     let mut qwords: [&str; 12] = [""; 12];
     let mut qn = 0usize;
@@ -470,12 +472,6 @@ pub fn evidence_bonus(intent: QueryIntent, ev: &Evidence, base: i32) -> i32 {
         }
     }
     x
-}
-
-/// Filename-only evidence (no relative path walk). Same as `evidence_for`
-/// for fields that don't need the path; path/segment/same_dir stay default.
-pub fn evidence_filename_only(filename: &str, query: &str, intent: QueryIntent) -> Evidence {
-    evidence_for("", filename, query, intent, None)
 }
 
 /// Query-side state that is identical for every candidate. Built once per

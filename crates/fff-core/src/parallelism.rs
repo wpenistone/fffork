@@ -179,13 +179,15 @@ pub fn search_pool_threads() -> usize {
     SEARCH_THREAD_POOL.current_num_threads().max(1)
 }
 
-/// Threads the background pool was built with.
+/// Threads the background pool was built with. Test helper.
+#[cfg(test)]
 pub fn bg_pool_threads() -> usize {
     BACKGROUND_THREAD_POOL.current_num_threads().max(1)
 }
 
 /// Default `max_threads` when the caller passes 0: effective cores, not the
-/// ambient pool size (which collapses under nested installs).
+/// Ambient pool size; collapses under nested installs. Test helper.
+#[cfg(test)]
 pub fn default_max_threads() -> usize {
     effective_core_count().max(1)
 }

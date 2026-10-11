@@ -9,7 +9,7 @@ use crate::index::{
 };
 use crate::parallelism::search_pool_threads;
 use crate::simd_string_utils::memmem;
-use crate::types::{ContentCacheBudget, FileItem, FileSliceExt, MmapSlot};
+use crate::types::{ContentCacheBudget, FileItem, MmapSlot};
 use fff_grep::{
     Searcher, SearcherBuilder, Sink, SinkMatch,
     matcher::{Match, Matcher, NoError},
@@ -574,6 +574,12 @@ pub(super) struct GrepContext<'a, 'b> {
 pub(crate) static CONTENT_MASK_REJECTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Files skipped by the whole-file memmem prefilter since process start.
+/// Counted separately: mask skips mean "unreadable without opening",
+/// memmem skips mean "opened but needle absent".
+pub(crate) static MEMMEM_PREFILTER_REJECTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Recover a file's original position in the picker's contiguous `FileItem`
 /// slice from its address.
 ///
@@ -744,7 +750,8 @@ where
                             // fetch_add here is a contended atomic on a single
                             // cache line, once per file. On a full-corpus grep
                             // that costs more than the check being measured.
-                            if phase_timing {
+                            // Tests always count (deterministic counter tests).
+                            if phase_timing || cfg!(test) {
                                 CONTENT_MASK_REJECTS
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
@@ -769,8 +776,8 @@ where
                             && pf.find(content).is_none()
                         {
                             // Diagnostic only, and gated (see above).
-                            if phase_timing {
-                                CONTENT_MASK_REJECTS
+                            if phase_timing || cfg!(test) {
+                                MEMMEM_PREFILTER_REJECTS
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                             return None;
@@ -874,12 +881,13 @@ where
 
     if phase_timing {
         eprintln!(
-            "PHASE grep files={} read_ms={:.1} scan_ms={:.1} total_ms={:.1} mask_skips={}",
+            "PHASE grep files={} read_ms={:.1} scan_ms={:.1} total_ms={:.1} mask_skips={} memmem_skips={}",
             files_consumed,
             phase_read_ns as f64 / 1e6,
             phase_scan_ns as f64 / 1e6,
             search_start.elapsed().as_secs_f64() * 1e3,
             CONTENT_MASK_REJECTS.load(std::sync::atomic::Ordering::Relaxed),
+            MEMMEM_PREFILTER_REJECTS.load(std::sync::atomic::Ordering::Relaxed),
         );
     }
 

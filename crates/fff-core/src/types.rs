@@ -347,6 +347,11 @@ impl Clone for FileItem {
 /// small enough to live on the stack.
 pub const BINARY_CLASSIFICATION_CHUNK_SIZE: usize = 16 * 1024;
 
+/// Prefix bytes the binary sniff reads. Git-style: binaries carry header
+/// NULs, so a clean prefix means text; full-file masks stay sound because
+/// partial reads record an empty (unknown) mask instead.
+pub const BINARY_CLASSIFICATION_CAP: usize = 256 * 1024;
+
 /// A file is treated as binary if any NUL byte appears in the scanned prefix.
 #[inline]
 pub(crate) fn detect_binary_content(content: &[u8]) -> bool {
@@ -378,11 +383,6 @@ impl ContentMask {
         self.0
     }
 
-    #[inline]
-    pub(crate) fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-
     /// Fold bytes into the mask. Call once per content chunk.
     #[inline]
     pub fn accumulate(&mut self, content: &[u8]) {
@@ -397,6 +397,8 @@ impl ContentMask {
     ///
     /// `None` means "unknown" (no mask recorded) and the caller must read the
     /// file. `Some(false)` means it provably cannot match.
+    /// Test-only spec: production filters through `MaskNeedle` instead.
+    #[cfg(test)]
     #[inline]
     pub(crate) fn allows(self, needle: &[u8], max_typos: u16) -> Option<bool> {
         if self.0 == 0 {
@@ -544,10 +546,6 @@ impl FileItem {
         let mut s = String::with_capacity(32);
         self.path.write_filename_to(arena.arena_for(self), &mut s);
         s
-    }
-
-    pub(crate) fn write_file_name_from_arena(&self, arena: ArenaPtr, out: &mut String) {
-        self.path.write_filename_to(arena, out);
     }
 
     pub fn relative_path(&self, arena: impl FFFStringStorage) -> String {
@@ -778,11 +776,16 @@ impl FileItem {
             return mask;
         };
 
-        // Streaming sniff to EOF (bounded by grep's max_file_size downstream):
-        // a NUL anywhere in the searchable range must classify as binary,
-        // otherwise grep matches text hidden inside a binary payload.
-        // Index-time cost is bounded by early exit on the first NUL.
+        // Prefix sniff, capped: a NUL in the first CAP bytes classifies
+        // as binary. Past the cap the mask would be unsound, so partial
+        // reads return empty (unknown) and grep opens the file instead.
+        // Index-time cost is bounded by the cap plus NUL early exit.
+        let cap = (self.size as usize).min(BINARY_CLASSIFICATION_CAP);
+        let mut read = 0usize;
         loop {
+            if read >= cap {
+                break;
+            }
             match file.read(chunk) {
                 Ok(0) => break,
                 Err(e) => {
@@ -790,6 +793,7 @@ impl FileItem {
                     break;
                 }
                 Ok(n) => {
+                    read += n;
                     let view = &chunk[..n];
                     mask.accumulate(view);
                     if detect_binary_content(view) {
@@ -798,6 +802,11 @@ impl FileItem {
                     }
                 }
             }
+        }
+        // Binary files are excluded from grep before the mask is consulted,
+        // so only a fully-read text file earns a recorded mask.
+        if self.is_binary() || (read as u64) < self.size {
+            return ContentMask::default();
         }
         mask
     }

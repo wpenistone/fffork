@@ -167,7 +167,6 @@ mod gate;
 pub use gate::{GateHit, gate_hit};
 pub(crate) mod interseq_sw;
 mod matcher;
-pub(crate) mod path_pack;
 pub(crate) mod presence;
 mod score;
 mod sort_buffer;

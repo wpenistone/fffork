@@ -146,17 +146,6 @@ impl NeedlePresence {
         }
         false
     }
-
-    #[inline(always)]
-    pub(crate) fn allows_mask(&self, path_mask: u64) -> Option<bool> {
-        if self.need == 0 {
-            return Some(true);
-        }
-        if !self.dup {
-            return Some((path_mask & self.needle_mask).count_ones() as usize >= self.need);
-        }
-        None
-    }
 }
 
 /// Sound necessary condition for `LCS(needle, path) >= |needle| - max_typos`.

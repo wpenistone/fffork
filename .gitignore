@@ -33,6 +33,9 @@ scripts/benchmark-results/
 # Test logs
 fff-test.log
 
+# Scratch work (notes, harnesses, one-way experiments; never merged)
+scratch/
+
 # Python
 __pycache__/
 *.py[cod]

@@ -48,7 +48,7 @@ use crate::types::{
 };
 use crate::walk::WalkOutput;
 use crate::watch::BackgroundWatcher;
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use fff_query_parser::FFFQuery;
 use git2::{Repository, Status};
 use rayon::prelude::*;
@@ -121,9 +121,6 @@ pub(crate) struct FileSync {
     overflow_builder: Option<crate::simd_path::ChunkedPathStoreBuilder>,
     bigram_index: Option<Arc<BigramFilter>>,
     bigram_overlay: Option<Arc<parking_lot::RwLock<BigramOverlay>>>,
-    /// Inverted bigram index over relative **paths** (not file contents).
-    /// Used to prefilter fuzzy file-name/path search before Smith-Waterman.
-    path_bigram_index: Option<Arc<BigramFilter>>,
     /// Chunk-level deduped path store. Arc so post-scan snapshots can hold
     /// the arena alive while iterating file paths.
     chunked_paths: Option<Arc<crate::simd_path::ChunkedPathStore>>,
@@ -220,7 +217,6 @@ impl FileSync {
             git_workdir: None,
             bigram_index: None,
             bigram_overlay: None,
-            path_bigram_index: None,
             chunked_paths: None,
             max_path_len: Arc::new(PathLenCache::new()),
             content_masks: Arc::new(ContentMaskStore::with_capacity(0)),
@@ -355,38 +351,6 @@ impl FileSync {
         }
 
         None
-    }
-
-    // TODO remove this function and make a better way to remove all files
-    // from the directory without looping over the whole sync data list
-    // Tombstones every matching arena file.
-    fn tombstone_files_with_arena<F, T>(&mut self, mut predicate: F, mut on_tombstone: T) -> usize
-    where
-        F: FnMut(&FileItem, ArenaPtr) -> bool,
-        T: FnMut(&mut FileItem, ArenaPtr),
-    {
-        let base_arena = self.arena_base_ptr();
-        let overflow_arena = self.arena_overflow_ptr();
-        let base_count = self.base_count;
-
-        let mut tombstoned = 0usize;
-        for (idx, file) in self.files.iter_mut().enumerate() {
-            if file.is_deleted() {
-                continue;
-            }
-            let arena = if idx < base_count {
-                base_arena
-            } else {
-                overflow_arena
-            };
-            if predicate(file, arena) {
-                on_tombstone(file, arena);
-                file.set_deleted(true);
-                tombstoned += 1;
-            }
-        }
-        self.live_count -= tombstoned;
-        tombstoned
     }
 
     /// Marks every dir matching `predicate` as deleted. Mirrors how dir-level
@@ -723,7 +687,8 @@ pub struct FilePickerOptions {
     pub git_recency: GitRecencyConfig,
     /// Do not discover .git, run git status, or apply git recency. Worktree
     /// search only â€” required for mega-corpus benches (sumo_fork has a 2.7GB
-    /// .git that is not a search corpus).
+    /// .git that is not a search corpus). Indexes above 200k files skip
+    /// automatically unless FFF_FORCE_GIT=1.
     pub skip_git: bool,
 }
 
@@ -743,6 +708,22 @@ impl Default for FilePickerOptions {
             skip_git: false,
         }
     }
+}
+
+/// Live files above this count skip git status/recency automatically.
+/// File count is a free post-walk proxy; full status on huge trees
+/// dominates query time. `FFF_FORCE_GIT=1` opts back in; explicit
+/// `skip_git` always wins.
+pub(crate) const AUTO_SKIP_GIT_FILE_COUNT: usize = 200_000;
+
+/// Single decision point for skipping git work.
+pub(crate) fn should_skip_git(explicit_skip: bool, live_count: usize, forced: bool) -> bool {
+    explicit_skip || (!forced && live_count > AUTO_SKIP_GIT_FILE_COUNT)
+}
+
+/// `FFF_FORCE_GIT` set disables auto-skip.
+pub(crate) fn git_force() -> bool {
+    std::env::var_os("FFF_FORCE_GIT").is_some()
 }
 
 pub struct FilePicker {
@@ -1260,7 +1241,6 @@ impl FilePicker {
         } else {
             FileSync::discover_git_workdir(&self.base_path)
         };
-        let git_handle = git_workdir.clone().map(FileSync::spawn_git_status);
 
         let empty_frecency = SharedFrecency::default();
         let sync = FileSync::walk_filesystem(
@@ -1273,6 +1253,26 @@ impl FilePicker {
         )?;
 
         self.sync_data = sync;
+        self.bump_index_generation();
+
+        // Spawn the status read once the live count is known, so
+        // mega-repos skip it instead of joining a uselessly long read.
+        let skip_git = should_skip_git(
+            self.skip_git,
+            self.live_file_count(),
+            git_force(),
+        );
+        if !self.skip_git && skip_git {
+            info!(
+                live = self.live_file_count(),
+                "auto-skipping git status on huge index (FFF_FORCE_GIT=1 overrides)"
+            );
+        }
+        let git_handle = if skip_git {
+            None
+        } else {
+            self.sync_data.git_workdir.clone().map(FileSync::spawn_git_status)
+        };
 
         if !self.has_explicit_cache_budget {
             let file_count = self.sync_data.files().len();
@@ -1300,7 +1300,8 @@ impl FilePicker {
             }
         }
 
-        if let Some(workdir) = self.sync_data.git_workdir.clone()
+        if !skip_git
+            && let Some(workdir) = self.sync_data.git_workdir.clone()
             && let Ok(repo) = Repository::open(&workdir)
                 .inspect_err(|e| debug!(?e, ?workdir, "git recency: failed to open repo"))
         {
@@ -1957,6 +1958,7 @@ impl FilePicker {
     pub(crate) fn commit_new_sync(&mut self, sync: FileSync) {
         self.sync_data = sync;
         self.cache_budget.reset();
+        self.bump_index_generation();
     }
 
     #[inline]
@@ -2221,6 +2223,7 @@ impl FilePicker {
         // Dir may have been tombstoned by an earlier removal; a new file
         // under it proves it exists again.
         self.sync_data.revive_dir(parent_dir);
+        self.bump_index_generation();
         self.sync_data.files.last()
     }
 
@@ -2249,6 +2252,7 @@ impl FilePicker {
         }
 
         self.sync_data.live_count -= 1;
+        self.bump_index_generation();
     }
 
     fn untombstone_file(&mut self, index: usize) {
@@ -2262,6 +2266,7 @@ impl FilePicker {
         self.sync_data.live_count += 1;
         // The path exists on disk again, so its parent dir does too.
         self.sync_data.revive_dir(parent_dir);
+        self.bump_index_generation();
     }
 
     /// Marks file as deleted, make sure that if you call this yourself these changes can be reverted
@@ -2277,7 +2282,6 @@ impl FilePicker {
         }
     }
 
-    // TODO make this O(n)
     pub fn remove_all_files_in_dir(&mut self, dir: impl AsRef<Path>) -> usize {
         self.remove_all_files_in_dirs_inner(std::iter::once(dir.as_ref()), None)
     }
@@ -2327,19 +2331,62 @@ impl FilePicker {
         let base_path = self.base_path.clone();
         let cache_budget = &self.cache_budget;
         let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-        let tombstoned = self.sync_data.tombstone_files_with_arena(
-            |file, arena| {
+        // Translate prefixes to dir-table indices once: the file loop then
+        // tests one integer per file instead of re-reading every arena path
+        // per prefix. Equivalent to the prefix match (table paths are the
+        // files' actual parents); out-of-table parents fall back to it.
+        let mut subtree: AHashSet<u32> = AHashSet::new();
+        {
+            let base_arena = self.sync_data.arena_base_ptr();
+            let overflow_arena = self.sync_data.arena_overflow_ptr();
+            let base_dirs_count = self.sync_data.base_dirs_count;
+            let mut dir_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+            for (di, dir) in self.sync_data.dirs.iter().enumerate() {
+                let arena = if di < base_dirs_count {
+                    base_arena
+                } else {
+                    overflow_arena
+                };
+                let rel = dir.read_relative_path(arena, &mut dir_buf);
+                if dir_prefixes.iter().any(|prefix| rel.starts_with(prefix)) {
+                    subtree.insert(di as u32);
+                }
+            }
+        }
+        let dirs_len = self.sync_data.dirs.len();
+        let base_count = self.sync_data.base_count;
+        let base_arena = self.sync_data.arena_base_ptr();
+        let overflow_arena = self.sync_data.arena_overflow_ptr();
+        let mut tombstoned = 0usize;
+        for (idx, file) in self.sync_data.files.iter_mut().enumerate() {
+            if file.is_deleted() {
+                continue;
+            }
+            let arena = if idx < base_count {
+                base_arena
+            } else {
+                overflow_arena
+            };
+            let hit = if subtree.contains(&file.parent_dir_index) {
+                true
+            } else if (file.parent_dir_index as usize) >= dirs_len {
                 dir_prefixes
                     .iter()
                     .any(|prefix| file.relative_path_starts_with(arena, prefix))
-            },
-            |file, arena| {
-                file.invalidate_mmap(cache_budget);
-                if let Some(callback) = callback.as_mut() {
-                    callback(file.write_absolute_path(arena, &base_path, &mut path_buf));
-                }
-            },
-        );
+            } else {
+                false
+            };
+            if !hit {
+                continue;
+            }
+            file.invalidate_mmap(cache_budget);
+            if let Some(callback) = callback.as_mut() {
+                callback(file.write_absolute_path(arena, &base_path, &mut path_buf));
+            }
+            file.set_deleted(true);
+            tombstoned += 1;
+        }
+        self.sync_data.live_count -= tombstoned;
 
         // The whole subtree is gone: tombstone the dirs too so directory
         // search stops surfacing them.
@@ -2349,6 +2396,9 @@ impl FilePicker {
             dir_prefixes.iter().any(|prefix| rel.starts_with(prefix))
         });
 
+        if tombstoned > 0 {
+            self.bump_index_generation();
+        }
         tombstoned
     }
 
@@ -2710,25 +2760,9 @@ impl FileSync {
             git_workdir,
             bigram_index: None,
             bigram_overlay: None,
-            // Built lazily on first typo-0 fuzzy search (`ensure_path_bigram`)
-            // so scan peak RSS does not include the bigram builder slab.
-            path_bigram_index: None,
             chunked_paths: Some(Arc::new(chunked_paths)),
             ignore_rules,
         })
-    }
-
-    /// Build (once) the path bigram index that prefilters typo-free fuzzy
-    /// queries. Deferred from scan so peak RSS does not include the builder
-    /// slab for workloads that never ask for a zero-typo filter.
-    pub(crate) fn ensure_path_bigram(&mut self) {
-        if self.path_bigram_index.is_some() {
-            return;
-        }
-        let files: &[FileItem] = &self.files;
-        let arena = self.arena_base_ptr();
-        let idx = crate::index::build_path_bigram_index(files, arena);
-        self.path_bigram_index = Some(Arc::new(idx));
     }
 }
 
@@ -3235,5 +3269,268 @@ mod tests {
         let outside = base.parent().unwrap().join("outside");
         assert_eq!(picker.remove_all_files_in_dir(&outside), 0);
         assert!(picker.get_file_by_path(&kept).is_some());
+    }
+
+    /// Live-narrow caches candidate indices per index generation.
+    /// Mutations must bump the generation and disarm narrow, or extended
+    /// queries search a stale set.
+    #[test]
+    fn live_narrow_invalidated_by_index_mutations() {
+        use crate::types::PaginationArgs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_buf = crate::path_utils::canonicalize(dir.path()).unwrap();
+        let base = base_buf.as_path();
+        for rel in ["src/alpha_1.rs", "src/alpha_2.rs"] {
+            let path = base.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        assert_eq!(picker.live_file_count(), 2);
+
+        let opts = || FuzzySearchOptions {
+            max_threads: 1,
+            current_file: None,
+            project_path: None,
+            combo_boost_score_multiplier: 0,
+            min_combo_count: 0,
+            pagination: PaginationArgs { offset: 0, limit: 50 },
+        };
+        let parser = fff_query_parser::QueryParser::default();
+        let names_of = |picker: &FilePicker, text: &str| {
+            let parsed = parser.parse(text);
+            let out = picker.fuzzy_search(&parsed, None, opts());
+            let names: Vec<String> =
+                out.items.iter().map(|f| f.relative_path(picker)).collect();
+            (out.total_matched, names)
+        };
+
+        let (total, _) = names_of(&picker, "alph");
+        assert_eq!(total, 2);
+        assert!(picker.live.lock().active);
+        let g0 = picker.index_generation();
+
+        // Added file bumps generation, disarms narrow, and surfaces.
+        let added = base.join("src/alpha_3.rs");
+        std::fs::write(&added, b"x").unwrap();
+        assert!(picker.add_new_file(&added).is_some());
+        assert!(!picker.live.lock().active);
+        assert!(picker.index_generation() > g0);
+        let (total, names) = names_of(&picker, "alpha");
+        assert_eq!(total, 3);
+        assert!(names.iter().any(|n| n.ends_with("alpha_3.rs")), "{names:?}");
+        let g1 = picker.index_generation();
+
+        // Removed file invalidates the same way and stops surfacing.
+        assert!(picker.remove_file_by_path(&added));
+        assert!(!picker.live.lock().active);
+        assert!(picker.index_generation() > g1);
+        let (total, names) = names_of(&picker, "alpha");
+        assert_eq!(total, 2);
+        assert!(!names.iter().any(|n| n.ends_with("alpha_3.rs")), "{names:?}");
+    }
+
+    /// Binary sniff reads a bounded prefix: early NULs flag binary, late
+    /// NULs past the cap stay text, and only fully-read files earn masks.
+    #[test]
+    fn binary_sniff_caps_at_prefix() {
+        use crate::types::BINARY_CLASSIFICATION_CAP;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_buf = crate::path_utils::canonicalize(dir.path()).unwrap();
+        let base = base_buf.as_path();
+        std::fs::create_dir_all(base.join("src")).unwrap();
+
+        let tiny = base.join("src/tiny.txt");
+        std::fs::write(&tiny, b"hello world").unwrap();
+        // `.dat` is not a known-binary extension, so content decides.
+        let early = base.join("src/early.dat");
+        let mut early_bytes = vec![b'x'; 64];
+        early_bytes[10] = 0;
+        std::fs::write(&early, &early_bytes).unwrap();
+
+        // 300KB files: content past the 256KB cap is never read.
+        let big = BINARY_CLASSIFICATION_CAP + 32 * 1024;
+        let mut late_bytes = vec![b'y'; big];
+        late_bytes[big - 8 * 1024] = 0;
+        let late = base.join("src/late.dat");
+        std::fs::write(&late, &late_bytes).unwrap();
+        let text = base.join("src/big.txt");
+        std::fs::write(&text, vec![b'z'; big]).unwrap();
+
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        for p in [&tiny, &early, &late, &text] {
+            assert!(picker.add_new_file(p).is_some());
+        }
+        // `add_new_file` classifies but does not store masks; assert on the
+        // detector return (empty mask reads back as unknown downstream).
+        let sniff = |picker: &FilePicker, p: &std::path::Path| {
+            let f = picker.get_file_by_path(p).unwrap();
+            let mut chunk = [0u8; crate::types::BINARY_CLASSIFICATION_CHUNK_SIZE];
+            let mask = f.detect_binary_per_byte(p, &mut chunk);
+            (f.is_binary(), mask)
+        };
+
+        let (binary, mask) = sniff(&picker, &tiny);
+        assert!(!binary);
+        assert_eq!(mask.allows(b"hello world", 0), Some(true));
+        let (binary, mask) = sniff(&picker, &early);
+        assert!(binary);
+        assert_eq!(mask.allows(b"x", 0), None);
+        // Late NUL past the cap: stays text, mask unknown so grep reads it.
+        let (binary, mask) = sniff(&picker, &late);
+        assert!(!binary);
+        assert_eq!(mask.allows(b"y", 0), None);
+        let (binary, mask) = sniff(&picker, &text);
+        assert!(!binary);
+        assert_eq!(mask.allows(b"z", 0), None);
+    }
+
+    #[test]
+    fn git_skip_decision_matrix() {
+        assert!(!should_skip_git(false, 0, false));
+        assert!(!should_skip_git(false, 199_999, false));
+        assert!(!should_skip_git(false, AUTO_SKIP_GIT_FILE_COUNT, false));
+        assert!(should_skip_git(false, AUTO_SKIP_GIT_FILE_COUNT + 1, false));
+        assert!(should_skip_git(false, 1_000_000, false));
+        assert!(!should_skip_git(false, 1_000_000, true));
+        assert!(should_skip_git(true, 0, false));
+        assert!(should_skip_git(true, 0, true));
+    }
+
+    fn git_repo_fixture() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = crate::path_utils::canonicalize(dir.path()).unwrap();
+        Repository::init(base.as_path()).unwrap();
+        let path = base.join("src/main.rs");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"fn main() {}").unwrap();
+        (dir, base)
+    }
+
+    #[test]
+    fn explicit_skip_git_stays_skipped() {
+        let (_dir, base) = git_repo_fixture();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            skip_git: true,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        assert!(!picker.has_git_repo());
+    }
+
+    #[test]
+    fn small_git_repo_keeps_git() {
+        // Far below the auto threshold: discovery + status path run.
+        let (_dir, base) = git_repo_fixture();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        assert!(picker.has_git_repo());
+    }
+
+    /// Dir removal tombstones exactly the subtree: survivors, callback set,
+    /// live count, search totals, idempotency, root, and overflow files.
+    #[test]
+    fn remove_all_files_in_dir_covers_subtree() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_buf = crate::path_utils::canonicalize(dir.path()).unwrap();
+        let base = base_buf.as_path();
+        for rel in [
+            "src/a/f1.rs",
+            "src/a/f2.rs",
+            "src/a/nested/f3.rs",
+            "src/b/f4.rs",
+            "root.rs",
+        ] {
+            let path = base.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        assert_eq!(picker.live_file_count(), 5);
+
+        let search_total = |picker: &FilePicker| {
+            let parser = fff_query_parser::QueryParser::default();
+            let parsed = parser.parse("");
+            picker
+                .fuzzy_search(
+                    &parsed,
+                    None,
+                    FuzzySearchOptions {
+                        max_threads: 1,
+                        current_file: None,
+                        project_path: None,
+                        combo_boost_score_multiplier: 0,
+                        min_combo_count: 0,
+                        pagination: crate::types::PaginationArgs { offset: 0, limit: 50 },
+                    },
+                )
+                .total_matched
+        };
+
+        let mut removed = Vec::new();
+        assert_eq!(
+            picker.remove_all_files_in_dirs_with_callback(
+                std::iter::once(base.join("src/a").as_path()),
+                |path| removed.push(path.to_path_buf()),
+            ),
+            3
+        );
+        removed.sort_unstable();
+        assert_eq!(
+            removed,
+            vec![
+                base.join("src/a/f1.rs"),
+                base.join("src/a/f2.rs"),
+                base.join("src/a/nested/f3.rs"),
+            ]
+        );
+        assert_eq!(picker.live_file_count(), 2);
+        assert_eq!(search_total(&picker), 2);
+
+        // Idempotent: second removal finds nothing.
+        assert_eq!(picker.remove_all_files_in_dir(base.join("src/a")), 0);
+        assert_eq!(picker.live_file_count(), 2);
+
+        // Overflow files (watcher-added) fall under the same subtree rule.
+        let extra = base.join("src/c/f5.rs");
+        std::fs::create_dir_all(extra.parent().unwrap()).unwrap();
+        std::fs::write(&extra, b"x").unwrap();
+        assert!(picker.add_new_file(&extra).is_some());
+        assert_eq!(picker.live_file_count(), 3);
+        assert_eq!(picker.remove_all_files_in_dir(base.join("src")), 2);
+        assert_eq!(picker.live_file_count(), 1);
+        assert_eq!(search_total(&picker), 1);
+
+        // Root removal takes the rest.
+        assert_eq!(picker.remove_all_files_in_dir(&base), 1);
+        assert_eq!(picker.live_file_count(), 0);
+        assert_eq!(search_total(&picker), 0);
     }
 }

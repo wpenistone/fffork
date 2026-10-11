@@ -371,7 +371,8 @@ fn score_one_scalar_stack(
     (last_row_max as u16, end_col)
 }
 
-/// Convenience wrapper: just the score.
+/// Convenience wrapper: just the score. Test oracle for the batch kernels.
+#[cfg(test)]
 pub(crate) fn score_one_scalar(
     needle: &[u8],
     haystack: &[u8],
@@ -393,6 +394,8 @@ pub(crate) mod avx2 {
 
     /// Build SoA buffer: soa[j * stride + p] = haystack[p][j], padded with 0.
     /// `stride` must match the kernel's lane count (16 for u16, 32 for u8).
+    /// Test oracle: production transposes straight from the stage buffer.
+    #[cfg(test)]
     pub(crate) fn build_soa(haystacks: &[&[u8]], max_len: usize, stride: usize) -> Vec<u8> {
         let n = haystacks.len().min(stride);
         let mut soa = vec![0u8; max_len * stride];
@@ -874,7 +877,11 @@ pub(crate) mod avx2 {
 
     /// Dispatch to a const-unrolled specialization for common needle lengths.
     /// `M = 0` keeps the general runtime-m loop. Results are bit-identical.
+    ///
+    /// # Safety
+    /// Caller must guarantee AVX2 (score.rs gates on simd_available).
     #[inline]
+    #[target_feature(enable = "avx2")]
     pub(crate) unsafe fn score_batch_avx2_u8_dispatch(
         needle: &[u8],
         soa: &[u8],
@@ -902,7 +909,8 @@ pub(crate) mod avx2 {
     /// Same as [`score_batch_avx2_u8`] but with a compile-time needle length so
     /// the DP row loop is fully unrolled and the state arrays SROA to registers.
     /// Bit-identical to the general loop (asserted in tests).
-    #[inline(always)]
+    #[inline]
+    #[target_feature(enable = "avx2")]
     unsafe fn score_batch_avx2_u8_const<const M: usize>(
         needle: &[u8],
         soa: &[u8],
@@ -1021,6 +1029,11 @@ pub(crate) mod avx2 {
             } else {
                 zero
             };
+            // The bonus pack is column-invariant, so build it once.
+            let bonus_base = _mm256_add_epi8(
+                _mm256_add_epi8(delim_bonus, cap_bonus),
+                _mm256_add_epi8(prefix_bonus, match_add_v),
+            );
 
             let nxt = 1 - cur;
             h[nxt][0] = zero;
@@ -1035,13 +1048,7 @@ pub(crate) mod avx2 {
                 let mm = _mm256_or_si256(eq_nc, eq_nf);
                 match_state[nxt][i] = mm;
 
-                let masked_bonus = _mm256_and_si256(
-                    _mm256_add_epi8(
-                        _mm256_add_epi8(delim_bonus, cap_bonus),
-                        _mm256_add_epi8(prefix_bonus, match_add_v),
-                    ),
-                    mm,
-                );
+                let masked_bonus = _mm256_and_si256(bonus_base, mm);
                 let diag = _mm256_add_epi8(h[cur][i - 1], masked_bonus);
                 let diag = _mm256_subs_epu8(diag, mismatch_v);
                 let diag = _mm256_add_epi8(diag, _mm256_and_si256(eq_nc, case_v));

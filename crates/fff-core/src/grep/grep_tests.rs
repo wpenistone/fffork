@@ -819,3 +819,83 @@ fn plain_page_pagination_covers_all_matches() {
 
     assert_eq!(seen.len(), 50, "expected 25 files × 2 matches = 50");
 }
+
+/// Record content masks from real file bytes at base positions. The sync
+/// collect path leaves the mask store empty; tests that need masks set
+/// them explicitly (positions match enumeration: no deletions/overflow).
+fn record_masks_from_disk(picker: &FilePicker, root: &std::path::Path) {
+    let store = picker.content_mask_store();
+    for (index, file) in picker.get_files().iter().enumerate() {
+        let content = std::fs::read(root.join(file.relative_path(picker))).unwrap();
+        let mut mask = crate::types::ContentMask::default();
+        mask.accumulate(&content);
+        store.set(index, mask);
+    }
+}
+
+#[test]
+fn mask_prefilter_skips_counted() {
+    use std::sync::atomic::Ordering;
+    let root = tempfile::tempdir().unwrap();
+    // No 'z' anywhere: every file is rejected unopened at the mask check.
+    for index in 0..64 {
+        std::fs::write(root.path().join(format!("file_{index}.txt")), "ordinary content\n")
+            .unwrap();
+    }
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: root.path().to_string_lossy().into_owned(),
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+    record_masks_from_disk(&picker, root.path());
+
+    let query = parse_grep_query("zzz");
+    let options = GrepSearchOptions {
+        mode: GrepMode::PlainText,
+        page_limit: usize::MAX,
+        ..Default::default()
+    };
+    let mask_before = super::grep::CONTENT_MASK_REJECTS.load(Ordering::Relaxed);
+    let result = picker.grep(&query, &options);
+    let mask_after = super::grep::CONTENT_MASK_REJECTS.load(Ordering::Relaxed);
+    assert!(result.matches.is_empty());
+    // `>=`: parallel tests sharing the process can only add to the counter.
+    assert!(mask_after - mask_before >= 64);
+}
+
+#[test]
+fn memmem_prefilter_skips_counted_separately() {
+    use std::sync::atomic::Ordering;
+    let root = tempfile::tempdir().unwrap();
+    // 'z' present (mask allows) but no "zzz" run: memmem performs the skip.
+    for index in 0..64 {
+        std::fs::write(root.path().join(format!("file_{index}.txt")), "zebra zone\n").unwrap();
+    }
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: root.path().to_string_lossy().into_owned(),
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+    record_masks_from_disk(&picker, root.path());
+
+    let query = parse_grep_query("zzz");
+    let options = GrepSearchOptions {
+        mode: GrepMode::PlainText,
+        page_limit: usize::MAX,
+        ..Default::default()
+    };
+    let mask_before = super::grep::CONTENT_MASK_REJECTS.load(Ordering::Relaxed);
+    let mem_before = super::grep::MEMMEM_PREFILTER_REJECTS.load(Ordering::Relaxed);
+    let result = picker.grep(&query, &options);
+    let mask_after = super::grep::CONTENT_MASK_REJECTS.load(Ordering::Relaxed);
+    let mem_after = super::grep::MEMMEM_PREFILTER_REJECTS.load(Ordering::Relaxed);
+    assert!(result.matches.is_empty());
+    assert!(mem_after - mem_before >= 64);
+    // All masks allow here, so only memmem skips fire locally; the mask
+    // counter may also include other parallel tests.
+    assert!(mask_after >= mask_before);
+}

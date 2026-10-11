@@ -12,7 +12,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Counterbalanced block subject order (METHODOLOGY).
+/// Doubled ABBA: every adjacent pair cancels linear drift, and the
+/// full run is 4-and-4 either way. Stream mode makes 8 blocks cheaper
+/// than 4 one-shot blocks (2 corpus opens instead of 16).
 const BLOCK_ORDER: &[[&str; 2]] = &[
+    ["baseline", "candidate"],
+    ["candidate", "baseline"],
+    ["candidate", "baseline"],
+    ["baseline", "candidate"],
     ["baseline", "candidate"],
     ["candidate", "baseline"],
     ["candidate", "baseline"],

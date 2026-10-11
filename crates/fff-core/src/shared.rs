@@ -356,6 +356,22 @@ impl SharedFilePicker {
             let Some(ref picker) = *guard else {
                 return Err(Error::FilePickerMissing);
             };
+            // Mega-repos skip full status refreshes; per-event path updates
+            // stay incremental. Explicit skip_git still applies.
+            let live = picker.live_file_count();
+            if !picker.skips_git()
+                && crate::file_picker::should_skip_git(
+                    false,
+                    live,
+                    crate::file_picker::git_force(),
+                )
+            {
+                tracing::warn!(
+                    live,
+                    "auto-skipping git status refresh on huge index (FFF_FORCE_GIT=1 overrides)"
+                );
+                return Ok(0);
+            }
             (
                 picker.git_root().map(|p| p.to_path_buf()),
                 picker.git_recency_config(),

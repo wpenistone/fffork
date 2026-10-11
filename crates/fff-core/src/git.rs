@@ -81,15 +81,6 @@ fn relative_keys_enabled() -> bool {
     )
 }
 
-/// `FFF_GIT_SORTED_MERGE=1` makes consumers merge a sorted entry vec against
-/// the sorted file index linearly instead of hashing per file.
-pub(crate) fn sorted_merge_enabled() -> bool {
-    matches!(
-        std::env::var("FFF_GIT_SORTED_MERGE").as_deref(),
-        Ok("1") | Ok("true")
-    )
-}
-
 /// Max pathspec entries per libgit2 call (`FFF_GIT_PATHSPEC_BATCH`).
 fn pathspec_batch_cap() -> usize {
     std::env::var("FFF_GIT_PATHSPEC_BATCH")
@@ -121,7 +112,8 @@ impl GitStatusCache {
 
     /// Sorted entries for a linear merge against the sorted file index.
     /// Byte order matches `Path::cmp`, so the merge is exact on case-variant
-    /// names (see the case test below).
+    /// names. Public API; no in-tree consumer yet.
+    #[allow(dead_code)]
     pub fn into_sorted_vec(self) -> Vec<(PathBuf, Status)> {
         let mut v: Vec<(PathBuf, Status)> = self.into_iter().collect();
         v.sort_by(|a, b| a.0.cmp(&b.0));
@@ -170,6 +162,8 @@ impl GitStatusCache {
     /// `include_unmodified`). Missing entries already mean "clean" because
     /// every `FileItem` starts with `git_status: None`, so enumerating all
     /// tracked paths is pure overhead on huge trees.
+    /// Test-only helper: production refresh goes through the status worker.
+    #[cfg(test)]
     pub(crate) fn read_dirty_status(repo: &Repository) -> Result<Self> {
         let mut opts = initial_scan_status_options();
         Self::read_status(repo, &mut opts)
