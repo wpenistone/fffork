@@ -221,9 +221,6 @@ pub struct GateNeedle {
     pm: Box<[u64; 256]>,
     /// Distinct folded needle bytes, for the vectorized membership test.
     distinct: Box<[u8]>,
-    /// Folded needle prefix (first 64 bytes) for the greedy cursor.
-    folded: [u8; 64],
-    folded_len: u8,
     len_mask: u64,
 }
 
@@ -234,12 +231,9 @@ impl GateNeedle {
         let mut pm = Box::new([0u64; 256]);
         let mut seen = [false; 256];
         let mut distinct = Vec::with_capacity(m.min(16));
-        let mut folded = [0u8; 64];
-        let folded_len = m.min(64);
         for (i, &b) in needle.iter().enumerate().take(64) {
             let f = fold_byte(b);
             pm[f as usize] |= 1u64 << i;
-            folded[i] = f;
             if !seen[f as usize] {
                 seen[f as usize] = true;
                 distinct.push(f);
@@ -252,8 +246,6 @@ impl GateNeedle {
             typos,
             need: m.saturating_sub(typos),
             pm,
-            folded,
-            folded_len: folded_len as u8,
             distinct: distinct.into_boxed_slice(),
         }
     }
@@ -331,14 +323,10 @@ impl GateNeedle {
                     include_prefix: true,
                 });
             }
-            let pm = &*self.pm;
             let distinct = &*self.distinct;
-            let mask = self.len_mask;
-            let greedy = self.typos == 0;
-            // Folded needle lives on the query (built in `new`), not per file.
-            let needle_folded = &self.folded[..self.folded_len as usize];
-            let mut s = 0u64;
-            let mut next_needle = 0usize;
+            // Span counting only: per-hit DP state is redundant here. LCS
+            // over the full path equals LCS over the span slice (affixes
+            // hold no needle bytes), and `decide` below runs that DP once.
             let mut first = usize::MAX;
             let mut last = 0usize;
             let mut n = 0usize;
@@ -347,42 +335,46 @@ impl GateNeedle {
                 let end = (off + chunk.len()).min(byte_len);
                 let len = end - off;
                 let view = &chunk[..len];
-                // One vector op per 16 bytes finds every needle-byte position;
-                // the Hyyro update stays serial but only runs on those.
+                // One vector op per 16 bytes; popcount replaces the per-hit
+                // scalar walk (first/last need only the extreme set bits).
                 let mut base = 0usize;
                 while base < len {
                     let step = 16.min(len - base);
-                    let mut mask = needle_byte_mask(&view[base..base + step], distinct, &self.span);
-                    while mask != 0 {
-                        let bit = mask.trailing_zeros() as usize;
-                        mask &= mask - 1;
-                        let pos = base + bit;
+                    let mask = needle_byte_mask(&view[base..base + step], distinct, &self.span);
+                    let c = mask.count_ones() as usize;
+                    if c != 0 {
                         if n == 0 {
-                            first = off + pos;
+                            first = off + base + mask.trailing_zeros() as usize;
                         }
-                        last = off + pos;
-                        n += 1;
-                        if greedy {
-                            if next_needle < needle_folded.len()
-                                && needle_folded[next_needle] == fold_byte(view[pos])
-                            {
-                                next_needle += 1;
-                            }
-                        } else {
-                            let x = s | pm[fold_byte(view[pos]) as usize];
-                            let y = (s << 1) | 1;
-                            s = x & (x ^ x.wrapping_sub(y));
-                        }
+                        last = off + base + (16 - mask.leading_zeros() as usize - 1);
+                        n += c;
                     }
                     base += step;
                 }
             });
-            let lcs = if greedy {
-                next_needle
-            } else {
-                (s & mask).count_ones() as usize
-            };
-            if lcs < self.need || first == usize::MAX {
+            // Fewer hits than the typo budget needs cannot match; the rest
+            // are adjudicated on the staged span slice, exactly like the
+            // staged `hit` path (same span, same decide).
+            if n < self.need {
+                return None;
+            }
+            let hi = (last + 1).min(byte_len);
+            thread_local! {
+                static SPAN: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+            }
+            let mut span = SPAN.with(|c| {
+                let mut b = c.borrow_mut();
+                let len = hi - first;
+                if b.len() < len {
+                    b.resize(len, 0);
+                }
+                std::mem::take(&mut *b)
+            });
+            file.path
+                .copy_window_to(arena, first as u32, hi as u32, &mut span[..hi - first]);
+            let ok = self.decide(&span[..hi - first]);
+            SPAN.with(|c| *c.borrow_mut() = span);
+            if !ok {
                 return None;
             }
             return Some(GateHit {
