@@ -1,6 +1,7 @@
 use super::db_healthcheck::DbHealthChecker;
-use super::lmdb::{DbHealth, LmdbStore, is_map_full};
+use super::env_pool::SharedEnv;
 use crate::error::Error;
+use crate::lmdb::{DbHealth, LmdbStore, WRITE_TXN_CHUNK, is_map_full};
 use heed::types::{Bytes, SerdeBincode};
 use heed::{Database, Env};
 use serde::{Deserialize, Serialize};
@@ -27,7 +28,7 @@ struct HistoryEntry {
 
 #[derive(Debug)]
 pub struct QueryTracker {
-    env: Env,
+    env: SharedEnv,
     // Database for (project_path, query) -> QueryMatchEntry mappings
     query_file_db: Database<Bytes, SerdeBincode<QueryMatchEntry>>,
     // Database for project_path -> VecDeque<HistoryEntry> mappings (file picker)
@@ -38,7 +39,7 @@ pub struct QueryTracker {
 }
 
 impl DbHealthChecker for QueryTracker {
-    fn get_env(&self) -> &Env {
+    fn get_env(&self) -> &Env<heed::WithoutTls> {
         &self.env
     }
 
@@ -92,7 +93,7 @@ impl LmdbStore for QueryTracker {
     const MAX_DBS: u32 = 16;
     const SIZE_CAP_BYTES: u64 = 8 * 1024 * 1024;
 
-    fn env(&self) -> &Env {
+    fn shared_env(&self) -> &SharedEnv {
         &self.env
     }
 
@@ -197,7 +198,7 @@ impl QueryTracker {
     /// offset=0 returns most recent, offset=1 returns 2nd most recent, etc.
     fn read_history_at_offset(
         db: &Database<Bytes, SerdeBincode<VecDeque<HistoryEntry>>>,
-        env: &Env,
+        env: &Env<heed::WithoutTls>,
         project_key: &[u8; 32],
         offset: usize,
     ) -> Result<Option<String>, Error> {
@@ -389,6 +390,159 @@ impl QueryTracker {
         }
     }
 
+    /// Batch variant: one write txn for many grep queries on one project.
+    /// Replaces N txns with one for history replays.
+    pub fn track_grep_queries(
+        &mut self,
+        queries: &[&str],
+        project_path: &Path,
+    ) -> Result<usize, Error> {
+        if queries.is_empty() {
+            return Ok(0);
+        }
+        let now = self.get_now();
+        let project_key = Self::create_project_key(project_path)?;
+        let mut done = 0usize;
+        for chunk in queries.chunks(WRITE_TXN_CHUNK) {
+            let mut wtxn = self
+                .env
+                .write_txn()
+                .map_err(|source| Error::DbStartWriteTxn {
+                    db: Self::LABEL,
+                    source,
+                })?;
+            for query in chunk {
+                if let Err(e) = Self::append_to_history(
+                    &self.grep_query_history_db,
+                    &mut wtxn,
+                    &project_key,
+                    query,
+                    now,
+                ) {
+                    if let Error::DbWrite {
+                        source: ref inner, ..
+                    } = e
+                        && is_map_full(inner)
+                    {
+                        self.health
+                            .mark_unhealthy("MDB_MAP_FULL on grep history append");
+                        return Ok(done);
+                    }
+                    return Err(e);
+                }
+                done += 1;
+            }
+            if let Err(e) = wtxn.commit() {
+                if is_map_full(&e) {
+                    self.health.mark_unhealthy("MDB_MAP_FULL on commit");
+                    return Ok(done);
+                }
+                return Err(Error::DbCommit {
+                    db: Self::LABEL,
+                    source: e,
+                });
+            }
+        }
+        Ok(done)
+    }
+
+    /// Batch variant of `track_query_completion`: one txn per chunk for many
+    /// (query, file) pairs on one project.
+    pub fn track_query_completions_batch(
+        &mut self,
+        items: &[(&str, &Path)],
+        project_path: &Path,
+    ) -> Result<usize, Error> {
+        if items.is_empty() {
+            return Ok(0);
+        }
+        let now = self.get_now();
+        let project_key = Self::create_project_key(project_path)?;
+        // Hash up front on the bg pool: blake3 under a held write txn would
+        // serialize bulk imports on hashing instead of LMDB.
+        let keys: Vec<Result<[u8; 32], Error>> = crate::parallelism::run_on_bg_pool(|| {
+            use rayon::prelude::*;
+            items
+                .par_iter()
+                .map(|(query, _)| Self::create_query_key(project_path, query))
+                .collect()
+        });
+        let mut paired: Vec<([u8; 32], &str, &Path)> = Vec::with_capacity(items.len());
+        for ((query, file_path), key) in items.iter().zip(keys) {
+            paired.push((key?, *query, *file_path));
+        }
+        let mut done = 0usize;
+        for chunk in paired.chunks(WRITE_TXN_CHUNK) {
+            let mut wtxn = self
+                .env
+                .write_txn()
+                .map_err(|source| Error::DbStartWriteTxn {
+                    db: Self::LABEL,
+                    source,
+                })?;
+            for (query_key, query, file_path) in chunk {
+                let mut entry = self
+                    .query_file_db
+                    .get(&wtxn, query_key)
+                    .map_err(|source| Error::DbRead {
+                        db: Self::LABEL,
+                        source,
+                    })?
+                    .unwrap_or_else(|| QueryMatchEntry {
+                        file_path: file_path.to_path_buf(),
+                        open_count: 0,
+                        last_opened: now,
+                    });
+                if entry.file_path == **file_path {
+                    entry.open_count += 1;
+                } else {
+                    entry.file_path = file_path.to_path_buf();
+                    entry.open_count = 1;
+                }
+                entry.last_opened = now;
+                if let Err(e) = self.query_file_db.put(&mut wtxn, query_key, &entry) {
+                    if is_map_full(&e) {
+                        self.health.mark_unhealthy("MDB_MAP_FULL on put");
+                        return Ok(done);
+                    }
+                    return Err(Error::DbWrite {
+                        db: Self::LABEL,
+                        source: e,
+                    });
+                }
+                if let Err(e) = Self::append_to_history(
+                    &self.query_history_db,
+                    &mut wtxn,
+                    &project_key,
+                    query,
+                    now,
+                ) {
+                    if let Error::DbWrite {
+                        source: ref inner, ..
+                    } = e
+                        && is_map_full(inner)
+                    {
+                        self.health.mark_unhealthy("MDB_MAP_FULL on history append");
+                        return Ok(done);
+                    }
+                    return Err(e);
+                }
+                done += 1;
+            }
+            if let Err(e) = wtxn.commit() {
+                if is_map_full(&e) {
+                    self.health.mark_unhealthy("MDB_MAP_FULL on commit");
+                    return Ok(done);
+                }
+                return Err(Error::DbCommit {
+                    db: Self::LABEL,
+                    source: e,
+                });
+            }
+        }
+        Ok(done)
+    }
+
     /// Get query from file picker history at a specific offset.
     /// offset=0 returns most recent query, offset=1 returns 2nd most recent, etc.
     pub fn get_historical_query(
@@ -509,6 +663,48 @@ mod tests {
             .get_last_query_path("main", &project_path, &file_path, 10000)
             .unwrap();
         assert_eq!(boost, 0, "Original file should not boost after replacement");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn batch_completions_match_single_writes() {
+        let temp_dir = env::temp_dir().join(format!("fff_test_query_batch_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+
+        let project_path = PathBuf::from("/test/project");
+        let file_a = PathBuf::from("/test/project/src/main.rs");
+        let file_b = PathBuf::from("/test/project/src/lib.rs");
+
+        let mut batch = QueryTracker::open(temp_dir.to_str().unwrap()).unwrap();
+        let done = batch
+            .track_query_completions_batch(
+                &[
+                    ("main", file_a.as_path()),
+                    ("main", file_a.as_path()),
+                    ("lib", file_b.as_path()),
+                ],
+                &project_path,
+            )
+            .unwrap();
+        assert_eq!(done, 3);
+        // Same file twice accumulates open_count, so the combo boost fires.
+        assert_eq!(
+            batch
+                .get_last_query_path("main", &project_path, &file_a, 10000)
+                .unwrap(),
+            10000
+        );
+        assert_eq!(
+            batch
+                .get_last_query_path("lib", &project_path, &file_b, 10000)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            batch.get_historical_query(&project_path, 0).unwrap(),
+            Some("lib".to_string())
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

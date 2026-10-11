@@ -1,6 +1,6 @@
 use pyo3::prelude::*;
 
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct Score {
     #[pyo3(get)]
@@ -37,7 +37,7 @@ impl Score {
     }
 }
 
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct FileItem {
     #[pyo3(get)]
@@ -70,7 +70,7 @@ impl FileItem {
     }
 }
 
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct DirItem {
     #[pyo3(get)]
@@ -91,7 +91,7 @@ impl DirItem {
     }
 }
 
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct MixedFileItem {
     #[pyo3(get)]
@@ -124,7 +124,7 @@ impl MixedFileItem {
     }
 }
 
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct MixedDirItem {
     #[pyo3(get)]
@@ -145,7 +145,7 @@ impl MixedDirItem {
     }
 }
 
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct MatchRange {
     #[pyo3(get)]
@@ -161,7 +161,7 @@ impl MatchRange {
     }
 }
 
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct GrepMatch {
     #[pyo3(get)]
@@ -212,7 +212,7 @@ impl GrepMatch {
     }
 }
 
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct SearchResult {
     #[pyo3(get)]
@@ -245,7 +245,7 @@ impl SearchResult {
     }
 }
 
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct DirSearchResult {
     #[pyo3(get)]
@@ -281,7 +281,7 @@ impl DirSearchResult {
 #[pyclass]
 pub struct MixedSearchResult {
     #[pyo3(get)]
-    pub items: Vec<PyObject>,
+    pub items: Vec<Py<PyAny>>,
     #[pyo3(get)]
     pub scores: Vec<Score>,
     #[pyo3(get)]
@@ -313,7 +313,7 @@ impl MixedSearchResult {
     }
 }
 
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct GrepResult {
     #[pyo3(get)]
@@ -365,7 +365,7 @@ impl GrepResult {
     }
 }
 
-#[pyclass]
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct ScanProgress {
     #[pyo3(get)]
@@ -388,7 +388,32 @@ impl ScanProgress {
     }
 }
 
-#[pyclass]
+#[pyclass(skip_from_py_object)]
+#[derive(Clone)]
+pub struct WatchEvent {
+    #[pyo3(get)]
+    pub path: String,
+    #[pyo3(get)]
+    pub kind: String,
+    /// Path the file moved from. Only set when `kind == "renamed"`.
+    #[pyo3(get)]
+    pub from_path: Option<String>,
+}
+
+#[pymethods]
+impl WatchEvent {
+    fn __repr__(&self) -> String {
+        match &self.from_path {
+            Some(from) => format!(
+                "WatchEvent(path={:?}, kind={:?}, from_path={:?})",
+                self.path, self.kind, from
+            ),
+            None => format!("WatchEvent(path={:?}, kind={:?})", self.path, self.kind),
+        }
+    }
+}
+
+#[pyclass(skip_from_py_object)]
 #[derive(Clone)]
 pub struct GrepCursor {
     #[pyo3(get)]

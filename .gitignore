@@ -33,6 +33,9 @@ scripts/benchmark-results/
 # Test logs
 fff-test.log
 
+# Scratch work (notes, harnesses, one-way experiments; never merged)
+scratch/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -63,3 +66,62 @@ htmlcov/
 *.swp
 *.swo
 *~
+
+# ─── local perf/bench scratch ───────────────────────────────────────────
+# Bench corpora and run logs are machine-local state, not reviewable. They
+# also drown real hits in the picker when left inside the worktree.
+.fff-bench/cache/
+.fff-bench/runs/
+.fff-bench/history/
+.fff-bench/*.patch
+.fff-bench/*.csv
+.fff-bench/*.json
+.fff-bench/*.py
+.fff-bench/profile-driver/Cargo.lock
+.fff-bench/profile-driver/probes-bak/
+archive/bench-binaries/
+archive/charts/
+archive/dot-fff-bench-runs/
+archive/*.json
+archive/*.log
+archive/*.out
+archive/_*.py
+archive/_*.ps1
+
+# One-off probes / throwaway harnesses (kept under archive/keepers-scratch-*)
+_head_*.rs
+_ff_*.rs
+_macro_test*
+_pad_brute*
+_tf_test*
+_sz_probe.rs
+*.pid
+
+# Review/measurement evidence and moved scratch (machine-local)
+archive/keepers-review-*/
+archive/keepers-scratch-*/
+
+# arena research lab artifacts
+archive/arena_lab/*.exe
+archive/arena_lab/*.bin
+
+# ─── perf-branch scratch (observed, ignore-only) ──────────────────────────
+# Tracked scratch stays tracked; purge separately with `git rm --cached`.
+/*.log
+/*.err
+/*.txt
+/*.ps1
+!install-mcp.ps1
+/*.jsonl
+/chart.png
+/fff-bench.json
+.fff-bench/*.rs
+.fff-bench/*.ps1
+archive/*.jsonl
+archive/*.png
+archive/*.html
+archive/*.svg
+archive/*.csv
+archive/*.md
+archive/*.py
+archive/*.ps1

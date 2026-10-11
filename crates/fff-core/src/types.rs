@@ -1,13 +1,13 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "windows"))]
-use std::sync::OnceLock;
+use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::{AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(not(target_os = "windows"))]
 use crate::constants::{FRESH_MMAP_THRESHOLD, MMAP_THRESHOLD};
 use crate::constants::{MAX_CACHED_CONTENT_BYTES, MAX_FFFILE_SIZE, PATH_BUF_SIZE};
-use crate::constraints::Constrainable;
+use crate::index::constraints::Constrainable;
 use crate::query_tracker::QueryMatchEntry;
 use crate::simd_path::ArenaPtr;
 use fff_query_parser::{FFFQuery, FuzzyQuery, Location};
@@ -53,6 +53,48 @@ impl FileSliceExt for [FileItem] {
     }
 }
 
+/// Ranking demotion applied to files under third-party directories.
+/// Exported so benches and SDKs can reconstruct totals from breakdowns.
+pub const VENDORED_PATH_PENALTY: i32 = 120;
+
+/// Directory names that hold third-party code. Ranking demotes files under
+/// these so a first-party module outranks a dependency with the same name.
+const VENDORED_DIRS: &[&str] = &[
+    "vendor",
+    "node_modules",
+    "third_party",
+    "thirdparty",
+    "external",
+    "deps",
+    "site-packages",
+];
+
+fn segment_is_vendored(name: &str) -> bool {
+    let b = name.as_bytes();
+    VENDORED_DIRS.iter().any(|v| {
+        b.len() == v.len()
+            && b.iter()
+                .zip(v.as_bytes())
+                .all(|(a, c)| a.to_ascii_lowercase() == *c)
+    })
+}
+
+/// True when any segment of the relative directory is a dependency directory.
+pub(crate) fn dir_is_vendored(dir: &str) -> bool {
+    dir.split(['/', '\\']).any(segment_is_vendored)
+}
+
+/// True when a relative file path lies under a dependency directory.
+/// Same rule the indexer uses for the VENDORED flag; exported so benches
+/// and SDKs can reconstruct score totals from breakdowns.
+pub fn path_is_vendored(relative_path: &str) -> bool {
+    let dir = relative_path
+        .rsplit_once(['/', '\\'])
+        .map(|(d, _)| d)
+        .unwrap_or("");
+    dir_is_vendored(dir)
+}
+
 pub struct FileItemFlags;
 
 impl FileItemFlags {
@@ -63,12 +105,16 @@ impl FileItemFlags {
     /// File was added after the last full reindex; its indices point
     /// into the overflow builder arena, not the base arena.
     pub const OVERFLOW: u8 = 1 << 2;
+    /// Path lies under a third-party dependency directory. Ranking demotes
+    /// these so a first-party module outranks a vendored namesake.
+    pub const VENDORED: u8 = 1 << 3;
 }
 
 pub struct DirFlags;
 
 impl DirFlags {
     pub const OVERFLOW: u8 = 1 << 0;
+    pub const DELETED: u8 = 1 << 1;
 }
 
 /// A directory in the file index. Shares chunk arena with file paths.
@@ -101,10 +147,41 @@ impl DirItem {
         self.flags & DirFlags::OVERFLOW != 0
     }
 
+    #[inline(always)]
+    pub fn is_deleted(&self) -> bool {
+        self.flags & DirFlags::DELETED != 0
+    }
+
+    /// Marks the dir deleted/restored. Returns `true` when the state changed.
+    pub(crate) fn set_deleted(&mut self, deleted: bool) -> bool {
+        if self.is_deleted() == deleted {
+            return false;
+        }
+        if deleted {
+            self.flags |= DirFlags::DELETED;
+        } else {
+            self.flags &= !DirFlags::DELETED;
+        }
+        true
+    }
+
     pub(crate) fn new(path: crate::simd_path::ChunkedString, last_segment_offset: u16) -> Self {
         Self {
             path,
             flags: 0,
+            last_segment_offset,
+            max_access_frecency: AtomicI32::new(0),
+        }
+    }
+
+    /// A dir appended after the initial scan; its path lives in the overflow arena.
+    pub(crate) fn new_overflow(
+        path: crate::simd_path::ChunkedString,
+        last_segment_offset: u16,
+    ) -> Self {
+        Self {
+            path,
+            flags: DirFlags::OVERFLOW,
             last_segment_offset,
             max_access_frecency: AtomicI32::new(0),
         }
@@ -213,34 +290,53 @@ impl Constrainable for DirItem {
 }
 
 #[derive(Debug)]
+#[repr(C)]
 pub struct FileItem {
     pub size: u64,
     pub modified: u64,
-    pub access_frecency_score: i16,
-    pub modification_frecency_score: i16,
-    pub git_status: Option<git2::Status>,
+    /// Scan-time 64-bit character-presence mask of the relative path
+    /// (see crate::presence). Sound necessary condition for fuzzy
+    /// LCS >= |q| - max_typos; never rejects a true match.
+    pub(crate) presence: u64,
     pub(crate) path: crate::simd_path::ChunkedString,
     pub(crate) parent_dir_index: u32,
+    /// Packed `Option<git2::Status>`: `u32::MAX` means None.
+    /// Stored as raw bits so FileItem stays 48 B (Option<Status> is 8 B
+    /// and pushed the struct to 56 B × 227k ≈ +1.8 MB peak RSS).
+    git_status_bits: u32,
+    pub access_frecency_score: i16,
+    pub modification_frecency_score: i16,
+    pub git_recency_score: i16,
     flags: AtomicU8,
-    /// Lazy mmap cache. Only populated by the actual file read, controlled by the budget.
+    /// Lazy mmap cache (boxed, set once). Only populated by the actual file
+    /// read, controlled by the budget. Null while empty.
     #[cfg(not(target_os = "windows"))]
-    content: OnceLock<memmap2::Mmap>,
+    content: AtomicPtr<memmap2::Mmap>,
+}
+
+#[cfg(not(target_os = "windows"))]
+impl Drop for FileItem {
+    fn drop(&mut self) {
+        self.take_content();
+    }
 }
 
 impl Clone for FileItem {
     fn clone(&self) -> Self {
         Self {
             path: self.path.clone(),
+            presence: self.presence,
             parent_dir_index: self.parent_dir_index,
             size: self.size,
             modified: self.modified,
             access_frecency_score: self.access_frecency_score,
             modification_frecency_score: self.modification_frecency_score,
-            git_status: self.git_status,
+            git_recency_score: self.git_recency_score,
+            git_status_bits: self.git_status_bits,
             flags: AtomicU8::new(self.flags.load(Ordering::Relaxed)),
-            // on clone we have to reset the content lock
+            // on clone we have to reset the content cache
             #[cfg(not(target_os = "windows"))]
-            content: OnceLock::new(),
+            content: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 }
@@ -251,10 +347,114 @@ impl Clone for FileItem {
 /// small enough to live on the stack.
 pub const BINARY_CLASSIFICATION_CHUNK_SIZE: usize = 16 * 1024;
 
+/// Prefix bytes the binary sniff reads. Git-style: binaries carry header
+/// NULs, so a clean prefix means text; full-file masks stay sound because
+/// partial reads record an empty (unknown) mask instead.
+pub const BINARY_CLASSIFICATION_CAP: usize = 256 * 1024;
+
 /// A file is treated as binary if any NUL byte appears in the scanned prefix.
 #[inline]
 pub(crate) fn detect_binary_content(content: &[u8]) -> bool {
     memchr::memchr(0, content).is_some()
+}
+
+/// Byte-presence mask of *file content*, folded to the same 64 classes as
+/// `presence::fold_bit`.
+///
+/// Built during the index-time binary sniff, which already streams every byte
+/// of every file, so it costs one OR per byte on an existing pass. Grep can
+/// then reject a candidate file without opening it: a length
+/// `m` match with `T` typos needs at least `m - T` distinct needle bytes
+/// present, which is a sound necessary condition.
+///
+/// Stored out of line (not in `FileItem`, which is packed to 48 B) - see
+/// `ContentMaskStore`.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ContentMask(u64);
+
+impl ContentMask {
+    #[inline]
+    pub(crate) fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    #[inline]
+    pub(crate) fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Fold bytes into the mask. Call once per content chunk.
+    #[inline]
+    pub fn accumulate(&mut self, content: &[u8]) {
+        let mut m = self.0;
+        for &b in content {
+            m |= 1u64 << crate::presence::fold_bit(b);
+        }
+        self.0 = m;
+    }
+
+    /// Sound necessary condition for `content` to contain `needle`.
+    ///
+    /// `None` means "unknown" (no mask recorded) and the caller must read the
+    /// file. `Some(false)` means it provably cannot match.
+    /// Test-only spec: production filters through `MaskNeedle` instead.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn allows(self, needle: &[u8], max_typos: u16) -> Option<bool> {
+        if self.0 == 0 {
+            return None;
+        }
+        let need = needle.len().saturating_sub(max_typos as usize);
+        if need == 0 {
+            return Some(true);
+        }
+        let mut hits = 0usize;
+        for &b in needle {
+            if self.0 & (1u64 << crate::presence::fold_bit(b)) != 0 {
+                hits += 1;
+                if hits >= need {
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
+    }
+}
+
+/// Sound necessary condition for `content` to contain `needle`, with the
+/// needle's byte classes resolved once so each file costs one AND + popcount.
+#[derive(Clone, Copy)]
+pub(crate) struct MaskNeedle {
+    /// Folded byte classes the needle uses, deduplicated.
+    classes: u64,
+    /// Distinct classes that must be present. Clamped to the class count,
+    /// since repeats in the needle cannot require more than they provide.
+    need: usize,
+}
+
+impl MaskNeedle {
+    pub(crate) fn new(needle: &[u8], max_typos: u16) -> Self {
+        let mut classes = 0u64;
+        for &b in needle {
+            classes |= 1u64 << crate::presence::fold_bit(b);
+        }
+        let need = needle
+            .len()
+            .saturating_sub(max_typos as usize)
+            .min(classes.count_ones() as usize);
+        Self { classes, need }
+    }
+
+    #[inline(always)]
+    pub(crate) fn allows(self, mask: ContentMask) -> Option<bool> {
+        if mask.0 == 0 {
+            return None;
+        }
+        if self.need == 0 {
+            return Some(true);
+        }
+        Some((mask.0 & self.classes).count_ones() as usize >= self.need)
+    }
 }
 
 impl FileItem {
@@ -275,16 +475,40 @@ impl FileItem {
 
         Self {
             path,
+            presence: 0,
             parent_dir_index: u32::MAX,
             size,
             modified,
             access_frecency_score: 0,
             modification_frecency_score: 0,
-            git_status,
+            git_recency_score: 0,
+            git_status_bits: Self::pack_git_status(git_status),
             flags: AtomicU8::new(flags),
             #[cfg(not(target_os = "windows"))]
-            content: OnceLock::new(),
+            content: AtomicPtr::new(std::ptr::null_mut()),
         }
+    }
+
+    #[inline]
+    const fn pack_git_status(s: Option<git2::Status>) -> u32 {
+        match s {
+            Some(s) => s.bits(),
+            None => u32::MAX,
+        }
+    }
+
+    #[inline]
+    pub fn git_status(&self) -> Option<git2::Status> {
+        if self.git_status_bits == u32::MAX {
+            None
+        } else {
+            Some(git2::Status::from_bits_retain(self.git_status_bits))
+        }
+    }
+
+    #[inline]
+    pub fn set_git_status(&mut self, s: Option<git2::Status>) {
+        self.git_status_bits = Self::pack_git_status(s);
     }
 
     /// Returns an absolute path of the file
@@ -296,6 +520,16 @@ impl FileItem {
 
     pub(crate) fn set_path(&mut self, path: crate::simd_path::ChunkedString) {
         self.path = path;
+    }
+
+    pub(crate) fn set_presence(&mut self, mask: u64) {
+        self.presence = mask;
+    }
+
+    /// Scan-time character-presence mask of the relative path.
+    #[inline(always)]
+    pub(crate) fn presence_mask(&self) -> u64 {
+        self.presence
     }
 
     pub fn dir_str(&self, arena: impl FFFStringStorage) -> String {
@@ -314,18 +548,10 @@ impl FileItem {
         s
     }
 
-    pub(crate) fn write_file_name_from_arena(&self, arena: ArenaPtr, out: &mut String) {
-        self.path.write_filename_to(arena, out);
-    }
-
     pub fn relative_path(&self, arena: impl FFFStringStorage) -> String {
         let mut s = String::with_capacity(64);
         self.path.write_to_string(arena.arena_for(self), &mut s);
         s
-    }
-
-    pub(crate) fn write_relative_path_from_arena(&self, arena: ArenaPtr, out: &mut String) {
-        self.path.write_to_string(arena, out);
     }
 
     pub fn relative_path_len(&self) -> usize {
@@ -337,12 +563,7 @@ impl FileItem {
     }
 
     pub(crate) fn relative_path_eq(&self, arena: ArenaPtr, other: &str) -> bool {
-        if other.len() != self.path.byte_len as usize {
-            return false;
-        }
-        let mut buf = [0u8; 512];
-        let mine = self.path.read_to_buf(arena, &mut buf);
-        mine == other
+        self.path.equals(arena, other)
     }
 
     pub(crate) fn relative_path_starts_with(&self, arena: ArenaPtr, prefix: &str) -> bool {
@@ -372,7 +593,12 @@ impl FileItem {
 
         let base_end_idx = base_len + sep_len;
         let relative_portion_str = self.path.read_to_buf(arena, &mut buf[base_end_idx..]);
-        let total = base_end_idx + relative_portion_str.len();
+        let rel_len = relative_portion_str.len();
+        let total = base_end_idx + rel_len;
+        // Stored relative paths are '/'-canonical; rewrite to the OS-native
+        // separator so the result matches git-cache keys, the frecency DB, and
+        // Win32 file APIs. No-op off Windows.
+        crate::path_utils::nativize_slashes_in_place(&mut buf[base_end_idx..total]);
         Path::new(unsafe { std::str::from_utf8_unchecked(&buf[..total]) })
     }
 
@@ -405,7 +631,7 @@ impl FileItem {
     #[allow(dead_code)]
     #[inline]
     pub(crate) fn is_likely_hot(&self) -> bool {
-        self.access_frecency_score > 0 || self.git_status.is_some()
+        self.access_frecency_score > 0 || self.git_status().is_some()
     }
 
     /// Reads a fixed bytes count from the file optimized for quick speed of opening
@@ -509,6 +735,17 @@ impl FileItem {
     }
 
     #[inline]
+    pub fn is_vendored(&self) -> bool {
+        self.flags.load(Ordering::Relaxed) & FileItemFlags::VENDORED != 0
+    }
+
+    #[inline]
+    pub fn set_vendored(&self) {
+        self.flags
+            .fetch_or(FileItemFlags::VENDORED, Ordering::Relaxed);
+    }
+
+    #[inline]
     pub fn set_binary(&self, val: bool) {
         if val {
             self.flags
@@ -521,9 +758,13 @@ impl FileItem {
 
     /// Chunked classifier of the binary content of the file chunk by chunk
     /// accepts path which to reuse the allocated buffer for absolute path read
-    pub(crate) fn detect_binary_per_byte(&self, path: &Path, chunk: &mut [u8]) {
+    ///
+    /// Returns the content byte-presence mask built from the same read. Callers
+    /// store it so grep can reject this file without opening it.
+    pub(crate) fn detect_binary_per_byte(&self, path: &Path, chunk: &mut [u8]) -> ContentMask {
+        let mut mask = ContentMask::default();
         if self.size == 0 {
-            return;
+            return mask;
         }
 
         let Ok(mut file) = std::fs::OpenOptions::new()
@@ -532,10 +773,19 @@ impl FileItem {
             .open(path)
         else {
             tracing::error!(path = ?path.display(), "Failed to open indexed file");
-            return;
+            return mask;
         };
 
+        // Prefix sniff, capped: a NUL in the first CAP bytes classifies
+        // as binary. Past the cap the mask would be unsound, so partial
+        // reads return empty (unknown) and grep opens the file instead.
+        // Index-time cost is bounded by the cap plus NUL early exit.
+        let cap = (self.size as usize).min(BINARY_CLASSIFICATION_CAP);
+        let mut read = 0usize;
         loop {
+            if read >= cap {
+                break;
+            }
             match file.read(chunk) {
                 Ok(0) => break,
                 Err(e) => {
@@ -543,12 +793,22 @@ impl FileItem {
                     break;
                 }
                 Ok(n) => {
-                    if detect_binary_content(&chunk[..n]) {
+                    read += n;
+                    let view = &chunk[..n];
+                    mask.accumulate(view);
+                    if detect_binary_content(view) {
                         self.set_binary(true);
+                        break;
                     }
                 }
             }
         }
+        // Binary files are excluded from grep before the mask is consulted,
+        // so only a fully-read text file earns a recorded mask.
+        if self.is_binary() || (read as u64) < self.size {
+            return ContentMask::default();
+        }
+        mask
     }
 
     #[inline]
@@ -595,12 +855,25 @@ impl FileItem {
     /// invalidating ensures a fresh read on the next access.
     #[cfg(not(target_os = "windows"))]
     pub fn invalidate_mmap(&mut self, budget: &ContentCacheBudget) {
-        if self.content.get().is_some() {
+        if self.take_content().is_some() {
             budget.cached_count.fetch_sub(1, Ordering::Relaxed);
             budget.cached_bytes.fetch_sub(self.size, Ordering::Relaxed);
         }
+    }
 
-        self.content = OnceLock::new();
+    #[cfg(not(target_os = "windows"))]
+    #[inline]
+    fn cached_content(&self) -> Option<&[u8]> {
+        let ptr = self.content.load(Ordering::Acquire);
+        // SAFETY: a non-null pointer is a leaked Box owned by this item until `take_content`.
+        (!ptr.is_null()).then(|| unsafe { (&*ptr).as_ref() })
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn take_content(&mut self) -> Option<Box<memmap2::Mmap>> {
+        let ptr = self.content.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        // SAFETY: non-null pointers always come from `Box::into_raw` in `get_cached_content`.
+        (!ptr.is_null()).then(|| unsafe { Box::from_raw(ptr) })
     }
 
     #[cfg(target_os = "windows")]
@@ -657,7 +930,7 @@ impl FileItem {
         base_path: &Path,
         budget: &ContentCacheBudget,
     ) -> Option<&[u8]> {
-        if let Some(content) = self.content.get() {
+        if let Some(content) = self.cached_content() {
             return Some(content);
         }
 
@@ -680,19 +953,29 @@ impl FileItem {
         // file updates; the only risk is SIGBUS on a concurrent truncate,
         // which the watcher mitigates by invalidating on modification.
         let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
-        let result = self.content.get_or_init(|| mmap);
+        let fresh = Box::into_raw(Box::new(mmap));
+        match self.content.compare_exchange(
+            std::ptr::null_mut(),
+            fresh,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                budget.cached_count.fetch_add(1, Ordering::Relaxed);
+                budget.cached_bytes.fetch_add(self.size, Ordering::Relaxed);
+            }
+            // Lost the race: another thread cached first, keep theirs.
+            Err(_) => drop(unsafe { Box::from_raw(fresh) }),
+        }
 
-        budget.cached_count.fetch_add(1, Ordering::Relaxed);
-        budget.cached_bytes.fetch_add(self.size, Ordering::Relaxed);
-
-        Some(result)
+        self.cached_content()
     }
 
     /// Get file content for searching — **always returns content** for eligible
     /// files, even when the persistent cache budget is exhausted.
     ///
-    /// The caller provides a reusable `path_buf` (pre-filled with `base_path/`)
-    /// and its `base_len` to avoid allocations when constructing the absolute path.
+    /// Open goes through `open_for_search` (openat on Unix); the
+    /// absolute path is built in a stack buffer (no per-file alloc).
     #[inline]
     pub(crate) fn get_content_for_search<'a>(
         &'a self,
@@ -701,6 +984,7 @@ impl FileItem {
         arena: ArenaPtr,
         base_path: &Path,
         budget: &ContentCacheBudget,
+        base_dir: Option<&std::fs::File>,
     ) -> Option<&'a [u8]> {
         #[cfg(not(target_os = "windows"))]
         {
@@ -717,11 +1001,10 @@ impl FileItem {
             return None;
         }
 
-        let abs = self.absolute_path(arena, base_path);
+        let mut file = self.open_for_search(arena, base_path, base_dir)?;
 
         #[cfg(not(target_os = "windows"))]
         if self.size >= FRESH_MMAP_THRESHOLD {
-            let file = std::fs::File::open(&abs).ok()?;
             let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
             let stored = mmap_slot.insert(mmap);
             return Some(&stored[..]);
@@ -730,11 +1013,56 @@ impl FileItem {
         }
 
         let len = self.size as usize;
-        buf.resize(len, 0);
+        // Avoid memset-fill of `len` before read_exact overwrites it.
+        buf.clear();
+        buf.reserve(len);
 
-        let mut file = std::fs::File::open(&abs).ok()?;
-        file.read_exact(buf).ok()?;
+        // SAFETY: read_exact writes every reserved byte or we truncate.
+        unsafe {
+            buf.set_len(len);
+        }
+        if file.read_exact(buf).is_err() {
+            buf.clear();
+            return None;
+        }
         Some(buf.as_slice())
+    }
+
+    fn open_for_search(
+        &self,
+        arena: ArenaPtr,
+        base_path: &Path,
+        #[cfg_attr(not(unix), allow(unused_variables))] base_dir: Option<&std::fs::File>,
+    ) -> Option<std::fs::File> {
+        let mut path_buf = [0u8; PATH_BUF_SIZE];
+        #[cfg(unix)]
+        if let Some(dir) = base_dir
+            && self.relative_path_len() < path_buf.len()
+        {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            let path = self.write_relative_cstr(arena, &mut path_buf);
+            // The directory FD stays borrowed; a successful openat returns an owned FD.
+            loop {
+                let fd = unsafe {
+                    libc::openat(
+                        dir.as_raw_fd(),
+                        path.as_ptr(),
+                        libc::O_RDONLY | libc::O_CLOEXEC,
+                    )
+                };
+                if fd >= 0 {
+                    return Some(unsafe { std::fs::File::from_raw_fd(fd) });
+                }
+                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    return None;
+                }
+            }
+        }
+        if base_path.as_os_str().len() + self.relative_path_len() + 1 < path_buf.len() {
+            std::fs::File::open(self.write_absolute_path(arena, base_path, &mut path_buf)).ok()
+        } else {
+            std::fs::File::open(self.absolute_path(arena, base_path)).ok()
+        }
     }
 }
 
@@ -753,13 +1081,18 @@ impl Constrainable for FileItem {
     }
 
     #[inline]
+    fn has_extension(&self, arena: ArenaPtr, extension: &str, _scratch: &mut String) -> bool {
+        self.path.has_extension(arena, extension)
+    }
+
+    #[inline]
     fn write_relative_path(&self, arena: ArenaPtr, out: &mut String) {
         self.path.write_to_string(arena, out);
     }
 
     #[inline]
     fn git_status(&self) -> Option<git2::Status> {
-        self.git_status
+        FileItem::git_status(self)
     }
 
     #[inline]
@@ -776,10 +1109,13 @@ pub struct Score {
     pub special_filename_bonus: i32,
     pub frecency_boost: i32,
     pub git_status_boost: i32,
+    pub git_recency_boost: i32,
     pub distance_penalty: i32,
     pub current_file_penalty: i32,
     pub combo_match_boost: i32,
     pub path_alignment_bonus: i32,
+    /// Intent-evidence mix (filename/ext/segments/role/proximity).
+    pub evidence_bonus: i32,
     pub exact_match: bool,
     pub match_type: &'static str,
 }
@@ -826,6 +1162,7 @@ impl ScoringContext<'_> {
 pub struct SearchResult<'a> {
     pub items: Vec<&'a FileItem>,
     pub scores: Vec<Score>,
+    pub match_byte_offsets: Vec<smallvec::SmallVec<[(u32, u32); 4]>>,
     pub total_matched: usize,
     pub total_files: usize,
     pub location: Option<Location>,
@@ -928,6 +1265,16 @@ impl ContentCacheBudget {
         }
     }
 
+    /// Apply an explicit file cap verbatim, keeping the default byte caps.
+    /// `0` means no persistent caching at all — files stay searchable through
+    /// the temporary mmaps that grep releases after each call.
+    pub fn with_max_files(max_files: usize) -> Self {
+        Self {
+            max_files,
+            ..Self::default()
+        }
+    }
+
     /// Build a budget from caller-supplied overrides.
     ///
     /// Each argument is a cap; `0` means "use the library default for that
@@ -962,5 +1309,191 @@ impl ContentCacheBudget {
 impl Default for ContentCacheBudget {
     fn default() -> Self {
         Self::new_for_repo(30_000)
+    }
+}
+
+#[cfg(test)]
+mod content_cache_budget_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn uncached_search_reads_relative_and_absolute_paths() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("nested")).unwrap();
+        let path = "nested/é file.txt";
+        let directory = std::fs::File::open(root.path()).unwrap();
+        let budget = ContentCacheBudget::with_max_files(0);
+        for size in [17, FRESH_MMAP_THRESHOLD as usize + 17] {
+            let contents = vec![b'x'; size];
+            std::fs::write(root.path().join(path), &contents).unwrap();
+            let mut file = FileItem::new_raw(7, size as u64, 0, None, false);
+            let (store, strings) = crate::simd_path::build_chunked_path_store_from_strings(
+                &[path.to_string()],
+                std::slice::from_ref(&file),
+            );
+            file.set_path(strings.into_iter().next().unwrap());
+            for base_dir in [Some(&directory), None] {
+                let mut buf = Vec::new();
+                let mut mmap = MmapSlot::default();
+                let actual = file
+                    .get_content_for_search(
+                        &mut buf,
+                        &mut mmap,
+                        store.as_arena_ptr(),
+                        root.path(),
+                        &budget,
+                        base_dir,
+                    )
+                    .unwrap();
+                assert_eq!(actual, contents);
+                assert_eq!(budget.cached_count.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn vendored_dirs_are_matched_per_segment() {
+        for d in [
+            "vendor/neo_frizbee/src",
+            "crates/x/node_modules/react",
+            "a/third_party/b",
+            "site-packages",
+            "VENDOR",
+        ] {
+            assert!(dir_is_vendored(d), "should be vendored: {d}");
+        }
+        for d in [
+            "",
+            "src",
+            "crates/fff-core/src",
+            "vendors",
+            "node_modules_old",
+            "lua/fff",
+            "src/vendorish",
+            "myvendor",
+            "src/vendorization",
+        ] {
+            assert!(!dir_is_vendored(d), "should not be vendored: {d}");
+        }
+    }
+
+    #[test]
+    fn fileitem_stays_48_bytes_on_64bit() {
+        // Packed layout keeps FileItem at 48 B on 64-bit targets, which
+        // matters at 227k files.
+        #[cfg(target_pointer_width = "64")]
+        {
+            let sz = std::mem::size_of::<FileItem>();
+            assert!(sz <= 56, "FileItem grew to {sz} B");
+            // Windows has no content AtomicPtr; expect 48.
+            #[cfg(target_os = "windows")]
+            assert_eq!(sz, 48, "FileItem should be 48 B on Windows");
+        }
+    }
+
+    #[test]
+    fn with_max_files_applies_the_cap_verbatim() {
+        // The cap is applied verbatim, not bucketed.
+        assert_eq!(ContentCacheBudget::with_max_files(2000).max_files, 2000);
+        assert_eq!(ContentCacheBudget::with_max_files(7).max_files, 7);
+        assert_eq!(
+            ContentCacheBudget::with_max_files(1_000_000).max_files,
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn with_max_files_zero_disables_persistent_caching_but_keeps_grep() {
+        let budget = ContentCacheBudget::with_max_files(0);
+        assert_eq!(budget.max_files, 0);
+        assert!(budget.is_exhausted());
+        // temporary-mmap grep is gated on max_file_size, which must survive
+        assert_eq!(budget.max_file_size, MAX_FFFILE_SIZE);
+        assert!(budget.max_bytes > 0);
+    }
+
+    #[test]
+    fn with_max_files_keeps_default_byte_caps() {
+        let budget = ContentCacheBudget::with_max_files(2000);
+        let default = ContentCacheBudget::default();
+        assert_eq!(budget.max_bytes, default.max_bytes);
+        assert_eq!(budget.max_file_size, default.max_file_size);
+    }
+}
+
+#[cfg(test)]
+mod content_mask_tests {
+    use super::ContentMask;
+
+    fn mask_of(content: &[u8]) -> ContentMask {
+        let mut m = ContentMask::default();
+        m.accumulate(content);
+        m
+    }
+
+    /// The whole point of the check: `Some(false)` must mean "provably cannot
+    /// match". A false negative here makes grep silently skip real matches.
+    #[test]
+    fn never_rejects_a_substring_that_exists() {
+        let contents: &[&[u8]] = &[
+            b"hello world",
+            b"fn main() { println!() }",
+            b"struct Foo { bar: u32 }",
+            b"aab",
+            b"",
+            b"   \n\t  ",
+        ];
+        let needles: &[&[u8]] = &[
+            b"h", b"ello", b"o w", b"fn", b"main", b"println", b"()", b"struct", b"Foo", b"bar",
+            b"u32", b"aab", b"ab", b"  ", b"xyz",
+        ];
+        for c in contents {
+            let m = mask_of(c);
+            for n in needles {
+                if let Some(false) = m.allows(n, 0) {
+                    assert!(
+                        !contains(c, n),
+                        "mask rejected needle {:?} for content {:?} that contains it",
+                        String::from_utf8_lossy(n),
+                        String::from_utf8_lossy(c)
+                    );
+                }
+            }
+        }
+    }
+
+    /// Case folding must not create false negatives either.
+    #[test]
+    fn case_insensitive_substrings_are_not_rejected() {
+        let m = mask_of(b"Hello World");
+        assert_ne!(m.allows(b"hello", 0), Some(false));
+        assert_ne!(m.allows(b"HELLO", 0), Some(false));
+        assert_ne!(m.allows(b"World", 0), Some(false));
+    }
+
+    /// An empty or unrecorded mask must fall through to reading the file.
+    #[test]
+    fn unknown_mask_returns_none() {
+        assert_eq!(ContentMask::default().allows(b"anything", 0), None);
+    }
+
+    /// A typo budget can only make the check more permissive.
+    #[test]
+    fn typos_only_relax_the_check() {
+        let m = mask_of(b"abcdefghij");
+        assert_eq!(m.allows(b"zzzz", 0), Some(false));
+        assert_eq!(m.allows(b"zzzz", 4), Some(true));
+    }
+
+    fn contains(hay: &[u8], needle: &[u8]) -> bool {
+        if needle.is_empty() {
+            return true;
+        }
+        if needle.len() > hay.len() {
+            return false;
+        }
+        hay.windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
     }
 }

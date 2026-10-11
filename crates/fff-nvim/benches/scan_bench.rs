@@ -112,11 +112,10 @@ fn wait_for_scan_done(sp: &SharedFilePicker, timeout: Duration) -> bool {
 
 fn cleanup(sp: SharedFilePicker) {
     // Clean teardown: wait for scan + post-scan to finish, then drop.
-    // On the refactored branch `wait_for_indexing_complete` guarantees
-    // no outstanding snapshots remain so the picker can be torn down
-    // safely. On the pre-refactor baseline this would UAF because the
-    // picker can drop while post-scan threads still hold raw pointers
-    // into its storage.
+    // The PostScanUnsafeSnapshot holds Arc-shared data, so dropping the
+    // picker while post-scan threads run is memory-safe, but we wait
+    // for completion to avoid detached git-status threads from causing
+    // I/O contention on the next benchmark iteration.
     sp.wait_for_indexing_complete(WAIT_TIMEOUT);
     if let Ok(mut guard) = sp.write()
         && let Some(mut picker) = guard.take()

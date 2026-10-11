@@ -6,6 +6,21 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Process-wide libgit2 tuning for read-heavy local use. By default libgit2
+/// never caches trees over 4KB and additionally verifies every object. This roughly costs 150% of
+/// its valuable runtime
+pub(crate) fn tune_libgit2_for_local_reads() {
+    static TUNE: std::sync::Once = std::sync::Once::new();
+    TUNE.call_once(|| {
+        // Same tradeoff cargo makes: local objects are trusted, skip hashing.
+        git2::opts::strict_hash_verification(false);
+        // SAFETY: plain process-global size limit; total memory stays bounded
+        // by libgit2's 256MB odb cache.
+        let _ =
+            unsafe { git2::opts::set_cache_object_limit(git2::ObjectType::Tree, 8 * 1024 * 1024) };
+    });
+}
+
 pub(crate) fn default_status_options() -> StatusOptions {
     let mut opts = StatusOptions::new();
     opts.include_untracked(true)
@@ -30,47 +45,128 @@ pub(crate) fn initial_scan_status_options() -> StatusOptions {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct GitStatusCache(AHashMap<PathBuf, Status>);
+pub(crate) struct GitStatusCache {
+    map: AHashMap<PathBuf, Status>,
+    // Workdir prefix when keys are stored relative (`FFF_GIT_RELATIVE_KEYS`).
+    // Empty means keys are absolute (default).
+    prefix: PathBuf,
+}
 
 impl IntoIterator for GitStatusCache {
     type Item = (PathBuf, Status);
     type IntoIter = <AHashMap<PathBuf, Status> as IntoIterator>::IntoIter;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
+        // Absolute keys and relative keys both hash by content; std's
+        // IntoIter hides which map type backs us.
+        let full: AHashMap<PathBuf, Status> = if self.prefix.as_os_str().is_empty() {
+            self.map
+        } else {
+            self.map
+                .into_iter()
+                .map(|(rel, st)| (self.prefix.join(rel), st))
+                .collect()
+        };
+        full.into_iter()
     }
+}
+
+/// `FFF_GIT_RELATIVE_KEYS=1` stores keys relative to the workdir: one short
+/// relative path per entry instead of repeating the absolute prefix (~40B
+/// saved/entry on deep roots). Lookup strips the prefix first.
+fn relative_keys_enabled() -> bool {
+    matches!(
+        std::env::var("FFF_GIT_RELATIVE_KEYS").as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
+
+/// Max pathspec entries per libgit2 call (`FFF_GIT_PATHSPEC_BATCH`).
+fn pathspec_batch_cap() -> usize {
+    std::env::var("FFF_GIT_PATHSPEC_BATCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(500)
 }
 
 impl GitStatusCache {
     pub fn statuses_len(&self) -> usize {
-        self.0.len()
+        self.map.len()
     }
 
     #[inline]
     pub fn lookup_status(&self, full_path: &Path) -> Option<Status> {
-        self.0.get(full_path).copied()
+        if self.prefix.as_os_str().is_empty() {
+            return self.map.get(full_path).copied();
+        }
+        // Relative keys: strip the workdir prefix, fall back to the full
+        // key so mixed callers still hit.
+        if let Ok(rel) = full_path.strip_prefix(&self.prefix) {
+            if let Some(st) = self.map.get(rel) {
+                return Some(*st);
+            }
+        }
+        self.map.get(full_path).copied()
+    }
+
+    /// Sorted entries for a linear merge against the sorted file index.
+    /// Byte order matches `Path::cmp`, so the merge is exact on case-variant
+    /// names. Public API; no in-tree consumer yet.
+    #[allow(dead_code)]
+    pub fn into_sorted_vec(self) -> Vec<(PathBuf, Status)> {
+        let mut v: Vec<(PathBuf, Status)> = self.into_iter().collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
     }
 
     #[tracing::instrument(skip(repo, status_options))]
-    fn read_status_impl(repo: &Repository, status_options: &mut StatusOptions) -> Result<Self> {
+    pub(crate) fn read_status(
+        repo: &Repository,
+        status_options: &mut StatusOptions,
+    ) -> Result<Self> {
         let statuses = repo.statuses(Some(status_options))?;
         let Some(repo_path) = repo.workdir() else {
-            return Ok(Self(AHashMap::new())); // repo is bare
+            return Ok(Self::default()); // repo is bare
         };
 
         let repo_path = crate::path_utils::normalize(repo_path.to_path_buf());
 
+        // Single pass: strip the prefix during insert when relative keys are
+        // on, instead of building a full map and re-hashing it. Entries
+        // outside the workdir only exist in the default absolute shape.
+        let relative = relative_keys_enabled();
         let mut entries = AHashMap::with_capacity(statuses.len());
         for entry in &statuses {
-            if let Some(entry_path) = entry.path() {
+            if let Ok(entry_path) = entry.path() {
                 // libgit2 returns entry paths with forward slashes on every platform
                 // fff stores native paths - meaning we have forward slash issue on windows
                 let full_path = crate::path_utils::normalize(repo_path.join(entry_path));
-                entries.insert(full_path, entry.status());
+                if relative {
+                    if let Ok(rel) = full_path.strip_prefix(&repo_path) {
+                        entries.insert(rel.to_path_buf(), entry.status());
+                    }
+                } else {
+                    entries.insert(full_path, entry.status());
+                }
             }
         }
 
-        Ok(Self(entries))
+        Ok(Self {
+            map: entries,
+            prefix: if relative { repo_path } else { PathBuf::new() },
+        })
+    }
+
+    /// Dirty-only refresh: same cheap options as the initial scan (no
+    /// `include_unmodified`). Missing entries already mean "clean" because
+    /// every `FileItem` starts with `git_status: None`, so enumerating all
+    /// tracked paths is pure overhead on huge trees.
+    /// Test-only helper: production refresh goes through the status worker.
+    #[cfg(test)]
+    pub(crate) fn read_dirty_status(repo: &Repository) -> Result<Self> {
+        let mut opts = initial_scan_status_options();
+        Self::read_status(repo, &mut opts)
     }
 
     pub fn read_git_status(
@@ -80,7 +176,7 @@ impl GitStatusCache {
         let git_workdir = git_workdir.as_ref()?;
         let repository = Repository::open(git_workdir).ok()?;
 
-        let status = Self::read_status_impl(&repository, status_options);
+        let status = Self::read_status(&repository, status_options);
 
         match status {
             Ok(status) => Some(status),
@@ -98,11 +194,11 @@ impl GitStatusCache {
         paths: &[TPath],
     ) -> Result<Self> {
         if paths.is_empty() {
-            return Ok(Self(AHashMap::new()));
+            return Ok(Self::default());
         }
 
         let Some(workdir) = repo.workdir() else {
-            return Ok(Self(AHashMap::new()));
+            return Ok(Self::default());
         };
         let workdir = crate::path_utils::normalize(workdir.to_path_buf());
 
@@ -114,29 +210,58 @@ impl GitStatusCache {
             let status = repo.status_file(relative_path)?;
 
             let mut map = AHashMap::with_capacity(1);
+            // Store relative when the flag is on so the shape matches bulk.
+            if relative_keys_enabled() {
+                let rel = full_path.strip_prefix(&workdir)?.to_path_buf();
+                map.insert(rel, status);
+                return Ok(Self {
+                    map,
+                    prefix: workdir,
+                });
+            }
             map.insert(full_path.to_path_buf(), status);
-            return Ok(Self(map));
+            return Ok(Self {
+                map,
+                prefix: PathBuf::new(),
+            });
         }
 
-        let mut status_options = default_status_options();
-        for path in paths {
-            status_options.pathspec(path.as_ref().strip_prefix(&workdir)?);
+        // Dirty-only options: `include_unmodified` would enumerate every
+        // tracked path even with a pathspec, turning a targeted refresh into
+        // a full walk. Chunked so one huge watcher burst cannot build an
+        // unbounded pathspec.
+        let cap = pathspec_batch_cap();
+        let mut merged = AHashMap::with_capacity(paths.len());
+        let mut merged_prefix = PathBuf::new();
+        for chunk in paths.chunks(cap) {
+            let mut status_options = initial_scan_status_options();
+            for path in chunk {
+                status_options.pathspec(path.as_ref().strip_prefix(&workdir)?);
+            }
+            let part = Self::read_status(repo, &mut status_options)?;
+            if !part.prefix.as_os_str().is_empty() {
+                merged_prefix = part.prefix.clone();
+            }
+            merged.extend(part.map);
         }
-
-        let git_status_cache = Self::read_status_impl(repo, &mut status_options)?;
-        Ok(git_status_cache)
+        Ok(Self {
+            map: merged,
+            prefix: merged_prefix,
+        })
     }
 }
 
-#[inline]
+const MODIFIED_STATUS_MASK: Status = Status::from_bits_truncate(
+    Status::WT_MODIFIED.bits()
+        | Status::INDEX_MODIFIED.bits()
+        | Status::WT_NEW.bits()
+        | Status::INDEX_NEW.bits()
+        | Status::WT_RENAMED.bits(),
+);
+
+#[inline(always)]
 pub fn is_modified_status(status: Status) -> bool {
-    status.intersects(
-        Status::WT_MODIFIED
-            | Status::INDEX_MODIFIED
-            | Status::WT_NEW
-            | Status::INDEX_NEW
-            | Status::WT_RENAMED,
-    )
+    status.intersects(MODIFIED_STATUS_MASK)
 }
 
 pub fn format_git_status_opt(status: Option<Status>) -> Option<&'static str> {
@@ -159,7 +284,9 @@ pub fn format_git_status_opt(status: Option<Status>) -> Option<&'static str> {
                 Some("staged_deleted")
             } else if status.contains(Status::IGNORED) {
                 Some("ignored")
-            } else if status.contains(Status::CURRENT) || status.is_empty() {
+            // `Status::CURRENT` is 0, so `contains` is true for every status:
+            // testing it here labelled conflicted/typechanged files "clean".
+            } else if status.is_empty() {
                 Some("clean")
             } else {
                 None
@@ -190,6 +317,35 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "git {args:?} failed");
+    }
+
+    #[test]
+    fn unclassified_status_is_not_reported_as_clean() {
+        // A merge-conflicted file must not claim to be clean.
+        assert_eq!(format_git_status_opt(Some(Status::CONFLICTED)), None);
+        assert_eq!(format_git_status(Some(Status::CONFLICTED)), "unknown");
+        assert_eq!(format_git_status(Some(Status::WT_TYPECHANGE)), "unknown");
+
+        // Every already-classified state keeps its label.
+        assert_eq!(format_git_status_opt(None), Some("clean"));
+        assert_eq!(format_git_status_opt(Some(Status::empty())), Some("clean"));
+        assert_eq!(format_git_status_opt(Some(Status::CURRENT)), Some("clean"));
+        assert_eq!(
+            format_git_status_opt(Some(Status::WT_NEW)),
+            Some("untracked")
+        );
+        assert_eq!(
+            format_git_status_opt(Some(Status::WT_MODIFIED)),
+            Some("modified")
+        );
+        assert_eq!(
+            format_git_status_opt(Some(Status::INDEX_MODIFIED)),
+            Some("staged_modified")
+        );
+        assert_eq!(
+            format_git_status_opt(Some(Status::IGNORED)),
+            Some("ignored")
+        );
     }
 
     /// Regression: on case-insensitive filesystems libgit2 returns
@@ -249,5 +405,58 @@ mod tests {
                 status
             );
         }
+    }
+
+    #[test]
+    fn relative_keys_lookup_matches_absolute() {
+        unsafe {
+            std::env::set_var("FFF_GIT_RELATIVE_KEYS", "1");
+        }
+        let tmp = TempDir::new().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        fs::write(base.join("a.rs"), "// a\n").unwrap();
+        fs::write(base.join("b.rs"), "// b\n").unwrap();
+        git(&base, &["init", "-b", "main"]);
+        git(&base, &["add", "-A"]);
+        git(&base, &["commit", "-m", "seed", "--no-gpg-sign"]);
+        fs::write(base.join("a.rs"), "// a\n// edit\n").unwrap();
+
+        let repo = Repository::open(&base).unwrap();
+        let cache = GitStatusCache::read_dirty_status(&repo).unwrap();
+        let abs = base.join("a.rs");
+        assert!(cache.lookup_status(&abs).is_some());
+        // into_iter re-expands to absolute paths for index application.
+        let mut found = false;
+        for (p, _) in cache {
+            if p == abs {
+                found = true;
+            }
+        }
+        assert!(found, "relative cache must re-expand to absolute paths");
+        unsafe {
+            std::env::remove_var("FFF_GIT_RELATIVE_KEYS");
+        }
+    }
+
+    #[test]
+    fn dirty_status_skips_clean_files() {
+        let tmp = TempDir::new().unwrap();
+        let base = crate::path_utils::canonicalize(tmp.path()).unwrap();
+        fs::write(base.join("clean.rs"), "// clean\n").unwrap();
+        fs::write(base.join("dirty.rs"), "// dirty\n").unwrap();
+        git(&base, &["init", "-b", "main"]);
+        git(&base, &["add", "-A"]);
+        git(&base, &["commit", "-m", "seed", "--no-gpg-sign"]);
+        fs::write(base.join("dirty.rs"), "// dirty\n// edit\n").unwrap();
+
+        let repo = Repository::open(&base).unwrap();
+        let cache = GitStatusCache::read_dirty_status(&repo).unwrap();
+        assert!(cache.lookup_status(&base.join("dirty.rs")).is_some());
+        assert!(cache.lookup_status(&base.join("clean.rs")).is_none());
+        // Sorted vec stays byte-ordered for linear merges.
+        let v = cache.into_sorted_vec();
+        let mut sorted = v.clone();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        assert!(v.iter().map(|(p, _)| p).eq(sorted.iter().map(|(p, _)| p)));
     }
 }

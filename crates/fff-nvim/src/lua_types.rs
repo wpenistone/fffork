@@ -74,7 +74,8 @@ fn file_item_into_lua(item: &FileItem, lua: &Lua, picker: &FilePicker) -> LuaRes
         item.modification_frecency_score,
     )?;
     table.set("total_frecency_score", item.total_frecency_score())?;
-    table.set("git_status", format_git_status(item.git_status))?;
+    table.set("git_status", format_git_status(item.git_status()))?;
+    table.set("git_recency_score", item.git_recency_score)?;
     table.set("is_binary", item.is_binary())?;
     Ok(LuaValue::Table(table))
 }
@@ -100,6 +101,8 @@ fn score_into_lua(score: &Score, lua: &Lua) -> LuaResult<LuaValue> {
     table.set("filename_bonus", score.filename_bonus)?;
     table.set("special_filename_bonus", score.special_filename_bonus)?;
     table.set("frecency_boost", score.frecency_boost)?;
+    table.set("git_status_boost", score.git_status_boost)?;
+    table.set("git_recency_boost", score.git_recency_boost)?;
     table.set("distance_penalty", score.distance_penalty)?;
     table.set("current_file_penalty", score.current_file_penalty)?;
     table.set("combo_match_boost", score.combo_match_boost)?;
@@ -107,6 +110,19 @@ fn score_into_lua(score: &Score, lua: &Lua) -> LuaResult<LuaValue> {
     table.set("match_type", score.match_type)?;
     table.set("exact_match", score.exact_match)?;
     Ok(LuaValue::Table(table))
+}
+
+fn set_match_ranges(lua: &Lua, item: &LuaTable, ranges: &[(u32, u32)]) -> LuaResult<()> {
+    let ranges_table = lua.create_table()?;
+
+    for (i, &(start, end)) in ranges.iter().enumerate() {
+        let range = lua.create_table()?;
+        range.set(1, start)?;
+        range.set(2, end)?;
+        ranges_table.set(i + 1, range)?;
+    }
+
+    item.set("match_ranges", ranges_table)
 }
 
 fn location_into_lua(location: &Location, lua: &Lua) -> LuaResult<LuaValue> {
@@ -134,7 +150,13 @@ impl IntoLua for SearchResultLua<'_> {
         // Convert items
         let items_table = lua.create_table()?;
         for (i, item) in self.inner.items.iter().enumerate() {
-            items_table.set(i + 1, file_item_into_lua(item, lua, self.picker)?)?;
+            let lua_item = file_item_into_lua(item, lua, self.picker)?;
+            if let LuaValue::Table(item_table) = &lua_item
+                && let Some(ranges) = self.inner.match_byte_offsets.get(i)
+            {
+                set_match_ranges(lua, item_table, ranges.as_slice())?;
+            }
+            items_table.set(i + 1, lua_item)?;
         }
         table.set("items", items_table)?;
 
@@ -225,7 +247,7 @@ impl IntoLua for GrepResultLua<'_> {
             item.set("relative_path", file.relative_path(self.picker))?;
             item.set("name", file.file_name(self.picker))?;
             item.set("is_binary", file.is_binary())?;
-            item.set("git_status", format_git_status(file.git_status))?;
+            item.set("git_status", format_git_status(file.git_status()))?;
             item.set("size", file.size)?;
             item.set("modified", file.modified)?;
             item.set("total_frecency_score", file.total_frecency_score())?;
@@ -246,15 +268,7 @@ impl IntoLua for GrepResultLua<'_> {
             item.set("is_binary_content", is_binary_content)?;
             item.set("line_content", m.line_content.as_str())?;
 
-            // Match byte ranges within line_content
-            let ranges = lua.create_table()?;
-            for (j, &(start, end)) in m.match_byte_offsets.iter().enumerate() {
-                let range = lua.create_table()?;
-                range.set(1, start)?;
-                range.set(2, end)?;
-                ranges.set(j + 1, range)?;
-            }
-            item.set("match_ranges", ranges)?;
+            set_match_ranges(lua, &item, m.match_byte_offsets.as_slice())?;
 
             // Fuzzy match score (only set in fuzzy grep mode, nil otherwise)
             if let Some(score) = m.fuzzy_score {
