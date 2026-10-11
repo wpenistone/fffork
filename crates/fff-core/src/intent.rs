@@ -641,8 +641,14 @@ pub fn is_related_filename(cand: &str, cur_fname: &str) -> bool {
 
 fn strip_sibling_suffix(mut s: &str) -> &str {
     for pat in [".test", ".spec", ".module", "_test", ".stories"] {
-        while s.len() >= pat.len() && s[s.len() - pat.len()..].eq_ignore_ascii_case(pat) {
-            s = &s[..s.len() - pat.len()];
+        while s.len() >= pat.len() {
+            let n = s.len() - pat.len();
+            // Byte cuts can land inside a multibyte char (CJK stems);
+            // the ASCII suffix cannot match there, so keep looking.
+            if !s.is_char_boundary(n) || !s[n..].eq_ignore_ascii_case(pat) {
+                break;
+            }
+            s = &s[..n];
         }
     }
     s
@@ -696,6 +702,13 @@ mod tests {
         assert!(is_related_filename("user.test.ts", "user.ts"));
         assert!(is_related_filename("user.module.css", "user.ts"));
         assert!(!is_related_filename("other.ts", "user.ts"));
+    }
+
+    #[test]
+    fn sibling_suffix_cut_inside_multibyte_char_keeps_stem() {
+        // "controller_é_100": naive cuts land inside é; must not panic.
+        assert_eq!(strip_sibling_suffix("controller_é_100"), "controller_é_100");
+        assert_eq!(strip_sibling_suffix("user_test"), "user");
     }
 
     #[test]

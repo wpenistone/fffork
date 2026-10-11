@@ -767,7 +767,7 @@ impl FileItem {
             return mask;
         }
 
-        let Ok(mut file) = std::fs::OpenOptions::new()
+        let Ok(file) = std::fs::OpenOptions::new()
             .write(false)
             .read(true)
             .open(path)
@@ -775,6 +775,8 @@ impl FileItem {
             tracing::error!(path = ?path.display(), "Failed to open indexed file");
             return mask;
         };
+        // only classify the first MAX_FFFILE_SIZE bytes, never read large files to EOF
+        let mut file = file.take(MAX_FFFILE_SIZE);
 
         // Prefix sniff, capped: a NUL in the first CAP bytes classifies
         // as binary. Past the cap the mask would be unsound, so partial
@@ -1495,5 +1497,38 @@ mod content_mask_tests {
         }
         hay.windows(needle.len())
             .any(|w| w.eq_ignore_ascii_case(needle))
+    }
+}
+
+#[cfg(test)]
+mod detect_binary_tests {
+    use super::*;
+
+    fn classify(content: &[u8]) -> bool {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("f");
+        std::fs::write(&path, content).unwrap();
+        let (item, _) = FileItem::new(path.clone(), root.path(), None);
+        item.detect_binary_per_byte(&path, &mut [0u8; BINARY_CLASSIFICATION_CHUNK_SIZE]);
+        item.is_binary()
+    }
+
+    #[test]
+    fn detects_nul_in_small_file() {
+        let mut content = vec![b'a'; BINARY_CLASSIFICATION_CHUNK_SIZE * 3];
+        content[10] = 0;
+        assert!(classify(&content));
+        assert!(!classify(b"plain text\n"));
+    }
+
+    #[test]
+    fn reads_only_first_max_size_bytes() {
+        let mut content = vec![b'a'; MAX_FFFILE_SIZE as usize + 1];
+        content[0] = 0;
+        assert!(classify(&content));
+
+        content[0] = b'a';
+        content[MAX_FFFILE_SIZE as usize] = 0;
+        assert!(!classify(&content));
     }
 }

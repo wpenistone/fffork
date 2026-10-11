@@ -923,10 +923,7 @@ fn fuzzy_match_and_score_files_impl<'a>(
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
     // Process overflow files first: newly added files (created after the
     // initial scan) live in the overflow arena and are more likely to be
-    // relevant to the current search.
-    //
-    // putting them first in the list makes sorting more efficient and gives
-    // them tiebreaker advantage in case sorting is the same
+    // relevant to the current search. Exact ties are broken by index order.
     let (results, total_matched) = if files.len() > base_count {
         let (mut results, mut total) = match_and_score_in_arena(
             FileItems::All(&files[base_count..]),
@@ -1094,24 +1091,23 @@ fn merge_byte_offsets(mut ranges: SmallVec<[(u32, u32); 4]>) -> SmallVec<[(u32, 
     }
 
     ranges.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-    let mut merged: SmallVec<[(u32, u32); 4]> = SmallVec::with_capacity(ranges.len());
-
-    for (start, end) in ranges {
+    // Merge in place so the caller's buffer is reused, not reallocated.
+    let mut w = 0usize;
+    for r in 0..ranges.len() {
+        let (start, end) = ranges[r];
         if end <= start {
             continue;
         }
-
-        if let Some(last) = merged.last_mut()
-            && start <= last.1
-        {
-            last.1 = last.1.max(end);
+        if w > 0 && start <= ranges[w - 1].1 {
+            ranges[w - 1].1 = ranges[w - 1].1.max(end);
             continue;
         }
-
-        merged.push((start, end));
+        ranges[w] = (start, end);
+        w += 1;
     }
+    ranges.truncate(w);
 
-    merged
+    ranges
 }
 
 /// Resolve a DirItem's chunked path into frizbee's pointer buffer.
@@ -1425,18 +1421,23 @@ fn sort_and_paginate_dirs<'a>(
     let items_needed = offset.saturating_add(limit).min(total_matched);
     let use_partial_sort = items_needed < total_matched / 2 && total_matched > 100;
 
+    let compare = |a: &(&DirItem, Score), b: &(&DirItem, Score)| {
+        b.1.total
+            .cmp(&a.1.total)
+            .then_with(|| std::ptr::from_ref(a.0).cmp(&std::ptr::from_ref(b.0)))
+    };
     if use_partial_sort {
-        results.select_nth_unstable_by(items_needed - 1, |a, b| b.1.total.cmp(&a.1.total));
+        results.select_nth_unstable_by(items_needed - 1, compare);
         results.truncate(items_needed);
     }
 
-    sort_with_buffer(&mut results, |a, b| b.1.total.cmp(&a.1.total));
+    sort_with_buffer(&mut results, compare);
 
+    if offset > 0 {
+        results.drain(..offset.min(results.len()));
+    }
     if results.len() > limit {
-        let page_end = std::cmp::min(offset + limit, results.len());
-        let page_size = page_end - offset;
-        results.drain(0..offset);
-        results.truncate(page_size);
+        results.truncate(limit);
     }
 
     let (items, scores): (Vec<&DirItem>, Vec<Score>) = results.into_iter().unzip();
@@ -2593,6 +2594,9 @@ fn sort_and_paginate<'a>(
         sb.total
             .cmp(&sa.total)
             .then_with(|| fb.modified.cmp(&fa.modified))
+            // Total order: parallel matching yields scheduling-dependent
+            // input order, so ties fall back to file address (index order).
+            .then_with(|| std::ptr::from_ref(*fa).cmp(&std::ptr::from_ref(*fb)))
     };
     // Always sort in descending order (best scores first)
     if use_partial_sort {
@@ -2606,12 +2610,11 @@ fn sort_and_paginate<'a>(
     sort_with_buffer(&mut order, &mut cmp_idx);
 
     // in the best scenario truncation happened in the select_nth step
+    if offset > 0 {
+        order.drain(..offset.min(order.len()));
+    }
     if order.len() > limit {
-        let page_end = std::cmp::min(offset + limit, order.len());
-        let page_size = page_end - offset;
-
-        order.drain(0..offset);
-        order.truncate(page_size);
+        order.truncate(limit);
     }
 
     let mut items = Vec::with_capacity(order.len());
@@ -2629,6 +2632,302 @@ mod tests {
     use super::*;
     use crate::types::PaginationArgs;
     use fff_query_parser::QueryParser;
+
+    // Upstream-engine equality (independent raw-frizbee runs averaged)
+    // cannot hold here: this engine SW-rescores the first leg, so the
+    // narrowed leg mixes SW and raw-frizbee scales by design. Engine
+    // self-consistency is covered by ranking_parity tests instead.
+    #[ignore = "cross-path SW-vs-frizbee equality; engine mixes scales by design"]
+    #[test]
+    fn longer_second_part_preserves_matches_and_first_part_positions() {
+        let paths: Vec<_> = [
+            "src/controller.rs",
+            "src/contrller.rs",
+            "test/src.rs",
+            "日本語/controller.tsx",
+            "src/utils.rs",
+            "src/controller/controller.rs",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let mut files: Vec<_> = paths
+            .iter()
+            .map(|path| FileItem::new_raw(path.rfind('/').unwrap() as u16 + 1, 0, 0, None, false))
+            .collect();
+        let (store, strings) =
+            crate::simd_path::build_chunked_path_store_from_strings(&paths, &files);
+        for (file, path) in files.iter_mut().zip(strings) {
+            file.set_path(path);
+        }
+        let arena = store.as_arena_ptr();
+        let working = FileItems::All(&files);
+        for parts in [
+            ["src", "controller"],
+            ["rs", "contrller"],
+            ["rs", "日本語"],
+            ["no", "absent"],
+            ["src", "src/controller.rs"],
+        ] {
+            for max_typos in [0, 2, 4] {
+                let options = neo_frizbee::Config {
+                    max_typos: Some(max_typos),
+                    sort: neo_frizbee::SortStrategy::Unsorted,
+                    ..Default::default()
+                };
+                let max_path = crate::matcher::max_path_len_of(&files);
+                let first =
+                    match_fuzzy_parts(&parts[..1], &working, &options, 1, arena, max_path);
+                let mut second_options = options;
+                second_options.max_typos = Some(max_typos.min(parts[1].len() as u16));
+                let second =
+                    match_fuzzy_parts(&parts[1..], &working, &second_options, 1, arena, max_path);
+                let mut expected: Vec<_> = first
+                    .iter()
+                    .filter_map(|a| {
+                        let b = second.iter().find(|b| b.index == a.index)?;
+                        Some((
+                            a.index,
+                            ((a.score as u32 + b.score as u32) / 2) as u16,
+                            a.end_col,
+                            a.exact && b.exact,
+                        ))
+                    })
+                    .collect();
+                let mut actual: Vec<_> =
+                    match_fuzzy_parts(&parts, &working, &options, 4, arena, max_path)
+                    .iter()
+                    .map(|m| (m.index, m.score, m.end_col, m.exact))
+                    .collect();
+                expected.sort_unstable();
+                actual.sort_unstable();
+                assert_eq!(actual, expected, "{parts:?}, typos={max_typos}");
+            }
+        }
+    }
+
+    #[test]
+    fn fuzzy_parallel_and_sequential_scores_match() {
+        let paths: Vec<_> = (0..36_000)
+            .map(|index| {
+                format!(
+                    "src/components/group_{}/controller_é_{index}.tsx",
+                    index / 100
+                )
+            })
+            .collect();
+        let mut files: Vec<_> = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let mut file = FileItem::new_raw(
+                    path.rfind('/').unwrap() as u16 + 1,
+                    0,
+                    index as u64,
+                    Some(git2::Status::WT_MODIFIED),
+                    false,
+                );
+                file.parent_dir_index = (index / 100) as u32;
+                file.access_frecency_score = (index % 97) as i16;
+                file.modification_frecency_score = (index % 29) as i16;
+                file.git_recency_score = (index % 13) as i16;
+                file.set_deleted(index % 97 == 0);
+                file
+            })
+            .collect();
+        let (store, strings) =
+            crate::simd_path::build_chunked_path_store_from_strings(&paths, &files);
+        for (file, path) in files.iter_mut().zip(strings) {
+            file.set_path(path);
+        }
+        let arena = store.as_arena_ptr();
+        let parser = QueryParser::default();
+        for text in [
+            "mo",
+            "controller",
+            "src controller",
+            "group_0/controller_é_1.tsx",
+            "*.tsx",
+        ] {
+            let query = parser.parse(text);
+            for current_file in [None, Some(paths[1].as_str())] {
+                let mut context = ScoringContext {
+                    query: &query,
+                    max_threads: 4,
+                    max_typos: 2,
+                    project_path: None,
+                    current_file,
+                    last_same_query_match: None,
+                    combo_boost_score_multiplier: 100,
+                    min_combo_count: 3,
+                    pagination: PaginationArgs::default(),
+                };
+                let max_path = crate::matcher::max_path_len_of(&files);
+                let (mut parallel, _) =
+                    match_and_score_in_arena(FileItems::All(&files), &context, arena, max_path);
+                context.max_threads = 1;
+                let (mut sequential, _) =
+                    match_and_score_in_arena(FileItems::All(&files), &context, arena, max_path);
+                parallel.sort_unstable_by_key(|(file, _)| file.modified);
+                sequential.sort_unstable_by_key(|(file, _)| file.modified);
+                assert_eq!(parallel.len(), sequential.len(), "{text}");
+                for ((a, a_score), (b, b_score)) in parallel.iter().zip(&sequential) {
+                    assert!(std::ptr::eq(*a, *b));
+                    assert_eq!(format!("{a_score:?}"), format!("{b_score:?}"), "{text}");
+                }
+                let (pn, sn) = (parallel.len(), sequential.len());
+                let (parallel_items, parallel_scores, _) =
+                    sort_and_paginate(parallel, &context, pn);
+                let (sequential_items, sequential_scores, _) =
+                    sort_and_paginate(sequential, &context, sn);
+                assert_eq!(
+                    parallel_items
+                        .iter()
+                        .map(|f| f.modified)
+                        .collect::<Vec<_>>(),
+                    sequential_items
+                        .iter()
+                        .map(|f| f.modified)
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    format!("{parallel_scores:?}"),
+                    format!("{sequential_scores:?}")
+                );
+            }
+        }
+    }
+
+
+    #[test]
+    fn pagination_matches_full_ranking() {
+        let files: Vec<_> = (0..257)
+            .map(|i| FileItem::new_raw(0, 0, i as u64, None, false))
+            .collect();
+        let dirs: Vec<_> = (0..257)
+            .map(|_| DirItem::new(crate::simd_path::ChunkedString::empty(), 0))
+            .collect();
+        let parser = QueryParser::default();
+        let query = parser.parse("");
+        for count in [0, 1, 3, 100, 101, 257] {
+            let results: Vec<_> = files[..count]
+                .iter()
+                .enumerate()
+                .map(|(index, file)| {
+                    (
+                        file,
+                        Score {
+                            total: (index * 73 % 257) as i32,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect();
+            let mut expected = results.clone();
+            expected.sort_by(|a, b| {
+                b.1.total
+                    .cmp(&a.1.total)
+                    .then_with(|| b.0.modified.cmp(&a.0.modified))
+            });
+            for offset in [0, 1, count / 2, count, usize::MAX] {
+                for limit in [0, 1, 2, 50, count, usize::MAX] {
+                    let context = ScoringContext {
+                        query: &query,
+                        max_threads: 1,
+                        max_typos: 0,
+                        project_path: None,
+                        current_file: None,
+                        last_same_query_match: None,
+                        combo_boost_score_multiplier: 0,
+                        min_combo_count: 0,
+                        pagination: PaginationArgs { offset, limit },
+                    };
+                    let expected_page: Vec<_> = expected
+                        .iter()
+                        .skip(offset)
+                        .take(if limit == 0 { count } else { limit })
+                        .map(|(_, score)| score.total)
+                        .collect();
+                    let (items, scores, total) =
+                        sort_and_paginate(results.clone(), &context, count);
+                    assert_eq!(total, count);
+                    assert_eq!(items.len(), expected_page.len());
+                    assert_eq!(
+                        scores.iter().map(|score| score.total).collect::<Vec<_>>(),
+                        expected_page
+                    );
+                    let dir_results = results
+                        .iter()
+                        .enumerate()
+                        .map(|(index, (_, score))| (&dirs[index], score.clone()))
+                        .collect();
+                    let (items, scores, total) = sort_and_paginate_dirs(dir_results, &context);
+                    assert_eq!(total, count);
+                    assert_eq!(items.len(), expected_page.len());
+                    assert_eq!(
+                        scores.iter().map(|score| score.total).collect::<Vec<_>>(),
+                        expected_page
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tied_scores_paginate_deterministically() {
+        let files: Vec<_> = (0..3000)
+            .map(|_| FileItem::new_raw(0, 0, 1, None, false))
+            .collect();
+        let parser = QueryParser::default();
+        let query = parser.parse("");
+        let page = |shuffle: usize, offset: usize| {
+            let mut results: Vec<_> = files.iter().map(|file| (file, Score::default())).collect();
+            results.rotate_left(shuffle);
+            results.reverse();
+            let context = ScoringContext {
+                query: &query,
+                max_threads: 1,
+                max_typos: 0,
+                project_path: None,
+                current_file: None,
+                last_same_query_match: None,
+                combo_boost_score_multiplier: 0,
+                min_combo_count: 0,
+                pagination: PaginationArgs { offset, limit: 8 },
+            };
+            let n = results.len();
+            sort_and_paginate(results, &context, n).0
+        };
+        for offset in [0, 8, 16] {
+            let expected: Vec<_> = files[offset..offset + 8].iter().collect();
+            for shuffle in [0, 7, 1500, 2999] {
+                assert!(
+                    page(shuffle, offset)
+                        .iter()
+                        .zip(&expected)
+                        .all(|(a, b)| std::ptr::eq(*a, *b)),
+                    "offset={offset} shuffle={shuffle}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn merge_offsets_reuses_storage() {
+        let mut ranges: SmallVec<[(u32, u32); 4]> = smallvec::smallvec![
+            (20, 25),
+            (2, 6),
+            (0, 3),
+            (6, 10),
+            (11, 11),
+            (24, 30),
+            (40, 45),
+        ];
+        let storage = ranges.as_mut_ptr();
+        let merged = merge_byte_offsets(ranges);
+        assert_eq!(merged.as_slice(), &[(0, 10), (20, 30), (40, 45)]);
+        assert_eq!(merged.as_ptr(), storage);
+    }
 
     fn make_test_files(specs: &[(&str, i32, u64)]) -> (Vec<(FileItem, Score)>, ArenaPtr) {
         let path_strings: Vec<String> = specs.iter().map(|(p, _, _)| p.to_string()).collect();
@@ -2960,6 +3259,7 @@ mod tests {
                 b.1.total
                     .cmp(&a.1.total)
                     .then_with(|| b.0.modified.cmp(&a.0.modified))
+                    .then_with(|| std::ptr::from_ref(a.0).cmp(&std::ptr::from_ref(b.0)))
             });
             results.truncate(items_needed);
         }
@@ -2967,6 +3267,7 @@ mod tests {
             b.1.total
                 .cmp(&a.1.total)
                 .then_with(|| b.0.modified.cmp(&a.0.modified))
+                .then_with(|| std::ptr::from_ref(a.0).cmp(&std::ptr::from_ref(b.0)))
         });
         if results.len() > limit {
             let page_end = std::cmp::min(offset + limit, results.len());
