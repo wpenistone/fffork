@@ -39,10 +39,7 @@
  * @packageDocumentation
  */
 
-export {
-  binaryExists,
-  findBinary,
-} from "./binary.js";
+export { binaryExists, findBinary } from "./binary.js";
 export { closeLibrary } from "./ffi.js";
 export type {
   DbHealth,
@@ -67,6 +64,11 @@ export type {
   Score,
   SearchOptions,
   SearchResult,
+  WatchBatchCallback,
+  WatchEvent,
+  WatchEventKind,
+  WatchOptions,
+  WatchUnsubscribe,
 } from "./fff-api.js";
 // Result helpers
 export { err, ok } from "./fff-api.js";

@@ -9,8 +9,6 @@ local fuzzy = require('fff.fuzzy')
 local file_renderer = require('fff.picker_ui.file_renderer')
 local tresitter_highlight = require('fff.treesitter_hl')
 
--- ===== Search Bridge =====
-
 ---@class fff.grep.SearchResult
 ---@field items table[] Array of grep match items
 ---@field total_matched number Total matches found in this call
@@ -40,7 +38,9 @@ function M.search(query, file_offset, page_size, config, grep_mode)
     conf.smart_case,
     grep_mode or 'plain',
     conf.time_budget_ms,
-    conf.trim_whitespace
+    conf.trim_whitespace,
+    conf.enforce_time_budget,
+    conf.casing
   )
   return last_result
 end

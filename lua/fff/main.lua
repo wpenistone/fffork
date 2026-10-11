@@ -28,7 +28,7 @@ end
 
 --- Live grep: search file contents in the current directory.
 --- When opts.resume is true, resumes the last live_grep picker (or opens a new one if none saved).
---- @param opts? {cwd?: string, title?: string, prompt?: string, layout?: table, grep?: {max_file_size?: number, smart_case?: boolean, max_matches_per_file?: number, modes?: string[]}, query?: string, resume?: boolean} Optional configuration overrides
+--- @param opts? {cwd?: string, title?: string, prompt?: string, layout?: table, grep?: {max_file_size?: number, smart_case?: boolean, casing?: "smart"|"sensitive"|"insensitive", max_matches_per_file?: number, modes?: string[]}, query?: string, resume?: boolean} Optional configuration overrides
 function M.live_grep(opts)
   local picker_ok, picker_ui = pcall(require, 'fff.picker_ui.picker_ui')
   if not picker_ok then
@@ -56,6 +56,27 @@ function M.live_grep(opts)
   picker_ui.open(picker_opts)
 end
 
+--- Live grep prefilled with the current word (normal mode) or the visual selection (visual mode).
+--- @param opts? table Forwarded to `live_grep`; `query` is overwritten by the resolved text.
+function M.live_grep_under_cursor(opts)
+  local mode = vim.fn.mode()
+  local query
+  if mode == 'v' or mode == 'V' or mode == '\22' then
+    -- Exit visual so '< / '> marks settle, then read the range directly —
+    -- no yank, no register clobber.
+    vim.cmd('normal! ' .. vim.api.nvim_replace_termcodes('<Esc>', true, false, true))
+    local s = vim.fn.getpos("'<")
+    local e = vim.fn.getpos("'>")
+    local lines = vim.fn.getregion(s, e, { type = mode })
+    query = table.concat(lines, ' ')
+  else
+    query = vim.fn.expand('<cword>')
+  end
+
+  opts = vim.tbl_deep_extend('force', opts or {}, { query = query })
+  M.live_grep(opts)
+end
+
 --- Changes the directory indexed by the file picker to the git root and opens the file picker
 --- @deprecated Use `find_files` instead
 function M.find_in_git_root()
@@ -80,7 +101,13 @@ function M.clear_cache(scope)
 
   if scope == 'all' or scope == 'files' then
     local ok, err = pcall(fuzzy.cleanup_file_picker)
-    if not ok then table.insert(errors, 'cleanup file picker: ' .. tostring(err)) end
+    if not ok then
+      table.insert(errors, 'cleanup file picker: ' .. tostring(err))
+    else
+      -- Rust picker is gone; clear the core flag so the next ensure_initialized
+      -- rebuilds it instead of operating on a dropped picker (#772).
+      require('fff.core').mark_file_picker_uninitialized()
+    end
   end
 
   if scope == 'all' or scope == 'frecency' then
@@ -302,9 +329,11 @@ end
 --- @field max_file_size? number Skip files larger than N bytes (default: config.grep.max_file_size).
 --- @field max_matches_per_file? number Cap matches per file, 0 = unlimited (default: config.grep.max_matches_per_file).
 --- @field smart_case? boolean Case-insensitive when query is all lowercase (default: config.grep.smart_case).
+--- @field casing? "smart"|"sensitive"|"insensitive" Explicit case mode, overrides smart_case (default: config.grep.casing).
 --- @field page_size? number Max matches returned (default: 50).
 --- @field file_offset? number File-based pagination offset (default: 0).
 --- @field time_budget_ms? number Max wall-clock time, 0 = unlimited (default: config.grep.time_budget_ms).
+--- @field enforce_time_budget? boolean Apply the budget even with zero matches (default: config.grep.enforce_time_budget).
 --- @field trim_whitespace? boolean Strip leading whitespace from matched lines (default: config.grep.trim_whitespace).
 --- @field cwd? string Switch indexed root before grepping (same semantics as `file_search`).
 --- @field wait_for_index_ms? number Block up to this many ms for the index to be ready.
@@ -348,7 +377,9 @@ function M.content_search(query, opts)
     max_file_size = opts.max_file_size or grep_cfg.max_file_size,
     max_matches_per_file = opts.max_matches_per_file or grep_cfg.max_matches_per_file,
     smart_case = opts.smart_case == nil and grep_cfg.smart_case or opts.smart_case,
+    casing = opts.casing == nil and grep_cfg.casing or opts.casing,
     time_budget_ms = opts.time_budget_ms or grep_cfg.time_budget_ms,
+    enforce_time_budget = opts.enforce_time_budget == nil and grep_cfg.enforce_time_budget or opts.enforce_time_budget,
     trim_whitespace = opts.trim_whitespace == nil and grep_cfg.trim_whitespace or opts.trim_whitespace,
   }
 

@@ -1,16 +1,21 @@
 ---@diagnostic disable: undefined-field, missing-fields
-local plugin_dir = vim.fn.fnamemodify(vim.fn.resolve(debug.getinfo(1, 'S').source:sub(2)), ':h:h')
-local log_file = vim.fs.normalize(plugin_dir .. '/fff-test.log')
-pcall(vim.fn.delete, log_file)
-
--- init_tracing uses OnceLock — first caller wins. Direct rust call BEFORE any
--- fff.* require, otherwise core.ensure_initialized() locks tracing to the
--- default config path and our trace dump on CI failure stays empty.
-pcall(require('fff.rust').init_tracing, log_file, 'trace')
-
 local fff = require('fff')
 local fff_rust = require('fff.rust')
 local file_picker = require('fff.file_picker')
+
+local plugin_dir = vim.fn.fnamemodify(vim.fn.resolve(debug.getinfo(1, 'S').source:sub(2)), ':h:h')
+local log_file = vim.fs.normalize(plugin_dir .. '/fff-test.log')
+
+local ok, session_log = pcall(require('fff.rust').init_tracing, log_file, 'trace')
+if not ok then session_log = nil end
+
+-- comment to get a local log of this file
+vim.api.nvim_create_autocmd('VimLeavePre', {
+  once = true,
+  callback = function()
+    if os.getenv('CI') == nil and session_log then pcall(vim.fn.delete, session_log) end
+  end,
+})
 
 local function init_picker_at_plugin_dir(timeout_ms)
   fff_rust.init_file_picker(plugin_dir)
@@ -26,7 +31,7 @@ local function find_result_by_name(items, name)
 end
 
 describe('programmatic search APIs', function()
-  describe('against the actual fff.nvim repo', function()
+  describe('against the actual fff repo', function()
     before_each(function()
       pcall(vim.api.nvim_del_augroup_by_name, 'fff_file_tracking')
       vim.g.fff = {}
@@ -176,9 +181,9 @@ describe('programmatic search APIs', function()
       fd:write('-- only lives in the other sandbox\n')
       fd:close()
 
-      -- Sanity: the file does not exist in the primary (fff.nvim) index.
+      -- Sanity: the file does not exist in the primary (fff) index.
       local before = fff.file_search(other_filename)
-      assert.are.equal(0, #before.items, 'sandbox file leaked into primary fff.nvim index')
+      assert.are.equal(0, #before.items, 'sandbox file leaked into primary fff index')
 
       local result = fff.file_search(other_filename, { cwd = sandbox_root })
       assert.is_true(#result.items > 0, 'cwd switch did not surface file from the new root')
@@ -197,7 +202,7 @@ describe('programmatic search APIs', function()
       sandbox_root = vim.fn.tempname() .. '_other_grep'
       vim.fn.mkdir(sandbox_root, 'p')
       -- Build the marker by concatenation so the literal string doesn't
-      -- appear anywhere in the fff.nvim tree (otherwise the "before" grep
+      -- appear anywhere in the fff tree (otherwise the "before" grep
       -- would find this very test file via its own marker constant).
       local marker = 'isolated_grep' .. '_marker_xyzzy'
       local fd = assert(io.open(sandbox_root .. '/grep_target.lua', 'w'))
@@ -209,11 +214,17 @@ describe('programmatic search APIs', function()
       -- this is fine in practice cause this is not a real use case for fff to search RIGHT AFTER mkdir
       if vim.fn.has('win32') == 1 then vim.wait(250, function() return false end) end
 
-      -- Marker must not exist anywhere in the primary fff.nvim tree.
+      -- Marker must not exist anywhere in the primary fff tree.
       local before = fff.content_search(marker)
-      assert.are.equal(0, #before.items, 'marker leaked into primary fff.nvim tree')
+      assert.are.equal(0, #before.items, 'marker leaked into primary fff tree')
 
-      local result = fff.content_search(marker, { cwd = sandbox_root })
+      -- Poll instead of asserting on the first grep: the index of the new root
+      -- can lag a mkdir by a few ms on CI, which flaked on linux too.
+      local result
+      vim.wait(2000, function()
+        result = fff.content_search(marker, { cwd = sandbox_root })
+        return #result.items > 0
+      end, 50)
       assert.is_true(#result.items > 0, 'cwd switch did not surface match from the new root')
     end)
   end)

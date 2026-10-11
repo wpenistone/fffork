@@ -2,6 +2,8 @@
 --- Simple renderer for file items with 2 functions: render_line and apply_highlights
 local M = {}
 
+local file_name_renderer = require('fff.picker_ui.file_name_renderer')
+
 --- File Item structure from Rust
 --- @class FileItem
 --- @field path string Absolute file path
@@ -14,6 +16,7 @@ local M = {}
 --- @field access_frecency_score number Access-based frecency score
 --- @field modification_frecency_score number Modification-based frecency score
 --- @field git_status string|nil Git status string (e.g. 'modified', 'untracked') if file is in git repo
+--- @field match_ranges number[][]|nil Byte ranges for fuzzy query matches
 
 --- Render a file item line
 --- @param item FileItem File item from Rust
@@ -48,15 +51,7 @@ function M.render_line(item, ctx, item_idx) -- luacheck: ignore item_idx
     end
   end
 
-  -- Format filename and path
-  -- Don't reserve space for frecency - path takes priority
-  local icon_width = icon and (vim.fn.strdisplaywidth(icon) + 1) or 0
-  local available_width = math.max(ctx.max_path_width - icon_width, 40)
-  local filename, dir_path = ctx.format_file_display(item, available_width)
-
-  -- Build line
-  local line = icon and string.format('%s %s %s%s', icon, filename, dir_path, frecency)
-    or string.format('%s %s%s', filename, dir_path, frecency)
+  local line = file_name_renderer.build(item, ctx, icon).text .. frecency
 
   local padding = math.max(0, ctx.win_width - vim.fn.strdisplaywidth(line) + 5)
   table.insert(lines, line .. string.rep(' ', padding))
@@ -83,9 +78,8 @@ function M.apply_highlights(item, ctx, item_idx, buf, ns_id, line_idx, line_cont
 
   -- Get icon and paths
   local icon, icon_hl_group = icons.get_icon(item.name, item.extension, false)
-  local icon_width = icon and (vim.fn.strdisplaywidth(icon) + 1) or 0
-  local available_width = math.max(ctx.max_path_width - icon_width, 40)
-  local filename, dir_path = ctx.format_file_display(item, available_width)
+  local name_layout = file_name_renderer.build(item, ctx, icon)
+  local filename, dir_path = name_layout.filename, name_layout.dir_path
 
   -- 1. Cursor highlight
   if is_cursor then
@@ -114,7 +108,7 @@ function M.apply_highlights(item, ctx, item_idx, buf, ns_id, line_idx, line_cont
   if ctx.config.git and ctx.config.git.status_text_color and icon and #filename > 0 then
     local git_text_hl = item.git_status and highlights.get_git_text_highlight(item.git_status) or nil
     if git_text_hl and git_text_hl ~= '' and not is_current_file then
-      local filename_start = #icon + 1
+      local filename_start = name_layout.filename_col
       vim.api.nvim_buf_set_extmark(
         buf,
         ns_id,
@@ -141,16 +135,12 @@ function M.apply_highlights(item, ctx, item_idx, buf, ns_id, line_idx, line_cont
 
   -- 5. Directory path (dimmed)
   if #filename > 0 and #dir_path > 0 then
-    local prefix_len = #filename + 1 -- filename bytes + space
-    if icon then
-      prefix_len = prefix_len + #icon + 1 -- if icon add icon bytes + space
-    end
     vim.api.nvim_buf_set_extmark(
       buf,
       ns_id,
       line_idx - 1,
-      prefix_len,
-      { end_col = prefix_len + #dir_path, hl_group = ctx.config.hl.directory_path }
+      name_layout.dir_col,
+      { end_col = name_layout.dir_end_col, hl_group = ctx.config.hl.directory_path }
     )
   end
 
@@ -199,17 +189,52 @@ function M.apply_highlights(item, ctx, item_idx, buf, ns_id, line_idx, line_cont
     })
   end
 
-  -- 9. Query match
+  -- 9. Query matches
   if ctx.query and ctx.query ~= '' then
-    local match_start, match_end = string.find(line_content, ctx.query, 1, true)
-    if match_start and match_end then
-      vim.api.nvim_buf_set_extmark(
-        buf,
-        ns_id,
-        line_idx - 1,
-        match_start - 1,
-        { end_col = match_end, hl_group = ctx.config.hl.matched or 'IncSearch' }
-      )
+    local matched_hl = ctx.config.hl.matched or 'IncSearch'
+    local fuzzy_highlighting = ctx.config.file_picker and ctx.config.file_picker.fuzzy_query_highlighting
+
+    if not fuzzy_highlighting then
+      local match_start, match_end = string.find(line_content, ctx.query, 1, true)
+      if match_start and match_end then
+        vim.api.nvim_buf_set_extmark(buf, ns_id, line_idx - 1, match_start - 1, {
+          end_col = match_end,
+          hl_group = matched_hl,
+        })
+      end
+      return
+    end
+
+    local ranges = item.match_ranges
+    if not ranges or #ranges == 0 then return end
+
+    local segments = file_name_renderer.fuzzy_segments(item, name_layout)
+
+    local function apply_segment(raw_start, raw_end, segment)
+      local source_start, source_end, target_start = segment[1], segment[2], segment[3]
+      local start_col = math.max(raw_start, source_start)
+      local end_col = math.min(raw_end, source_end)
+      if end_col <= start_col then return end
+
+      local hl_start = target_start + (start_col - source_start)
+      local hl_end = target_start + (end_col - source_start)
+      if hl_start < #line_content and hl_end <= #line_content then
+        vim.api.nvim_buf_set_extmark(buf, ns_id, line_idx - 1, hl_start, {
+          end_col = hl_end,
+          hl_group = matched_hl,
+          priority = 200,
+        })
+      end
+    end
+
+    for _, range in ipairs(ranges) do
+      local raw_start = range[1] or 0
+      local raw_end = range[2] or 0
+      if raw_end > raw_start then
+        for _, segment in ipairs(segments) do
+          apply_segment(raw_start, raw_end, segment)
+        end
+      end
     end
   end
 end

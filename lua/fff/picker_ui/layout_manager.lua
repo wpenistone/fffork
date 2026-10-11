@@ -131,6 +131,7 @@ function M.close()
   S.current_file_cache = nil
   S.location = nil
   S.selected_files = {}
+  S.selected_file_order = {}
   S.selected_items = {}
   S.mode = nil
   S.grep_config = nil
@@ -144,6 +145,8 @@ function M.close()
   S.combo_initial_cursor = nil
   P.reset_history_state()
   pcall(vim.api.nvim_del_augroup_by_name, 'fff_picker_focus')
+
+  vim.api.nvim_exec_autocmds('User', { pattern = 'FFFClose', modeline = false })
 end
 
 return M

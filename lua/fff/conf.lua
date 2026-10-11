@@ -9,6 +9,8 @@ local M = {}
 --- @field min_list_height number
 --- @field show_scrollbar boolean
 --- @field path_shorten_strategy string
+--- @field show_path_first boolean
+--- @field border? 'single'|'double'|'rounded'|'solid'|'shadow'|'none'|table<string[],string[]> Border preset; falls back to `vim.o.winborder` when nil
 
 --- @class FffPreviewConfig
 --- @field enabled boolean
@@ -33,14 +35,18 @@ local M = {}
 --- @field preview_scroll_down string
 --- @field toggle_debug string
 --- @field cycle_grep_modes string
+--- @field insert_newline_escape string
 --- @field cycle_previous_query string
 --- @field cycle_forward_query string
+--- @field clear_query string|string[]|nil
 --- @field grep_jump_to_next_file string|string[]
 --- @field grep_jump_to_prev_file string|string[]
 --- @field toggle_select string
 --- @field send_to_quickfix string
 --- @field focus_list string
 --- @field focus_preview string
+
+--- @alias FffMappingsConfig table<string, table<string, function|string>>
 
 --- @class FffFrecencyConfig
 --- @field enabled boolean
@@ -56,10 +62,17 @@ local M = {}
 --- @field max_file_size number
 --- @field max_matches_per_file number
 --- @field smart_case boolean
+--- @field casing? "smart"|"sensitive"|"insensitive"
 --- @field time_budget_ms number
+--- @field enforce_time_budget boolean
 --- @field modes string[]
 --- @field trim_whitespace boolean
 --- @field location_format string
+--- @field enable_filename_constraint boolean
+
+--- @class FffSuggestionsConfig
+--- @field enabled boolean
+--- @field grep_time_budget_ms number
 
 --- @alias FffSelectAction 'edit' | 'split' | 'vsplit' | 'tab'
 
@@ -80,6 +93,7 @@ local M = {}
 --- @field layout FffLayoutConfig
 --- @field preview FffPreviewConfig
 --- @field keymaps FffKeymapsConfig
+--- @field mappings FffMappingsConfig extra keymaps for the picker input, keyed by mode
 --- @field hl table<string, string>
 --- @field frecency FffFrecencyConfig
 --- @field history FffHistoryConfig
@@ -90,6 +104,7 @@ local M = {}
 --- @field wrap_around boolean
 --- @field file_picker table
 --- @field grep FffGrepConfig
+--- @field suggestions FffSuggestionsConfig
 
 ---@class fff.conf.State
 local state = {
@@ -203,6 +218,33 @@ local function fallback_hl(name)
   return resolved_hl or name[#name]
 end
 
+-- Drops malformed user mappings so a bad entry can't break picker creation
+local function sanitize_mappings(mappings)
+  if type(mappings) ~= 'table' then return {} end
+
+  for mode, maps in pairs(mappings) do
+    if type(mode) ~= 'string' or type(maps) ~= 'table' then
+      vim.notify(
+        ('fff: ignoring mappings[%s], expected a table of keymaps'):format(vim.inspect(mode)),
+        vim.log.levels.WARN
+      )
+      mappings[mode] = nil
+    else
+      for lhs, rhs in pairs(maps) do
+        if type(lhs) ~= 'string' or not vim.tbl_contains({ 'string', 'function' }, type(rhs)) then
+          vim.notify(
+            ('fff: ignoring mappings.%s[%s], rhs must be a string or function'):format(mode, vim.inspect(lhs)),
+            vim.log.levels.WARN
+          )
+          maps[lhs] = nil
+        end
+      end
+    end
+  end
+
+  return mappings
+end
+
 local function init()
   local config = vim.g.fff or {}
   local default_config = {
@@ -225,6 +267,10 @@ local function init()
       prompt_position = 'bottom', -- or 'top'
       preview_position = 'right', -- or 'left', 'right', 'top', 'bottom'
       preview_size = 0.5,
+      -- Border style for the picker windows: 'single', 'double', 'rounded',
+      -- 'solid', 'shadow' or 'none'. Leave unset (nil) to follow the global
+      -- `vim.o.winborder` setting.
+      border = nil,
       flex = { -- set to nil to disable flex layout
         size = 130, -- column threshold: if screen width >= size, use preview_position; otherwise use wrap
         wrap = 'top', -- position to use when screen is narrower than size
@@ -241,6 +287,8 @@ local function init()
       -- 'end': truncates from the end, keeps the start (home/user/projects)
       -- 'start': truncates from the start, keeps the end (.../parts/ai_extracted)
       path_shorten_strategy = 'middle',
+      -- Render results as `path/to/file` instead of `file path/to`
+      show_path_first = false,
     },
     preview = {
       enabled = true,
@@ -271,6 +319,9 @@ local function init()
       toggle_debug = '<F2>',
       -- grep mode: cycle between plain text, regex, and fuzzy search
       cycle_grep_modes = '<S-Tab>',
+      -- grep mode only: insert a literal `\n` to search across lines
+      -- (requires a terminal with extended-key support to distinguish from <CR>)
+      insert_newline_escape = '<C-CR>',
       -- grep mode only: jump cursor to first item of next/prev file group
       grep_jump_to_next_file = { '<C-A-n>', '<A-Down>' },
       grep_jump_to_prev_file = { '<C-A-p>', '<A-Up>' },
@@ -285,6 +336,9 @@ local function init()
       focus_list = '<leader>l',
       focus_preview = '<leader>p',
     },
+    -- extra keymaps for the picker input, keyed by mode, e.g.
+    -- mappings = { i = { ['<A-BS>'] = function() vim.api.nvim_input('<C-w>') end } }
+    mappings = {},
     hl = {
       border = 'FloatBorder',
       normal = 'NormalFloat',
@@ -380,6 +434,13 @@ local function init()
     -- Git integration
     git = {
       status_text_color = false, -- Apply git status colors to filename text (default: false, only sign column)
+      -- Boost files that participated in recent commits of the current branch:
+      -- +1 score point per commit the file appeared in (max = max_commits)
+      recency = {
+        enabled = true,
+        max_commits = 10, -- Analyze the last N branch-specific commits
+        max_files_per_commit = 50, -- Skip bulk commits (merges, refactors) touching more files
+      },
     },
     debug = {
       enabled = false, -- Show file info panel in preview
@@ -409,13 +470,21 @@ local function init()
     -- find_files settings
     file_picker = {
       current_file_label = '(current)',
+      fuzzy_query_highlighting = false,
+    },
+    -- Cross-mode suggestions shown when a query has no results
+    suggestions = {
+      enabled = true,
+      grep_time_budget_ms = 50, -- Hard cap for the grep hint in file mode (it never runs before content indexing finishes)
     },
     -- grep settings
     grep = {
       max_file_size = 10 * 1024 * 1024, -- Skip files larger than 10MB
       max_matches_per_file = 100, -- Maximum matches per file (set 0 to unlimited)
       smart_case = true, -- Case-insensitive unless query has uppercase
+      casing = nil, -- "smart" | "sensitive" | "insensitive"; overrides smart_case when set
       time_budget_ms = 150, -- Max search time in ms per call (prevents UI freeze, 0 = no limit)
+      enforce_time_budget = false, -- Apply time_budget_ms even before anything matched (off = zero-match queries scan everything)
       modes = { 'plain', 'regex', 'fuzzy' }, -- Available grep modes and their cycling order
       trim_whitespace = false, -- Strip leading whitespace from matched lines (useful for cleaner display)
       -- Treat filename-like tokens (e.g. `score.rs`, `src/main.rs`) in a grep query as a
@@ -450,6 +519,8 @@ local function init()
   else
     merged_config.debug.show_file_info = default_sections
   end
+
+  merged_config.mappings = sanitize_mappings(merged_config.mappings)
 
   state.config = merged_config
 end

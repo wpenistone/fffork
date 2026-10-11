@@ -1,6 +1,6 @@
 // ----------------------------------------------------------------------------
 // GENERATED FILE - DO NOT EDIT.
-// Source of truth: packages/shared/fff-api.ts
+// Copied from: packages/shared/fff-api.ts
 // Run make sync-js-api from the repo root to regenerate.
 // ----------------------------------------------------------------------------
 
@@ -49,23 +49,17 @@ export interface InitOptions {
   frecencyDbPath?: string;
   /** Path to query history database (optional, omit to skip query tracker initialization) */
   historyDbPath?: string;
-  /**
-   * @deprecated No-op. The no-lock LMDB flags showed no measurable win under
-   * realistic contention and are now ignored. Kept for source-compat.
-   */
+  /** @deprecated no-op */
   useUnsafeNoLock?: boolean;
   /**
    * Disable mmap cache warmup after the initial scan. When mmap cache is
    * enabled (the default), the first grep search is as fast as subsequent
    * ones at the cost of a longer scan time and higher initial memory usage.
-   * (default: false)
    */
   disableMmapCache?: boolean;
   /**
    * Disable the content index built after the initial scan.
    * Content indexing enables faster content-aware filtering during grep.
-   * When omitted, follows `disableMmapCache` for backward compatibility.
-   * (default: follows `disableMmapCache`)
    */
   disableContentIndexing?: boolean;
   /**
@@ -97,17 +91,15 @@ export interface InitOptions {
   /** Override for the per-file byte cap in the content cache. */
   cacheBudgetMaxFileSize?: number;
   /**
-   * Allow indexing the filesystem root (`/`). Off by default — root is
-   * rarely the intended target and floods the watcher with churn-prone
-   * events. Setting this true is opt-in and the caller is responsible for
-   * the resulting fs-event volume.
-   */
+   * Allow indexing the filesystem root (`/`).
+   * Off by default, having fff instance at the large folder will generally require
+   * file watcher and indexing which will consume a lot of resources if performed uncontrolled
+   **/
   enableFsRootScanning?: boolean;
-  /**
-   * Allow indexing the user's home directory. Same trade-off as
-   * `enableFsRootScanning`.
-   */
+  /** Allow indexing the user's home directory. Same trade-off as `enableFsRootScanning`. */
   enableHomeDirScanning?: boolean;
+  /** Follow symlinks for directories */
+  followSymlinks?: boolean;
 }
 
 /**
@@ -163,6 +155,8 @@ export interface FileItem {
   modificationFrecencyScore: number;
   /** Combined frecency score */
   totalFrecencyScore: number;
+  /** Whether the file was detected as binary (absent on older natives) */
+  isBinary?: boolean;
   /** Git status: 'clean', 'modified', 'untracked', 'staged_new', etc. */
   gitStatus: string;
 }
@@ -187,6 +181,14 @@ export interface Score {
   currentFilePenalty: number;
   /** Boost from query history combo matching */
   comboMatchBoost: number;
+  /** Bonus for query segments aligning with path segments */
+  pathAlignmentBonus: number;
+  /**
+   * Intent-evidence mix (filename/ext/segments/role/proximity).
+   * Reserved: the frozen FffScore ABI has no field for it yet, so FFI
+   * results never populate this; `total` already folds it in.
+   */
+  evidenceBonus?: number;
   /** Whether this was an exact match */
   exactMatch: boolean;
   /** Type of match: 'fuzzy', 'exact', 'prefix', etc. */
@@ -302,8 +304,40 @@ export interface ScanProgress {
 }
 
 /**
- * Database health information
+ * Normalized watch event kind.
+ * A file removed and recreated in one processed batch is marked as modified.
+ *
+ * rescan = internal OS buffers were overloaded, some events might be missing.
+ * The `path` is going to be a folder needs to be rescanned
+ *
+ * renamed = the file was moved to the other path without changing the content
  */
+export type WatchEventKind = "created" | "modified" | "removed" | "rescan" | "renamed";
+
+/** A single filesystem change notification. */
+export interface WatchEvent {
+  /** Absolute path of the affected file (base path to rescan if `kind == rescan`) */
+  path: string;
+  kind: WatchEventKind;
+  /** Absolute path the file moved from. Only set when `kind == "renamed"`. */
+  from?: string;
+}
+
+/** Options for watch subscriptions. */
+export interface WatchOptions {
+  /** Additional glob wildcard patterns to ignore */
+  ignore?: string[];
+}
+
+/**
+ * Receives normalized batches of up to 128 events. Each path appears once.
+ */
+export type WatchBatchCallback = (events: WatchEvent[]) => void;
+
+/** Call me to unsubscribe. */
+export type WatchUnsubscribe = () => void;
+
+/** Database health information */
 export interface DbHealth {
   /** Path to the database */
   path: string;
@@ -412,6 +446,11 @@ export interface GrepOptions {
    * partial results. 0 = unlimited. (default: 0)
    */
   timeBudgetMs?: number;
+  /**
+   * Apply `timeBudgetMs` even before anything matched. Off by default, so a
+   * zero-match query scans every candidate file. (default: false)
+   */
+  enforceTimeBudget?: boolean;
   /** Number of context lines to include before each match (default: 0) */
   beforeContext?: number;
   /** Number of context lines to include after each match (default: 0) */
@@ -518,6 +557,11 @@ export interface MultiGrepOptions {
    * partial results. 0 = unlimited. (default: 0)
    */
   timeBudgetMs?: number;
+  /**
+   * Apply `timeBudgetMs` even before anything matched. Off by default, so a
+   * zero-match query scans every candidate file. (default: false)
+   */
+  enforceTimeBudget?: boolean;
   /** Number of context lines to include before each match (default: 0) */
   beforeContext?: number;
   /** Number of context lines to include after each match (default: 0) */
@@ -611,6 +655,22 @@ export interface FileFinderApi {
 
   /** Get a historical query by offset (0 = most recent). */
   getHistoricalQuery(offset: number): Result<string | null>;
+
+  /**
+   * Subscribe to filesystem changes matching `pattern`.
+   *
+   * Patterns may be base-relative globs (./ works), exact paths inside the indexed
+   * tree, or existing directories. An empty pattern watches the whole tree.
+   *
+   * Events are debounced over a 50-ms window and submitted in batches of at most 128 events.
+   * Gitignored and other ignored files are never triggering watcher.
+   */
+  watch(callback: WatchBatchCallback, options?: WatchOptions): Result<WatchUnsubscribe>;
+  watch(
+    pattern: string,
+    callback: WatchBatchCallback,
+    options?: WatchOptions,
+  ): Result<WatchUnsubscribe>;
 
   /** Health/diagnostics information for this instance. */
   healthCheck(testPath?: string): Result<HealthCheck>;

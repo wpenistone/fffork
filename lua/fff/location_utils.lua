@@ -1,5 +1,9 @@
 local M = {}
 
+-- NOTE: preview highlights must be verified with prompt_position="top" and
+-- "bottom" (reversed layout); keep location_utils_spec covering both.
+local set_cursor_line_mark
+
 --- Jump to a location in the current buffer
 --- @param location table|nil Location data from search results
 function M.jump_to_location(location)
@@ -51,11 +55,12 @@ function M.highlight_location(bufnr, location, namespace)
       local line_content = vim.api.nvim_buf_get_lines(bufnr, target_line - 1, target_line, false)[1] or ''
       local end_col = math.min(target_col + 1, #line_content)
 
+      local line_ok, line_mark_id = set_cursor_line_mark(bufnr, namespace, target_line - 1)
+      if line_ok then table.insert(extmarks, { id = line_mark_id, line = target_line - 1 }) end
+
       local ok, mark_id = pcall(vim.api.nvim_buf_set_extmark, bufnr, namespace, target_line - 1, target_col, {
         end_col = end_col,
         hl_group = 'IncSearch', -- inc search are better visible for a single chars
-        line_hl_group = 'CursorLine',
-        number_hl_group = 'CursorLineNr',
         priority = 1000,
       })
 
@@ -82,11 +87,12 @@ function M.highlight_location(bufnr, location, namespace)
         local line_content = vim.api.nvim_buf_get_lines(bufnr, start_line - 1, start_line, false)[1] or ''
         end_col = math.min(end_col, #line_content)
 
+        local line_ok, line_mark_id = set_cursor_line_mark(bufnr, namespace, start_line - 1)
+        if line_ok then table.insert(extmarks, { id = line_mark_id, line = start_line - 1 }) end
+
         local ok, mark_id = pcall(vim.api.nvim_buf_set_extmark, bufnr, namespace, start_line - 1, start_col, {
           end_col = end_col,
           hl_group = 'IncSearch',
-          line_hl_group = 'CursorLine',
-          number_hl_group = 'CursorLineNr',
           priority = 1000,
         })
 
@@ -139,12 +145,8 @@ function M.highlight_location(bufnr, location, namespace)
   return #extmarks > 0 and extmarks or nil
 end
 
---- Highlight all occurrences of a grep pattern in the preview buffer.
---- For plain text and regex modes: highlights every match on all loaded lines
---- using Lua string.find with the query text.
---- For fuzzy mode: uses the pre-computed match byte offsets from Rust on the
---- target line only, since the fuzzy needle (e.g. "shcema") won't match via
---- literal search against the actual content (e.g. "schema").
+--- Highlight grep matches in the preview buffer.
+--- Plain/regex modes scan text; fuzzy mode uses Rust byte offsets.
 --- @param bufnr number Buffer number
 --- @param location table Location with .grep_query, .line, optional .col, optional .fuzzy_match_ranges
 --- @param namespace number Namespace for extmarks
@@ -154,26 +156,18 @@ function M.highlight_grep_matches(bufnr, location, namespace)
 
   local line_count = vim.api.nvim_buf_line_count(bufnr)
   local extmarks = {}
+  local grep_hl = require('fff.conf').get().hl.grep_match or 'IncSearch'
 
-  -- Pin CursorLine + CursorLineNr to the target match line via extmark, so
-  -- the highlight stays anchored when the user pages the preview viewport
-  -- with <C-d>/<C-u>. The cursor itself moves with paging, but the match
-  -- line stays styled until it scrolls out of view.
+  -- Pin CursorLine to the match line so it stays styled while paging
+  -- the preview viewport with <C-d>/<C-u>.
   if location.line then
     local target_line = math.max(1, math.min(location.line, line_count))
-    local ok, mark_id = pcall(vim.api.nvim_buf_set_extmark, bufnr, namespace, target_line - 1, 0, {
-      line_hl_group = 'CursorLine',
-      number_hl_group = 'CursorLineNr',
-      priority = 999,
-    })
+    local ok, mark_id = set_cursor_line_mark(bufnr, namespace, target_line - 1)
     if ok then table.insert(extmarks, { id = mark_id, line = target_line - 1 }) end
   end
 
-  -- Fuzzy mode: use pre-computed byte offsets from Rust's match_indices.
-  -- These are the exact matched character positions within the line, already
-  -- computed by the SIMD scoring + reference smith-waterman traceback.
-  -- We only highlight the target line since each fuzzy result has its own
-  -- unique set of matched positions.
+  -- Fuzzy mode: highlight the target line from Rust byte offsets only;
+  -- the fuzzy needle never matches the literal line text.
   if location.fuzzy_match_ranges and location.line then
     local target_line = math.max(1, math.min(location.line, line_count))
     for _, range in ipairs(location.fuzzy_match_ranges) do
@@ -181,7 +175,7 @@ function M.highlight_grep_matches(bufnr, location, namespace)
       local end_byte = range[2] -- 0-based exclusive end
       local ok, mark_id = pcall(vim.api.nvim_buf_set_extmark, bufnr, namespace, target_line - 1, start_byte, {
         end_col = end_byte,
-        hl_group = 'IncSearch',
+        hl_group = grep_hl,
         priority = 1000,
       })
       if ok then table.insert(extmarks, { id = mark_id, line = target_line - 1 }) end
@@ -192,9 +186,7 @@ function M.highlight_grep_matches(bufnr, location, namespace)
 
   local query = location.grep_query
 
-  -- Use the Rust GrepConfig parser as the single source of truth for
-  -- stripping constraint tokens. This avoids duplicating constraint
-  -- detection in Lua, which would break whenever a new token type is added.
+  -- Rust GrepConfig parser strips constraint tokens (single source of truth).
   local fuzzy = require('fff.fuzzy')
   local parsed = fuzzy.parse_grep_query(query)
   local search_text = parsed.grep_text
@@ -204,7 +196,6 @@ function M.highlight_grep_matches(bufnr, location, namespace)
 
   -- Build case-insensitive pattern if the query has no uppercase (smart case)
   local has_upper = search_text:match('[A-Z]')
-  local escaped = vim.pesc(search_text)
 
   -- Highlight pattern occurrences in a window around the target line.
   -- Limit to ±200 lines from target to keep it fast for large files.
@@ -218,7 +209,7 @@ function M.highlight_grep_matches(bufnr, location, namespace)
   for idx, line in ipairs(lines) do
     local i = scan_start + idx - 1
     local search_line = has_upper and line or line:lower()
-    local search_pat = has_upper and escaped or escaped:lower()
+    local search_pat = has_upper and search_text or search_text:lower()
     local start_pos = 1
     while true do
       local s, e = search_line:find(search_pat, start_pos, true)
@@ -226,7 +217,7 @@ function M.highlight_grep_matches(bufnr, location, namespace)
       -- s and e are 1-based byte positions; extmarks need 0-based
       local ok, mark_id = pcall(vim.api.nvim_buf_set_extmark, bufnr, namespace, i - 1, s - 1, {
         end_col = e,
-        hl_group = 'IncSearch',
+        hl_group = grep_hl,
         priority = 1000,
       })
       if ok then table.insert(extmarks, { id = mark_id, line = i - 1 }) end
@@ -303,6 +294,23 @@ function M.format_location(location)
   end
 
   return ''
+end
+
+--- Pin a row with a full-width CursorLine range, above syntax but below matches
+--- (`line_hl_group` bg would override every `hl_group` bg regardless of priority)
+--- @param bufnr number Buffer number
+--- @param namespace number Namespace for extmarks
+--- @param row number 0-based row to highlight
+--- @return boolean ok, number|string mark_id_or_err pcall result of nvim_buf_set_extmark
+set_cursor_line_mark = function(bufnr, namespace, row)
+  return pcall(vim.api.nvim_buf_set_extmark, bufnr, namespace, row, 0, {
+    end_row = row + 1,
+    end_col = 0,
+    hl_eol = true,
+    hl_group = 'CursorLine',
+    number_hl_group = 'CursorLineNr',
+    priority = 999,
+  })
 end
 
 return M
