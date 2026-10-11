@@ -703,11 +703,7 @@ fn match_fuzzy_parts(
                 }
             } else {
                 use rayon::prelude::*;
-                // Size chunks so each pool worker gets one; small inputs
-                // stay serial. Partitioning does not affect output.
-                let workers = crate::parallelism::effective_core_count().max(1);
-                let adaptive = matches.len().div_ceil(workers).max(4096);
-                matches.par_chunks_mut(adaptive).for_each(sw_body);
+                matches.par_chunks_mut(CHUNK).for_each(sw_body);
             }
 
             let sw_us = t_sw.elapsed().as_micros();
