@@ -103,73 +103,34 @@ fn match_fuzzy_parts(
         // length+presence. Only worth the extra scan when the needle can
         // actually reject (longer / typed letters). Common short queries
         // match almost everything Ã¢â‚¬â€ skip so we don't scan twice.
-        // Adaptive candidate prefilter: probe a dispatch-sized sample
-        // (cost ~= one fork/join), time presence and gate on it, and fire
-        // the full parallel scan only when measured reject savings beat
-        // the scan. Short/common needles probe at ~100% pass and skip by
-        // measurement; small inputs skip (no parallel scan amortizes).
-        let gate_typos = first_options.max_typos.unwrap_or(u16::MAX);
-        let gate_state = crate::gate::GateNeedle::new(first_part.as_bytes(), gate_typos);
         let mut cand: Vec<u32> = Vec::new();
         let t_cand = std::time::Instant::now();
-        let n_files = working_files.len();
-        let avg_bytes = max_path_len.max(1);
-        let big_enough =
-            crate::dispatch::plan_files(n_files, avg_bytes, usize::MAX).threads > 1;
-        if big_enough && n_files > 0 {
-            let n_probe = crate::dispatch::probe_len(n_files, avg_bytes);
-            let stride = (n_files / n_probe).max(1);
-            let needle_b = first_part.as_bytes();
-            let min_len = np.min_path_len();
-            let t_probe = std::time::Instant::now();
+        let try_cand = first_part.len() >= 6 && working_files.len() >= 8_192;
+        if try_cand {
+            // Probe presence selectivity on a small sample first. A full
+            // 227k scan is wasted when the needle is too common to reject.
+            let n_probe = working_files.len().min(4_096);
+            let stride = (working_files.len() / n_probe).max(1);
             let mut pass = 0usize;
             let mut probed = 0usize;
-            // Passing probe indices for gate timing below (bounded: the
-            // probe itself must stay near one fork/join of cost).
-            let mut pass_idx: SmallVec<[u32; 32]> = SmallVec::new();
-            for i in (0..n_files).step_by(stride) {
+            let needle_b = first_part.as_bytes();
+            for i in (0..working_files.len()).step_by(stride) {
                 let f = working_files.index(i);
-                if (f.path.byte_len as usize) >= min_len {
-                    let mask = f.presence_mask();
-                    if mask == 0 || np.allows(mask, needle_b) {
-                        pass += 1;
-                        if pass_idx.len() < 32 {
-                            pass_idx.push(i as u32);
-                        }
-                    }
-                }
+                let mask = f.presence_mask();
+                let ok = (f.path.byte_len as usize) >= np.min_path_len()
+                    && (mask == 0 || np.allows(mask, needle_b));
+                pass += ok as usize;
                 probed += 1;
                 if probed >= n_probe {
                     break;
                 }
             }
-            let presence_ns =
-                t_probe.elapsed().as_nanos() as f64 / probed.max(1) as f64;
-            // Time the gate on passing probe files for the savings leg.
-            let mut gate_ns = 0.0f64;
-            if !pass_idx.is_empty() {
-                let t_gate = std::time::Instant::now();
-                for &pi in pass_idx.iter() {
-                    let f = working_files.index(pi as usize);
-                    std::hint::black_box(gate_state.hit_file(f, arena));
-                }
-                gate_ns = t_gate.elapsed().as_nanos() as f64 / pass_idx.len() as f64;
-            }
-            let rate = pass as f64 / probed.max(1) as f64;
-            // Serial-view break-even: rejects x gate cost vs full presence
-            // scan + in-group rechecks + dispatch. Empty probe passes mean
-            // groups all-reject cheaply on their own; a scan proving that
-            // would cost more than it saves.
-            let fire = pass > 0
-                && rate < 1.0
-                && (n_files as f64 * (1.0 - rate) * gate_ns
-                    > n_files as f64 * presence_ns
-                        + crate::dispatch::fork_join_ns() as f64
-                        + n_files as f64 * rate * presence_ns);
-            if fire {
+            // Need the probe to eliminate at least half the corpus.
+            if probed > 0 && pass * 2 <= probed {
                 use rayon::prelude::*;
+                let min_len = np.min_path_len();
                 cand = crate::parallelism::run_on_bg_pool(|| {
-                    (0..n_files)
+                    (0..working_files.len())
                         .into_par_iter()
                         .filter_map(|i| {
                             let f = working_files.index(i);
@@ -187,12 +148,15 @@ fn match_fuzzy_parts(
             }
         }
         let cand_ms = t_cand.elapsed().as_secs_f64() * 1e3;
-        // Dense re-index only helps when something was rejected;
-        // a full pass set would add indirection for no savings.
-        let use_cand = !cand.is_empty() && cand.len() < n_files;
-        // TISG gate match-set + window without frizbee. `gate_n` is the
-        // gate's index space (candidates when the prefilter fired).
-        let gate_n = if use_cand { cand.len() } else { n_files };
+        let use_cand = try_cand && cand.len() * 2 < working_files.len() && !cand.is_empty();
+        // TISG gate (span + skip-DP) Ã¢â‚¬â€ match-set + window without frizbee.
+        // Emits the same skip_sw Match encoding the pipeline already decodes.
+        // Shared per-query gate state for the fused group pass below.
+        // `gate_n` is the gate's index space (candidates when the
+        // prefilter fired); groups partition it in file order.
+        let gate_n = if use_cand { cand.len() } else { working_files.len() };
+        let gate_typos = first_options.max_typos.unwrap_or(u16::MAX);
+        let gate_state = crate::gate::GateNeedle::new(first_part.as_bytes(), gate_typos);
         let check_presence = np.should_check();
         let t_gate_us = std::sync::atomic::AtomicU64::new(0);
         let t_exact_us = std::sync::atomic::AtomicU64::new(0);
@@ -240,9 +204,10 @@ fn match_fuzzy_parts(
         // match count is known.)
         let t_sw = std::time::Instant::now();
         {
-            // Chunked scoring: metadata working set sized from the
-            // private L2 so TLS scratch stays resident (vs a full
-            // 227k-wide set of faults/RSS). See `sw_metadata_chunk`.
+            // Chunked scoring: process at most CHUNK matches of metadata at a
+            // time so peak working set stays small (faults/RSS).
+            // 32k Ãƒâ€” ~16 B Ãƒâ€” a few arrays Ã¢â€°Ë† 1 MB peak, vs a full 227k-wide set.
+            const CHUNK: usize = 32 * 1024;
             thread_local! {
                 static TRIMS: std::cell::RefCell<Vec<crate::matcher::Trim>> =
                     const { std::cell::RefCell::new(Vec::new()) };
@@ -256,10 +221,9 @@ fn match_fuzzy_parts(
                 *b = v;
                 // Cap retained capacity so one huge match set does not pin TLS
                 // forever, but keep a full chunk warm (avoids re-alloc/re-fault).
-                // Hysteresis is one extra SIMD batch past the chunk.
-                let retain = crate::dispatch::sw_metadata_chunk() + 64;
-                if b.capacity() > retain {
-                    b.shrink_to(retain);
+                const TLS_RETAIN: usize = CHUNK + 1024;
+                if b.capacity() > TLS_RETAIN {
+                    b.shrink_to(TLS_RETAIN);
                 }
             }
 
@@ -631,16 +595,9 @@ fn match_fuzzy_parts(
                         }
                         STAGE.with(|c| *c.borrow_mut() = stage);
                     };
-                    // Fan out only past Amdahl break-even at measured
-                    // dispatch cost; inside pool workers the guard below
-                    // degrades to serial (no nested storm).
-                    let n_batches = order.len().div_ceil(batch_sz);
-                    let batch_est =
-                        crate::dispatch::sw_batch_ns(batch_sz, needle.len(), needle.len());
-                    let bg_width = crate::parallelism::BACKGROUND_THREAD_POOL
-                        .current_num_threads()
-                        .max(1);
-                    if !crate::dispatch::parallel_batches(n_batches, batch_est, bg_width) {
+                    // Fewer than 4 batches cannot amortize a fork/join; run them
+                    // inline instead of fanning out through the pool.
+                    if order.len() < 4 * batch_sz {
                         for ((ord, sc_out), ec_out) in order
                             .chunks(batch_sz)
                             .zip(ps_aligned.chunks_mut(batch_sz))
@@ -720,23 +677,17 @@ fn match_fuzzy_parts(
             // Fused groups: gate, exact, and SW per file chunk while the
             // chunk's bytes are hot. Concatenated in file order; outputs
             // are per-index, so the size cannot change results.
-            // Test-tunable (`FFF_SW_CHUNK`); production plans from the
-            // same work model as the thread estimator, capped at pool
-            // width: the gate is latency-bound (SMT siblings add MLP),
-            // so width here buys wall even past the LLC-bound scan cap.
-            // Small index spaces still serialize via the amortize rule.
-            // Same outputs for any chunk size.
-            let per_file = crate::dispatch::match_bytes_per_file(
-                first_part.len(),
-                max_path_len,
-                first_options.max_typos,
-            );
-            let pool = crate::parallelism::effective_core_count().max(1);
+            // Test-tunable (`FFF_SW_CHUNK`); production sizes chunks so
+            // each pool worker gets one: candidate/file density varies per
+            // chunk, and coarse fixed chunks strand stragglers (measured
+            // +73% wall on selective queries). Floor keeps tiny inputs
+            // serial and per-chunk fixed costs negligible.
+            let workers = crate::parallelism::effective_core_count().max(1);
             let file_chunk: usize = std::env::var("FFF_SW_CHUNK")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|&n| n >= 1)
-                .unwrap_or(crate::dispatch::plan_files(gate_n, per_file, pool).chunk);
+                .unwrap_or((gate_n.div_ceil(workers)).max(1024));
             let n_groups = gate_n.div_ceil(file_chunk);
             let one_group = |g: usize| {
                 let lo = g * file_chunk;
@@ -862,15 +813,19 @@ fn match_fuzzy_parts(
 
         // Match only the files that survived the previous round, addressed
         // through the previous matches without collecting a subset.
-        // Serial cutoff lives in the estimator (amortize rule), not here.
         let survivors = &matches;
-        let sub_threads = effective_match_threads(
-            survivors.len(),
-            part.len(),
-            max_path_len,
-            part_options.max_typos,
-            scan_cap.max(max_threads),
-        );
+        let sub_threads = if survivors.len() < 1024 {
+            1
+        } else {
+            let max_path = max_path_len;
+            effective_match_threads(
+                survivors.len(),
+                part.len(),
+                max_path,
+                part_options.max_typos,
+                scan_cap.max(max_threads),
+            )
+        };
         let sub_np = crate::presence::NeedlePresence::new(
             part.as_bytes(),
             part_options.max_typos.unwrap_or(u16::MAX),
@@ -1196,17 +1151,14 @@ fn match_fuzzy_parts_dirs(
         return vec![];
     }
 
-    let scan_cap = crate::machine::scan_thread_cap();
-    // Dir haystack bound sampled, not estimated: dirs are few.
-    let max_dir_len = working_dirs
-        .iter()
-        .map(|d| d.path.byte_len as usize)
-        .max()
-        .unwrap_or(0);
+    let scan_cap = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .min(8);
     let dir_threads = effective_match_threads(
         working_dirs.len(),
         valid_parts[0].len(),
-        max_dir_len,
+        256,
         options.max_typos,
         scan_cap.max(max_threads),
     );
@@ -1232,13 +1184,11 @@ fn match_fuzzy_parts_dirs(
 
         // Match only the dirs that survived the previous round, addressed
         // through the previous matches without collecting a subset.
-        // Bound by the corpus max (O(1)): over-estimate saturates the
-        // cap, never under-provisions.
         let survivors = &matches;
         let sub_dir_threads = effective_match_threads(
             survivors.len(),
             part.len(),
-            max_dir_len,
+            256,
             part_options.max_typos,
             scan_cap.max(max_threads),
         );
@@ -1731,6 +1681,10 @@ fn match_and_score_in_arena<'a>(
     // (filename + evidence + path alignment) without displacing a genuinely
     // better first-party match (see VENDORED_PATH_PENALTY).
 
+    // Rayon dispatch + per-worker 4KB scratch costs more than scoring itself
+    // below a few thousand matches (file_picker_-class queries). Short
+    // high-match queries still fan out so the 200k-match path keeps its win.
+    const PARALLEL_SCORE_MIN: usize = 4096;
     // Third buffer is the filename scratch. It has to be separate from
     // `path_buf`: on the common path (`need_rel == false`) the filename is
     // materialised here while `path_buf` stays free for a later relative-path
@@ -2018,23 +1972,10 @@ fn match_and_score_in_arena<'a>(
             usize::MAX / 4
         })
         .saturating_add(1);
-    // Heap algorithm chosen on work alone (page-bounded: O(n log k) vs
-    // O(n log n)); serial vs parallel comes from the dispatch plan below.
-    let use_topk = page_cap < path_matches.len();
-    // Per-match cost is the path bytes each item materializes plus the
-    // score struct; `max_threads == 1` forces serial, else pool width.
-    let score_bytes =
-        crate::dispatch::sampled_path_avg(&working_files) + std::mem::size_of::<Score>();
-    let bg_width = crate::parallelism::BACKGROUND_THREAD_POOL
-        .current_num_threads()
-        .max(1);
-    let score_cap = if context.max_threads == 1 {
-        1
-    } else {
-        bg_width
-    };
-    let score_plan =
-        crate::dispatch::plan_matches(path_matches.len(), score_bytes, score_cap);
+    // Top-k only pays for itself when the match set is large. Threading
+    // is decided at each dispatch site (serial for max_threads == 1);
+    // the heap algorithm wins on work alone for page-bounded queries.
+    let use_topk = page_cap < path_matches.len() && path_matches.len() > 256;
     let t_score = std::time::Instant::now();
     let score_entrance_count = path_matches.len();
 
@@ -2071,7 +2012,7 @@ fn match_and_score_in_arena<'a>(
                 heap.push(Reverse(entry));
             }
         };
-        if score_plan.threads < 2 {
+        if path_matches.len() < PARALLEL_SCORE_MIN || context.max_threads == 1 {
             let mut scratch = make_scratch();
             for (match_idx, path_match) in path_matches.iter().enumerate() {
                 if !no_prune && heap.len() >= page_cap {
@@ -2102,16 +2043,16 @@ fn match_and_score_in_arena<'a>(
             // fold accumulator (4 KB Ãƒâ€” rayon tree overflowed the worker stack).
             let (par_heap, par_skipped) = crate::parallelism::run_on_bg_pool(|| {
                 use rayon::prelude::*;
-                let chunk = score_plan.chunk.max(1);
+                const SCORE_CHUNK: usize = 8192;
                 let n = path_matches.len();
-                let n_chunks = n.div_ceil(chunk);
+                let n_chunks = n.div_ceil(SCORE_CHUNK);
                 (0..n_chunks)
                     .into_par_iter()
                     .map_init(make_scratch, |scratch, chunk_idx| {
                         let mut h: Heap<'_> = Heap::new();
                         let mut skipped = 0u64;
-                        let lo = chunk_idx * chunk;
-                        let hi = (lo + chunk).min(n);
+                        let lo = chunk_idx * SCORE_CHUNK;
+                        let hi = (lo + SCORE_CHUNK).min(n);
                         for match_idx in lo..hi {
                             let path_match = &path_matches[match_idx];
                             if !no_prune && h.len() >= page_cap {
@@ -2179,7 +2120,7 @@ fn match_and_score_in_arena<'a>(
         return (results, path_matches.len());
     }
 
-    let results: Vec<_> = if score_plan.threads < 2 {
+    let results: Vec<_> = if path_matches.len() < PARALLEL_SCORE_MIN || context.max_threads == 1 {
         let mut scratch = make_scratch();
         path_matches
             .iter()
@@ -2453,24 +2394,13 @@ fn score_filtered_by_frecency<'a>(
             usize::MAX / 4
         })
         .saturating_add(1);
-    let use_topk = page_cap < files.len();
+    let use_topk = page_cap < files.len() && files.len() > 256;
     let no_prune = std::env::var_os("FFF_NO_PRUNE").is_some();
-    // Dispatch plan shared by both frecency loops below: sampled path
-    // bytes plus the score struct per item.
-    let fre_bytes =
-        crate::dispatch::sampled_path_avg(files) + std::mem::size_of::<Score>();
-    let fre_cap = if context.max_threads == 1 {
-        1
-    } else {
-        crate::parallelism::BACKGROUND_THREAD_POOL
-            .current_num_threads()
-            .max(1)
-    };
-    let fre_plan = crate::dispatch::plan_matches(files.len(), fre_bytes, fre_cap);
 
     if !use_topk {
         let scored: Vec<(&'a FileItem, Score)> = match files {
-            FileItems::All(s) if fre_plan.threads >= 2 => s
+            // Below 32768 Rayon scheduling costs more than this pass.
+            FileItems::All(s) if s.len() >= 32_768 && context.max_threads > 1 => s
                 .par_iter()
                 .filter_map(|f| {
                     let live = !f.is_deleted();
@@ -2540,7 +2470,8 @@ fn score_filtered_by_frecency<'a>(
     let FileItems::All(s) = files else {
         unreachable!("Filtered handled above")
     };
-    if fre_plan.threads < 2 {
+    // Below 32768 Rayon scheduling costs more than this pass.
+    if s.len() < 32_768 || context.max_threads == 1 {
         let mut heap: Heap<'_> = Heap::new();
         let mut total = 0usize;
         for f in s.iter() {
@@ -2563,9 +2494,9 @@ fn score_filtered_by_frecency<'a>(
         );
     }
 
-    let chunk = fre_plan.chunk.max(1);
+    const FRE_CHUNK: usize = 8192;
     let n = s.len();
-    let n_chunks = n.div_ceil(chunk);
+    let n_chunks = n.div_ceil(FRE_CHUNK);
     let (heap, total) = crate::parallelism::run_on_bg_pool(|| {
         use rayon::prelude::*;
         (0..n_chunks)
@@ -2573,8 +2504,8 @@ fn score_filtered_by_frecency<'a>(
             .map(|chunk_idx| {
                 let mut h: Heap<'_> = Heap::new();
                 let mut t = 0usize;
-                let hi = ((chunk_idx + 1) * chunk).min(n);
-                for f in &s[chunk_idx * chunk..hi] {
+                let hi = ((chunk_idx + 1) * FRE_CHUNK).min(n);
+                for f in &s[chunk_idx * FRE_CHUNK..hi] {
                     if f.is_deleted() {
                         continue;
                     }
