@@ -167,19 +167,17 @@ fn is_subseq_fold(needle: &[u8], hay: &[u8]) -> bool {
     true
 }
 
-/// Bit i set when `chunk[i]` folds to a needle byte. The arena stores paths in
-/// 16-byte chunks, so one SSE2 register covers exactly one chunk and SSE2 is
-/// baseline on x86_64 (no runtime dispatch). Short tails and non-x86 use the
-/// 256-bit span test, which is O(1) like the vector path.
+/// Bit i set when `chunk[i]` folds to a needle byte. Nibble lookup
+/// tables cover all 256 byte values in constant ops per 16 bytes,
+/// independent of distinct-needle count (SSSE3; scalar span test on
+/// tails, non-x86, or no-SSSE3). Same bits as the scalar path.
 #[inline]
-fn needle_byte_mask(chunk: &[u8], distinct: &[u8], span: &NeedleMask) -> u16 {
+fn needle_byte_mask(chunk: &[u8], span: &NeedleMask, tables: &SpanTables) -> u16 {
     #[cfg(target_arch = "x86_64")]
     {
-        // One vector compare per distinct byte; past 8 the scalar span
-        // test is cheaper than the compare+or chain. Same bits either way.
-        if chunk.len() == 16 && !distinct.is_empty() && distinct.len() <= 8 {
-            // SAFETY: SSE2 is baseline on x86_64; `chunk` is exactly 16 bytes.
-            return unsafe { needle_byte_mask_sse2(chunk, distinct) };
+        if chunk.len() == 16 && tables.simd {
+            // SAFETY: SSSE3 verified in `GateNeedle::new`; 16 exact bytes.
+            return unsafe { needle_byte_mask_shuf(chunk, &tables.lo, &tables.hi) };
         }
     }
     let mut m = 0u16;
@@ -191,21 +189,65 @@ fn needle_byte_mask(chunk: &[u8], distinct: &[u8], span: &NeedleMask) -> u16 {
     m
 }
 
+/// 16 parallel set-membership tests: `lo`/`hi` hold the span's high-nibble
+/// rows, `B0T`/`B1T` select the tested half without a blend (SSE4.1).
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
-unsafe fn needle_byte_mask_sse2(chunk: &[u8], distinct: &[u8]) -> u16 {
+#[target_feature(enable = "ssse3")]
+unsafe fn needle_byte_mask_shuf(chunk: &[u8], t0: &[u8; 16], t1: &[u8; 16]) -> u16 {
     use core::arch::x86_64::*;
     let v = _mm_loadu_si128(chunk.as_ptr() as *const __m128i);
-    // Branchless ASCII fold: add 32 where the byte is in 'A'..='Z'.
-    let upper = _mm_cmpgt_epi8(v, _mm_set1_epi8(b'A' as i8 - 1));
-    let below_z = _mm_cmpgt_epi8(_mm_set1_epi8(b'Z' as i8 + 1), v);
-    let is_upper = _mm_and_si128(upper, below_z);
-    let folded = _mm_add_epi8(v, _mm_and_si128(is_upper, _mm_set1_epi8(32)));
-    let mut acc = _mm_setzero_si128();
-    for &c in distinct {
-        acc = _mm_or_si128(acc, _mm_cmpeq_epi8(folded, _mm_set1_epi8(c as i8)));
+    let lo = _mm_and_si128(v, _mm_set1_epi8(0x0F));
+    let hi = _mm_and_si128(_mm_srli_epi16(v, 4), _mm_set1_epi8(0x0F));
+    let a0 = _mm_shuffle_epi8(_mm_loadu_si128(t0.as_ptr() as *const __m128i), lo);
+    let a1 = _mm_shuffle_epi8(_mm_loadu_si128(t1.as_ptr() as *const __m128i), lo);
+    let b0 = _mm_shuffle_epi8(
+        _mm_set_epi8(0, 0, 0, 0, 0, 0, 0, 0, -128, 64, 32, 16, 8, 4, 2, 1),
+        hi,
+    );
+    let b1 = _mm_shuffle_epi8(
+        _mm_set_epi8(-128, 64, 32, 16, 8, 4, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0),
+        hi,
+    );
+    let r = _mm_or_si128(_mm_and_si128(a0, b0), _mm_and_si128(a1, b1));
+    let nz = _mm_cmpeq_epi8(r, _mm_setzero_si128());
+    ((!_mm_movemask_epi8(nz)) as u16) & 0xFFFF
+}
+
+/// Per-query nibble tables for `needle_byte_mask_shuf`: `lo[l]`/`hi[l]`
+/// hold the span's high-nibble rows for low nibble `l`.
+struct SpanTables {
+    lo: [u8; 16],
+    hi: [u8; 16],
+    simd: bool,
+}
+
+impl SpanTables {
+    fn new(span: &NeedleMask) -> Self {
+        let mut lo = [0u8; 16];
+        let mut hi = [0u8; 16];
+        for l in 0..16usize {
+            let mut row = 0u16;
+            for h in 0..16u8 {
+                if span.contains(h << 4 | l as u8) {
+                    row |= 1 << h;
+                }
+            }
+            lo[l] = row as u8;
+            hi[l] = (row >> 8) as u8;
+        }
+        #[cfg(target_arch = "x86_64")]
+        let simd = std::is_x86_feature_detected!("ssse3") && !force_scalar();
+        #[cfg(not(target_arch = "x86_64"))]
+        let simd = false;
+        Self { lo, hi, simd }
     }
-    _mm_movemask_epi8(acc) as u16
+}
+
+/// `FFF_FORCE_SCALAR=1` disables all runtime SIMD dispatch so scalar
+/// fallbacks stay covered (same hatch as the SW kernels).
+fn force_scalar() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("FFF_FORCE_SCALAR").is_some())
 }
 
 /// Per-query gate state: span mask + bit-parallel LCS position masks.
@@ -219,8 +261,8 @@ pub struct GateNeedle {
     span: NeedleMask,
     /// `pm[c]` = bitmask of needle positions holding folded byte `c`.
     pm: Box<[u64; 256]>,
-    /// Distinct folded needle bytes, for the vectorized membership test.
-    distinct: Box<[u8]>,
+    /// Nibble membership tables for the vectorized span test.
+    tables: SpanTables,
     len_mask: u64,
 }
 
@@ -229,24 +271,19 @@ impl GateNeedle {
         let typos = (max_typos as usize).min(MAX_SKIPS);
         let m = needle.len();
         let mut pm = Box::new([0u64; 256]);
-        let mut seen = [false; 256];
-        let mut distinct = Vec::with_capacity(m.min(16));
         for (i, &b) in needle.iter().enumerate().take(64) {
-            let f = fold_byte(b);
-            pm[f as usize] |= 1u64 << i;
-            if !seen[f as usize] {
-                seen[f as usize] = true;
-                distinct.push(f);
-            }
+            pm[fold_byte(b) as usize] |= 1u64 << i;
         }
+        let span = NeedleMask::new(needle);
+        let tables = SpanTables::new(&span);
         Self {
-            span: NeedleMask::new(needle),
+            span,
+            tables,
             len_mask: if m >= 64 { u64::MAX } else { (1u64 << m) - 1 },
             needle: needle.to_vec().into_boxed_slice(),
             typos,
             need: m.saturating_sub(typos),
             pm,
-            distinct: distinct.into_boxed_slice(),
         }
     }
 
@@ -323,10 +360,12 @@ impl GateNeedle {
                     include_prefix: true,
                 });
             }
-            let distinct = &*self.distinct;
-            // Span counting only: per-hit DP state is redundant here. LCS
-            // over the full path equals LCS over the span slice (affixes
-            // hold no needle bytes), and `decide` below runs that DP once.
+            let tables = &self.tables;
+            let pm = &*self.pm;
+            // Single adjudicating walk: per-hit Myers state is exact (skipped
+            // non-needle bytes are identity updates), so no second DP and no
+            // staging. Extremes come from the mask bits, not a per-hit loop.
+            let mut s = 0u64;
             let mut first = usize::MAX;
             let mut last = 0usize;
             let mut n = 0usize;
@@ -335,46 +374,34 @@ impl GateNeedle {
                 let end = (off + chunk.len()).min(byte_len);
                 let len = end - off;
                 let view = &chunk[..len];
-                // One vector op per 16 bytes; popcount replaces the per-hit
-                // scalar walk (first/last need only the extreme set bits).
+                // One vector op per 16 bytes finds every needle-byte position;
+                // the Myers update stays serial but only runs on those.
                 let mut base = 0usize;
                 while base < len {
                     let step = 16.min(len - base);
-                    let mask = needle_byte_mask(&view[base..base + step], distinct, &self.span);
+                    let mask = needle_byte_mask(&view[base..base + step], &self.span, tables);
                     let c = mask.count_ones() as usize;
                     if c != 0 {
                         if n == 0 {
                             first = off + base + mask.trailing_zeros() as usize;
                         }
                         last = off + base + (16 - mask.leading_zeros() as usize - 1);
+                        // Myers bit-parallel LCS over hit bytes only; bytes
+                        // outside the needle alphabet are identity updates.
+                        let mut bits = mask;
+                        while bits != 0 {
+                            let bit = bits.trailing_zeros() as usize;
+                            bits &= bits - 1;
+                            let x = s | pm[fold_byte(view[base + bit]) as usize];
+                            let y = (s << 1) | 1;
+                            s = x & (x ^ x.wrapping_sub(y));
+                        }
                         n += c;
                     }
                     base += step;
                 }
             });
-            // Fewer hits than the typo budget needs cannot match; the rest
-            // are adjudicated on the staged span slice, exactly like the
-            // staged `hit` path (same span, same decide).
-            if n < self.need {
-                return None;
-            }
-            let hi = (last + 1).min(byte_len);
-            thread_local! {
-                static SPAN: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
-            }
-            let mut span = SPAN.with(|c| {
-                let mut b = c.borrow_mut();
-                let len = hi - first;
-                if b.len() < len {
-                    b.resize(len, 0);
-                }
-                std::mem::take(&mut *b)
-            });
-            file.path
-                .copy_window_to(arena, first as u32, hi as u32, &mut span[..hi - first]);
-            let ok = self.decide(&span[..hi - first]);
-            SPAN.with(|c| *c.borrow_mut() = span);
-            if !ok {
+            if (s & self.len_mask).count_ones() < self.need as u32 {
                 return None;
             }
             return Some(GateHit {
@@ -646,8 +673,8 @@ mod tests {
 
     #[test]
     fn streamed_and_staged_agree_with_many_distinct_bytes() {
-        // Needles with >8 distinct bytes take the scalar span path in
-        // `hit_file` while `hit` stages flat; windows must still agree.
+        // Membership is a nibble-table lookup either way; windows must
+        // agree for many-distinct needles too.
         use crate::simd_path::build_chunked_path_store_from_strings;
         let needles: &[&[u8]] = &[
             b"abcdefghijklmnop",
