@@ -587,7 +587,11 @@ fn editing_an_indexed_file_is_never_mistaken_for_a_rename() {
         .modified()
         .unwrap();
     std::fs::remove_file(f.path("src/gone.rs")).unwrap();
-    std::fs::File::open(f.path("src/keep.rs"))
+    // Write access: SetFileTime needs more than a read-only handle
+    // on Windows.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(f.path("src/keep.rs"))
         .unwrap()
         .set_modified(mtime)
         .unwrap();

@@ -265,13 +265,26 @@ impl FrecencyTracker {
     fn path_to_hash_bytes(path: &Path) -> Result<[u8; 32]> {
         // On Windows, resolve to the canonical form (short-name/case/symlink)
         // so the same file always hashes to one key regardless of how the
-        // caller spelled it. Falls back to the raw path when the file no
-        // longer exists (e.g. watcher delete events), so the op is never
-        // dropped. No-op on other platforms.
+        // caller spelled it. A missing file (renamed/deleted before the hash
+        // runs) cannot canonicalize directly, but its parent still resolves;
+        // join the leaf back on so the key matches the one recorded while
+        // the file existed. Raw path is the last resort. No-op elsewhere.
         #[cfg(windows)]
-        let canonical: Option<std::path::PathBuf> = crate::path_utils::canonicalize(path).ok();
+        let owned: Option<std::path::PathBuf>;
         #[cfg(windows)]
-        let path: &Path = canonical.as_deref().unwrap_or(path);
+        {
+            owned = crate::path_utils::canonicalize(path).ok().or_else(|| {
+                path.parent().and_then(|parent| {
+                    crate::path_utils::canonicalize(parent)
+                        .ok()
+                        .and_then(|c| {
+                            path.file_name().map(|leaf| c.join(leaf))
+                        })
+                })
+            });
+        }
+        #[cfg(windows)]
+        let path: &Path = owned.as_deref().unwrap_or(path);
 
         Self::path_hash_raw(path)
     }
@@ -660,18 +673,24 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let tracker = FrecencyTracker::open(&dir).unwrap();
 
-        let a = Path::new("/tmp/fff_batch_a.rs");
-        let b = Path::new("/tmp/fff_batch_b.rs");
+        // Real files under a canonicalized dir: raw and canonicalized
+        // spellings coincide, so both hash spellings must agree. (Fake
+        // nonexistent paths exercise fallback branches, not this invariant.)
+        let base = crate::path_utils::canonicalize(&dir).unwrap();
+        let a = base.join("a.rs");
+        let b = base.join("b.rs");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
         let now = tracker.get_now();
-        tracker.track_access(a).unwrap();
+        tracker.track_access(&a).unwrap();
 
         let hashes = [
-            FrecencyTracker::path_hash_raw(a).unwrap(),
-            FrecencyTracker::path_hash_raw(b).unwrap(),
+            FrecencyTracker::path_hash_raw(&a).unwrap(),
+            FrecencyTracker::path_hash_raw(&b).unwrap(),
         ];
         let batch = tracker.get_access_scores_for_hashes(&hashes, FFFMode::Neovim);
-        let single_a = tracker.get_access_score(a, FFFMode::Neovim);
-        let single_b = tracker.get_access_score(b, FFFMode::Neovim);
+        let single_a = tracker.get_access_score(&a, FFFMode::Neovim);
+        let single_b = tracker.get_access_score(&b, FFFMode::Neovim);
         assert_eq!(batch.len(), 2);
         // Single lookup canonicalizes on Windows; raw hash matches when the
         // path spelling is already canonical (these temp paths are).
