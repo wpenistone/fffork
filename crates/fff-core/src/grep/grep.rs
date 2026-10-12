@@ -734,7 +734,14 @@ where
 
                         // One-chunk lookahead: warm chunk k+1's pages while
                         // this worker reads its own file. Hint only.
-                        prefetch_ahead(files_to_search, idx, chunk.len(), ctx);
+                        // `FFF_NO_PREFETCH=1` disables it for benchmarking.
+                        static NO_PREFETCH: std::sync::OnceLock<bool> =
+                            std::sync::OnceLock::new();
+                        if !NO_PREFETCH.get_or_init(|| {
+                            std::env::var_os("FFF_NO_PREFETCH").is_some()
+                        }) {
+                            prefetch_ahead(files_to_search, idx, chunk.len(), ctx);
+                        }
 
                         let t_read = phase_timing.then(std::time::Instant::now);
                         // Content-mask pre-check: skip the open+read entirely for
