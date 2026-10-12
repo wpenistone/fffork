@@ -28,7 +28,7 @@ pub(super) fn repo_picker() -> Option<FilePicker> {
                 file.relative_path(&picker),
                 file.size,
                 file.modified,
-                file.git_status.map(|status| status.bits()),
+                file.git_status().map(|status| status.bits()),
                 file.git_recency_score,
             )
         })

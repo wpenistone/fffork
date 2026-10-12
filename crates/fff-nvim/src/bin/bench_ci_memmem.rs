@@ -1,12 +1,13 @@
-/// Benchmark: AVX2 vs scalar case-insensitive memmem prefilter.
+/// Benchmark: case-insensitive memmem prefilter throughput.
 ///
-/// Loads all non-binary file contents from a repo, then times both
-/// implementations scanning every file for the query.
+/// Loads all non-binary file contents from a repo, then times the live
+/// (adaptive AVX2/memchr) implementation scanning every file.
+/// Originally AVX2-vs-scalar; the dispatch is internal now.
 ///
 /// Usage:
 ///   cargo build --release --bin bench_ci_memmem
 ///   ./target/release/bench_ci_memmem --path ./big-repo --query "nomore" --iters 5
-use fff::case_insensitive_memmem;
+use fff::simd_string_utils::memmem::find;
 use std::io::Read;
 use std::path::Path;
 use std::time::Instant;
@@ -152,7 +153,7 @@ fn main() {
     let canonical = fff::path_utils::canonicalize(&repo).expect("Failed to canonicalize path");
     let needle_lower: Vec<u8> = query.bytes().map(|b| b.to_ascii_lowercase()).collect();
 
-    eprintln!("=== bench_ci_memmem: AVX2 vs Scalar ===");
+    eprintln!("=== bench_ci_memmem: prefilter throughput ===");
     eprintln!("Path:   {}", canonical.display());
     eprintln!("Query:  \"{}\"", query);
     eprintln!("Needle: {:?}", std::str::from_utf8(&needle_lower).unwrap());
@@ -172,20 +173,11 @@ fn main() {
     eprintln!("\n[2/2] Benchmarking memmem prefilter (scanning ALL files)");
 
     bench_impl(
-        "Packed pair: (AVX2 two-byte scan)",
+        "live prefilter (adaptive AVX2/memchr)",
         &contents,
         &needle_lower,
         total_bytes,
         iters,
-        case_insensitive_memmem::search_packed_pair,
-    );
-
-    bench_impl(
-        "scalar: memchr2 first-byte + AVX2 verify",
-        &contents,
-        &needle_lower,
-        total_bytes,
-        iters,
-        case_insensitive_memmem::search,
+        |h, n| find(h, n).is_some(),
     );
 }
