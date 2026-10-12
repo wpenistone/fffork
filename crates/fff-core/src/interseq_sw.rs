@@ -513,6 +513,8 @@ pub(crate) mod avx2 {
     /// `include_prefix` is a per-lane bitmask (bit i = lane i gets prefix bonus at j=0).
     /// Returns per-lane (score, end_col_local) where end_col_local is the last
     /// column in the trimmed slice where the last-row max occurs.
+    /// Needle rows are dynamic up to 32 (arrays sized 33); longer needles
+    /// take the scalar path (see `use_simd` in score.rs).
     ///
     /// # Safety
     /// Caller must ensure AVX2 is available and `out.len() >= haystacks.len()`.
@@ -526,7 +528,7 @@ pub(crate) mod avx2 {
         out: &mut [u16],
         end_cols: &mut [u16],
     ) {
-        let m = needle.len().min(16);
+        let m = needle.len().min(32);
         let n = max_len;
         if m == 0 || n == 0 {
             out.iter_mut().for_each(|s| *s = 0);
@@ -556,8 +558,8 @@ pub(crate) mod avx2 {
         let lt128 = set1(128);
         let need_case = p.capitalization_bonus != 0 || p.matching_case_bonus != 0;
         let need_delim = p.delimiter_bonus != 0;
-        let mut nc_v = [zero; 17];
-        let mut nf_v = [zero; 17];
+        let mut nc_v = [zero; 33];
+        let mut nf_v = [zero; 33];
         for i in 0..m {
             nc_v[i + 1] = set1(needle[i] as u16);
             nf_v[i + 1] = set1(flip_case(needle[i]) as u16);
@@ -576,12 +578,12 @@ pub(crate) mod avx2 {
             _mm256_loadu_si256(arr.as_ptr() as *const __m256i)
         };
 
-        // DP state arrays (max 17 rows for m<=16). Ping-pong with an index
-        // instead of swapping 544-byte arrays every column.
-        let mut h = [[zero; 17]; 2];
-        let mut e = [[zero; 17]; 2];
-        let mut f = [[zero; 17]; 2];
-        let mut match_state = [[zero; 17]; 2];
+        // DP state arrays (max 33 rows for m<=32). Ping-pong with an index
+        // instead of swapping 1056-byte arrays every column.
+        let mut h = [[zero; 33]; 2];
+        let mut e = [[zero; 33]; 2];
+        let mut f = [[zero; 33]; 2];
+        let mut match_state = [[zero; 33]; 2];
         let mut cur = 0usize; // read from [cur], write to [1-cur]
 
         let mut prev_lower = zero;
@@ -1561,6 +1563,54 @@ mod tests {
                     simd_ecol[k], scalar_ecol
                 );
             }
+        }
+    }
+
+    #[test]
+    fn avx2_u16_matches_scalar_long_needle() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let p = params();
+        // M=20 exercises rows past the old 16-row domain.
+        let needle = b"internationalization";
+        let hays: &[&str] = &[
+            "src/internationalization/mod.rs",
+            "src/internationalizatio/mod.rs",
+            "src/intenationalization/mod.rs",
+            "xxxxxxxxxxxxxxxxxxxxxxxx",
+            "src/other.rs",
+        ];
+        let max_len = hays.iter().map(|h| h.len()).max().unwrap();
+        let hays_b: Vec<&[u8]> = hays.iter().map(|h| h.as_bytes()).collect();
+        let soa = super::avx2::build_soa(&hays_b, max_len, 16);
+        let mut simd_out = vec![0u16; hays.len()];
+        let mut simd_ecol = vec![0u16; hays.len()];
+        let prefix_mask: u16 = (1u16 << hays.len()) - 1;
+        unsafe {
+            super::avx2::score_batch_avx2(
+                needle,
+                &soa,
+                max_len,
+                &p,
+                prefix_mask,
+                &mut simd_out,
+                &mut simd_ecol,
+            );
+        }
+        for (k, h) in hays.iter().enumerate() {
+            let (scalar_score, scalar_ecol) =
+                score_one_scalar_full(needle, h.as_bytes(), &p, true);
+            assert_eq!(
+                simd_out[k], scalar_score,
+                "lane[{k}]={h:?}: simd_score={} scalar_score={}",
+                simd_out[k], scalar_score
+            );
+            assert_eq!(
+                simd_ecol[k], scalar_ecol,
+                "lane[{k}]={h:?}: simd_ecol={} scalar_ecol={}",
+                simd_ecol[k], scalar_ecol
+            );
         }
     }
 

@@ -240,7 +240,8 @@ fn match_fuzzy_parts(
             // (u8_safe) and the needle fits the kernel's 32-row domain.
             let use_u8 = avx2_ok && needle.len() <= 32 && p.u8_safe(needle.len());
             let batch_sz: usize = if use_u8 { 32 } else { 16 };
-            let use_simd = avx2_ok && needle.len() <= 16;
+            // u16 rows are dynamic to 32; longer needles stay scalar.
+            let use_simd = avx2_ok && needle.len() <= 32;
 
             // Sub-phase accounting, accumulated across rayon workers.
             let t_collect_us = std::sync::atomic::AtomicU64::new(0);
