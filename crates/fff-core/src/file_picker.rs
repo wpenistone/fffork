@@ -794,6 +794,23 @@ struct LiveNarrow {
     candidates: Vec<u32>,
     /// Files already scored at previous length â€” set only when we stored a hit set.
     active: bool,
+    /// Recent hit sets by query: shortening the query (backspace) reuses
+    /// the matching entry instead of rescanning. Bounded below.
+    history: Vec<BackEntry>,
+}
+
+struct BackEntry {
+    query: String,
+    max_typos: u16,
+    generation: u64,
+    candidates: Vec<u32>,
+}
+
+// Subset scoring chases an index per file (~7ns) while the gate it
+// skips costs ~100ns/file (sumo cool-pair): only narrow when the set
+// skips at least 1/16 of the corpus, else scan directly.
+fn narrow_pays(subset_len: usize, files_len: usize) -> bool {
+    (subset_len as u64) * 16 < (files_len as u64) * 15
 }
 
 impl std::fmt::Debug for FilePicker {
@@ -1526,12 +1543,35 @@ impl FilePicker {
                     // else falls back to the full corpus scan.
                     if orig.is_empty() {
                         NarrowPlan::Empty
-                    } else if orig.len() < live.candidates.len() {
+                    } else if orig.len() < live.candidates.len()
+                        && narrow_pays(orig.len(), files.len())
+                    {
                         NarrowPlan::Narrow { orig }
-                    } else if live.candidates.len() < files.len() {
+                    } else if live.candidates.len() < files.len()
+                        && narrow_pays(live.candidates.len(), files.len())
+                    {
                         NarrowPlan::Narrow {
                             orig: live.candidates.clone(),
                         }
+                    } else {
+                        NarrowPlan::Full
+                    }
+                } else if let Some(orig) = live
+                    .history
+                    .iter()
+                    .rfind(|e| {
+                        e.generation == self.index_generation()
+                            && e.max_typos == max_typos
+                            && e.query == context.effective_query()
+                    })
+                    .map(|e| e.candidates.clone())
+                {
+                    // Backspace chain: identical query, typos, and generation
+                    // recompute deterministically over the same hit set.
+                    if orig.is_empty() {
+                        NarrowPlan::Empty
+                    } else if narrow_pays(orig.len(), files.len()) {
+                        NarrowPlan::Narrow { orig }
                     } else {
                         NarrowPlan::Full
                     }
@@ -1579,6 +1619,25 @@ impl FilePicker {
             live.active = !hit_buf.is_empty();
             // Move, don't copy â€” hit_buf is dead after this.
             live.candidates = hit_buf;
+            // Backspace chain: remember this hit set under its query.
+            // Depth-bounded (8 x <= full-corpus u32s); stale generations
+            // never match and age out. Full-corpus sets narrow to nothing.
+            let q = context.effective_query();
+            live.history
+                .retain(|e| e.query != q || e.max_typos != max_typos);
+            if narrow_pays(live.candidates.len(), files.len()) {
+                let snapshot = live.candidates.clone();
+                let generation = live.generation;
+                live.history.push(BackEntry {
+                    query: q.to_string(),
+                    max_typos,
+                    generation,
+                    candidates: snapshot,
+                });
+                while live.history.len() > 8 {
+                    live.history.remove(0);
+                }
+            }
         }
         // `msa_us` covers match+score, including the narrow plan above.
         let msa_us = t_msa.elapsed().as_micros();
@@ -3413,6 +3472,80 @@ mod tests {
                 "narrow diverged for {text:?}"
             );
         }
+    }
+
+    /// Shortening the query reuses the matching history entry instead of
+    /// rescanning, and must agree with a fresh full-corpus search.
+    #[test]
+    fn live_narrow_backspace_matches_full_search() {
+        use crate::types::PaginationArgs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_buf = crate::path_utils::canonicalize(dir.path()).unwrap();
+        let base = base_buf.as_path();
+        for rel in ["src/alpha_1.rs", "src/alpha_2.rs", "src/beta.rs"] {
+            let path = base.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+        let mut fresh = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        fresh.collect_files().unwrap();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+
+        let opts = || FuzzySearchOptions {
+            max_threads: 1,
+            current_file: None,
+            project_path: None,
+            combo_boost_score_multiplier: 0,
+            min_combo_count: 0,
+            pagination: PaginationArgs { offset: 0, limit: 50 },
+        };
+        let parser = fff_query_parser::QueryParser::default();
+        let run = |picker: &FilePicker, text: &str| {
+            let parsed = parser.parse(text);
+            let out = picker.fuzzy_search(&parsed, None, opts());
+            let names: Vec<String> =
+                out.items.iter().map(|f| f.relative_path(picker)).collect();
+            let totals: Vec<i32> = out.scores.iter().map(|s| s.total).collect();
+            (out.total_matched, names, totals)
+        };
+
+        // Forward chain populates history; backspaces must reuse it.
+        for text in ["alph", "alpha", "alpha_"] {
+            assert_eq!(
+                run(&picker, text),
+                run(&fresh, text),
+                "forward diverged for {text:?}"
+            );
+        }
+        assert!(!picker.live.lock().history.is_empty());
+        for text in ["alpha", "alph", "alpha_", "alphzzz", "alph"] {
+            assert_eq!(
+                run(&picker, text),
+                run(&fresh, text),
+                "backspace diverged for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_margin_follows_measurement() {
+        assert!(narrow_pays(0, 227_405));
+        assert!(narrow_pays(20_778, 227_405));
+        assert!(!narrow_pays(226_747, 227_405));
+        assert!(!narrow_pays(227_405, 227_405));
+        assert!(narrow_pays(2, 3));
     }
 
     /// Binary sniff reads a bounded prefix: early NULs flag binary, late
