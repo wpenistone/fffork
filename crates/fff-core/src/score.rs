@@ -42,6 +42,12 @@ fn simd_available() -> bool {
     })
 }
 
+// Measured break-even for per-file presence rechecks: expected reject
+// savings vs recheck cost, both timed on the probe sample. No tuning.
+fn presence_rechecks_pay(rate: f64, presence_ns: f64, gate_ns: f64) -> bool {
+    (1.0 - rate) * gate_ns > presence_ns
+}
+
 fn match_fuzzy_parts(
     fuzzy_parts: &[&str],
     working_files: &FileItems<'_>,
@@ -116,6 +122,10 @@ fn match_fuzzy_parts(
         let avg_bytes = max_path_len.max(1);
         let big_enough =
             crate::dispatch::plan_files(n_files, avg_bytes, usize::MAX).threads > 1;
+        // Probe-measured presence economics (rate, presence_ns, gate_ns),
+        // set only when the gate leg was actually timed (empty passes mean
+        // highly selective: keep the pretest, it likely pays).
+        let mut presence_probe: Option<(f64, f64, f64)> = None;
         if big_enough && n_files > 0 {
             let n_probe = crate::dispatch::probe_len(n_files, avg_bytes);
             let stride = (n_files / n_probe).max(1);
@@ -156,6 +166,9 @@ fn match_fuzzy_parts(
                 gate_ns = t_gate.elapsed().as_nanos() as f64 / pass_idx.len() as f64;
             }
             let rate = pass as f64 / probed.max(1) as f64;
+            if !pass_idx.is_empty() {
+                presence_probe = Some((rate, presence_ns, gate_ns));
+            }
             // Serial-view break-even: rejects x gate cost vs full presence
             // scan + in-group rechecks + dispatch. Empty probe passes mean
             // groups all-reject cheaply on their own; a scan proving that
@@ -193,7 +206,16 @@ fn match_fuzzy_parts(
         // TISG gate match-set + window without frizbee. `gate_n` is the
         // gate's index space (candidates when the prefilter fired).
         let gate_n = if use_cand { cand.len() } else { n_files };
-        let check_presence = np.should_check();
+        // Rechecks are a sound pretest, so skipping never changes results:
+        // scan members already passed the same test, and uniform queries
+        // (probe rate ~1) save less than rechecks cost (measured, no tuning).
+        // Also honors the bench hatch the test-only path already respects.
+        let check_presence = np.should_check()
+            && std::env::var_os("FFF_NO_GATE_PREFILTER").is_none()
+            && !use_cand
+            && presence_probe.map_or(true, |(rate, pns, gns)| {
+                presence_rechecks_pay(rate, pns, gns)
+            });
         let t_gate_us = std::sync::atomic::AtomicU64::new(0);
         let t_exact_us = std::sync::atomic::AtomicU64::new(0);
         let t_swslice_us = std::sync::atomic::AtomicU64::new(0);
@@ -4385,6 +4407,40 @@ mod topk_prune_tests {
                 assert_eq!(base_items, tiny_items, "items differ for {q:?} t={threads}");
                 let totals = |s: Vec<Score>| s.into_iter().map(|x| x.total).collect::<Vec<_>>();
                 assert_eq!(totals(base_scores), totals(tiny_scores), "totals differ");
+            }
+        }
+    }
+
+    #[test]
+    fn presence_recheck_decision_follows_measurement() {
+        assert!(!presence_rechecks_pay(1.0, 5.0, 100.0));
+        assert!(!presence_rechecks_pay(0.99, 5.0, 100.0));
+        assert!(presence_rechecks_pay(0.1, 5.0, 100.0));
+        assert!(presence_rechecks_pay(0.5, 5.0, 100.0));
+    }
+
+    #[test]
+    fn gate_prefilter_hatch_ranks_identically() {
+        // Fused path honors FFF_NO_GATE_PREFILTER; pretest is sound so
+        // both legs rank identically. Same race-safety as neighbors.
+        let paths: Vec<String> = (0..1500)
+            .map(|i| format!("src/mod{}/Handler_{}.rs", i % 37, i % 50))
+            .collect();
+        let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        let (files, arena) = make_paths(&refs);
+        for q in ["handler", "mod7 Handler_7"] {
+            for threads in [1usize, 4] {
+                let (base_items, base_scores) = search_with(&files, q, arena, threads, None);
+                unsafe {
+                    std::env::set_var("FFF_NO_GATE_PREFILTER", "1");
+                }
+                let (hatch_items, hatch_scores) = search_with(&files, q, arena, threads, None);
+                unsafe {
+                    std::env::remove_var("FFF_NO_GATE_PREFILTER");
+                }
+                assert_eq!(base_items, hatch_items, "items differ for {q:?} t={threads}");
+                let totals = |s: Vec<Score>| s.into_iter().map(|x| x.total).collect::<Vec<_>>();
+                assert_eq!(totals(base_scores), totals(hatch_scores), "totals differ");
             }
         }
     }
