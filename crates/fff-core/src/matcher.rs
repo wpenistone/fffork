@@ -289,24 +289,11 @@ pub(crate) fn effective_match_threads(
     if let Some(n) = forced {
         return n.min(max_threads.max(1));
     }
-    if item_count < 1024 {
+    if max_threads <= 1 || item_count == 0 {
         return 1;
     }
-    if max_threads <= 1 {
-        return 1;
-    }
-    let selectivity = match max_typos {
-        Some(t) if t >= 3 => 25,
-        Some(_) => 50,
-        None => 100,
-    };
-    let work = (item_count as u64)
-        .saturating_mul(needle_len.max(1) as u64)
-        .saturating_mul(max_haystack_len.min(512).div_ceil(16).max(1) as u64)
-        .saturating_mul(selectivity)
-        / 100;
-    (work.div_ceil(crate::machine::match_work_per_thread() as u64) as usize)
-        .clamp(1, max_threads.max(1))
+    let per_file = crate::dispatch::match_bytes_per_file(needle_len, max_haystack_len, max_typos);
+    crate::dispatch::plan_files(item_count, per_file, max_threads.max(1)).threads
 }
 
 #[cfg(test)]

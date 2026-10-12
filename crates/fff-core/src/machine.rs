@@ -254,18 +254,10 @@ fn pin_thread_to_core(t: usize, allowed: Option<&[usize]>) {
 #[cfg(not(target_os = "linux"))]
 fn pin_thread_to_core(_t: usize, _allowed: Option<&[usize]>) {}
 
-/// rayon fork/join dispatch cost. A property of the scheduler, not of any corpus.
-const FORK_JOIN_NS: usize = 25_000;
-
+/// rayon fork/join dispatch cost. Measured once in `dispatch` (empty
+/// fan-out median); historically ~25us. A property of the scheduler.
 fn fork_join_ns() -> usize {
-    static NS: LazyLock<usize> = LazyLock::new(|| {
-        std::env::var("FFF_FORK_JOIN_NS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(FORK_JOIN_NS)
-    });
-    *NS
+    crate::dispatch::fork_join_ns() as usize
 }
 
 static MACHINE: LazyLock<Machine> = LazyLock::new(Machine::probe);
@@ -323,6 +315,9 @@ pub(crate) fn scan_thread_cap() -> usize {
 /// fire inside the first query (~30ms of buffers and bandwidth samples).
 pub(crate) fn warm_calibration() {
     let _ = (match_work_per_thread(), scan_thread_cap());
+    // Dispatch probes (empty fan-out median) join the open path so no
+    // measurement fires inside the first query.
+    let _ = (crate::dispatch::fork_join_ns(), crate::dispatch::bytes_to_amortize());
 }
 impl Machine {
     fn probe() -> Self {
