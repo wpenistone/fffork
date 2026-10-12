@@ -3434,14 +3434,21 @@ mod tests {
         early_bytes[10] = 0;
         std::fs::write(&early, &early_bytes).unwrap();
 
-        // 300KB files: content past the 256KB cap is never read.
+        // NUL at 1 MiB: past the old 256 KiB window but inside the
+        // 2 MiB cap, so it must still be detected.
         let big = BINARY_CLASSIFICATION_CAP + 32 * 1024;
         let mut late_bytes = vec![b'y'; big];
-        late_bytes[big - 8 * 1024] = 0;
+        late_bytes[1024 * 1024] = 0;
         let late = base.join("src/late.dat");
         std::fs::write(&late, &late_bytes).unwrap();
         let text = base.join("src/big.txt");
         std::fs::write(&text, vec![b'z'; big]).unwrap();
+        // NUL past the cap stays unread: text, mask unknown so grep reads it.
+        let huge = BINARY_CLASSIFICATION_CAP + 64 * 1024;
+        let mut huge_bytes = vec![b'w'; huge];
+        huge_bytes[huge - 8 * 1024] = 0;
+        let huge = base.join("src/huge.dat");
+        std::fs::write(&huge, &huge_bytes).unwrap();
 
         let mut picker = FilePicker::new(FilePickerOptions {
             base_path: base.to_str().unwrap().into(),
@@ -3449,7 +3456,7 @@ mod tests {
             ..Default::default()
         })
         .unwrap();
-        for p in [&tiny, &early, &late, &text] {
+        for p in [&tiny, &early, &late, &text, &huge] {
             assert!(picker.add_new_file(p).is_some());
         }
         // `add_new_file` classifies but does not store masks; assert on the
@@ -3467,13 +3474,17 @@ mod tests {
         let (binary, mask) = sniff(&picker, &early);
         assert!(binary);
         assert_eq!(mask.allows(b"x", 0), None);
-        // Late NUL past the cap: stays text, mask unknown so grep reads it.
+        // Late NUL inside the cap: binary, mask unknown so grep skips it.
         let (binary, mask) = sniff(&picker, &late);
-        assert!(!binary);
+        assert!(binary);
         assert_eq!(mask.allows(b"y", 0), None);
         let (binary, mask) = sniff(&picker, &text);
         assert!(!binary);
         assert_eq!(mask.allows(b"z", 0), None);
+        // NUL past the cap: stays text, mask unknown so grep reads it.
+        let (binary, mask) = sniff(&picker, &huge);
+        assert!(!binary);
+        assert_eq!(mask.allows(b"w", 0), None);
     }
 
     #[test]

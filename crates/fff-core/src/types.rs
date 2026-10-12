@@ -347,10 +347,12 @@ impl Clone for FileItem {
 /// small enough to live on the stack.
 pub const BINARY_CLASSIFICATION_CHUNK_SIZE: usize = 16 * 1024;
 
-/// Prefix bytes the binary sniff reads. Git-style: binaries carry header
-/// NULs, so a clean prefix means text; full-file masks stay sound because
-/// partial reads record an empty (unknown) mask instead.
-pub const BINARY_CLASSIFICATION_CAP: usize = 256 * 1024;
+/// Prefix bytes the binary sniff reads. Matches the bigram content
+/// horizon (2 MiB): grep reads that far, so the detector must cover the
+/// same range or late NULs leak through as text. Bigger files stay
+/// capped; partial reads record an empty (unknown) mask instead, which
+/// grep treats as must-open (safe direction).
+pub const BINARY_CLASSIFICATION_CAP: usize = 2 * 1024 * 1024;
 
 /// A file is treated as binary if any NUL byte appears in the scanned prefix.
 #[inline]
