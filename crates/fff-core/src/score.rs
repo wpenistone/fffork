@@ -711,22 +711,6 @@ fn match_fuzzy_parts(
                     {
                         continue;
                     }
-                    // Next-file prefetch: hides arena load latency while the
-                    // gate walks this file. `FFF_NO_NEXT_PREFETCH=1` skips
-                    // it for benchmarking (arena may already be L1-hot).
-                    static NO_NEXT_PREFETCH: std::sync::OnceLock<bool> =
-                        std::sync::OnceLock::new();
-                    if !NO_NEXT_PREFETCH.get_or_init(|| {
-                        std::env::var_os("FFF_NO_NEXT_PREFETCH").is_some()
-                    }) && k + 1 < gate_n
-                    {
-                        let nf = if use_cand {
-                            working_files.index(cand[k + 1] as usize)
-                        } else {
-                            working_files.index(k + 1)
-                        };
-                        nf.path.prefetch(arena);
-                    }
                     if let Some(hit) = gate_state.hit_file(file, arena) {
                         m.push(neo_frizbee::Match {
                             score: hit.start as u16,
