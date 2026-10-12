@@ -711,7 +711,15 @@ fn match_fuzzy_parts(
                     {
                         continue;
                     }
-                    if k + 1 < gate_n {
+                    // Next-file prefetch: hides arena load latency while the
+                    // gate walks this file. `FFF_NO_NEXT_PREFETCH=1` skips
+                    // it for benchmarking (arena may already be L1-hot).
+                    static NO_NEXT_PREFETCH: std::sync::OnceLock<bool> =
+                        std::sync::OnceLock::new();
+                    if !NO_NEXT_PREFETCH.get_or_init(|| {
+                        std::env::var_os("FFF_NO_NEXT_PREFETCH").is_some()
+                    }) && k + 1 < gate_n
+                    {
                         let nf = if use_cand {
                             working_files.index(cand[k + 1] as usize)
                         } else {
