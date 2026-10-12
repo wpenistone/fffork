@@ -44,6 +44,20 @@ impl SwParams {
             .saturating_add(self.prefix_bonus as u32)
             < 256
     }
+
+    // Sound upper bound on any SW score for this needle: each alignment
+    // path takes at most one diagonal per column (gaps only subtract),
+    // so rows contribute at most `per` each, prefix once, exact once.
+    // Reserved for UB work (pre-SW prune needs a sound global threshold
+    // first); the fuzz test below pins it.
+    #[allow(dead_code)]
+    pub(crate) fn max_sw_score(&self, m: usize) -> i32 {
+        let per = self.match_score as i32
+            + self.delimiter_bonus as i32
+            + self.capitalization_bonus as i32
+            + self.matching_case_bonus as i32;
+        (m as i32) * per + self.prefix_bonus as i32 + 8
+    }
 }
 
 #[inline(always)]
@@ -1149,8 +1163,7 @@ mod tests {
     }
 
     #[test]
-    fn scalar_matches_frizbee_on_basic_cases() {
-        let p = params();
+    fn scalar_matches_frizbee_on_basic_cases() {        let p = params();
         let cases: &[(&str, &str)] = &[
             ("abc", "abc"),
             ("abc", "aabbcc"),
@@ -1174,6 +1187,45 @@ mod tests {
                 mine, theirs,
                 "needle={n:?} haystack={h:?}: mine={mine} frizbee={theirs}"
             );
+        }
+    }
+
+    #[test]
+    fn max_sw_bound_holds_on_random() {
+        // Falsification for pre-SW pruning: any violation kills the idea.
+        // Batch kernels replicate scalar exactly (parity battery), so
+        // scalar coverage transfers.
+        let mut state = 0xBEEFu32;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(1664525)
+                .wrapping_add(1013904223);
+            (state >> 16) as u16
+        };
+        let mut byte = move |next: &mut dyn FnMut() -> u16| {
+            let r = next() % 6;
+            if r == 0 {
+                b'/'
+            } else if r == 1 {
+                b'A' + (next() % 26) as u8
+            } else {
+                b'a' + (next() % 26) as u8
+            }
+        };
+        for _ in 0..8000 {
+            let m = 1 + (next() % 32) as usize;
+            let n = 1 + (next() % 64) as usize;
+            let needle: Vec<u8> = (0..m).map(|_| byte(&mut next)).collect();
+            let hay: Vec<u8> = (0..n).map(|_| byte(&mut next)).collect();
+            let p = SwParams::for_query(next() % 2 == 0);
+            let bound = p.max_sw_score(m);
+            for inc in [false, true] {
+                let (sc, _) = score_one_scalar_full(&needle, &hay, &p, inc);
+                assert!(
+                    sc as i32 <= bound,
+                    "m={m} n={n} inc={inc} sc={sc} bound={bound}"
+                );
+            }
         }
     }
 
