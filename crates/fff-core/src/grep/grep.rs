@@ -732,17 +732,6 @@ where
                             return None;
                         }
 
-                        // One-chunk lookahead: warm chunk k+1's pages while
-                        // this worker reads its own file. Hint only.
-                        // `FFF_NO_PREFETCH=1` disables it for benchmarking.
-                        static NO_PREFETCH: std::sync::OnceLock<bool> =
-                            std::sync::OnceLock::new();
-                        if !NO_PREFETCH.get_or_init(|| {
-                            std::env::var_os("FFF_NO_PREFETCH").is_some()
-                        }) {
-                            prefetch_ahead(files_to_search, idx, chunk.len(), ctx);
-                        }
-
                         let t_read = phase_timing.then(std::time::Instant::now);
                         // Content-mask pre-check: skip the open+read entirely for
                         // files whose indexed byte classes cannot contain the
@@ -909,51 +898,4 @@ where
         regex_fallback_error: None,
         literal_fallback: false,
     }
-}
-
-// One-chunk lookahead: fadvise warms chunk k+1's pages while the pool
-// scans chunk k. Pure kernel hint — never changes results, only latency.
-// Linux-only: Darwin has no posix_fadvise; macOS uses the no-op below.
-#[cfg(all(unix, not(target_vendor = "apple")))]
-#[inline]
-fn prefetch_ahead(
-    files_to_search: &[&FileItem],
-    idx: usize,
-    stride: usize,
-    ctx: &GrepContext<'_, '_>,
-) {
-    let Some(next) = files_to_search.get(idx.saturating_add(stride)).copied() else {
-        return;
-    };
-    // Same read-only eligibility as get_content_for_search: never warm
-    // pages for files the worker would skip without opening.
-    if next.is_binary() || next.size == 0 || next.size > ctx.budget.max_file_size {
-        return;
-    }
-    if let (Some(masks), Some(needle)) = (ctx.content_masks, ctx.mask_needle)
-        && let Some(pos) = original_index(ctx.files, next)
-        && let Some(mask) = masks.get(pos)
-        && needle.allows(mask) == Some(false)
-    {
-        return;
-    }
-    let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-    let abs = next.write_absolute_path(ctx.arena_for_file(next), ctx.base_path, &mut path_buf);
-    if let Ok(file) = std::fs::File::open(abs) {
-        use std::os::fd::AsRawFd;
-        unsafe {
-            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED);
-        }
-    }
-}
-
-// No page-cache hint API; the call site stays platform-independent.
-#[cfg(any(not(unix), target_vendor = "apple"))]
-#[inline]
-fn prefetch_ahead(
-    _files_to_search: &[&FileItem],
-    _idx: usize,
-    _stride: usize,
-    _ctx: &GrepContext<'_, '_>,
-) {
 }
