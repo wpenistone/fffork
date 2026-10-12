@@ -891,6 +891,22 @@ pub(crate) mod avx2 {
         out: &mut [u16],
         end_cols: &mut [u16],
     ) {
+        // `FFF_NO_UNROLL=1` forces the general runtime-m loop for
+        // benchmarking the const specializations against it.
+        static NO_UNROLL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *NO_UNROLL
+            .get_or_init(|| std::env::var_os("FFF_NO_UNROLL").is_some())
+        {
+            return score_batch_avx2_u8(
+                needle,
+                soa,
+                max_len,
+                p,
+                include_prefix_mask,
+                out,
+                end_cols,
+            );
+        }
         let m = needle.len().min(32);
         macro_rules! unrolled {
             ($($v:literal),*) => {
