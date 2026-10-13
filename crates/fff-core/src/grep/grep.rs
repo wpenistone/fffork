@@ -54,7 +54,7 @@ impl<'a> NeedleFinder<'a> {
     }
 
     /// Compare `haystack` against a slice of the needle with the same case
-    /// semantics as `find`. Short prefix loop, not a memmem dispatch.
+    // semantics as `find`. Short prefix loop, not a memmem dispatch.
     #[inline]
     fn eq_fold(&self, haystack: &[u8], needle_seg: &[u8]) -> bool {
         match self {
@@ -64,8 +64,8 @@ impl<'a> NeedleFinder<'a> {
     }
 
     /// Collect highlight spans for every needle occurrence within a line.
-    /// Steps by needle length (non-overlapping); reslicing per hit keeps
-    /// memmem's skip tables effective instead of degrading to pos+1.
+    // Steps by needle length (non-overlapping); reslicing per hit keeps
+    // memmem's skip tables effective instead of degrading to pos+1.
     #[inline]
     fn for_each_occurrence(&self, haystack: &[u8], mut on_match: impl FnMut(usize)) {
         let step = self.needle().len().max(1);
@@ -187,7 +187,7 @@ impl Sink for PlainTextSink<'_> {
 }
 
 /// Perform a grep search across all indexed files.
-///
+//
 /// When `query` is empty, returns git-modified/untracked files sorted by
 /// frecency for the "welcome state" UI.
 #[tracing::instrument(skip_all, fields(file_count = files.len()))]
@@ -478,7 +478,7 @@ fn grep_search_parsed<'a>(
 }
 
 /// Replace unescaped `\n` escapes with real newlines in a single pass.
-///
+//
 /// Returns `Some((replaced, first_newline_pos))` when the pattern contained at
 /// least one real `\n` escape (the user wants multiline search), where
 /// `first_newline_pos` is the byte offset of the first inserted newline in the
@@ -556,42 +556,42 @@ pub(super) struct GrepContext<'a, 'b> {
     pub(super) overflow_arena: crate::simd_path::ArenaPtr,
     pub(super) prefilter: Option<&'a NeedleFinder<'b>>,
     pub(super) abort_signal: &'a AtomicBool,
-    /// Content byte-presence masks, indexed by file position. Lets grep skip
-    /// `get_content_for_search` for files that provably cannot contain the
-    /// needle, which is ~95% of grep's wall time.
+    // Content byte-presence masks, indexed by file position. Lets grep skip
+    // `get_content_for_search` for files that provably cannot contain the
+    // needle, which is ~95% of grep's wall time.
     pub(super) content_masks: Option<&'a crate::file_picker::ContentMaskStore>,
-    /// Literal needle bytes for the content mask pre-check. `None` disables it
-    /// (regex queries have no single literal to test for).
-    /// Needle with its byte classes precomputed, so the per-file check is one
-    /// AND + popcount instead of a scan over the needle bytes.
+    // Literal needle bytes for the content mask pre-check. `None` disables it
+    // (regex queries have no single literal to test for).
+    // Needle with its byte classes precomputed, so the per-file check is one
+    // AND + popcount instead of a scan over the needle bytes.
     pub(super) mask_needle: Option<crate::types::MaskNeedle>,
-    /// The picker's contiguous FileItem slice, used to recover original
-    /// positions from the prefilter's filtered output.
+    // The picker's contiguous FileItem slice, used to recover original
+    // positions from the prefilter's filtered output.
     pub(super) files: &'a [FileItem],
 }
 
-/// Files skipped by the content-mask prefilter since process start.
+// Files skipped by the content-mask prefilter since process start.
 pub(crate) static CONTENT_MASK_REJECTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Files skipped by the whole-file memmem prefilter since process start.
-/// Counted separately: mask skips mean "unreadable without opening",
-/// memmem skips mean "opened but needle absent".
+// Files skipped by the whole-file memmem prefilter since process start.
+// Counted separately: mask skips mean "unreadable without opening",
+// memmem skips mean "opened but needle absent".
 pub(crate) static MEMMEM_PREFILTER_REJECTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Recover a file's original position in the picker's contiguous `FileItem`
-/// slice from its address.
-///
-/// The grep prefilter returns a *filtered* `Vec<&FileItem>`, so its loop index
-/// is not the file's position, and `GrepMatch::file_index` indexes
-/// `result_files` rather than the index either. Using either as a mask index
-/// would make grep skip files that do match.
-///
-/// The slice is contiguous - `FileSync` lays out base and overflow files in one
-/// allocation, partitioned by `base_count` - so the offset is exact. Returning
-/// `None` for anything outside the slice keeps the caller safe if that layout
-/// ever changes.
+// Recover a file's original position in the picker's contiguous `FileItem`
+// slice from its address.
+//
+// The grep prefilter returns a *filtered* `Vec<&FileItem>`, so its loop index
+// is not the file's position, and `GrepMatch::file_index` indexes
+// `result_files` rather than the index either. Using either as a mask index
+// would make grep skip files that do match.
+//
+// The slice is contiguous - `FileSync` lays out base and overflow files in one
+// allocation, partitioned by `base_count` - so the offset is exact. Returning
+// `None` for anything outside the slice keeps the caller safe if that layout
+// ever changes.
 #[inline]
 pub(super) fn original_index(files: &[FileItem], f: &FileItem) -> Option<usize> {
     let base = files.as_ptr() as usize;

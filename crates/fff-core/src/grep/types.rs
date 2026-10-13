@@ -35,7 +35,7 @@ pub enum GrepMode {
     Regex,
     /// Smart fuzzy mode, allows user to make either a couple of single char typos or long gaps
     /// e.g. shcema -> shcema, or UserController -> UserAuthController
-    ///
+    //
     /// Significatnly slower than plain text, especially on unindexed FilePicker
     Fuzzy,
 }
@@ -289,42 +289,19 @@ impl<'a> GrepResult<'a> {
     }
 }
 
-/// Ordered page-fill gate for the parallel chunk search.
-///
-/// Workers record each file's match count as they finish. A confirmed-prefix
-/// cursor advances only over the leading consecutive completed files, so
-/// `confirmed_matches` always equals the match count of local files
-/// `0..confirmed_len` in chunk order. Once that prefix plus the matches from
-/// earlier chunks already covers the page, `is_full()` latches true and later
-/// files are skipped: they sit after the tipping file in `(file_index, line)`
-/// order and cannot enter the current page.
-///
-/// Correctness (first page unchanged):
-/// - The serial consumer fills the page from chunk results in file order and
-///   stops at the first file where the cumulative match count reaches
-///   `page_limit`. Call that file `k`.
-/// - `is_full()` latches only when `base + confirmed_matches >= page_limit`
-///   and at least one confirmed file matched, so `k` lies strictly inside the
-///   confirmed prefix (`k < confirmed_len`) and has already been searched.
-/// - Every file skipped after the latch has `local_idx >= confirmed_len > k`,
-///   hence contributes matches only after the page is already full.
-/// - Interaction with abort (`first_skipped` / `resume_at`): the serial
-///   consumer drops results with global index `>= resume_at`. If the confirmed
-///   prefix stays below that boundary, `confirmed_matches` counts only real
-///   (non-dropped) matches and `k` is in the prefix. If the prefix crosses the
-///   boundary, then every file with global index `< resume_at` is already
-///   inside the prefix (done), so the consumer still sees all real matches;
-///   skipped files all have global index `>= resume_at` and would be dropped
-///   anyway. Either way the page is identical.
+// Ordered page-fill gate: `is_full` latches once confirmed files cover the page.
+// Confirmed prefix counts leading completed files; latch needs a matched file
+// inside the prefix, so skipped files sit after the page. Aborts drop
+// `>= resume_at`, which skipped files also satisfy; page is unchanged.
 pub(crate) struct PageFillGate {
-    /// `0` = pending, `n + 1` = completed with `n` matches. The `+ 1` shift
-    /// distinguishes "finished, zero matches" from "not started".
+    // `0` = pending, `n + 1` = completed with `n` matches. The `+ 1` shift
+    // distinguishes "finished, zero matches" from "not started".
     counts: Vec<AtomicU32>,
-    /// Number of leading local indices that have completed.
+    // Number of leading local indices that have completed.
     confirmed_len: AtomicUsize,
-    /// Sum of match counts over that confirmed prefix.
+    // Sum of match counts over that confirmed prefix.
     confirmed_matches: AtomicUsize,
-    /// Matches contributed by earlier chunks (already consumed into the page).
+    // Matches contributed by earlier chunks (already consumed into the page).
     base_matches: usize,
     page_limit: usize,
     full: AtomicBool,
@@ -342,15 +319,15 @@ impl PageFillGate {
         }
     }
 
-    /// Whether the current page is provably full from lower-indexed files.
+    // Whether the current page is provably full from lower-indexed files.
     #[inline]
     pub(crate) fn is_full(&self) -> bool {
         self.full.load(Ordering::Relaxed)
     }
 
-    /// Record that local file `local_idx` finished with `n` matches (`0` for
-    /// no-match, unreadable, prefiltered, or skipped files). Advances the
-    /// confirmed prefix and latches `full` once the page is covered.
+    // Record that local file `local_idx` finished with `n` matches (`0` for
+    // no-match, unreadable, prefiltered, or skipped files). Advances the
+    // confirmed prefix and latches `full` once the page is covered.
     pub(crate) fn record_done(&self, local_idx: usize, n: usize) {
         // `n + 1` so "done with zero matches" is not confused with "pending".
         self.counts[local_idx].store(n as u32 + 1, Ordering::Release);

@@ -40,8 +40,8 @@ pub(crate) struct ScanConfig {
     pub(crate) follow_symlinks: bool,
     pub(crate) enable_fs_root_scanning: bool,
     pub(crate) enable_home_dir_scanning: bool,
-    /// Skip all git discovery/status/recency. Bench and search-only workloads
-    /// should never touch .git (multi-GB object stores are not search paths).
+    // Skip all git discovery/status/recency. Search-only workloads
+    // never touch .git (object stores are not search paths).
     pub(crate) skip_git: bool,
 }
 
@@ -215,10 +215,7 @@ impl ScanJob {
             return;
         }
 
-        // Spawn the git status worker once. BUG PINNNING. If the user initiated git in the folder
-        // which is a real use case we need to have a way to start the git worker background thread dynamically
-        // Same auto-skip as the sync path: huge trees skip the worker
-        // unless forced (threshold still uncalibrated; see P1-2).
+        // Start the git worker once; huge trees skip it unless forced.
         let skip_git = crate::file_picker::should_skip_git(
             config.skip_git,
             n_files,
@@ -226,11 +223,11 @@ impl ScanJob {
         );
         if git_workdir.is_some() && !skip_git && !signals.cancelled.load(Ordering::Acquire) {
             git_status_worker.spawn_once(shared_picker.weaken(), shared_frecency.clone());
-            git_status_worker.request_full_rescan(); // this runs anyway
+            git_status_worker.request_full_rescan();
         }
 
-        // BUG pinning: take the snapshot *before* the storing the scan=true, otherwise there is a tiny
-        // race window when there scanned is set to true, but `post_scan_indexing_active` flag is `false`
+        // Snapshot before marking scan complete; avoids a race where
+        // scan reads true while post-scan indexing is still inactive.
         let snapshot = if !signals.cancelled.load(Ordering::Acquire) {
             shared_picker.read().ok().and_then(|guard| {
                 guard

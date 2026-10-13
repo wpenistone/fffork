@@ -1,14 +1,8 @@
-//! Inter-sequence Smith-Waterman: lanes = paths, haystack sequential.
+//! Inter-sequence Smith-Waterman: lanes hold paths, haystack runs sequential.
 //!
-//! Replicates frizbee's gap model exactly (ascii_gap.rs):
-//! - gap_open applied ONLY when the previous cell was a match
-//!   (`shifted_match_mask` gates `gop` in `gap_step!`)
-//! - gap_extend for all other gap positions
-//! Score = max of LAST query row (not global max), matching frizbee's
-//! `max_scores.horizontal_max()` which tracks only `row_scores` after the
-//! inner row loop.
+//! Replicates frizbee's gap model; score is the last row's max.
 
-/// Scoring params matching frizbee defaults + fff overrides for lowercase queries.
+// Scoring params matching frizbee defaults + fff overrides for lowercase queries.
 #[derive(Clone, Copy)]
 pub(crate) struct SwParams {
     pub match_score: u16,
@@ -124,12 +118,12 @@ thread_local! {
         }) };
 }
 
-/// Scalar reference SW matching frizbee's exact semantics on a TRIMMED haystack.
-/// `include_prefix` must be `true` iff the trimmed start == 0 (frizbee:
-/// `haystack_start_pos == 0` after `trim_haystack`'s saturating_sub(1)).
-/// Returns (score, end_col_local). end_col_local = LAST column in the trimmed
-/// slice where the last-row max occurs (frizbee's match_end_col).
-/// No exact_match_bonus — caller adds it when `include_exact && needle == trimmed`.
+// Scalar reference SW matching frizbee's exact semantics on a TRIMMED haystack.
+// `include_prefix` must be `true` iff the trimmed start == 0 (frizbee:
+// `haystack_start_pos == 0` after `trim_haystack`'s saturating_sub(1)).
+// Returns (score, end_col_local). end_col_local = LAST column in the trimmed
+// slice where the last-row max occurs (frizbee's match_end_col).
+// No exact_match_bonus — caller adds it when `include_exact && needle == trimmed`.
 pub(crate) fn score_one_scalar_full(
     needle: &[u8],
     haystack: &[u8],
@@ -385,7 +379,7 @@ fn score_one_scalar_stack(
     (last_row_max as u16, end_col)
 }
 
-/// Convenience wrapper: just the score. Test oracle for the batch kernels.
+// Score-only wrapper; test oracle for the batch kernels.
 #[cfg(test)]
 pub(crate) fn score_one_scalar(
     needle: &[u8],
@@ -406,9 +400,9 @@ pub(crate) mod avx2 {
 
     pub(crate) const LANES: usize = 16;
 
-    /// Build SoA buffer: soa[j * stride + p] = haystack[p][j], padded with 0.
-    /// `stride` must match the kernel's lane count (16 for u16, 32 for u8).
-    /// Test oracle: production transposes straight from the stage buffer.
+    // Build SoA buffer: soa[j * stride + p] = haystack[p][j], padded with 0.
+    // `stride` must match the kernel's lane count (16 for u16, 32 for u8).
+    // Test oracle: production transposes straight from the stage buffer.
     #[cfg(test)]
     pub(crate) fn build_soa(haystacks: &[&[u8]], max_len: usize, stride: usize) -> Vec<u8> {
         let n = haystacks.len().min(stride);
@@ -422,16 +416,16 @@ pub(crate) mod avx2 {
         soa
     }
 
-    /// 8×8 byte matrix transpose via SSE2 unpack shuffles.
-    ///
-    /// `dst[j * dst_stride + i] = src[i * src_stride + j]` for i, j in 0..8.
-    /// Reads 8 contiguous bytes from each of 8 source rows and writes 8
-    /// contiguous bytes to each of 8 destination rows (AoS → SoA tiles).
-    ///
-    /// # Safety
-    /// Caller must ensure `src` has 8 rows of `src_stride` readable bytes and
-    /// `dst` has 8 rows of `dst_stride` writable bytes; `dst` may alias `src`
-    /// only when both strides are equal and the tiles coincide exactly.
+    // 8×8 byte matrix transpose via SSE2 unpack shuffles.
+    //
+    // `dst[j * dst_stride + i] = src[i * src_stride + j]` for i, j in 0..8.
+    // Reads 8 contiguous bytes from each of 8 source rows and writes 8
+    // contiguous bytes to each of 8 destination rows (AoS → SoA tiles).
+    //
+    // # Safety
+    // Caller must ensure `src` has 8 rows of `src_stride` readable bytes and
+    // `dst` has 8 rows of `dst_stride` writable bytes; `dst` may alias `src`
+    // only when both strides are equal and the tiles coincide exactly.
     #[inline]
     #[target_feature(enable = "sse2")]
     pub(crate) unsafe fn transpose_8x8(
@@ -489,18 +483,18 @@ pub(crate) mod avx2 {
         }
     }
 
-    /// Fill SoA from path-major staged bytes using 8×8 shuffle transpose tiles.
-    ///
-    /// `stage` is path-major: path `k` lives at `stage[k * rows + j]` and is
-    /// zero-padded to `rows`. `out` is position-major SoA with `stride` lanes
-    /// per row: `out[j * stride + k]`. `rows` and `stride` must both be
-    /// multiples of 8 (`rows` = padded max trimmed len, `stride` = lane count).
-    /// Every SoA byte is written; no pre-zeroing of `out` is required.
-    ///
-    /// # Safety
-    /// Caller must ensure `stage.len() >= stride * rows` and
-    /// `out.len() >= rows * stride`, and AVX2-capable target is not required
-    /// (SSE2 only) but must not race with concurrent aliasing writes.
+    // Fill SoA from path-major staged bytes using 8×8 shuffle transpose tiles.
+    //
+    // `stage` is path-major: path `k` lives at `stage[k * rows + j]` and is
+    // zero-padded to `rows`. `out` is position-major SoA with `stride` lanes
+    // per row: `out[j * stride + k]`. `rows` and `stride` must both be
+    // multiples of 8 (`rows` = padded max trimmed len, `stride` = lane count).
+    // Every SoA byte is written; no pre-zeroing of `out` is required.
+    //
+    // # Safety
+    // Caller must ensure `stage.len() >= stride * rows` and
+    // `out.len() >= rows * stride`, and AVX2-capable target is not required
+    // (SSE2 only) but must not race with concurrent aliasing writes.
     #[target_feature(enable = "sse2")]
     pub(crate) unsafe fn soa_from_stage(stage: &[u8], rows: usize, stride: usize, out: &mut [u8]) {
         debug_assert_eq!(rows % 8, 0);
@@ -523,15 +517,15 @@ pub(crate) mod avx2 {
         }
     }
 
-    /// Score a batch of up to 16 pre-trimmed haystacks using inter-sequence AVX2 SW.
-    /// `include_prefix` is a per-lane bitmask (bit i = lane i gets prefix bonus at j=0).
-    /// Returns per-lane (score, end_col_local) where end_col_local is the last
-    /// column in the trimmed slice where the last-row max occurs.
-    /// Needle rows are dynamic up to 32 (arrays sized 33); longer needles
-    /// take the scalar path (see `use_simd` in score.rs).
-    ///
-    /// # Safety
-    /// Caller must ensure AVX2 is available and `out.len() >= haystacks.len()`.
+    // Score a batch of up to 16 pre-trimmed haystacks using inter-sequence AVX2 SW.
+    // `include_prefix` is a per-lane bitmask (bit i = lane i gets prefix bonus at j=0).
+    // Returns per-lane (score, end_col_local) where end_col_local is the last
+    // column in the trimmed slice where the last-row max occurs.
+    // Needle rows are dynamic up to 32 (arrays sized 33); longer needles
+    // take the scalar path (see `use_simd` in score.rs).
+    //
+    // # Safety
+    // Caller must ensure AVX2 is available and `out.len() >= haystacks.len()`.
     #[target_feature(enable = "avx2")]
     pub(crate) unsafe fn score_batch_avx2(
         needle: &[u8],
@@ -700,12 +694,12 @@ pub(crate) mod avx2 {
         }
     }
 
-    /// Score a batch of up to 32 pre-trimmed haystacks using inter-sequence AVX2 SW
-    /// with u8 scores (32 lanes). Only valid when `score_fits_in_u8` is true
-    /// (max score < 256). Same semantics as `score_batch_avx2` but 2x lanes.
-    ///
-    /// # Safety
-    /// Caller must ensure AVX2 is available. Scores must fit in u8.
+    // Score a batch of up to 32 pre-trimmed haystacks using inter-sequence AVX2 SW
+    // with u8 scores (32 lanes). Only valid when `score_fits_in_u8` is true
+    // (max score < 256). Same semantics as `score_batch_avx2` but 2x lanes.
+    //
+    // # Safety
+    // Caller must ensure AVX2 is available. Scores must fit in u8.
     #[target_feature(enable = "avx2")]
     pub(crate) unsafe fn score_batch_avx2_u8(
         needle: &[u8],
@@ -891,11 +885,11 @@ pub(crate) mod avx2 {
         }
     }
 
-    /// Dispatch to a const-unrolled specialization for common needle lengths.
-    /// `M = 0` keeps the general runtime-m loop. Results are bit-identical.
-    ///
-    /// # Safety
-    /// Caller must guarantee AVX2 (score.rs gates on simd_available).
+    // Dispatch to a const-unrolled specialization for common needle lengths.
+    // `M = 0` keeps the general runtime-m loop. Results are bit-identical.
+    //
+    // # Safety
+    // Caller must guarantee AVX2 (score.rs gates on simd_available).
     #[inline]
     #[target_feature(enable = "avx2")]
     pub(crate) unsafe fn score_batch_avx2_u8_dispatch(
@@ -907,8 +901,7 @@ pub(crate) mod avx2 {
         out: &mut [u16],
         end_cols: &mut [u16],
     ) {
-        // `FFF_NO_UNROLL=1` forces the general runtime-m loop for
-        // benchmarking the const specializations against it.
+        // `FFF_NO_UNROLL=1` forces the general runtime-m loop.
         static NO_UNROLL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *NO_UNROLL
             .get_or_init(|| std::env::var_os("FFF_NO_UNROLL").is_some())
@@ -938,9 +931,9 @@ pub(crate) mod avx2 {
         );
     }
 
-    /// Same as [`score_batch_avx2_u8`] but with a compile-time needle length so
-    /// the DP row loop is fully unrolled and the state arrays SROA to registers.
-    /// Bit-identical to the general loop (asserted in tests).
+    // Same as [`score_batch_avx2_u8`] but with a compile-time needle length so
+    // the DP row loop is fully unrolled and the state arrays SROA to registers.
+    // Bit-identical to the general loop (asserted in tests).
     #[inline]
     #[target_feature(enable = "avx2")]
     unsafe fn score_batch_avx2_u8_const<const M: usize>(
@@ -1131,11 +1124,11 @@ mod tests {
         SwParams::for_query(false)
     }
 
-    /// Serializes access to `FRIZBEE_SKIP_SW` across parallel tests.
+    // Serializes access to `FRIZBEE_SKIP_SW` across parallel tests.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// Compare against frizbee's Matcher (the ground truth) using fff's
-    /// scoring config (matching_case_bonus=0 for lowercase queries).
+    // Compare against frizbee's Matcher (the ground truth) using fff's
+    // scoring config (matching_case_bonus=0 for lowercase queries).
     fn frizbee_score(needle: &str, haystack: &str) -> u16 {
         // Ensure skip_sw is OFF for the ground-truth measurement
 
@@ -1236,8 +1229,7 @@ mod tests {
         for &(n, h) in cases {
             let mine = score_one_scalar(n.as_bytes(), h.as_bytes(), &p, false);
             let theirs = frizbee_score(n, h);
-            // Without prefix, scores may differ (frizbee always uses include_prefix=true
-            // when start_pos==0). Just check non-negative.
+            // Without prefix, scores may differ; check upper bound only.
             assert!(
                 mine <= theirs + 12,
                 "needle={n} haystack={h}: mine={mine} theirs={theirs}"

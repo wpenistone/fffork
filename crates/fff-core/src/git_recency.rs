@@ -22,7 +22,7 @@ impl Default for GitRecencyConfig {
 
 const MAX_COMMITS_HARD_CAP: usize = 128;
 
-/// Walk multiplier override (`FFF_GIT_RECENCY_WALK_MULT`).
+// Walk multiplier override (`FFF_GIT_RECENCY_WALK_MULT`).
 fn walk_mult_override() -> Option<usize> {
     std::env::var("FFF_GIT_RECENCY_WALK_MULT")
         .ok()
@@ -30,7 +30,7 @@ fn walk_mult_override() -> Option<usize> {
         .filter(|n| *n >= 1)
 }
 
-/// Max commits override (`FFF_GIT_RECENCY_MAX_COMMITS`, 0 disables).
+// Max commits override (`FFF_GIT_RECENCY_MAX_COMMITS`, 0 disables).
 fn max_commits_override() -> Option<usize> {
     std::env::var("FFF_GIT_RECENCY_MAX_COMMITS")
         .ok()

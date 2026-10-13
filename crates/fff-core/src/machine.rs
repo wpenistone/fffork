@@ -1,21 +1,7 @@
-//! Machine calibration.
+//! Machine calibration: topology first, latency probed once.
 //!
-//! Tuning constants must hold on a 4-core laptop, a 32-core server and an
-//! M-series Mac alike, so none of them is a literal.
-//!
-//! **Topology first, measurement only for what topology cannot give us.**
-//! Core counts, SMT siblings, cache-line size, LLC and L2 size, clock, NUMA
-//! nodes and any cgroup limit are *facts about the box*, read from CPUID (x86),
-//! sysfs (Linux, any arch) or sysctl (macOS). Everything the dispatcher needs is
-//! derived from those. The one measured quantity is memory latency, which no
-//! register reports and which belongs to the memory controller rather than the
-//! CPU - and that is probed with one small buffer sized from the LLC.
-//!
-//! The gate moves little data per byte it touches, so the model that matters is
-//! "how many misses can this box keep in flight" - latency x line size x
-//! memory-level parallelism - rather than aggregate GB/s.
-//!
-//! Overrides: `FFF_MATCH_WORK_PER_THREAD`, `FFF_SCAN_THREAD_CAP`,
+//! Core, cache, NUMA and cgroup facts derive dispatch constants; only latency
+//! is measured. Overrides: `FFF_MATCH_WORK_PER_THREAD`, `FFF_SCAN_THREAD_CAP`,
 //! `FFF_FORK_JOIN_NS`, `FFF_NO_PROBE`.
 
 use std::sync::LazyLock;
@@ -42,12 +28,8 @@ pub(crate) struct Machine {
 }
 
 impl Machine {
-    /// Sustained cache-line fill rate for one core, bytes/ns.
-    ///
-    /// Each miss retires a whole cache line after one latency and a core keeps
-    /// `MLP` misses in flight, so per-core throughput is
-    /// `line / latency * mlp`. This is what limits the gate: it walks paths
-    /// through dependent loads, it does not stream bytes.
+    // Sustained cache-line fill rate for one core, bytes/ns:
+    // `line / latency * mlp`; the gate walks dependent loads.
     pub fn read_bytes_per_ns(&self) -> f64 {
         // 10 outstanding line fills is the conservative end of what modern OoO
         // cores sustain. Erring low only widens the dispatch window; the
@@ -64,29 +46,17 @@ impl Machine {
         (self.cache_line as f64 * MLP / latency).clamp(0.05, 64.0)
     }
 
-    /// Bytes of path data one match thread should own.
-    ///
-    /// A thread only pays for itself once it has enough work to amortize the
-    /// fork/join. `FORK_JOIN_NS` is rayon's real dispatch cost, not a tuned
-    /// corpus constant, and the throughput term scales with the machine: a box
-    /// that walks path bytes twice as fast needs twice the bytes per thread.
+    // Bytes of path data one match thread should own: enough to amortize
+    // the fork/join; scales with the machine's walk rate.
     pub fn match_work_per_thread(&self) -> usize {
         let bytes = (self.read_bytes_per_ns() * fork_join_ns() as f64) as usize;
         // Clamped so a paused VM or a bad probe cannot pick 0 or saturate.
         bytes.clamp(8 * 1024, 8 * 1024 * 1024)
     }
 
-    /// Upper bound on threads for an internal scan.
-    ///
-    /// Was a literal `.min(8)`, which under-uses a 32-core server and over-uses
-    /// a phone. Three bounds, all from topology:
-    ///
-    /// - **Physical cores**, not logical: SMT siblings share L1/L2.
-    /// - **The LLC** at ~2 MB of live index per active thread. Past that the
-    ///   threads evict each other, which is the wall measured on a 20-core
-    ///   desktop (flat past 2 threads, worse at 6).
-    /// - **NUMA nodes**, because a thread reading another node's memory pays a
-    ///   cross-socket hop on every miss.
+    // Upper bound on scan threads from topology: physical cores, LLC capacity
+    // (~2 MB live index per thread), and NUMA nodes. Prevents sibling, cache,
+    // and cross-socket contention.
     pub fn scan_thread_cap(&self) -> usize {
         let by_physical = self.physical_cores.max(1);
         let by_llc = if self.llc_bytes == 0 {
@@ -107,17 +77,9 @@ impl Machine {
             .clamp(1, 64)
     }
 
-    /// Smallest thread count reaching ~90% of the best observed read
-    /// bandwidth: the knee of the memory-scaling curve.
-    ///
-    /// This one genuinely cannot be derived from topology - it depends on the
-    /// memory controller and on what else the machine is doing - so it is
-    /// measured, but cheaply: one buffer sized past the LLC (never more
-    /// than 32 MB), filled once, sampled at {1,2,4,max} with median-of-3
-    /// per count. The previous
-    /// implementation allocated and LCG-filled a fresh multi-hundred-MB buffer
-    /// per sample, and separately had a bug that made it return 2 on every
-    /// machine because it compared each sample against a running peak.
+    // Thread count at ~90% of peak read bandwidth (memory-scaling knee).
+    // Topology cannot give this; measured cheaply on one buffer sized
+    // past the LLC, sampled at {1,2,4,max} with median-of-3.
     fn bandwidth_knee(&self) -> usize {
         static KNEE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *KNEE.get_or_init(|| {
@@ -188,8 +150,8 @@ impl Machine {
     }
 }
 
-/// Aggregate read bandwidth in bytes/ns with `threads` threads over one shared
-/// buffer, used only to locate the memory-scaling knee.
+// Aggregate read bandwidth in bytes/ns with `threads` threads over one shared
+// buffer, used only to locate the memory-scaling knee.
 fn parallel_read_bw(buf: &[u64], threads: usize, allowed: Option<&[usize]>) -> f64 {
     // One padded slot per thread: joining adjacent `u64` results would ping-pong
     // a single cache line between cores (false sharing) and under-report.
@@ -254,8 +216,8 @@ fn pin_thread_to_core(t: usize, allowed: Option<&[usize]>) {
 #[cfg(not(target_os = "linux"))]
 fn pin_thread_to_core(_t: usize, _allowed: Option<&[usize]>) {}
 
-/// rayon fork/join dispatch cost. Measured once in `dispatch` (empty
-/// fan-out median); historically ~25us. A property of the scheduler.
+// rayon fork/join dispatch cost. Measured once in `dispatch` (empty
+// fan-out median); historically ~25us. A property of the scheduler.
 fn fork_join_ns() -> usize {
     crate::dispatch::fork_join_ns() as usize
 }
@@ -277,8 +239,8 @@ pub(crate) fn match_work_per_thread() -> usize {
     *W
 }
 
-/// Point-in-time calibration values for bench metadata. Lets paired
-/// runs attribute thread-count differences instead of inferring them.
+/// Point-in-time calibration values for paired runs; attributes
+/// thread-count differences instead of inferring them.
 #[derive(Debug, Clone, Copy)]
 pub struct CalibrationSnapshot {
     pub logical_cores: usize,
@@ -311,8 +273,8 @@ pub(crate) fn scan_thread_cap() -> usize {
     *C
 }
 
-/// Run probe + derived caps now (open path). Lazy statics would otherwise
-/// fire inside the first query (~30ms of buffers and bandwidth samples).
+// Run probe + derived caps now (open path). Lazy statics would otherwise
+// fire inside the first query (~30ms of buffers and bandwidth samples).
 pub(crate) fn warm_calibration() {
     let _ = (match_work_per_thread(), scan_thread_cap());
     // Dispatch probes (empty fan-out median) join the open path so no
@@ -415,7 +377,7 @@ fn x86_topology(t: &mut Topology) {
     linux_topology(t);
 }
 
-/// (line size, L2 bytes, LLC bytes) from a deterministic-cache-parameters leaf.
+// (line size, L2 bytes, LLC bytes) from a deterministic-cache-parameters leaf.
 #[cfg(target_arch = "x86_64")]
 fn cpuid_cache_leaf(leaf: u32) -> (usize, usize, usize) {
     use core::arch::x86_64::__cpuid_count;
@@ -552,9 +514,9 @@ fn arch_cache_line() -> usize {
     64
 }
 
-/// sysfs topology, which on Linux is authoritative for cache sizes, SMT
-/// siblings and the NUMA node count - including inside containers, where it
-/// reflects the cpuset rather than the host.
+// sysfs topology, which on Linux is authoritative for cache sizes, SMT
+// siblings and the NUMA node count - including inside containers, where it
+// reflects the cpuset rather than the host.
 #[cfg(target_os = "linux")]
 fn linux_topology(t: &mut Topology) {
     let mut best_level = 0usize;
@@ -638,7 +600,7 @@ fn linux_topology(t: &mut Topology) {
 #[cfg(not(target_os = "linux"))]
 fn linux_topology(_t: &mut Topology) {}
 
-/// sysfs reports sizes like `32K`, `1024K`, `48M`.
+// sysfs reports sizes like `32K`, `1024K`, `48M`.
 #[cfg(target_os = "linux")]
 fn parse_cache_size(s: &str) -> Option<usize> {
     let s = s.trim();
@@ -651,22 +613,14 @@ fn parse_cache_size(s: &str) -> Option<usize> {
     num.trim().parse::<usize>().ok().map(|n| n * mult)
 }
 
-/// Memory latency in ns, by pointer-chasing a random permutation of a buffer
-/// sized just past the last-level cache.
-///
-/// This is the only measurement left, and it is a *latency* probe rather than
-/// a bandwidth sweep: one buffer, allocated once, sized from topology, walked
-/// with a dependent load chain so the hardware cannot overlap the misses. The
-/// previous implementation sampled bandwidth at 2/4/8/16 threads and
-/// allocated a fresh multi-hundred-MB buffer per sample.
-///
-/// Returns 0 when probing is disabled (`FFF_NO_PROBE`) or allocation fails; the
-/// caller then uses the documented default.
+// Latency probe: pointer-chase a buffer sized past the last-level cache
+// with a dependent load chain. Returns 0 when probing is disabled
+// (`FFF_NO_PROBE`) or allocation fails; the caller uses the default.
 fn measure_latency_ns(cache_sizes: &[usize; 2]) -> f64 {
     if std::env::var_os("FFF_NO_PROBE").is_some() {
         return 0.0;
     }
-    // Just past LLC, but never a huge allocation in a plugin host: capped at
+    // Past LLC, but never a huge allocation in a plugin host: capped at
     // 32 MB and additionally clamped by any cgroup limit.
     let llc = cache_sizes[1];
     let mut want = if llc > 0 {
@@ -786,8 +740,8 @@ mod tests {
         }
     }
 
-    /// A single-socket 8-core laptop: the LLC bound should not throttle it to
-    /// nothing, and it must stay under the core count.
+    // A single-socket 8-core laptop: the LLC bound should not throttle it to
+    // nothing, and it must stay under the core count.
     #[test]
     fn cap_respects_topology() {
         let laptop = m(8, 4, 16 << 20, 1);
@@ -795,21 +749,21 @@ mod tests {
         assert!(laptop.scan_thread_cap() >= 1);
     }
 
-    /// Two sockets: threads beyond one per node read across the interconnect.
+    // Two sockets: threads beyond one per node read across the interconnect.
     #[test]
     fn numa_limits_threads_per_node() {
         let dual = m(64, 32, 64 << 20, 2);
         assert!(dual.scan_thread_cap() <= 32 / 2);
     }
 
-    /// SMT must not be mistaken for more cores to use.
+    // SMT must not be mistaken for more cores to use.
     #[test]
     fn smt_siblings_are_not_extra_threads() {
         let smt = m(16, 8, 32 << 20, 1);
         assert!(smt.scan_thread_cap() <= 8, "got {}", smt.scan_thread_cap());
     }
 
-    /// A tiny LLC (a phone) must not ask for more threads than it can serve.
+    // A tiny LLC (a phone) must not ask for more threads than it can serve.
     #[test]
     fn small_llc_throttles() {
         let tiny = m(8, 8, 2 << 20, 1);
@@ -820,7 +774,7 @@ mod tests {
         );
     }
 
-    /// Unknown LLC must not divide by zero or fall through to core count.
+    // Unknown LLC must not divide by zero or fall through to core count.
     #[test]
     fn unknown_llc_is_safe() {
         let unknown = m(4, 4, 0, 0);
@@ -829,8 +783,8 @@ mod tests {
         assert!((1..=4).contains(&unknown_numa.scan_thread_cap()));
     }
 
-    /// Latency, not bandwidth, is the driver: a faster-memory box must derive
-    /// more work per thread, and an unprobed box must still land in range.
+    // Latency, not bandwidth, is the driver: a faster-memory box must derive
+    // more work per thread, and an unprobed box must still land in range.
     #[test]
     fn throughput_scales_with_latency() {
         let slow = m(8, 8, 32 << 20, 1);
@@ -850,7 +804,7 @@ mod tests {
         assert!((0.05..=64.0).contains(&b), "default throughput {b}");
     }
 
-    /// Whatever the host reports, derived values must stay usable.
+    // Whatever the host reports, derived values must stay usable.
     #[test]
     fn derived_values_are_sane_on_any_machine() {
         let real = machine();

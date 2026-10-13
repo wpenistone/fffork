@@ -146,7 +146,7 @@ impl BigramIndexBuilder {
         &slab[start..start + self.words]
     }
 
-    #[doc(hidden)] // `pub` (via `#[doc(hidden)]`) only for benchmarking
+    #[doc(hidden)] // Public for external use; hidden from docs.
     pub fn add_file_content(&self, skip_builder: &Self, file_idx: usize, content: &[u8]) {
         if content.len() < 2 {
             return;
@@ -891,7 +891,7 @@ fn normalize_byte_scalar(b: u8) -> u8 {
 /// in `0..src.len()`. Inlined-scalar so LLVM auto-vectorises with the
 /// build's baseline SIMD; on x86_64 we runtime-dispatch to AVX2.
 /// Caller guarantees `dst.len() >= src.len()`.
-/// Cache CPUID once. `is_x86_feature_detected!` is not free on every call.
+// Cache CPUID once. `is_x86_feature_detected!` is not free on every call.
 #[inline(always)]
 fn has_avx2_cached() -> bool {
     #[cfg(target_feature = "avx2")]

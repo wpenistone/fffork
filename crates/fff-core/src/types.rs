@@ -54,11 +54,11 @@ impl FileSliceExt for [FileItem] {
 }
 
 /// Ranking demotion applied to files under third-party directories.
-/// Exported so benches and SDKs can reconstruct totals from breakdowns.
+/// Exported so SDKs can reconstruct totals from breakdowns.
 pub const VENDORED_PATH_PENALTY: i32 = 120;
 
-/// Directory names that hold third-party code. Ranking demotes files under
-/// these so a first-party module outranks a dependency with the same name.
+// Directory names that hold third-party code. Ranking demotes files under
+// these so a first-party module outranks a dependency with the same name.
 const VENDORED_DIRS: &[&str] = &[
     "vendor",
     "node_modules",
@@ -79,14 +79,14 @@ fn segment_is_vendored(name: &str) -> bool {
     })
 }
 
-/// True when any segment of the relative directory is a dependency directory.
+// True when any segment of the relative directory is a dependency directory.
 pub(crate) fn dir_is_vendored(dir: &str) -> bool {
     dir.split(['/', '\\']).any(segment_is_vendored)
 }
 
 /// True when a relative file path lies under a dependency directory.
-/// Same rule the indexer uses for the VENDORED flag; exported so benches
-/// and SDKs can reconstruct score totals from breakdowns.
+/// Same rule the indexer uses for the VENDORED flag; exported so SDKs
+/// can reconstruct score totals from breakdowns.
 pub fn path_is_vendored(relative_path: &str) -> bool {
     let dir = relative_path
         .rsplit_once(['/', '\\'])
@@ -294,15 +294,15 @@ impl Constrainable for DirItem {
 pub struct FileItem {
     pub size: u64,
     pub modified: u64,
-    /// Scan-time 64-bit character-presence mask of the relative path
-    /// (see crate::presence). Sound necessary condition for fuzzy
-    /// LCS >= |q| - max_typos; never rejects a true match.
+    // Scan-time 64-bit character-presence mask of the relative path
+    // (see crate::presence). Sound necessary condition for fuzzy
+    // LCS >= |q| - max_typos; never rejects a true match.
     pub(crate) presence: u64,
     pub(crate) path: crate::simd_path::ChunkedString,
     pub(crate) parent_dir_index: u32,
-    /// Packed `Option<git2::Status>`: `u32::MAX` means None.
-    /// Stored as raw bits so FileItem stays 48 B (Option<Status> is 8 B
-    /// and pushed the struct to 56 B × 227k ≈ +1.8 MB peak RSS).
+    // Packed `Option<git2::Status>`: `u32::MAX` means None.
+    // Stored as raw bits so FileItem stays 48 B (Option<Status> is 8 B
+    // and pushed the struct to 56 B × 227k ≈ +1.8 MB peak RSS).
     git_status_bits: u32,
     pub access_frecency_score: i16,
     pub modification_frecency_score: i16,
@@ -360,17 +360,17 @@ pub(crate) fn detect_binary_content(content: &[u8]) -> bool {
     memchr::memchr(0, content).is_some()
 }
 
-/// Byte-presence mask of *file content*, folded to the same 64 classes as
-/// `presence::fold_bit`.
-///
-/// Built during the index-time binary sniff, which already streams every byte
-/// of every file, so it costs one OR per byte on an existing pass. Grep can
-/// then reject a candidate file without opening it: a length
-/// `m` match with `T` typos needs at least `m - T` distinct needle bytes
-/// present, which is a sound necessary condition.
-///
-/// Stored out of line (not in `FileItem`, which is packed to 48 B) - see
-/// `ContentMaskStore`.
+// Byte-presence mask of *file content*, folded to the same 64 classes as
+// `presence::fold_bit`.
+//
+// Built during the index-time binary sniff, which already streams every byte
+// of every file, so it costs one OR per byte on an existing pass. Grep can
+// then reject a candidate file without opening it: a length
+// `m` match with `T` typos needs at least `m - T` distinct needle bytes
+// present, which is a sound necessary condition.
+//
+// Stored out of line (not in `FileItem`, which is packed to 48 B) - see
+// `ContentMaskStore`.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct ContentMask(u64);
 
@@ -395,11 +395,11 @@ impl ContentMask {
         self.0 = m;
     }
 
-    /// Sound necessary condition for `content` to contain `needle`.
-    ///
-    /// `None` means "unknown" (no mask recorded) and the caller must read the
-    /// file. `Some(false)` means it provably cannot match.
-    /// Test-only spec: production filters through `MaskNeedle` instead.
+    // Sound necessary condition for `content` to contain `needle`.
+    //
+    // `None` means "unknown" (no mask recorded) and the caller must read the
+    // file. `Some(false)` means it provably cannot match.
+    // Test-only spec: production filters through `MaskNeedle` instead.
     #[cfg(test)]
     #[inline]
     pub(crate) fn allows(self, needle: &[u8], max_typos: u16) -> Option<bool> {
@@ -423,14 +423,14 @@ impl ContentMask {
     }
 }
 
-/// Sound necessary condition for `content` to contain `needle`, with the
-/// needle's byte classes resolved once so each file costs one AND + popcount.
+// Sound necessary condition for `content` to contain `needle`, with the
+// needle's byte classes resolved once so each file costs one AND + popcount.
 #[derive(Clone, Copy)]
 pub(crate) struct MaskNeedle {
-    /// Folded byte classes the needle uses, deduplicated.
+    // Folded byte classes the needle uses, deduplicated.
     classes: u64,
-    /// Distinct classes that must be present. Clamped to the class count,
-    /// since repeats in the needle cannot require more than they provide.
+    // Distinct classes that must be present. Clamped to the class count,
+    // since repeats in the needle cannot require more than they provide.
     need: usize,
 }
 
@@ -528,7 +528,7 @@ impl FileItem {
         self.presence = mask;
     }
 
-    /// Scan-time character-presence mask of the relative path.
+    // Scan-time character-presence mask of the relative path.
     #[inline(always)]
     pub(crate) fn presence_mask(&self) -> u64 {
         self.presence
@@ -606,7 +606,7 @@ impl FileItem {
 
     /// Write the relative path into `buf` and NUL-terminate, returning
     /// a `&CStr`. Fixed-size array so the buffer is stack-allocatable.
-    ///
+    //
     /// Paired with a parent-directory fd this eliminates the per-file
     /// absolute-path memcpy: `openat(dir_fd, cstr.as_ptr(), O_RDONLY)`
     /// resolves the name relative to `dir_fd`. Unix-only.
@@ -760,9 +760,9 @@ impl FileItem {
 
     /// Chunked classifier of the binary content of the file chunk by chunk
     /// accepts path which to reuse the allocated buffer for absolute path read
-    ///
-    /// Returns the content byte-presence mask built from the same read. Callers
-    /// store it so grep can reject this file without opening it.
+    //
+    // Returns the content byte-presence mask built from the same read. Callers
+    // store it so grep can reject this file without opening it.
     pub(crate) fn detect_binary_per_byte(&self, path: &Path, chunk: &mut [u8]) -> ContentMask {
         let mut mask = ContentMask::default();
         if self.size == 0 {
@@ -903,13 +903,13 @@ impl FileItem {
     }
 
     /// Get the cached file contents or lazily load and cache them.
-    ///
+    //
     /// Returns `None` if the file is too large, empty, can't be opened, **or
     /// the cache budget is exhausted**. Callers that need content regardless
     /// of the budget should use [`get_content_for_search`].
-    ///
+    //
     /// After the first call, this is lock-free (just an atomic load + pointer deref).
-    ///
+    //
     /// On Windows we never back this cache — `memmap2` would require a full
     /// `std::fs::read` heap copy and the OS page cache already absorbs repeat
     /// reopens. Returning `None` keeps callers on the scratch-read slow path
@@ -925,7 +925,7 @@ impl FileItem {
     }
 
     /// Returns a reference to a cached mmap of the file's contents.
-    ///
+    //
     /// SAFETY-CRITICAL: callers must hold the picker read lock for as long as the returned slice is in use.
     #[cfg(not(target_os = "windows"))]
     pub(crate) fn get_cached_content(
@@ -975,11 +975,11 @@ impl FileItem {
         self.cached_content()
     }
 
-    /// Get file content for searching — **always returns content** for eligible
-    /// files, even when the persistent cache budget is exhausted.
-    ///
-    /// Open goes through `open_for_search` (openat on Unix); the
-    /// absolute path is built in a stack buffer (no per-file alloc).
+    // Get file content for searching — **always returns content** for eligible
+    // files, even when the persistent cache budget is exhausted.
+    //
+    // Open goes through `open_for_search` (openat on Unix); the
+    // absolute path is built in a stack buffer (no per-file alloc).
     #[inline]
     pub(crate) fn get_content_for_search<'a>(
         &'a self,
@@ -1436,8 +1436,8 @@ mod content_mask_tests {
         m
     }
 
-    /// The whole point of the check: `Some(false)` must mean "provably cannot
-    /// match". A false negative here makes grep silently skip real matches.
+    // The whole point of the check: `Some(false)` must mean "provably cannot
+    // match". A false negative here makes grep silently skip real matches.
     #[test]
     fn never_rejects_a_substring_that_exists() {
         let contents: &[&[u8]] = &[
@@ -1467,7 +1467,7 @@ mod content_mask_tests {
         }
     }
 
-    /// Case folding must not create false negatives either.
+    // Case folding must not create false negatives either.
     #[test]
     fn case_insensitive_substrings_are_not_rejected() {
         let m = mask_of(b"Hello World");
@@ -1476,13 +1476,13 @@ mod content_mask_tests {
         assert_ne!(m.allows(b"World", 0), Some(false));
     }
 
-    /// An empty or unrecorded mask must fall through to reading the file.
+    // An empty or unrecorded mask must fall through to reading the file.
     #[test]
     fn unknown_mask_returns_none() {
         assert_eq!(ContentMask::default().allows(b"anything", 0), None);
     }
 
-    /// A typo budget can only make the check more permissive.
+    // A typo budget can only make the check more permissive.
     #[test]
     fn typos_only_relax_the_check() {
         let m = mask_of(b"abcdefghij");

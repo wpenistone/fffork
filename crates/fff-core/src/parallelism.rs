@@ -1,6 +1,6 @@
 use std::sync::LazyLock;
 
-/// Override for background pool size (`FFF_BG_THREADS`).
+// Override for background pool size (`FFF_BG_THREADS`).
 fn bg_threads_override() -> Option<usize> {
     std::env::var("FFF_BG_THREADS")
         .ok()
@@ -8,7 +8,7 @@ fn bg_threads_override() -> Option<usize> {
         .filter(|n| *n >= 1)
 }
 
-/// Override for search pool size (`FFF_SEARCH_THREADS`).
+// Override for search pool size (`FFF_SEARCH_THREADS`).
 fn search_threads_override() -> Option<usize> {
     std::env::var("FFF_SEARCH_THREADS")
         .ok()
@@ -68,7 +68,7 @@ pub fn effective_core_count() -> usize {
     base
 }
 
-/// Linux cgroup CPU cap: min of quota and cpuset size. `None` when uncapped.
+// Linux cgroup CPU cap: min of quota and cpuset size. `None` when uncapped.
 #[cfg(target_os = "linux")]
 pub(crate) fn cgroup_cpu_count() -> Option<usize> {
     let mut cap: Option<usize> = None;
@@ -112,14 +112,14 @@ pub(crate) fn cgroup_cpu_count() -> Option<usize> {
     cap.filter(|n| *n >= 1)
 }
 
-/// Count CPUs in a cpuset list like `0-3,8,10-11`.
+// Count CPUs in a cpuset list like `0-3,8,10-11`.
 #[cfg(target_os = "linux")]
 fn parse_cpuset_len(s: &str) -> Option<usize> {
     cpuset_cpus_inner(s).map(|v| v.len())
 }
 
-/// Allowed CPUs from the cpuset files, for pinning probe threads inside the
-/// container instead of `t % host_ncpu` (which can address forbidden cores).
+// Allowed CPUs from the cpuset files, for pinning probe threads inside the
+// container instead of `t % host_ncpu` (which can address forbidden cores).
 #[cfg(target_os = "linux")]
 pub(crate) fn cpuset_cpus() -> Option<Vec<usize>> {
     [

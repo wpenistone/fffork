@@ -4,7 +4,7 @@
 
 use std::sync::LazyLock;
 
-/// Thread count and chunk size for one parallel loop.
+// Thread count and chunk size for one parallel loop.
 pub(crate) struct Plan {
     pub threads: usize,
     pub chunk: usize,
@@ -50,7 +50,7 @@ pub(crate) fn fork_join_ns() -> u64 {
     fork_join_measured()
 }
 
-/// Bytes of path work that amortize one fork/join on this box.
+// Bytes of path work that amortize one fork/join on this box.
 pub(crate) fn bytes_to_amortize() -> usize {
     static B: LazyLock<usize> = LazyLock::new(|| {
         if let Some(v) = std::env::var("FFF_MATCH_WORK_PER_THREAD")
@@ -69,9 +69,9 @@ pub(crate) fn bytes_to_amortize() -> usize {
     *B
 }
 
-/// Byte-equivalents of one gate file: DP cost over SIMD lanes scaled
-/// by strictness, plus the memory walk itself. Shared by the thread
-/// estimator and the group sizer so they cannot disagree.
+// Byte-equivalents of one gate file: DP cost over SIMD lanes scaled
+// by strictness, plus the memory walk itself. Shared by the thread
+// estimator and the group sizer so they cannot disagree.
 pub(crate) fn match_bytes_per_file(
     needle_len: usize,
     max_haystack_len: usize,
@@ -88,10 +88,10 @@ pub(crate) fn match_bytes_per_file(
     (nl * chunks * strict).max(1.0) as usize
 }
 
-/// Plan a file-count loop. `bytes_per_file` is a conservative upper
-/// bound (max path len scaled by query cost); over-estimate saturates
-/// the cap, under-estimate serializes. Both directions cost at most
-/// one fork/join of waste, never correctness.
+// Plan a file-count loop. `bytes_per_file` is a conservative upper
+// bound (max path len scaled by query cost); over-estimate saturates
+// the cap, under-estimate serializes. Both directions cost at most
+// one fork/join of waste, never correctness.
 pub(crate) fn plan_files(n: usize, bytes_per_file: usize, cap: usize) -> Plan {
     let cap = cap.max(1);
     if n == 0 {
@@ -106,14 +106,14 @@ pub(crate) fn plan_files(n: usize, bytes_per_file: usize, cap: usize) -> Plan {
     }
 }
 
-/// Plan a match-count loop (top-k, scoring). `bytes_per_match` covers
-/// the score struct plus the path bytes each item touches.
+// Plan a match-count loop (top-k, scoring). `bytes_per_match` covers
+// the score struct plus the path bytes each item touches.
 pub(crate) fn plan_matches(n: usize, bytes_per_match: usize, cap: usize) -> Plan {
     plan_files(n, bytes_per_match, cap)
 }
 
-/// Match count whose metadata working set fills one private L2.
-/// Keeps TLS scratch resident; falls back when topology is unknown.
+// Match count whose metadata working set fills one private L2.
+// Keeps TLS scratch resident; falls back when topology is unknown.
 pub(crate) fn sw_metadata_chunk() -> usize {
     static C: LazyLock<usize> = LazyLock::new(|| {
         let l2 = crate::machine::machine().l2_bytes;
@@ -129,15 +129,15 @@ pub(crate) fn sw_metadata_chunk() -> usize {
     *C
 }
 
-/// Probe length whose cost is ~one fork/join (negligible). Floor is
-/// sampling statistics (SE <= 9% on a proportion), not corpus tuning.
+// Probe length whose cost is ~one fork/join (negligible). Floor is
+// sampling statistics (SE <= 9% on a proportion), not corpus tuning.
 pub(crate) fn probe_len(n: usize, avg_bytes: usize) -> usize {
     let p = bytes_to_amortize().div_ceil(avg_bytes.max(1)).max(32);
     p.min(n)
 }
 
-/// Mean path bytes over a strided sample (same statistics floor as
-/// the probe). Scales per-match work estimates without walking 227k.
+// Mean path bytes over a strided sample (same statistics floor as
+// the probe). Scales per-match work estimates without walking 227k.
 pub(crate) fn sampled_path_avg(files: &crate::matcher::FileItems<'_>) -> usize {
     let n = files.len();
     if n == 0 {
@@ -156,8 +156,8 @@ pub(crate) fn sampled_path_avg(files: &crate::matcher::FileItems<'_>) -> usize {
     sum.div_ceil(count.max(1)).max(1)
 }
 
-/// Inner fan-out decision for fixed-size SIMD batches. Amdahl
-/// break-even: parallel wins iff saved time exceeds dispatch.
+// Inner fan-out decision for fixed-size SIMD batches. Amdahl
+// break-even: parallel wins iff saved time exceeds dispatch.
 pub(crate) fn parallel_batches(n_batches: usize, ns_per_batch: f64, threads: usize) -> bool {
     if n_batches < 2 || ns_per_batch <= 0.0 || threads < 2 {
         return false;
@@ -166,11 +166,8 @@ pub(crate) fn parallel_batches(n_batches: usize, ns_per_batch: f64, threads: usi
     (n_batches as f64) * ns_per_batch * (1.0 - 1.0 / t) > fork_join_ns() as f64
 }
 
-/// Measured cost of one SW batch, per lane class (u8 32-wide vs u16
-/// 16-wide kernels differ ~2x). Seeds are order-of-magnitude values
-/// from reference-box measurement; every slice refines them, so even
-/// 2x seed error barely moves the dispatch boundary. Only moves the
-/// serial/parallel boundary; either side wastes at most one fork/join.
+// Measured cost of one SW batch per lane class; seeds refine per slice,
+// so seed error only moves the serial/parallel boundary slightly.
 static BATCH_NS_U8: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(3_000);
 static BATCH_NS_U16: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(6_000);
 
@@ -183,8 +180,8 @@ pub(crate) fn batch_ns_estimate(u8_class: bool) -> f64 {
     cell.load(std::sync::atomic::Ordering::Relaxed) as f64
 }
 
-/// Fold one slice's mean batch cost into the estimate (EWMA, /8).
-/// Benign races: concurrent slices may drop samples, never corrupt.
+// Fold one slice's mean batch cost into the estimate (EWMA, /8).
+// Benign races: concurrent slices may drop samples, never corrupt.
 pub(crate) fn observe_batch_ns(u8_class: bool, slice_ns: f64, n_batches: usize) {
     if n_batches == 0 || slice_ns <= 0.0 {
         return;

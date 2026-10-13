@@ -71,9 +71,9 @@ impl IntoIterator for GitStatusCache {
     }
 }
 
-/// `FFF_GIT_RELATIVE_KEYS=1` stores keys relative to the workdir: one short
-/// relative path per entry instead of repeating the absolute prefix (~40B
-/// saved/entry on deep roots). Lookup strips the prefix first.
+// `FFF_GIT_RELATIVE_KEYS=1` stores keys relative to the workdir: one short
+// relative path per entry instead of repeating the absolute prefix (~40B
+// saved/entry on deep roots). Lookup strips the prefix first.
 fn relative_keys_enabled() -> bool {
     matches!(
         std::env::var("FFF_GIT_RELATIVE_KEYS").as_deref(),
@@ -81,7 +81,7 @@ fn relative_keys_enabled() -> bool {
     )
 }
 
-/// Max pathspec entries per libgit2 call (`FFF_GIT_PATHSPEC_BATCH`).
+// Max pathspec entries per libgit2 call (`FFF_GIT_PATHSPEC_BATCH`).
 fn pathspec_batch_cap() -> usize {
     std::env::var("FFF_GIT_PATHSPEC_BATCH")
         .ok()
@@ -158,11 +158,11 @@ impl GitStatusCache {
         })
     }
 
-    /// Dirty-only refresh: same cheap options as the initial scan (no
-    /// `include_unmodified`). Missing entries already mean "clean" because
-    /// every `FileItem` starts with `git_status: None`, so enumerating all
-    /// tracked paths is pure overhead on huge trees.
-    /// Test-only helper: production refresh goes through the status worker.
+    // Dirty-only refresh: same cheap options as the initial scan (no
+    // `include_unmodified`). Missing entries already mean "clean" because
+    // every `FileItem` starts with `git_status: None`, so enumerating all
+    // tracked paths is pure overhead on huge trees.
+    // Test-only helper: production refresh goes through the status worker.
     #[cfg(test)]
     pub(crate) fn read_dirty_status(repo: &Repository) -> Result<Self> {
         let mut opts = initial_scan_status_options();

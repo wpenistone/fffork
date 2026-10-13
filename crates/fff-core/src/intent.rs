@@ -1,22 +1,20 @@
 //! Query intent + evidence model for file finding.
 //!
-//! Fuzzy path score is a weak proxy for "the file I mean". This module
-//! classifies the user's job from the query shape and editor context, and
-//! exposes structured evidence (filename, ext, path segments, role) that
+//! Classifies the job from query shape and context; exposes evidence
 //! the ranker mixes per intent.
 
 /// What the user is trying to do. One query → one primary intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryIntent {
-    /// Empty or whitespace — show working set (MRU, buffers, current dir).
+    // Empty or whitespace — show working set (MRU, buffers, current dir).
     WorkingSet,
-    /// `foo.rs` / `user_service.ts` — name + optional extension.
+    // `foo.rs` / `user_service.ts` — name + optional extension.
     FileName,
-    /// `src/auth/login` / `../x/y` — path structure.
+    // `src/auth/login` / `../x/y` — path structure.
     Path,
-    /// `handler`, `router`, `login` — concept / role / word.
+    // `handler`, `router`, `login` — concept / role / word.
     Concept,
-    /// Looks like a typo of a name (`filw_pikcer`).
+    // Looks like a typo of a name (`filw_pikcer`).
     Typo,
 }
 
@@ -86,7 +84,7 @@ pub fn detect_intent(raw: &str, current_file: Option<&str>, _has_mru: bool) -> Q
     }
     // `name.ext` — a single dot, not leading, plausible extension.
     if let Some(_ne) = split_name_ext(q) {
-        // Very long random strings with a dot still count as name.
+        // Long random strings with a dot still count as name.
         return QueryIntent::FileName;
     }
     // Typo heuristic: high oddness (rare double letters, qwerty near-misses
@@ -187,8 +185,8 @@ pub fn for_each_word<'a>(name: &'a str, mut f: impl FnMut(&'a str)) {
     }
 }
 
-/// Cheap typo proxy: long identifier, mixed case noise, or uncommon bigrams.
-/// Conservative — only fires when the string looks "wrong".
+// Cheap typo proxy: long identifier, mixed case noise, or uncommon bigrams.
+// Conservative — only fires when the string looks "wrong".
 fn looks_like_typo(q: &str) -> bool {
     if q.len() < 4 || q.len() > 40 {
         return false;
@@ -208,12 +206,8 @@ fn looks_like_typo(q: &str) -> bool {
     }
     false
 }
-/// Case-insensitive substring test without allocating.
-///
-/// The naive `h.windows(n).any(eq_ignore_ascii_case)` pays a full slice
-/// comparison at every offset. Screening on the first byte first turns the
-/// common case (most offsets mismatch immediately) into one compare, which
-/// matters because this runs once per candidate on the non-collapsed path.
+// Case-insensitive substring without allocating; screens on the first
+// byte so mismatches cost one compare per offset.
 #[inline]
 pub(crate) fn contains_ignore_ascii(hay: &str, needle: &str) -> bool {
     let h = hay.as_bytes();
@@ -399,7 +393,7 @@ pub(crate) fn word_coverage_prepared(fname: &str, qwords: &[&str]) -> u8 {
     (hits * 100 / qwords.len()).min(100) as u8
 }
 
-/// Case-insensitive prefix test without allocating.
+// Case-insensitive prefix test without allocating.
 fn starts_with_ignore_ascii(hay: &str, prefix: &str) -> bool {
     let h = hay.as_bytes();
     let p = prefix.as_bytes();
@@ -586,7 +580,7 @@ pub fn evidence_prepared(
                 contains_ignore_ascii(filename, pq.stem_lower.as_deref().unwrap_or_default());
         }
     } else if want_name {
-        // Bare name query: stem equality is "this is the file", not just contains.
+        // Bare name query: stem equality signals the file, not containment.
         let stem = filename_stem(filename);
         ev.exact_filename = filename.eq_ignore_ascii_case(q) || stem.eq_ignore_ascii_case(q);
         ev.filename_substring = contains_ignore_ascii(filename, &pq.lower);

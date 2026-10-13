@@ -1,17 +1,17 @@
 use ahash::AHashMap;
 use std::borrow::Cow;
 
-/// Path chunk size in bytes. Swept on sumo_fork (226k files, 87 B avg path):
-///
-///   bytes   heap    dedup    gate      sw
-///    16     7.5MB   12.2x   4879us   6478us
-///    32     8.2MB    4.6x   4223us   5783us
-///    64    14.1MB    2.2x   4438us   6715us
-///
-/// 32 wins: it halves the index table (1.33M -> 0.72M slots) and shortens
-/// the dependent chunk chain, which is what the gate actually costs. 64
-/// overshoots - dedup collapses and the chunk array (12.3 MB) no longer
-/// fits cache, so both gate and SW get worse again.
+// Path chunk size in bytes. Swept on sumo_fork (226k files, 87 B avg path):
+//
+//   bytes   heap    dedup    gate      sw
+//    16     7.5MB   12.2x   4879us   6478us
+//    32     8.2MB    4.6x   4223us   5783us
+//    64    14.1MB    2.2x   4438us   6715us
+//
+// 32 wins: it halves the index table (1.33M -> 0.72M slots) and shortens
+// the dependent chunk chain, which is what the gate actually costs. 64
+// overshoots - dedup collapses and the chunk array (12.3 MB) no longer
+// fits cache, so both gate and SW get worse again.
 pub(crate) const SIMD_CHUNK_BYTES: usize = 32;
 
 /// Read-only view of a path store: 16-byte chunk arena plus the flat table of
@@ -81,8 +81,8 @@ pub use crate::constants::PATH_BUF_SIZE;
 /// Chunk pointer capacity needed for the longest path the platform allows.
 pub(crate) const MAX_PATH_CHUNKS: usize = PATH_BUF_SIZE.div_ceil(SIMD_CHUNK_BYTES);
 
-/// Pointer capacity for frizbee's resolved API, which counts 16 B units.
-/// Keep separate from MAX_PATH_CHUNKS (32 B arena units).
+// Pointer capacity for frizbee's resolved API, which counts 16 B units.
+// Keep separate from MAX_PATH_CHUNKS (32 B arena units).
 pub(crate) const MAX_FRIZBEE_CHUNKS: usize =
     PATH_BUF_SIZE.div_ceil(neo_frizbee::SIMD_CHUNK_BYTES);
 
@@ -97,8 +97,8 @@ pub(crate) struct ChunkedString {
 }
 
 impl ChunkedString {
-    /// Stable ordering key for tie-breaks. Paths are stored in scan order, so
-    /// this is unique per path and orders deterministically.
+    // Stable ordering key for tie-breaks. Paths are stored in scan order, so
+    // this is unique per path and orders deterministically.
     #[inline]
     pub(crate) fn rank_key(&self) -> u64 {
         (self.byte_len as u64) << 32 | self.index_offset as u64

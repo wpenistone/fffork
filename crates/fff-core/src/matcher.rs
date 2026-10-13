@@ -10,9 +10,9 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Copy a chunked path into 16 B-unit pointers for frizbee's resolved API.
-/// Arena chunks are 32 B deduped, so their sub-slices are not contiguous.
-/// Frizbee gathers synchronously before the next resolve on this thread,
+// Copy a chunked path into 16 B-unit pointers for frizbee's resolved API.
+// Arena chunks are 32 B deduped, so their sub-slices are not contiguous.
+// Frizbee gathers synchronously before the next resolve on this thread,
 // one TLS buffer is sound.
 pub(crate) fn resolve_frizbee_bytes(
     path: &ChunkedString,
@@ -52,7 +52,7 @@ pub(crate) struct MatchWindow {
     pub(crate) include_exact: bool,
 }
 
-/// Packed trim window: 12 B vs 16 B tuple. Paths fit u16 (ChunkedString).
+// Packed trim window: 12 B vs 16 B tuple. Paths fit u16 (ChunkedString).
 #[derive(Clone, Copy, Default)]
 pub(crate) struct Trim {
     pub file_idx: u32,
@@ -115,10 +115,10 @@ pub(crate) fn resolve_file_chunks_prefiltered(
     resolve_file_chunks(file, arena, buf)
 }
 
-/// Build a frizbee `Matcher` for one search. Construction parses the
-/// pattern, so a thread-local pristine-template cache clones one per call.
-/// Every call still runs on a fresh-equivalent instance (`new().clone()`),
-/// never on a previously-run matcher, which keeps results identical.
+// Build a frizbee `Matcher` for one search. Construction parses the
+// pattern, so a thread-local pristine-template cache clones one per call.
+// Every call still runs on a fresh-equivalent instance (`new().clone()`),
+// never on a previously-run matcher, which keeps results identical.
 #[inline]
 pub(crate) fn with_cached_matcher<R>(
     needle: &str,
@@ -151,7 +151,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// Collect match indices from the next `fuzzy_search` (typing live-narrow).
+// Collect match indices from the next `fuzzy_search` (typing live-narrow).
 pub(crate) fn capture_hit_indices(iter: impl Iterator<Item = u32>) {
     HIT_CAPTURE.with(|c| {
         if let Some(v) = c.borrow_mut().as_mut() {
@@ -174,8 +174,8 @@ pub(crate) fn with_hit_capture<T>(sink: &mut Vec<u32>, f: impl FnOnce() -> T) ->
     t
 }
 
-/// Max path byte length over a plain slice. Test helper; production uses
-/// the incremental `PathLenCache`.
+// Max path byte length over a plain slice. Test helper; production uses
+// the incremental `PathLenCache`.
 #[cfg(test)]
 #[inline]
 pub(crate) fn max_path_len_of(files: &[FileItem]) -> usize {
@@ -244,7 +244,7 @@ impl<'a> FileItems<'a> {
         }
     }
 
-    /// Corpus/file index for a working-set position (live-narrow hits).
+    // Corpus/file index for a working-set position (live-narrow hits).
     #[inline]
     pub(crate) fn file_index(&self, index: usize) -> u32 {
         match self {
@@ -254,8 +254,8 @@ impl<'a> FileItems<'a> {
     }
 }
 
-/// Resolve a FileItem's chunked path into frizbee's pointer buffer.
-/// Returns `Some((chunk_count, byte_len))` or `None` for deleted files.
+// Resolve a FileItem's chunked path into frizbee's pointer buffer.
+// Returns `Some((chunk_count, byte_len))` or `None` for deleted files.
 #[inline]
 pub(crate) fn resolve_file_chunks(
     file: &FileItem,
@@ -268,9 +268,9 @@ pub(crate) fn resolve_file_chunks(
     resolve_frizbee_bytes(&file.path, arena, buf)
 }
 
-/// Test-only override so thread scaling is actually measurable. Without it
-/// the estimate below overwrites the caller's request, which silently makes
-/// every "1T / 4T" comparison the same thread count. Read once.
+// Test-only override so thread scaling is actually measurable. Without it
+// the estimate below overwrites the caller's request, which silently makes
+// every "1T / 4T" comparison the same thread count. Read once.
 static THREAD_OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
 
 pub(crate) fn effective_match_threads(

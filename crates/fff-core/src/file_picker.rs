@@ -1354,6 +1354,14 @@ impl FilePicker {
             fff_query_parser::FuzzyQuery::Parts(parts) if !parts.is_empty() => parts[0],
             _ => query.raw_query.trim(),
         };
+        // Mirrors the scoring junction: short/empty queries take the
+        // frecency path and capture no hit set, so their empty buffer
+        // must not enter history (repeats would read NarrowPlan::Empty).
+        let fuzzy_ran = match &query.fuzzy_query {
+            fff_query_parser::FuzzyQuery::Text(t) => t.len() >= 2,
+            fff_query_parser::FuzzyQuery::Parts(parts) => !parts.is_empty(),
+            _ => false,
+        };
 
         // Tiny queries are too small to amortize Rayon dispatch when the
         // caller asked for a small pool. Never override an explicit request
@@ -1626,7 +1634,7 @@ impl FilePicker {
             let q = context.effective_query();
             live.history
                 .retain(|e| e.query != q || e.max_typos != max_typos);
-            if narrow_pays(live.candidates.len(), files.len()) {
+            if fuzzy_ran && narrow_pays(live.candidates.len(), files.len()) {
                 let snapshot = live.candidates.clone();
                 let generation = live.generation;
                 live.history.push(BackEntry {
@@ -3551,6 +3559,50 @@ mod tests {
         assert!(!narrow_pays(226_747, 227_405));
         assert!(!narrow_pays(227_405, 227_405));
         assert!(narrow_pays(2, 3));
+    }
+
+    #[test]
+    fn short_query_repeats_match_first_search() {
+        use crate::types::PaginationArgs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_buf = crate::path_utils::canonicalize(dir.path()).unwrap();
+        let base = base_buf.as_path();
+        for rel in ["src/alpha_1.rs", "src/alpha_2.rs", "src/beta.rs"] {
+            let path = base.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+
+        let opts = || FuzzySearchOptions {
+            max_threads: 1,
+            current_file: None,
+            project_path: None,
+            combo_boost_score_multiplier: 0,
+            min_combo_count: 0,
+            pagination: PaginationArgs { offset: 0, limit: 50 },
+        };
+        let parser = fff_query_parser::QueryParser::default();
+        let run = |picker: &FilePicker, text: &str| {
+            let parsed = parser.parse(text);
+            let out = picker.fuzzy_search(&parsed, None, opts());
+            (out.total_matched, out.items.len())
+        };
+
+        // Single-char queries take the frecency path (no hit capture);
+        // repeats and backspaces onto them must recompute, not read Empty.
+        let first = run(&picker, "a");
+        assert_eq!(first.0, 3);
+        assert_eq!(run(&picker, "a"), first);
+        assert_eq!(run(&picker, "alph"), (2, 2));
+        assert_eq!(run(&picker, "a"), first);
     }
 
     /// Binary sniff reads a bounded prefix: early NULs flag binary, late

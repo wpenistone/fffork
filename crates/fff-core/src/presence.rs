@@ -1,25 +1,10 @@
-//! Scan-time per-path character-presence index.
+//! Scan-time per-path presence index: 64-bit mask per path (8 bytes).
 //!
-//! Each path gets a 64-bit mask: bit `fold_bit(b)` is set iff byte `b`
-//! occurs anywhere in the path (ASCII case-folded). The mask is a *sound
-//! necessary condition* for `LCS(needle, path) >= |needle| - max_typos`:
-//! any true match must have at least `|needle| - max_typos` needle bytes
-//! present in the path, so if fewer needle bytes have their bit set the
-//! path cannot match and can be skipped without touching its bytes.
-//!
-//! The fold is lossy (`b & 15` overflow bucket), so the check can pass
-//! paths that still cannot match (false positives) — the matcher remains
-//! the authority. It never rejects a true match (no false negatives).
-//!
-//! 64 bits keep the index at 8 bytes/path (contiguous, sequential scan)
-//! versus 32 bytes for a 256-bit mask.
+//! Sound pretest for `LCS >= |needle| - max_typos`; lossy fold may pass
+//! non-matches, but never rejects a true match.
 
-/// Map a byte to a bit index in `0..64`.
-///
-/// ASCII uppercase folds onto its lowercase bit so case-insensitive
-/// matching stays sound. The first 48 bits are injective on the path
-/// alphabet (a-z, 0-9, and twelve common punctuation bytes); the rest of
-/// the byte space shares 16 overflow bits, which only costs selectivity.
+// Map a byte to a bit in `0..64`; uppercase folds to lowercase so the
+// pretest stays sound. Overflow bits only cost selectivity.
 #[inline(always)]
 pub(crate) fn fold_bit(b: u8) -> u32 {
     let b = if b.is_ascii_uppercase() { b + 32 } else { b };
@@ -42,7 +27,7 @@ pub(crate) fn fold_bit(b: u8) -> u32 {
     }
 }
 
-/// Build the presence mask for a path (relative path bytes, any case).
+// Build the presence mask for a path (relative path bytes, any case).
 #[inline]
 pub(crate) fn mask_of(path: &[u8]) -> u64 {
     let mut m = 0u64;
@@ -52,8 +37,8 @@ pub(crate) fn mask_of(path: &[u8]) -> u64 {
     m
 }
 
-/// Precomputed per-query presence check. The needle fold is built once
-/// instead of per path (227k calls in the prefilter hot loop).
+// Precomputed per-query presence check. The needle fold is built once
+// instead of per path (227k calls in the prefilter hot loop).
 #[derive(Clone, Copy)]
 pub(crate) struct NeedlePresence {
     need: usize,
@@ -102,14 +87,14 @@ impl NeedlePresence {
         }
     }
 
-    /// Shortest path that can still match (LCS ≤ path_len).
+    // Shortest path that can still match (LCS ≤ path_len).
     #[inline(always)]
     pub(crate) fn min_path_len(&self) -> usize {
         self.min_len
     }
 
-    /// False when the presence check is not worth running (need < 3:
-    /// short queries match almost every path, so the check is overhead).
+    // False when the presence check is not worth running (need < 3:
+    // short queries match almost every path, so the check is overhead).
     #[inline(always)]
     pub(crate) fn should_check(&self) -> bool {
         self.need >= 3
@@ -148,19 +133,14 @@ impl NeedlePresence {
     }
 }
 
-/// Sound pretest for one file: unknown masks (0) always scan.
+// Sound pretest for one file: unknown masks (0) always scan.
 #[inline]
 pub(crate) fn allows_or_unknown(np: &NeedlePresence, path_mask: u64, needle: &[u8]) -> bool {
     path_mask == 0 || np.allows(path_mask, needle)
 }
 
-/// Sound necessary condition for `LCS(needle, path) >= |needle| - max_typos`.
-///
-/// Counts needle bytes (with multiplicity) whose folded bit is set in the
-/// path mask. Multiplicity is required: counting distinct needle bits would
-/// reject `needle="aab"` vs `path="aab"` at `need=3`.
-///
-/// `need == 0` (typo budget covers the whole needle) accepts everything.
+// Sound pretest for `LCS >= |needle| - max_typos`; counts with multiplicity
+// (`need == 0` accepts everything).
 #[inline]
 pub(crate) fn allows(path_mask: u64, needle: &[u8], max_typos: u16) -> bool {
     let np = NeedlePresence::new(needle, max_typos);
@@ -171,8 +151,8 @@ pub(crate) fn allows(path_mask: u64, needle: &[u8], max_typos: u16) -> bool {
 mod tests {
     use super::*;
 
-    /// Exhaustive soundness: for random path/needle pairs with a cheap LCS
-    /// oracle, `allows` never rejects when LCS >= need.
+    // Exhaustive soundness: for random path/needle pairs with a cheap LCS
+    // oracle, `allows` never rejects when LCS >= need.
     fn lcs_len(a: &[u8], b: &[u8]) -> usize {
         // Case-insensitive to match frizbee's matcher semantics.
         let fold = |x: u8| if x.is_ascii_uppercase() { x + 32 } else { x };

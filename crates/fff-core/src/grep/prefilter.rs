@@ -69,9 +69,9 @@ pub(super) fn prefilter_with_filepath_retry_indexed<'a>(
     )
 }
 
-/// Shared chunk sizing for plain + fuzzy grep. Base stays small for cheap
-/// page-fill exit; max stays large so zero-hit scans still ramp to few
-/// barriers via AIMD. Full scans skip the gate entirely.
+// Shared chunk sizing for plain + fuzzy grep. Base stays small for cheap
+// page-fill exit; max stays large so zero-hit scans still ramp to few
+// barriers via AIMD. Full scans skip the gate entirely.
 pub(super) fn chunk_plan(
     num_candidates: usize,
     total_files: usize,

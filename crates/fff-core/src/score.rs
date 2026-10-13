@@ -123,8 +123,7 @@ fn match_fuzzy_parts(
         let big_enough =
             crate::dispatch::plan_files(n_files, avg_bytes, usize::MAX).threads > 1;
         // Probe-measured presence economics (rate, presence_ns, gate_ns),
-        // set only when the gate leg was actually timed (empty passes mean
-        // highly selective: keep the pretest, it likely pays).
+        // set only when the gate probe was timed (empty probes stay selective).
         let mut presence_probe: Option<(f64, f64, f64)> = None;
         if big_enough && n_files > 0 {
             let n_probe = crate::dispatch::probe_len(n_files, avg_bytes);
@@ -155,7 +154,7 @@ fn match_fuzzy_parts(
             }
             let presence_ns =
                 t_probe.elapsed().as_nanos() as f64 / probed.max(1) as f64;
-            // Time the gate on passing probe files for the savings leg.
+            // Time the gate on passing probe files for the savings estimate.
             let mut gate_ns = 0.0f64;
             if !pass_idx.is_empty() {
                 let t_gate = std::time::Instant::now();
@@ -209,7 +208,7 @@ fn match_fuzzy_parts(
         // Rechecks are a sound pretest, so skipping never changes results:
         // scan members already passed the same test, and uniform queries
         // (probe rate ~1) save less than rechecks cost (measured, no tuning).
-        // Also honors the bench hatch the test-only path already respects.
+        // Honors `FFF_NO_GATE_PREFILTER`, as the test-only path does.
         let check_presence = np.should_check()
             && std::env::var_os("FFF_NO_GATE_PREFILTER").is_none()
             && !use_cand
@@ -1852,7 +1851,7 @@ fn match_and_score_in_arena<'a>(
         // filename going through filename_cow (which heap-allocates
         // whenever the filename straddles a chunk boundary).
         // Only the suffix test, the combo test and path-shaped evidence
-        // need the full path; collapsed queries with just an open file skip it.
+        // need the full path; collapsed queries with only an open file skip it.
         let need_rel = need_rel_q;
         // When nothing else needs the path, borrow the filename straight
         // out of the arena when it fits a chunk and copy into the scratch
@@ -1931,7 +1930,7 @@ fn match_and_score_in_arena<'a>(
         // Path alignment bonus: when the query looks like a file path,
         // reward candidates whose path closely matches the typed query.
         // Uses suffix overlap Ã¢â‚¬â€ bytes matching from the end. A full prefix
-        // match is just the 100% coverage case, so no separate branch needed.
+        // match is the 100% coverage case, so no separate branch is needed.
         let path_alignment_bonus = if query_contains_path_separator && main_needle.len() > 10 {
             let path_bytes = rel.unwrap_or("").as_bytes();
             let common_suffix = main_needle
@@ -2114,8 +2113,8 @@ fn match_and_score_in_arena<'a>(
             }
         } else {
             // Fold into per-worker heaps sized page_cap and reduce. Avoids
-            // materializing 226k Score structs (~10 MB of faults/RSS) just to
-            // keep the top 100. Ranking stays exact (same comparator).
+            // materializing all Score structs only to keep the top 100.
+            // Ranking stays exact (same comparator).
             // scratch stays per-thread via map_init Ã¢â‚¬â€ do NOT carry it in the
             // fold accumulator (4 KB Ãƒâ€” rayon tree overflowed the worker stack).
             let (par_heap, par_skipped) = crate::parallelism::run_on_search_pool(|| {
@@ -2717,10 +2716,8 @@ mod tests {
     use crate::types::PaginationArgs;
     use fff_query_parser::QueryParser;
 
-    // Upstream-engine equality (independent raw-frizbee runs averaged)
-    // cannot hold here: this engine SW-rescores the first leg, so the
-    // narrowed leg mixes SW and raw-frizbee scales by design. Engine
-    // self-consistency is covered by ranking_parity tests instead.
+    // Upstream-engine equality cannot hold here: this engine SW-rescores
+    // the first pass, so the narrowed pass mixes scales by design.
     #[ignore = "cross-path SW-vs-frizbee equality; engine mixes scales by design"]
     #[test]
     fn longer_second_part_preserves_matches_and_first_part_positions() {
@@ -4415,7 +4412,7 @@ mod topk_prune_tests {
     #[test]
     fn gate_prefilter_hatch_ranks_identically() {
         // Fused path honors FFF_NO_GATE_PREFILTER; pretest is sound so
-        // both legs rank identically. Same race-safety as neighbors.
+        // both paths rank identically.
         let paths: Vec<String> = (0..1500)
             .map(|i| format!("src/mod{}/Handler_{}.rs", i % 37, i % 50))
             .collect();

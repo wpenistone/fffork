@@ -1,17 +1,8 @@
-//! Tolerant subsequence gate — match-set + window without frizbee.
+//! Tolerant subsequence gate: span reject, skip-DP accept, span window.
 //!
-//! Novel pipeline per haystack (and batched across paths):
-//! 1. **Span gate (SIMD-friendly)**: min/max positions of any *needle* byte.
-//!    Everything outside the span cannot belong to an LCS. If
-//!    `span_len < m - max_typos`, reject without touching the rest.
-//! 2. **Skip-DP (Allison-style)**: `best[s]` = furthest needle cursor after
-//!    `s` deletions. Accept iff some `s <= T` reaches `m`.
-//! 3. **Window**: the needle-byte span (sound superset of the minimal
-//!    alignment window). Includes_prefix = span starts at 0.
-//!
-//! Soundness: never rejects when `LCS(needle, hay) >= m - T`.
-//! False accepts are impossible — skip-DP is exact for the typo model
-//! (deletions in the needle = unmatched needle chars).
+//! Span bounds needle bytes; skip-DP accepts iff `LCS >= m - T`.
+//! Window is the needle-byte span. Sound: never rejects a true match;
+//! skip-DP is exact, so false accepts are impossible.
 
 use crate::simd_path::ArenaPtr;
 use crate::types::FileItem;
@@ -55,7 +46,7 @@ impl NeedleMask {
     }
 }
 
-/// Span of needle-bytes in `hay`. None if fewer than `need` such bytes.
+// Span of needle-bytes in `hay`. None if fewer than `need` such bytes.
 fn needle_span(mask: &NeedleMask, hay: &[u8], need: usize) -> Option<(usize, usize)> {
     if hay.len() < need {
         return None;
@@ -81,9 +72,9 @@ fn needle_span(mask: &NeedleMask, hay: &[u8], need: usize) -> Option<(usize, usi
     Some((first.unwrap(), last))
 }
 
-/// Exact skip-DP over the whole hay: true iff
-/// `LCS(needle, hay) >= needle.len() - max_typos`.
-/// Fallback for needles longer than one 64-bit word.
+// Exact skip-DP over the whole hay: true iff
+// `LCS(needle, hay) >= needle.len() - max_typos`.
+// Fallback for needles longer than one 64-bit word.
 fn skip_dp_accept_slow(needle: &[u8], hay: &[u8], max_typos: usize) -> bool {
     let m = needle.len();
     if m == 0 {
@@ -125,9 +116,9 @@ fn skip_dp_accept_slow(needle: &[u8], hay: &[u8], max_typos: usize) -> bool {
     best[..=t].iter().any(|&p| p != INF)
 }
 
-/// Hyyrö bit-parallel LCS length: one linear pass, no per-needle rescans.
-/// `pm[c]` must hold the folded-byte position masks and `len_mask` the
-/// low `needle.len()` bits. Exact for `needle.len() <= 64`.
+// Hyyrö bit-parallel LCS length: one linear pass, no per-needle rescans.
+// `pm[c]` must hold the folded-byte position masks and `len_mask` the
+// low `needle.len()` bits. Exact for `needle.len() <= 64`.
 #[inline]
 fn lcs_len_bitparallel(pm: &[u64; 256], len_mask: u64, hay: &[u8]) -> usize {
     let mut s = 0u64;
@@ -155,7 +146,7 @@ fn find_byte_fold(hay: &[u8], from: usize, needle_b: u8) -> Option<usize> {
     None
 }
 
-/// Exact subsequence (T=0) — faster than skip-DP.
+// Exact subsequence (T=0) — faster than skip-DP.
 fn is_subseq_fold(needle: &[u8], hay: &[u8]) -> bool {
     let mut hi = 0usize;
     for &nb in needle {
@@ -167,10 +158,10 @@ fn is_subseq_fold(needle: &[u8], hay: &[u8]) -> bool {
     true
 }
 
-/// Bit i set when `chunk[i]` folds to a needle byte. Nibble lookup
-/// tables cover all 256 byte values in constant ops per 16 bytes,
-/// independent of distinct-needle count (SSSE3; scalar span test on
-/// tails, non-x86, or no-SSSE3). Same bits as the scalar path.
+// Bit i set when `chunk[i]` folds to a needle byte. Nibble lookup
+// tables cover all 256 byte values in constant ops per 16 bytes,
+// independent of distinct-needle count (SSSE3; scalar span test on
+// tails, non-x86, or no-SSSE3). Same bits as the scalar path.
 #[inline]
 fn needle_byte_mask(chunk: &[u8], span: &NeedleMask, tables: &SpanTables) -> u16 {
     #[cfg(target_arch = "x86_64")]
@@ -189,8 +180,8 @@ fn needle_byte_mask(chunk: &[u8], span: &NeedleMask, tables: &SpanTables) -> u16
     m
 }
 
-/// 16 parallel set-membership tests: `lo`/`hi` hold the span's high-nibble
-/// rows, `B0T`/`B1T` select the tested half without a blend (SSE4.1).
+// 16 parallel set-membership tests: `lo`/`hi` hold the span's high-nibble
+// rows, `B0T`/`B1T` select the tested half without a blend (SSE4.1).
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
 unsafe fn needle_byte_mask_shuf(chunk: &[u8], t0: &[u8; 16], t1: &[u8; 16]) -> u16 {
@@ -213,8 +204,8 @@ unsafe fn needle_byte_mask_shuf(chunk: &[u8], t0: &[u8; 16], t1: &[u8; 16]) -> u
     ((!_mm_movemask_epi8(nz)) as u16) & 0xFFFF
 }
 
-/// Per-query nibble tables for `needle_byte_mask_shuf`: `lo[l]`/`hi[l]`
-/// hold the span's high-nibble rows for low nibble `l`.
+// Per-query nibble tables for `needle_byte_mask_shuf`: `lo[l]`/`hi[l]`
+// hold the span's high-nibble rows for low nibble `l`.
 struct SpanTables {
     lo: [u8; 16],
     hi: [u8; 16],
@@ -243,8 +234,8 @@ impl SpanTables {
     }
 }
 
-/// `FFF_FORCE_SCALAR=1` disables all runtime SIMD dispatch so scalar
-/// fallbacks stay covered (same hatch as the SW kernels).
+// `FFF_FORCE_SCALAR=1` disables all runtime SIMD dispatch so scalar
+// fallbacks stay covered (same hatch as the SW kernels).
 fn force_scalar() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("FFF_FORCE_SCALAR").is_some())
@@ -254,14 +245,14 @@ fn force_scalar() -> bool {
 /// Built once per search so per-path work is a single linear pass.
 pub struct GateNeedle {
     needle: Box<[u8]>,
-    /// Typo budget actually used (capped at `MAX_SKIPS`).
+    // Typo budget actually used (capped at `MAX_SKIPS`).
     typos: usize,
-    /// `needle.len() - typos`.
+    // `needle.len() - typos`.
     need: usize,
     span: NeedleMask,
-    /// `pm[c]` = bitmask of needle positions holding folded byte `c`.
+    // `pm[c]` = bitmask of needle positions holding folded byte `c`.
     pm: Box<[u64; 256]>,
-    /// Nibble membership tables for the vectorized span test.
+    // Nibble membership tables for the vectorized span test.
     tables: SpanTables,
     len_mask: u64,
 }
@@ -287,7 +278,7 @@ impl GateNeedle {
         }
     }
 
-    /// Exact accept test: `LCS(needle, hay) >= need`.
+    // Exact accept test: `LCS(needle, hay) >= need`.
     #[inline]
     fn decide(&self, hay: &[u8]) -> bool {
         if self.needle.is_empty() {
@@ -457,7 +448,7 @@ where
     let state = GateNeedle::new(needle, max_typos);
     // Presence pretest: paths missing more needle bytes than the typo
     // budget allows cannot match. Skipped below need 3.
-    // `FFF_NO_GATE_PREFILTER=1` disables it for benchmarking.
+    // `FFF_NO_GATE_PREFILTER=1` disables the pretest.
     let presence = crate::presence::NeedlePresence::new(needle, max_typos);
     let check_presence = presence.should_check()
         && std::env::var_os("FFF_NO_GATE_PREFILTER").is_none();
@@ -482,8 +473,7 @@ where
             end_col: hit.end as u16,
         })
     };
-    // The work estimate already decided serial-vs-parallel (see
-    // `effective_match_threads`); the gate just honors it.
+    // Work estimate selects serial vs parallel; the gate honors it.
     if threads <= 1 {
         return (0..n as u32).filter_map(scan).collect();
     }

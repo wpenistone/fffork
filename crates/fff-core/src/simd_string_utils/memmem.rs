@@ -310,8 +310,8 @@ fn find_first_byte_with_memchr(haystack: &[u8], needle_lower: &[u8]) -> Option<u
 
 /// ASCII case-insensitive substring search returning the leftmost match
 /// position. `needle_lower` must be pre-lowercased (ASCII).
-// pub because it is used in out of the crate benchmarks
-#[doc(hidden)] // it's pub only for benches
+// Visible for external consumers; hidden from docs.
+#[doc(hidden)] // Public for external use; hidden from docs.
 pub fn find(haystack: &[u8], needle_lower: &[u8]) -> Option<usize> {
     let n = needle_lower.len();
     if n == 0 {
@@ -360,8 +360,7 @@ pub fn find(haystack: &[u8], needle_lower: &[u8]) -> Option<usize> {
         }
     }
 
-    // fallbacks to memchr based implementation cause we still have it and it supports more SIMD backends
-    // TODO convert all the supported backend by memchr and get rid of the fallback
+    // Falls back to the memchr implementation, which covers more SIMD backends.
     find_first_byte_with_memchr(haystack, needle_lower)
 }
 
@@ -478,7 +477,7 @@ mod tests {
         assert_eq!(find(upper_hay, b"qrstuvwxyz0123456789a"), Some(16));
         assert_eq!(find(upper_hay, b"qrstuvwxyz01234567899"), None);
 
-        // Needle at very end / very start.
+        // Needle at either end.
         let end_hay = b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxfind_me";
         assert_eq!(find(end_hay, b"find_me"), Some(end_hay.len() - 7));
         assert_eq!(find(end_hay, b"xx"), Some(0));

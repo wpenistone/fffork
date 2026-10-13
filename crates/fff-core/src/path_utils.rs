@@ -212,8 +212,8 @@ impl DirPenaltyMemo {
 mod tests {
     use super::*;
 
-    /// Reference implementation using `Path::components` (July / upstream
-    /// semantics). Used to catch byte-walk scoring drift (checksum mismatches).
+    // Reference implementation using `Path::components` (July / upstream
+    // semantics). Used to catch byte-walk scoring drift (checksum mismatches).
     fn penalty_via_components(current_file: Option<&str>, candidate_dir: &str) -> i32 {
         let Some(current_path) = current_file else {
             return 0;
@@ -298,7 +298,7 @@ mod tests {
     #[test]
     #[cfg(not(target_family = "windows"))]
     fn test_calculate_distance_penalty() {
-        // candidate_dir is now just the directory portion (with or without trailing /)
+        // candidate_dir is the directory portion (with or without trailing /)
         assert_eq!(calculate_distance_penalty(None, "examples/user/test/"), 0);
         // Same directory
         assert_eq!(

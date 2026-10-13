@@ -295,7 +295,7 @@ pub(crate) fn fuzzy_to_bigram_query(query: &str, num_probes: usize) -> BigramQue
     }
 
     // Generate all C(n, required) subsets as OR(AND(subset), ...).
-    // n <= 5 bounds this at 10 branches; more would just burn bitset ANDs.
+    // n <= 5 bounds this at 10 branches; larger n costs bitset ANDs.
     let mut branches = Vec::new();
     let mut combo = vec![0u16; required];
     combine(&probes, required, 0, 0, &mut combo, &mut branches);

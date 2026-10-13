@@ -12,11 +12,11 @@ pub(crate) fn is_map_full(err: &heed::Error) -> bool {
     matches!(err, heed::Error::Mdb(heed::MdbError::MapFull))
 }
 
-/// Chunk size for multi-put write txns (frecency/query batches, GC purges).
+// Chunk size for multi-put write txns (frecency/query batches, GC purges).
 pub(crate) const WRITE_TXN_CHUNK: usize = 5_000;
 
-/// Optional `FFF_LMDB_MAP_SIZE_MB` override for all stores, clamped and
-/// rounded down to a 4K multiple (LMDB requires page multiples).
+// Optional `FFF_LMDB_MAP_SIZE_MB` override for all stores, clamped and
+// rounded down to a 4K multiple (LMDB requires page multiples).
 fn map_size_override() -> Option<usize> {
     let mb: usize = std::env::var("FFF_LMDB_MAP_SIZE_MB").ok()?.parse().ok()?;
     let bytes = mb.checked_mul(1024 * 1024)?;
