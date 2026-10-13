@@ -1342,6 +1342,7 @@ impl FilePicker {
         query_tracker: Option<&QueryTracker>,
         options: FuzzySearchOptions<'q>,
     ) -> SearchResult<'_> {
+        let _query = crate::parallelism::QueryActiveGuard::new();
         let files = self.get_files();
 
         let total_files = self.live_file_count();
@@ -1682,6 +1683,7 @@ impl FilePicker {
         query: &'q FFFQuery<'q>,
         options: FuzzySearchOptions<'q>,
     ) -> DirSearchResult<'_> {
+        let _query = crate::parallelism::QueryActiveGuard::new();
         let dirs = self.get_dirs();
         let max_threads = if options.max_threads == 0 {
             std::thread::available_parallelism()
@@ -1751,6 +1753,7 @@ impl FilePicker {
         query_tracker: Option<&QueryTracker>,
         options: FuzzySearchOptions<'q>,
     ) -> MixedSearchResult<'_> {
+        let _query = crate::parallelism::QueryActiveGuard::new();
         let location = query.location;
         let page_offset = options.pagination.offset;
         let page_limit = if options.pagination.limit > 0 {
@@ -1893,6 +1896,7 @@ impl FilePicker {
     /// If `options.abort_signal` is set it overrides the picker's internal
     /// cancellation flag, giving the caller full control over when to stop.
     pub fn grep(&self, query: &FFFQuery<'_>, options: &GrepSearchOptions) -> GrepResult<'_> {
+        let _query = crate::parallelism::QueryActiveGuard::new();
         let overlay_guard = self.sync_data.bigram_overlay.as_ref().map(|o| o.read());
         let arena = self.arena_base_ptr();
         let overflow_arena = self.sync_data.arena_overflow_ptr();
@@ -1932,6 +1936,7 @@ impl FilePicker {
         constraints: &[fff_query_parser::Constraint<'_>],
         options: &GrepSearchOptions,
     ) -> GrepResult<'_> {
+        let _query = crate::parallelism::QueryActiveGuard::new();
         let overlay_guard = self.sync_data.bigram_overlay.as_ref().map(|o| o.read());
         let arena = self.arena_base_ptr();
         let overflow_arena = self.sync_data.arena_overflow_ptr();

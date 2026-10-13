@@ -1168,6 +1168,10 @@ pub(crate) fn build_bigram_index(
             .par_chunks(BIGRAM_CHUNK_FILES)
             .enumerate()
             .for_each(|(chunk_idx, chunk)| {
+                // Queries win over indexing: pause while one runs.
+                while crate::parallelism::query_active() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
                 let base_idx = chunk_idx * BIGRAM_CHUNK_FILES;
                 for (offset, file) in chunk.iter().enumerate() {
                     let file_idx = base_idx + offset;
@@ -1249,8 +1253,13 @@ pub(crate) fn sniff_binary_for_non_indexable(
 
     for (i, file) in files.iter().enumerate() {
         // check every 256 files to avoid useless work
-        if (i & 0xFF) == 0 && cancelled.load(Ordering::Acquire) {
-            return;
+        if (i & 0xFF) == 0 {
+            while crate::parallelism::query_active() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if cancelled.load(Ordering::Acquire) {
+                return;
+            }
         }
 
         // Extension-classified binaries are already settled — do not reopen them.

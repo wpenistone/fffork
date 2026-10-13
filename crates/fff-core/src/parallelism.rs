@@ -192,6 +192,29 @@ pub fn default_max_threads() -> usize {
     effective_core_count().max(1)
 }
 
+// Interactive searches in flight. Background indexing yields while
+// nonzero so early queries get the cores and memory bandwidth.
+static QUERY_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn query_active() -> bool {
+    QUERY_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
+pub(crate) struct QueryActiveGuard;
+
+impl QueryActiveGuard {
+    pub(crate) fn new() -> Self {
+        QUERY_ACTIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for QueryActiveGuard {
+    fn drop(&mut self) {
+        QUERY_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Run `f` on `BACKGROUND_THREAD_POOL` unless we are already inside a rayon
 /// worker. Nested `install()` from a pool worker deadlocks on large scans
 /// (the spawn task occupies a worker while `install` waits for workers).

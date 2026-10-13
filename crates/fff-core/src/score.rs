@@ -181,7 +181,7 @@ fn match_fuzzy_parts(
                         + n_files as f64 * rate * presence_ns);
             if fire {
                 use rayon::prelude::*;
-                cand = crate::parallelism::run_on_bg_pool(|| {
+                cand = crate::parallelism::run_on_search_pool(|| {
                     (0..n_files)
                         .into_par_iter()
                         .filter_map(|i| {
@@ -661,11 +661,9 @@ fn match_fuzzy_parts(
                     // each slice folds its mean back in.
                     let n_batches = order.len().div_ceil(batch_sz);
                     let batch_est = crate::dispatch::batch_ns_estimate(use_u8);
-                    let bg_width = crate::parallelism::BACKGROUND_THREAD_POOL
-                        .current_num_threads()
-                        .max(1);
+                    let pool_width = crate::parallelism::search_pool_threads();
                     let t_fan = std::time::Instant::now();
-                    if !crate::dispatch::parallel_batches(n_batches, batch_est, bg_width) {
+                    if !crate::dispatch::parallel_batches(n_batches, batch_est, pool_width) {
                         for ((ord, sc_out), ec_out) in order
                             .chunks(batch_sz)
                             .zip(ps_aligned.chunks_mut(batch_sz))
@@ -674,7 +672,7 @@ fn match_fuzzy_parts(
                             score_batch(ord, sc_out, ec_out);
                         }
                     } else {
-                        crate::parallelism::run_on_bg_pool(|| {
+                        crate::parallelism::run_on_search_pool(|| {
                             use rayon::prelude::*;
                             order
                                 .par_chunks(batch_sz)
@@ -2048,13 +2046,10 @@ fn match_and_score_in_arena<'a>(
     // score struct; `max_threads == 1` forces serial, else pool width.
     let score_bytes =
         crate::dispatch::sampled_path_avg(&working_files) + std::mem::size_of::<Score>();
-    let bg_width = crate::parallelism::BACKGROUND_THREAD_POOL
-        .current_num_threads()
-        .max(1);
     let score_cap = if context.max_threads == 1 {
         1
     } else {
-        bg_width
+        crate::parallelism::search_pool_threads()
     };
     let score_plan =
         crate::dispatch::plan_matches(path_matches.len(), score_bytes, score_cap);
@@ -2123,7 +2118,7 @@ fn match_and_score_in_arena<'a>(
             // keep the top 100. Ranking stays exact (same comparator).
             // scratch stays per-thread via map_init Ã¢â‚¬â€ do NOT carry it in the
             // fold accumulator (4 KB Ãƒâ€” rayon tree overflowed the worker stack).
-            let (par_heap, par_skipped) = crate::parallelism::run_on_bg_pool(|| {
+            let (par_heap, par_skipped) = crate::parallelism::run_on_search_pool(|| {
                 use rayon::prelude::*;
                 let chunk = score_plan.chunk.max(1);
                 let n = path_matches.len();
@@ -2210,7 +2205,7 @@ fn match_and_score_in_arena<'a>(
             .map(|(match_idx, path_match)| score_one(&mut scratch, match_idx, path_match))
             .collect()
     } else {
-        crate::parallelism::run_on_bg_pool(|| {
+        crate::parallelism::run_on_search_pool(|| {
             path_matches
                 .par_iter()
                 .enumerate()
@@ -2485,9 +2480,7 @@ fn score_filtered_by_frecency<'a>(
     let fre_cap = if context.max_threads == 1 {
         1
     } else {
-        crate::parallelism::BACKGROUND_THREAD_POOL
-            .current_num_threads()
-            .max(1)
+        crate::parallelism::search_pool_threads()
     };
     let fre_plan = crate::dispatch::plan_matches(files.len(), fre_bytes, fre_cap);
 
@@ -2589,7 +2582,7 @@ fn score_filtered_by_frecency<'a>(
     let chunk = fre_plan.chunk.max(1);
     let n = s.len();
     let n_chunks = n.div_ceil(chunk);
-    let (heap, total) = crate::parallelism::run_on_bg_pool(|| {
+    let (heap, total) = crate::parallelism::run_on_search_pool(|| {
         use rayon::prelude::*;
         (0..n_chunks)
             .into_par_iter()
