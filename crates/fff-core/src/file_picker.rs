@@ -13,14 +13,14 @@
 //!
 //! ```text
 //!   new_with_shared_state()
-//!     â”‚
-//!     â”œâ”€> background scan thread â”€â”€> populates SharedPicker
-//!     â””â”€> file-system watcher    â”€â”€> live updates SharedPicker
+//!     │
+//!     ├─> background scan thread ──> populates SharedPicker
+//!     └─> file-system watcher    ──> live updates SharedPicker
 //!
-//!   search()         <â”€â”€ borrows &self, delegates to fuzzy_search
-//!   grep()           <â”€â”€ static, borrows &[FileItem] (live content search)
-//!   trigger_rescan() <â”€â”€ synchronous re-index
-//!   cancel()         <â”€â”€ shuts down background work
+//!   search()         <── borrows &self, delegates to fuzzy_search
+//!   grep()           <── static, borrows &[FileItem] (live content search)
+//!   trigger_rescan() <── synchronous re-index
+//!   cancel()         <── shuts down background work
 //! ```
 //!
 //! # Thread Safety
@@ -295,7 +295,7 @@ impl FileSync {
         self.find_by_relative_path(&crate::path_utils::to_canonical_slashes(&rel_path_owned))
     }
 
-    // Lookup for a base-relative, '/'-canonical path â€” the form paths are
+    // Lookup for a base-relative, '/'-canonical path — the form paths are
     // stored in, so no normalization is needed.
     fn find_by_relative_path(&self, rel_path: &str) -> Option<usize> {
         let arena = self.arena_base_ptr();
@@ -597,8 +597,8 @@ impl FileItem {
 
     /// Zlob-walker fast path: skip the `pathdiff::diff_paths` PathBuf alloc by
     /// taking the already-relative slice and the basename-offset that zlob's
-    /// scanner computed during traversal. ~80â€“120 ms saved on a chromium scan
-    /// (500k entries Ã— one fewer alloc + no component walk).
+    /// scanner computed during traversal. ~80–120 ms saved on a chromium scan
+    /// (500k entries × one fewer alloc + no component walk).
     ///
     /// `relative_path` is root-relative bytes; `basename_offset` is the byte
     /// offset where the basename begins (e.g. zlob's `entry.path_bytes().len()
@@ -686,7 +686,7 @@ pub struct FilePickerOptions {
     /// current branch. Enabled with default limits unless overridden.
     pub git_recency: GitRecencyConfig,
     /// Do not discover .git, run git status, or apply git recency. Worktree
-    /// search only â€” required for mega-corpus benches (sumo_fork has a 2.7GB
+    /// search only — required for mega-corpus benches (sumo_fork has a 2.7GB
     /// .git that is not a search corpus). Indexes above 200k files skip
     /// automatically unless FFF_FORCE_GIT=1.
     pub skip_git: bool,
@@ -751,7 +751,7 @@ pub struct FilePicker {
     trace_id: String,
     /// Live candidate narrowing for typing. Sound only when the new query
     /// extends the previous one **and** `max_typos` is unchanged (then
-    /// Match(longer,T) âŠ† Match(shorter,T)). Invalidated on index change.
+    /// Match(longer,T) ⊆ Match(shorter,T)). Invalidated on index change.
     live: parking_lot::Mutex<LiveNarrow>,
     /// Bumped whenever the file set changes so live state is dropped.
     index_generation: std::sync::atomic::AtomicU64,
@@ -792,7 +792,7 @@ struct LiveNarrow {
     max_typos: u16,
     /// File indices (into sync_data.files) that matched the previous query.
     candidates: Vec<u32>,
-    /// Files already scored at previous length â€” set only when we stored a hit set.
+    /// Files already scored at previous length — set only when we stored a hit set.
     active: bool,
     /// Recent hit sets by query: shortening the query (backspace) reuses
     /// the matching entry instead of rescanning. Bounded below.
@@ -951,7 +951,7 @@ impl FilePicker {
 
     /// Sequentially touch per-file search metadata after the scan so the
     /// first keystroke does not pay the page-fault cost of FileItem +
-    /// presence_mask (227k Ã— ~64 B â‰ˆ 14 MB of cold pages).
+    /// presence_mask (227k × ~64 B ≈ 14 MB of cold pages).
     /// Read-only; does not change results. Call once before `scanning=false`.
     pub fn prefault_search_metadata(&self) {
         let files = self.sync_data.files();
@@ -1027,7 +1027,7 @@ impl FilePicker {
                 }
 
                 let mut i = common_dir_prefix_len(&prev_relative_path, relative_path);
-                // If we stopped on a separator, skip it â€” we want to start
+                // If we stopped on a separator, skip it — we want to start
                 // emitting at the first unseen segment, not re-emit the
                 // already-emitted prefix path.
                 if i < relative_path.len()
@@ -1213,7 +1213,7 @@ impl FilePicker {
         {
             let mut guard = shared_picker.write()?;
             *guard = Some(picker);
-            // dropping old picker flips its `cancelled` flag â†’ bg threads exit cleanly
+            // dropping old picker flips its `cancelled` flag → bg threads exit cleanly
         }
 
         ScanJob::new_initial(
@@ -1241,7 +1241,7 @@ impl FilePicker {
         Ok(())
     }
 
-    /// Synchronous filesystem scan â€” populates `self` with indexed files.
+    /// Synchronous filesystem scan — populates `self` with indexed files.
     ///
     /// Use this when you need direct access to the picker without shared state:
     /// ```ignore
@@ -1365,7 +1365,7 @@ impl FilePicker {
 
         // Tiny queries are too small to amortize Rayon dispatch when the
         // caller asked for a small pool. Never override an explicit request
-        // for 3+ threads â€” that collapsed 4T parallel efficiency.
+        // for 3+ threads — that collapsed 4T parallel efficiency.
         let max_threads = if options.max_threads == 1
             || (effective_query.len() <= 1 && options.max_threads <= 2)
             || (effective_query.len() <= 2 && options.max_threads == 2 && total_files < 20_000)
@@ -1500,10 +1500,10 @@ impl FilePicker {
         let overflow_arena = self.sync_data.arena_overflow_ptr();
 
         // Typing live-narrow: when the query only extends the previous one and
-        // max_typos is unchanged, Match(longer,T) âŠ† Match(shorter,T).
+        // max_typos is unchanged, Match(longer,T) ⊆ Match(shorter,T).
         //
         // Fast path holds the live lock only to filter the previous hit set
-        // into (file_index, &FileItem) pairs â€” no clone of the 226k u32
+        // into (file_index, &FileItem) pairs — no clone of the 226k u32
         // candidate vector, and the kept indices stay aligned with the subset
         // so hit mapping is exact even when the presence mask drops items.
         let mut hit_buf: Vec<u32> = Vec::new();
@@ -1626,7 +1626,7 @@ impl FilePicker {
             live.query = context.effective_query().to_string();
             live.max_typos = max_typos;
             live.active = !hit_buf.is_empty();
-            // Move, don't copy â€” hit_buf is dead after this.
+            // Move, don't copy — hit_buf is dead after this.
             live.candidates = hit_buf;
             // Backspace chain: remember this hit set under its query.
             // Depth-bounded (8 x <= full-corpus u32s); stale generations
@@ -1752,7 +1752,7 @@ impl FilePicker {
     /// by total score in descending order.
     ///
     /// If the raw query ends with a path separator (`/`), only directories
-    /// are searched â€” files are skipped entirely. The caller should parse the
+    /// are searched — files are skipped entirely. The caller should parse the
     /// query with `DirSearchConfig` so that trailing `/` is kept as fuzzy
     /// text instead of becoming a `PathSegment` constraint.
     pub fn fuzzy_search_mixed<'q>(
@@ -1874,11 +1874,11 @@ impl FilePicker {
     }
 
     /// Glob search: filter indexed files by a single glob pattern, rank by
-    /// frecency, and paginate. Bypasses the regular query parser entirely â€”
+    /// frecency, and paginate. Bypasses the regular query parser entirely —
     /// useful when callers already have a literal glob (`*.rs`, `**/*.test.ts`)
     /// and want neither fuzzy matching nor multi-token constraint parsing.
     ///
-    /// Pipeline: `apply_constraints(Glob) â†’ score_filtered_by_frecency â†’ sort_and_paginate`.
+    /// Pipeline: `apply_constraints(Glob) → score_filtered_by_frecency → sort_and_paginate`.
     /// Same ranking semantics as `fuzzy_search` when the fuzzy query is empty.
     pub fn glob<'p>(
         &'p self,
@@ -2006,16 +2006,16 @@ impl FilePicker {
     /// on drop. This is the ONLY approved way to escape the lock for
     /// long-running parallel work (git status, warmup, bigram).
     ///
-    /// Returns `None` if `post_scan_indexing_active` is already set â€” this
+    /// Returns `None` if `post_scan_indexing_active` is already set — this
     /// means another post-scan is in flight and we must not create a second
     /// set of dangling pointers.
     ///
     /// # Safety
     /// 1. `walk_filesystem` reserved `MAX_OVERFLOW_FILES` capacity on the
-    ///    files Vec at creation â€” watcher pushes cannot reallocate it.
-    /// 2. `post_scan_indexing_active` is set â€” prevents `commit_new_sync`
+    ///    files Vec at creation — watcher pushes cannot reallocate it.
+    /// 2. `post_scan_indexing_active` is set — prevents `commit_new_sync`
     ///    from replacing the Vec (ScanJob::new checks this flag).
-    /// 3. Only `[..base_count]` is accessed â€” base files use the immutable
+    /// 3. Only `[..base_count]` is accessed — base files use the immutable
     ///    base arena. Overflow files use a different arena.
     pub(crate) unsafe fn post_scan_snapshot(&self) -> Option<PostScanUnsafeSnapshot> {
         if self
@@ -2077,7 +2077,7 @@ impl FilePicker {
                     }
                     // Update parent dir frecency inline. `DirItem` has an
                     // interior-mutable atomic score, so `&self` access is
-                    // enough â€” no write aliasing against Arc clones.
+                    // enough — no write aliasing against Arc clones.
                     let score = file.access_frecency_score as i32;
                     let dir_idx = file.parent_dir_index as usize;
                     if let Some(dir) = self.sync_data.dirs.get(dir_idx) {
@@ -2560,7 +2560,7 @@ fn canonical_relative_path(path: &Path, base: &Path) -> Option<String> {
         return Some(crate::path_utils::to_canonical_slashes(s).into_owned());
     }
 
-    // Deleted files can't be canonicalized â€” canonicalize the parent and
+    // Deleted files can't be canonicalized — canonicalize the parent and
     // re-attach the filename.
     let parent = path.parent()?;
     let file_name = path.file_name()?;
@@ -2602,7 +2602,7 @@ impl FileSlot {
 /// Each data field is an Arc-shared clone of the picker's backing
 /// allocation, so dropping the `FilePicker` (e.g. via
 /// `SharedFilePicker::write().take()`) cannot free memory this
-/// snapshot is still reading â€” UAF is impossible by construction.
+/// snapshot is still reading — UAF is impossible by construction.
 ///
 /// Implements `Drop` to clear `post_scan_indexing_active`. Since only
 /// one snapshot can exist at a time (enforced by the flag check in
@@ -2734,7 +2734,7 @@ impl FileSync {
         let chunked_paths = builder.finish();
         let arena = chunked_paths.as_arena_ptr();
 
-        // Apply frecency scores (access-based only â€” git status not yet available).
+        // Apply frecency scores (access-based only — git status not yet available).
         // DirItem.max_access_frecency is AtomicI32, so parallel threads write directly.
         let frecency = shared_frecency
             .read()
@@ -2990,7 +2990,7 @@ pub fn is_known_binary_extension(path: &Path) -> bool {
 
 /// Like [`is_known_binary_extension`] but takes a basename string directly,
 /// avoiding `Path::extension()` overhead. Mirrors `Path::extension()`
-/// semantics: dotfiles with no other dots â†’ no extension. Used by the zlob
+/// semantics: dotfiles with no other dots → no extension. Used by the zlob
 /// walker, which already has the basename slice from traversal.
 #[cfg(feature = "zlob")]
 #[inline]
@@ -3056,14 +3056,14 @@ fn is_binary_extension_str(ext: &str) -> bool {
 
 /// Length of the longest shared directory prefix of two relative dir
 /// paths (without a trailing separator), measured as the number of bytes
-/// up to and including the last shared separator â€” plus the full shorter
+/// up to and including the last shared separator — plus the full shorter
 /// path when it is itself a directory prefix of the longer one.
 ///
 /// Examples:
-///   `"src/components"` vs `"src/routes"`   â†’ 4  (`"src/"` emitted once)
-///   `"lib/deep/nested"` vs `"lib/deep"`   â†’ 8  (`"lib/deep"` is a prefix)
-///   `"lib/deep"` vs `"lib/deeper"`        â†’ 4  (only `"lib/"` is shared)
-///   `"lib"` vs `"src"`                    â†’ 0
+///   `"src/components"` vs `"src/routes"`   → 4  (`"src/"` emitted once)
+///   `"lib/deep/nested"` vs `"lib/deep"`   → 8  (`"lib/deep"` is a prefix)
+///   `"lib/deep"` vs `"lib/deeper"`        → 4  (only `"lib/"` is shared)
+///   `"lib"` vs `"src"`                    → 0
 ///
 /// Used by [`FilePicker::for_each_watch_dir`] to avoid re-emitting
 /// ancestors that were already yielded for the previous (sorted) sibling.
@@ -3111,7 +3111,7 @@ pub extern "C" fn tune_mimalloc() {
 pub(crate) fn hint_allocator_collect() {
     #[cfg(feature = "mimalloc-collect")]
     {
-        // Collect BACKGROUND_THREAD_POOL workers â€” that's where the bigram
+        // Collect BACKGROUND_THREAD_POOL workers — that's where the bigram
         // builder allocated memory. `rayon::broadcast` would target the global
         // pool, which is the wrong set of threads.
         BACKGROUND_THREAD_POOL.broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true) });
@@ -3200,14 +3200,14 @@ mod tests {
             );
         }
 
-        // No duplicates â€” streaming dedup must not emit the same dir twice.
+        // No duplicates — streaming dedup must not emit the same dir twice.
         assert_eq!(
             watch_dirs.len(),
             watch_set.len(),
             "duplicate watch dir emitted: {watch_dirs:?}",
         );
 
-        // Base path itself is NOT walked into the result â€” the walker stops
+        // Base path itself is NOT walked into the result — the walker stops
         // at `current == base`. The outer `debouncer.watch(base_path, ...)`
         // call in create_debouncer covers it separately.
         assert!(
@@ -3227,7 +3227,7 @@ mod tests {
 
         // Tree:
         //   base/init.lua                  (file directly under base)
-        //   base/commands/                 (empty at scan â€” the #725 repro)
+        //   base/commands/                 (empty at scan — the #725 repro)
         //   base/src/main.rs               (src is indexed)
         //   base/src/plugins/extra/        (empty chain under an indexed dir)
         std::fs::create_dir_all(base.join("commands")).unwrap();
@@ -3317,7 +3317,7 @@ mod tests {
         assert_eq!(common_dir_prefix_len("lib/deep", "lib/deep/nested"), 8);
         assert_eq!(common_dir_prefix_len("lib/deep", "lib/deeper"), 4);
         assert_eq!(common_dir_prefix_len("src", "src"), 0);
-        // "src" is emitted-as-dir; "src/x" extends it â€” full "src" is shared.
+        // "src" is emitted-as-dir; "src/x" extends it — full "src" is shared.
         assert_eq!(common_dir_prefix_len("src", "src/x"), 3);
     }
 

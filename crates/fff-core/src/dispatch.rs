@@ -1,6 +1,6 @@
-//! Adaptive dispatch: serial vs parallel decided per call from measured
-//! cost, not corpus constants. Work estimate over amortize cost gives
-//! threads; ceiling over threads gives chunk. Same rule at every site.
+//! Picks serial or parallel per call from measured cost.
+//! Estimates total work, divides by what one fork/join must amortize,
+//! and caps by pool width. Same rule at every call site.
 
 use std::sync::LazyLock;
 

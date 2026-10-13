@@ -68,7 +68,7 @@ fn match_fuzzy_parts(
         return vec![];
     }
 
-    // Prefilter is an internal scan Ã¢â‚¬â€ parallelize even when the *search*
+    // Prefilter is an internal scan — parallelize even when the *search*
     // is 1 thread (one query). Interseq SW already uses the bg pool this way.
     // The cap comes from the machine profile (cores, bounded by LLC), not a
     // literal: `.min(8)` starved 32-core servers and oversubscribed phones.
@@ -108,7 +108,7 @@ fn match_fuzzy_parts(
         // Index reject before frizbee: only resolve paths that pass
         // length+presence. Only worth the extra scan when the needle can
         // actually reject (longer / typed letters). Common short queries
-        // match almost everything Ã¢â‚¬â€ skip so we don't scan twice.
+        // match almost everything — skip so we don't scan twice.
         // Adaptive candidate prefilter: probe a dispatch-sized sample
         // (cost ~= one fork/join), time presence and gate on it, and fire
         // the full parallel scan only when measured reject savings beat
@@ -225,7 +225,7 @@ fn match_fuzzy_parts(
         let p = crate::interseq_sw::SwParams::for_query(has_upper);
         let needle = first_part.as_bytes();
 
-        // Query intent: `name.ext` Ã¢â‚¬â€ pin exact filename hits among the match
+        // Query intent: `name.ext` — pin exact filename hits among the match
         // set (not a full-corpus walk; score_one already ranks exact names).
         let looks_like_filename = {
             let q = first_part;
@@ -935,7 +935,7 @@ fn match_fuzzy_parts(
     matches
 }
 
-/// Score only `idx` (indices into `base`) Ã¢â‚¬â€ used for typing live-narrow.
+/// Score only `idx` (indices into `base`) — used for typing live-narrow.
 /// `total_matched` is the subset hit count.
 pub(crate) fn fuzzy_match_and_score_subset<'a>(
     base: &'a [FileItem],
@@ -1191,7 +1191,7 @@ fn resolve_dir_chunks(
 }
 
 /// Run SIMD fuzzy match across directory items, narrowing the candidate set
-/// through each query part Ã¢â‚¬â€ same pipeline as file matching.
+/// through each query part — same pipeline as file matching.
 fn match_fuzzy_parts_dirs(
     fuzzy_parts: &[&str],
     working_dirs: &[&DirItem],
@@ -1627,7 +1627,7 @@ fn match_and_score_in_arena<'a>(
         ));
     }
 
-    // Expose file indices for typing live-narrow (Match(longer,T) Ã¢Å â€
+    // Expose file indices for typing live-narrow (Match(longer,T) ⊆
     // Match(shorter,T) when T is unchanged).
     let t_capture = std::time::Instant::now();
     crate::score::capture_hit_indices(
@@ -1723,7 +1723,7 @@ fn match_and_score_in_arena<'a>(
 
     // Map filename-fallback hits by path-match index for O(1) lookup
     // in the scoring loop. Match-list order is irrelevant to the table.
-    // Skip the table entirely when nothing fell back Ã¢â‚¬â€ common on filename-hit
+    // Skip the table entirely when nothing fell back — common on filename-hit
     // queries like `file_picker_`.
     let fallback_us = t_fallback.elapsed().as_micros();
     if phase_timing {
@@ -1929,7 +1929,7 @@ fn match_and_score_in_arena<'a>(
 
         // Path alignment bonus: when the query looks like a file path,
         // reward candidates whose path closely matches the typed query.
-        // Uses suffix overlap Ã¢â‚¬â€ bytes matching from the end. A full prefix
+        // Uses suffix overlap — bytes matching from the end. A full prefix
         // match is the 100% coverage case, so no separate branch is needed.
         let path_alignment_bonus = if query_contains_path_separator && main_needle.len() > 10 {
             let path_bytes = rel.unwrap_or("").as_bytes();
@@ -2115,8 +2115,8 @@ fn match_and_score_in_arena<'a>(
             // Fold into per-worker heaps sized page_cap and reduce. Avoids
             // materializing all Score structs only to keep the top 100.
             // Ranking stays exact (same comparator).
-            // scratch stays per-thread via map_init Ã¢â‚¬â€ do NOT carry it in the
-            // fold accumulator (4 KB Ãƒâ€” rayon tree overflowed the worker stack).
+            // scratch stays per-thread via map_init — do NOT carry it in the
+            // fold accumulator (4 KB × rayon tree overflowed the worker stack).
             let (par_heap, par_skipped) = crate::parallelism::run_on_search_pool(|| {
                 use rayon::prelude::*;
                 let chunk = score_plan.chunk.max(1);
@@ -3811,7 +3811,7 @@ mod typo_resistance_tests {
             "src/config/feature_flags.rs",
         ]);
 
-        // Exact substring Ã¢â‚¬â€ must always match
+        // Exact substring — must always match
         let results = search_with_typos(&files, "bid_comparison", arena, 6);
         assert!(
             results
@@ -3820,10 +3820,10 @@ mod typo_resistance_tests {
             "exact substring 'bid_comparison' should match, got: {results:?}"
         );
 
-        // Concatenated query with typos Ã¢â‚¬â€ the real-world scenario.
+        // Concatenated query with typos — the real-world scenario.
         // "bidcomparsionsupplierpartcostmodfiers" is a smushed version of
         // "bid_comparison_supplier_part_cost_modifiers" with 2 typos
-        // (comparison Ã¢â€ â€™ comparison, modifiers Ã¢â€ â€™ modifiers).
+        // (comparison → comparison, modifiers → modifiers).
         let results = search_with_typos(&files, "bidcomparsionsupplierpartcostmodfiers", arena, 6);
         assert!(
             results
@@ -3969,13 +3969,13 @@ mod constraint_only_query_tests {
     }
 }
 
-/// Executable ranking policy. If these fail, result order changed Ã¢â‚¬â€
+/// Executable ranking policy. If these fail, result order changed —
 /// update this spec deliberately, not as a side effect of a perf patch.
 ///
 /// Policy (base = SW score):
 /// 1. exact filename match > fuzzy filename match > path-only match
 /// 2. at equal match quality, higher frecency wins
-/// 3. special entry-point names (mod.rs, index.ts, Ã¢â‚¬Â¦) beat ordinary
+/// 3. special entry-point names (mod.rs, index.ts, …) beat ordinary
 ///    path-only matches but lose to filename hits
 #[cfg(test)]
 mod ranking_policy_tests {
@@ -4072,7 +4072,7 @@ mod ranking_policy_tests {
         );
     }
 
-    /// Job: "I know the name + ext" Ã¢â‚¬â€ exact stem+ext wins over wrong ext.
+    /// Job: "I know the name + ext" — exact stem+ext wins over wrong ext.
     #[test]
     fn filename_intent_prefers_matching_extension() {
         let (files, arena) = make(&[
@@ -4087,7 +4087,7 @@ mod ranking_policy_tests {
         );
     }
 
-    /// Job: "I know the path" Ã¢â‚¬â€ segment hits beat scattered letters.
+    /// Job: "I know the path" — segment hits beat scattered letters.
     #[test]
     fn path_intent_prefers_segment_sequence() {
         let (files, arena) = make(&[("xsrc/xauth/xlogin.rs", 0), ("src/auth/login.rs", 0)]);
@@ -4098,7 +4098,7 @@ mod ranking_policy_tests {
         );
     }
 
-    /// Job: "I know the concept" Ã¢â‚¬â€ filename words beat path-only scatter.
+    /// Job: "I know the concept" — filename words beat path-only scatter.
     #[test]
     fn concept_intent_prefers_filename_words() {
         let (files, arena) = make(&[("src/hidden/handler_util.rs", 0), ("src/api/handler.rs", 0)]);
@@ -4109,7 +4109,7 @@ mod ranking_policy_tests {
         );
     }
 
-    /// Job: "I want the test for this role" Ã¢â‚¬â€ role keyword ranks test files up.
+    /// Job: "I want the test for this role" — role keyword ranks test files up.
     #[test]
     fn concept_test_role_ranks_test_files() {
         let (files, arena) = make(&[("src/user.rs", 0), ("src/user_test.rs", 0)]);
