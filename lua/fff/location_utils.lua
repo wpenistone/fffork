@@ -1,7 +1,5 @@
 local M = {}
 
--- NOTE: preview highlights must be verified with prompt_position="top" and
--- "bottom" (reversed layout); keep location_utils_spec covering both.
 local set_cursor_line_mark
 
 --- Jump to a location in the current buffer
@@ -145,8 +143,12 @@ function M.highlight_location(bufnr, location, namespace)
   return #extmarks > 0 and extmarks or nil
 end
 
---- Highlight grep matches in the preview buffer.
---- Plain/regex modes scan text; fuzzy mode uses Rust byte offsets.
+--- Highlight all occurrences of a grep pattern in the preview buffer.
+--- For plain text and regex modes: highlights every match on all loaded lines
+--- using Lua string.find with the query text.
+--- For fuzzy mode: uses the pre-computed match byte offsets from Rust on the
+--- target line only, since the fuzzy needle (e.g. "shcema") won't match via
+--- literal search against the actual content (e.g. "schema").
 --- @param bufnr number Buffer number
 --- @param location table Location with .grep_query, .line, optional .col, optional .fuzzy_match_ranges
 --- @param namespace number Namespace for extmarks
@@ -158,16 +160,21 @@ function M.highlight_grep_matches(bufnr, location, namespace)
   local extmarks = {}
   local grep_hl = require('fff.conf').get().hl.grep_match or 'IncSearch'
 
-  -- Pin CursorLine to the match line so it stays styled while paging
-  -- the preview viewport with <C-d>/<C-u>.
+  -- Pin CursorLine + CursorLineNr to the target match line via extmark, so
+  -- the highlight stays anchored when the user pages the preview viewport
+  -- with <C-d>/<C-u>. The cursor itself moves with paging, but the match
+  -- line stays styled until it scrolls out of view.
   if location.line then
     local target_line = math.max(1, math.min(location.line, line_count))
     local ok, mark_id = set_cursor_line_mark(bufnr, namespace, target_line - 1)
     if ok then table.insert(extmarks, { id = mark_id, line = target_line - 1 }) end
   end
 
-  -- Fuzzy mode: highlight the target line from Rust byte offsets only;
-  -- the fuzzy needle never matches the literal line text.
+  -- Fuzzy mode: use pre-computed byte offsets from Rust's match_indices.
+  -- These are the exact matched character positions within the line, already
+  -- computed by the SIMD scoring + reference smith-waterman traceback.
+  -- We only highlight the target line since each fuzzy result has its own
+  -- unique set of matched positions.
   if location.fuzzy_match_ranges and location.line then
     local target_line = math.max(1, math.min(location.line, line_count))
     for _, range in ipairs(location.fuzzy_match_ranges) do
@@ -186,7 +193,9 @@ function M.highlight_grep_matches(bufnr, location, namespace)
 
   local query = location.grep_query
 
-  -- Rust GrepConfig parser strips constraint tokens (single source of truth).
+  -- Use the Rust GrepConfig parser as the single source of truth for
+  -- stripping constraint tokens. This avoids duplicating constraint
+  -- detection in Lua, which would break whenever a new token type is added.
   local fuzzy = require('fff.fuzzy')
   local parsed = fuzzy.parse_grep_query(query)
   local search_text = parsed.grep_text

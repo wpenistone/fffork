@@ -2,7 +2,7 @@ name: Build & Publish
 
 on:
   push:
-    branches: [main, fix/use-trusted-publishing]
+    branches: [main, fix/npm-pulish]
     tags:
       - "v*"
   pull_request:
@@ -17,10 +17,18 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
+
 jobs:
   build-nvim:
     name: Build Neovim ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
     permissions:
       contents: read
       id-token: write
@@ -84,6 +92,18 @@ jobs:
       - name: Install Rust
         run: rustup target add ${{ matrix.target }}
 
+      # Cache the per-target build dir and cargo-zigbuild binary. Keyed by
+      # target so matrix legs don't collide. See issue on slow release CI.
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          key: nvim-${{ matrix.target }}
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: v0.17.0
+
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -96,7 +116,7 @@ jobs:
       - name: Build for Linux
         if: contains(matrix.os, 'ubuntu') && !contains(matrix.target, 'android')
         run: |
-          cargo zigbuild --profile ci --target ${{ matrix.zigbuild_target || matrix.target }} -p fff-nvim --features zlob
+          cargo zigbuild --profile ci --target ${{ matrix.zigbuild_target || matrix.target }} -p fff-nvim --no-default-features --features zlob
           mv "${{ matrix.artifact_name }}" "${{ matrix.target }}.${{ matrix.ext }}"
 
       - name: Build for Android (Termux)
@@ -110,13 +130,13 @@ jobs:
           export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_BIN/aarch64-linux-android24-clang"
 
-          cargo build --profile ci --target ${{ matrix.target }} -p fff-nvim --features zlob
+          cargo build --profile ci --target ${{ matrix.target }} -p fff-nvim --no-default-features --features zlob
           mv "${{ matrix.artifact_name }}" "${{ matrix.target }}.${{ matrix.ext }}"
 
       - name: Build for macOS
         if: contains(matrix.os, 'macos')
         run: |
-          MACOSX_DEPLOYMENT_TARGET="13" cargo build --profile ci --target ${{ matrix.target }} -p fff-nvim --features zlob
+          MACOSX_DEPLOYMENT_TARGET="13" cargo build --profile ci --target ${{ matrix.target }} -p fff-nvim --no-default-features --features zlob
           mv "${{ matrix.artifact_name }}" "${{ matrix.target }}.${{ matrix.ext }}"
 
       - name: Ad-hoc sign macOS binary
@@ -127,7 +147,7 @@ jobs:
         if: contains(matrix.os, 'windows')
         shell: bash
         run: |
-          cargo build --profile ci --target ${{ matrix.target }} -p fff-nvim --features zlob
+          cargo build --profile ci --target ${{ matrix.target }} -p fff-nvim --no-default-features --features zlob
           mv "${{ matrix.artifact_name }}" "${{ matrix.target }}.${{ matrix.ext }}"
 
       - name: Upload artifacts
@@ -139,6 +159,10 @@ jobs:
   build-c:
     name: Build C FFI ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
     permissions:
       contents: read
     strategy:
@@ -176,6 +200,7 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-linux-android
             artifact_name: target/aarch64-linux-android/ci/libfff_c.so
+            npm_package: fff-bin-android-arm64
             lib_filename: libfff_c.so
             ext: so
 
@@ -215,6 +240,16 @@ jobs:
       - name: Install Rust
         run: rustup target add ${{ matrix.target }}
 
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          key: c-${{ matrix.target }}
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: v0.17.0
+
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -227,7 +262,7 @@ jobs:
       - name: Build for Linux
         if: contains(matrix.os, 'ubuntu') && !contains(matrix.target, 'android')
         run: |
-          cargo zigbuild --profile ci --target ${{ matrix.zigbuild_target || matrix.target }} -p fff-c --features zlob
+          cargo zigbuild --profile ci --target ${{ matrix.zigbuild_target || matrix.target }} -p fff-c --no-default-features --features zlob
           mv "${{ matrix.artifact_name }}" "c-lib-${{ matrix.target }}.${{ matrix.ext }}"
 
       - name: Build for Android (Termux)
@@ -240,13 +275,13 @@ jobs:
           export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$NDK_BIN/aarch64-linux-android24-clang"
 
-          cargo build --profile ci --target ${{ matrix.target }} -p fff-c --features zlob
+          cargo build --profile ci --target ${{ matrix.target }} -p fff-c --no-default-features --features zlob
           mv "${{ matrix.artifact_name }}" "c-lib-${{ matrix.target }}.${{ matrix.ext }}"
 
       - name: Build for macOS
         if: contains(matrix.os, 'macos')
         run: |
-          MACOSX_DEPLOYMENT_TARGET="13" cargo build --profile ci --target ${{ matrix.target }} -p fff-c --features zlob
+          MACOSX_DEPLOYMENT_TARGET="13" cargo build --profile ci --target ${{ matrix.target }} -p fff-c --no-default-features --features zlob
           mv "${{ matrix.artifact_name }}" "c-lib-${{ matrix.target }}.${{ matrix.ext }}"
 
       - name: Ad-hoc sign macOS binary
@@ -257,11 +292,10 @@ jobs:
         if: contains(matrix.os, 'windows')
         shell: bash
         run: |
-          cargo build --profile ci --target ${{ matrix.target }} -p fff-c --features zlob
+          cargo build --profile ci --target ${{ matrix.target }} -p fff-c --no-default-features --features zlob
           mv "${{ matrix.artifact_name }}" "c-lib-${{ matrix.target }}.${{ matrix.ext }}"
 
       - name: Prepare npm package
-        if: "!contains(matrix.target, 'android')"
         shell: bash
         run: |
           # Copy the built binary into the platform npm package directory
@@ -274,7 +308,6 @@ jobs:
           path: c-lib-${{ matrix.target }}.*
 
       - name: Upload npm package artifact
-        if: "!contains(matrix.target, 'android')"
         uses: actions/upload-artifact@v4
         with:
           name: npm-${{ matrix.npm_package }}
@@ -283,6 +316,10 @@ jobs:
   build-mcp:
     name: Build MCP ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_IDLE_TIMEOUT: "0"
     permissions:
       contents: read
     strategy:
@@ -328,6 +365,16 @@ jobs:
       - name: Install Rust
         run: rustup target add ${{ matrix.target }}
 
+      - name: Rust cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          key: mcp-${{ matrix.target }}
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+        with:
+          version: v0.17.0
+
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
@@ -340,13 +387,13 @@ jobs:
       - name: Build for Linux
         if: contains(matrix.os, 'ubuntu')
         run: |
-          cargo zigbuild --profile ci --target ${{ matrix.zigbuild_target || matrix.target }} -p fff-mcp --features zlob
+          cargo zigbuild --profile ci --target ${{ matrix.zigbuild_target || matrix.target }} -p fff-mcp --no-default-features --features zlob
           cp "${{ matrix.artifact_name }}" "fff-mcp-${{ matrix.target }}"
 
       - name: Build for macOS
         if: contains(matrix.os, 'macos')
         run: |
-          MACOSX_DEPLOYMENT_TARGET="13" cargo build --profile ci --target ${{ matrix.target }} -p fff-mcp --features zlob
+          MACOSX_DEPLOYMENT_TARGET="13" cargo build --profile ci --target ${{ matrix.target }} -p fff-mcp --no-default-features --features zlob
           cp "${{ matrix.artifact_name }}" "fff-mcp-${{ matrix.target }}"
 
       - name: Ad-hoc sign macOS binary
@@ -357,7 +404,7 @@ jobs:
         if: contains(matrix.os, 'windows')
         shell: bash
         run: |
-          cargo build --profile ci --target ${{ matrix.target }} -p fff-mcp --features zlob
+          cargo build --profile ci --target ${{ matrix.target }} -p fff-mcp --no-default-features --features zlob
           cp "${{ matrix.artifact_name }}" "fff-mcp-${{ matrix.target }}.exe"
 
       - name: Upload artifact
@@ -423,7 +470,7 @@ jobs:
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --features zlob
+          args: --release --out dist --no-default-features --features zlob
           sccache: "true"
           working-directory: packages/fff-python
           container: ${{ matrix.container || '' }}
@@ -462,11 +509,14 @@ jobs:
     name: Release
     needs: [build-nvim, build-c, build-mcp, build-python, build-python-sdist]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/use-trusted-publishing' || startsWith(github.ref, 'refs/tags/v'))
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     permissions:
       contents: write
     steps:
+      # we have to make sure that pushing a commit on this workflow triggers the CI for nightly neovim
       - uses: actions/checkout@v5
+        with:
+          token: ${{ secrets.GUSTAV_PAT || github.token }}
 
       - name: Install Lua
         uses: leafo/gh-actions-lua@v12
@@ -593,7 +643,7 @@ jobs:
 
             Update mcp via:
             ```sh
-            curl -fsSL https://raw.githubusercontent.com/dmtrKovalenko/fff.nvim/main/install-mcp.sh | bash
+            curl -fsSL https://raw.githubusercontent.com/dmtrKovalenko/fff/main/install-mcp.sh | bash
             ```
 
       - name: Bump Homebrew formula (uses local checksums)
@@ -605,8 +655,6 @@ jobs:
         run: make bump-install-mcp-sh VERSION="${{ steps.version.outputs.version }}" BINARIES_DIR=./binaries
 
       - name: Commit formula + installer bump to main
-        # Uses the default GITHUB_TOKEN configured by actions/checkout above.
-        # Requires github-actions[bot] in the main branch-protection bypass list.
         if: steps.version.outputs.is_release == 'true' && github.repository_owner == 'dmtrKovalenko'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
@@ -621,7 +669,7 @@ jobs:
     name: Publish Python wheels to PyPI
     needs: [build-python, build-python-sdist]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/use-trusted-publishing' || startsWith(github.ref, 'refs/tags/v'))
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     environment:
       name: pypi
       url: https://pypi.org/p/fff-search
@@ -646,7 +694,7 @@ jobs:
     name: Publish Rust crates
     needs: [build-nvim, build-c, build-mcp]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/use-trusted-publishing' || startsWith(github.ref, 'refs/tags/v'))
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     permissions:
       contents: read
       id-token: write
@@ -677,7 +725,7 @@ jobs:
     name: Publish npm packages
     needs: [build-c]
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/use-trusted-publishing' || startsWith(github.ref, 'refs/tags/v'))
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/fix/npm-pulish' || startsWith(github.ref, 'refs/tags/v'))
     permissions:
       contents: read
       id-token: write
@@ -692,6 +740,8 @@ jobs:
         with:
           node-version: "25"
           registry-url: "https://registry.npmjs.org"
+
+      - uses: oven-sh/setup-bun@v2
 
       - name: Determine version
         id: version
@@ -721,6 +771,16 @@ jobs:
             fi
           done
 
+      # Every install must happen before the first set-npm-version: the bump
+      # injects platform optionalDependencies that only resolve once published,
+      # and npm ci validates the whole workspace against the lockfile.
+      - name: Install and build JS packages
+        working-directory: packages
+        run: |
+          npm ci
+          (cd fff-bun && npm run build)
+          (cd fff-node && npm run build)
+
       - name: Publish bun package
         run: |
           VERSION="${{ steps.version.outputs.version }}"
@@ -741,8 +801,6 @@ jobs:
           make set-npm-version PKG=packages/fff-node VERSION="$VERSION"
 
           cd packages/fff-node
-          npm install
-          npm run build
           npm publish --tag "$TAG" --access public --provenance
 
       - name: Publish pi-fff package

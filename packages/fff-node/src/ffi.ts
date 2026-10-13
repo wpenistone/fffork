@@ -702,7 +702,6 @@ function readFileItemFromRaw(raw: FffFileItemRaw): FileItem {
     accessFrecencyScore: Number(raw.access_frecency_score),
     modificationFrecencyScore: Number(raw.modification_frecency_score),
     totalFrecencyScore: Number(raw.total_frecency_score),
-    isBinary: raw.is_binary !== 0,
   };
 }
 
@@ -754,7 +753,6 @@ function readMixedItemFromRaw(raw: FffMixedItemRaw): MixedItem {
       accessFrecencyScore: Number(raw.access_frecency_score),
       modificationFrecencyScore: Number(raw.modification_frecency_score),
       totalFrecencyScore: Number(raw.total_frecency_score),
-      isBinary: raw.is_binary !== 0,
     },
   };
 }
