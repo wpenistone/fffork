@@ -2073,6 +2073,28 @@ fn match_and_score_in_arena<'a>(
             },
         };
 
+        // Score-shape census: which terms actually fire. One branch when
+        // off; counts aim the remaining per-match cost (materialization
+        // vs ALU). Timing-gated like the rest of the profiler.
+        if SCORE_PROF.load(std::sync::atomic::Ordering::Relaxed) {
+            let bump = |c: &std::sync::atomic::AtomicU64| {
+                c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            };
+            if rel.is_some() {
+                bump(&PROF_NREL);
+            }
+            if is_filename_match {
+                bump(&PROF_FMATCH);
+            }
+            if is_exact_filename {
+                bump(&PROF_EXACT);
+            }
+            if combo_match_boost != 0 {
+                bump(&PROF_COMBO);
+            }
+            bump(&PROF_SCORED);
+        }
+
         (file, score)
     };
 
@@ -2258,8 +2280,13 @@ fn match_and_score_in_arena<'a>(
             let miss = MEMO_MISS.swap(0, std::sync::atomic::Ordering::Relaxed);
             let push = HEAP_PUSH.swap(0, std::sync::atomic::Ordering::Relaxed);
             let repl = HEAP_REPLACE.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let nrel = PROF_NREL.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let fmatch = PROF_FMATCH.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let exact = PROF_EXACT.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let combo = PROF_COMBO.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let scored = PROF_SCORED.swap(0, std::sync::atomic::Ordering::Relaxed);
             eprintln!(
-                "PHASE scoreprof memo_hit={hit} memo_miss={miss} heap_push={push} heap_replace={repl}"
+                "PHASE scoreprof memo_hit={hit} memo_miss={miss} heap_push={push} heap_replace={repl} nrel={nrel} fmatch={fmatch} exact={exact} combo={combo} scored={scored}"
             );
         }
         return (results, path_matches.len());
@@ -2294,8 +2321,13 @@ fn match_and_score_in_arena<'a>(
         let miss = MEMO_MISS.swap(0, std::sync::atomic::Ordering::Relaxed);
         let push = HEAP_PUSH.swap(0, std::sync::atomic::Ordering::Relaxed);
         let repl = HEAP_REPLACE.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let nrel = PROF_NREL.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let fmatch = PROF_FMATCH.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let exact = PROF_EXACT.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let combo = PROF_COMBO.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let scored = PROF_SCORED.swap(0, std::sync::atomic::Ordering::Relaxed);
         eprintln!(
-            "PHASE scoreprof memo_hit={hit} memo_miss={miss} heap_push={push} heap_replace={repl}"
+            "PHASE scoreprof memo_hit={hit} memo_miss={miss} heap_push={push} heap_replace={repl} nrel={nrel} fmatch={fmatch} exact={exact} combo={combo} scored={scored}"
         );
     }
     (results, n)
@@ -2823,6 +2855,11 @@ static MEMO_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 static MEMO_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HEAP_PUSH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static HEAP_REPLACE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_NREL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_FMATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_EXACT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_COMBO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PROF_SCORED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // Filename-keyed evidence cache. Sound only when evidence is a pure
 // function of (query, filename): non-Path intent with no open file, so
