@@ -759,11 +759,21 @@ fn match_fuzzy_parts(
                 first_options.max_typos,
             );
             let pool = crate::parallelism::effective_core_count().max(1);
+            let plan = crate::dispatch::plan_files(gate_n, per_file, pool);
+            // Serial cutoff comes from the plan, unchanged: below it the
+            // fork/join alone costs more than the whole body.
+            let serial = gate_n <= plan.chunk;
             let file_chunk: usize = std::env::var("FFF_SW_CHUNK")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|&n| n >= 1)
-                .unwrap_or(crate::dispatch::plan_files(gate_n, per_file, pool).chunk);
+                .unwrap_or_else(|| {
+                    // Over-partition past one task per worker: extra groups
+                    // give work-stealing slack against stragglers and keep
+                    // each group's bytes L2-resident. Measured 4x (2-4k
+                    // sweet spot on 227k); floor bounds per-group costs.
+                    (plan.chunk / 4).max(1024)
+                });
             let n_groups = gate_n.div_ceil(file_chunk);
             let one_group = |g: usize| {
                 let lo = g * file_chunk;
@@ -814,7 +824,7 @@ fn match_fuzzy_parts(
                 m
             };
             let mut matches: Vec<neo_frizbee::Match> = Vec::new();
-            if gate_n <= file_chunk {
+            if serial {
                 for g in 0..n_groups {
                     matches.extend(one_group(g));
                 }
