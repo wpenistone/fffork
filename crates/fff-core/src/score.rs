@@ -1799,6 +1799,13 @@ fn match_and_score_in_arena<'a>(
         .last_same_query_match
         .as_ref()
         .map(|m| m.file_path.as_os_str().as_encoded_bytes());
+    // Evidence memo is exact only when evidence ignores the path: the
+    // proximity terms need an open file and the structure terms need
+    // Path intent, so both must be off. Epoch retires the table per query.
+    let memo_epoch = MEMO_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let memo_active = std::env::var_os("FFF_NO_EVIDENCE_MEMO").is_none()
+        && query_intent != crate::intent::QueryIntent::Path
+        && context.current_file.is_none();
 
     // Current-file dir split once per query; penalties memoized per
     // parent dir in thread-local scratch (dirs repeat across candidates).
@@ -1966,8 +1973,14 @@ fn match_and_score_in_arena<'a>(
         };
 
         // Intent evidence: filename/ext/segments/role mixed per job.
+        // Memoized by filename when the path terms are dead (see
+        // memo_active): repeated names share one computation exactly.
         let evidence_bonus = if rank_collapsed {
             0
+        } else if memo_active {
+            let fname_ref = fname.as_ref().unwrap();
+            let ev = memoized_evidence(memo_epoch, fname_ref, &prepared_query, query_intent);
+            crate::intent::evidence_bonus(query_intent, &ev, base_score)
         } else {
             let fname_ref = fname.as_ref().unwrap();
             let need_path =
@@ -2718,6 +2731,73 @@ fn sort_and_paginate<'a>(
         scores.push(score.clone());
     }
     (items, scores, total_matched)
+}
+
+#[derive(Clone)]
+struct FxBuilder;
+struct FxHasher(u64);
+impl std::hash::BuildHasher for FxBuilder {
+    type Hasher = FxHasher;
+    fn build_hasher(&self) -> FxHasher {
+        FxHasher(0x51ab_3c9d)
+    }
+}
+impl std::hash::Hasher for FxHasher {
+    fn write(&mut self, b: &[u8]) {
+        for &x in b {
+            self.0 = (self.0.rotate_left(5) ^ x as u64).wrapping_mul(0x517c_c1b7_2720_0a95);
+        }
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+struct MemoEntry {
+    key: Box<[u8]>,
+    ev: crate::intent::Evidence,
+}
+
+thread_local! {
+    static EVIDENCE_MEMO: std::cell::RefCell<(
+        u64,
+        std::collections::HashMap<u64, MemoEntry, FxBuilder>,
+    )> = std::cell::RefCell::new((0, std::collections::HashMap::with_hasher(FxBuilder)));
+}
+static MEMO_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+// Filename-keyed evidence cache. Sound only when evidence is a pure
+// function of (query, filename): non-Path intent with no open file, so
+// the path-dependent terms are dead. Hash collisions just replace the
+// slot; the stored key is always verified, so outputs stay exact.
+fn memoized_evidence(
+    epoch: u64,
+    fname: &str,
+    pq: &crate::intent::PreparedQuery<'_>,
+    intent: crate::intent::QueryIntent,
+) -> crate::intent::Evidence {
+    EVIDENCE_MEMO.with(|c| {
+        let mut m = c.borrow_mut();
+        if m.0 != epoch {
+            m.1.clear();
+            if m.1.capacity() > 1 << 14 {
+                m.1.shrink_to(1 << 14);
+            }
+            m.0 = epoch;
+        }
+        let fb = fname.as_bytes();
+        let mut h = std::hash::BuildHasher::build_hasher(&FxBuilder);
+        std::hash::Hasher::write(&mut h, fb);
+        let h = std::hash::Hasher::finish(&h);
+        if let Some(e) = m.1.get(&h) {
+            if e.key.as_ref() == fb {
+                return e.ev;
+            }
+        }
+        let ev = crate::intent::evidence_prepared(pq, "", fname, intent, None);
+        m.1.insert(h, MemoEntry { key: fb.into(), ev });
+        ev
+    })
 }
 
 #[cfg(test)]
@@ -4380,6 +4460,72 @@ mod topk_prune_tests {
                 assert_eq!(on_items, off_items, "items differ for {q:?} t={threads}");
                 let totals = |s: Vec<Score>| s.into_iter().map(|x| x.total).collect::<Vec<_>>();
                 assert_eq!(totals(on_scores), totals(off_scores), "totals differ");
+            }
+        }
+    }
+
+    #[test]
+    fn evidence_memo_hatch_ranks_identically() {
+        // Memo shares evidence across repeated filenames; outputs must
+        // equal a fresh computation. Path intent and open-file legs run
+        // the memo-inactive path and must match too.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _held = ENV_LOCK.lock().unwrap();
+        let mut paths = Vec::new();
+        for i in 0..3000 {
+            paths.push(format!("src/mod{}/Handler_{}.rs", i % 37, i % 50));
+        }
+        paths.push("src/a/mod.rs".to_string());
+        paths.push("src/b/lib.rs".to_string());
+        let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        let (files, arena) = make_paths(&refs);
+        for q in ["handler", "mod handler", "src/mod"] {
+            for threads in [1usize, 4] {
+                for current in [None, Some("src/mod7/other.rs")] {
+                    let run = || {
+                        let parser = QueryParser::default();
+                        let parsed = parser.parse(q);
+                        let ctx = ScoringContext {
+                            query: &parsed,
+                            max_threads: threads,
+                            max_typos: 2,
+                            current_file: current,
+                            last_same_query_match: None,
+                            project_path: None,
+                            combo_boost_score_multiplier: 100,
+                            min_combo_count: 3,
+                            pagination: PaginationArgs { offset: 0, limit: 50 },
+                        };
+                        fuzzy_match_and_score_files(
+                            &files,
+                            &ctx,
+                            files.len(),
+                            arena,
+                            arena,
+                            max_path_len_of(&files),
+                        )
+                    };
+                    let (base_items, base_scores, base_total) = run();
+                    unsafe {
+                        std::env::set_var("FFF_NO_EVIDENCE_MEMO", "1");
+                    }
+                    let (hatch_items, hatch_scores, hatch_total) = run();
+                    unsafe {
+                        std::env::remove_var("FFF_NO_EVIDENCE_MEMO");
+                    }
+                    let names = |items: Vec<&FileItem>| {
+                        items.iter().map(|f| f.relative_path(arena)).collect::<Vec<_>>()
+                    };
+                    assert_eq!(
+                        names(base_items),
+                        names(hatch_items),
+                        "items differ for {q:?} t={threads} cur={current:?}"
+                    );
+                    assert_eq!(base_total, hatch_total, "total differs");
+                    let totals =
+                        |s: Vec<Score>| s.into_iter().map(|x| x.total).collect::<Vec<_>>();
+                    assert_eq!(totals(base_scores), totals(hatch_scores), "totals differ");
+                }
             }
         }
     }
