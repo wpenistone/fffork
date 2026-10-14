@@ -325,7 +325,12 @@ fn match_fuzzy_parts(
             // Only fan out when there is more than one chunk: a single chunk has
             // nothing to split, and the fork/join alone measured ~8x the whole
             // serial body on a few-hundred-match corpus (782us vs 97us).
-            let sw_body = |matches_chunk: &mut [neo_frizbee::Match], exact_hits: &[u32]| {
+            // `outer_saturates` skips the inner fanout when file chunks alone
+            // feed every worker: nested dispatch then only adds join/task
+            // overhead (measured ~29 CPU-ms on 116k) for no wall gain.
+            let sw_body = |matches_chunk: &mut [neo_frizbee::Match],
+                           exact_hits: &[u32],
+                           outer_saturates: bool| {
                 let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
                 let t_chunk = std::time::Instant::now();
                 let n_matches = matches_chunk.len();
@@ -676,6 +681,7 @@ fn match_fuzzy_parts(
                     let pool_width = crate::parallelism::search_pool_threads();
                     let t_fan = std::time::Instant::now();
                     if no_batch_par
+                        || outer_saturates
                         || !crate::dispatch::parallel_batches(n_batches, batch_est, pool_width)
                     {
                         if timing {
@@ -839,7 +845,7 @@ fn match_fuzzy_parts(
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 let t = std::time::Instant::now();
-                sw_body(&mut m, &exact);
+                sw_body(&mut m, &exact, n_groups > 1 && n_groups >= pool);
                 t_swslice_us.fetch_add(
                     t.elapsed().as_micros() as u64,
                     std::sync::atomic::Ordering::Relaxed,
