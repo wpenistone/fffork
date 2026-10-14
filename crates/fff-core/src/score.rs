@@ -299,6 +299,9 @@ fn match_fuzzy_parts(
             let batch_sz: usize = if use_u8 { 32 } else { 16 };
             // u16 rows are dynamic to 32; longer needles stay scalar.
             let use_simd = avx2_ok && needle.len() <= 32;
+            // Probe hatch: serial batches inside each chunk (one task per
+            // chunk instead of per batch). Sizes nested-fanout overhead.
+            let no_batch_par = std::env::var_os("FFF_NO_BATCH_PAR").is_some();
 
             // Sub-phase accounting, accumulated across rayon workers.
             let t_collect_us = std::sync::atomic::AtomicU64::new(0);
@@ -311,6 +314,9 @@ fn match_fuzzy_parts(
             let t_scalar_us = std::sync::atomic::AtomicU64::new(0);
             let t_prep_us = std::sync::atomic::AtomicU64::new(0);
             let t_scatter_us = std::sync::atomic::AtomicU64::new(0);
+            let t_sort_us = std::sync::atomic::AtomicU64::new(0);
+            let t_fan_serial = std::sync::atomic::AtomicU64::new(0);
+            let t_fan_parallel = std::sync::atomic::AtomicU64::new(0);
             let timing = part_timing;
 
             // Chunks are disjoint slices of `matches` and every scratch buffer is
@@ -418,6 +424,7 @@ fn match_fuzzy_parts(
                     // Counting sort by trim length (stable, O(n)). Batch grouping only
                     // affects SIMD max_len, not per-match scores. A single batch is
                     // already one group, so identity order is the same grouping.
+                    let t_sort = std::time::Instant::now();
                     if n_matches > batch_sz {
                         let mut cnt = [0u32; 129];
                         for i in 0..n_matches {
@@ -441,6 +448,12 @@ fn match_fuzzy_parts(
                         for i in 0..n_matches {
                             order[i] = i as u32;
                         }
+                    }
+                    if timing {
+                        t_sort_us.fetch_add(
+                            t_sort.elapsed().as_micros() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                     }
                     let mut perm_scores = PERM_SCORES.with(|c| take_tls(c, n_matches + 32));
                     set_len_uninit(&mut perm_scores, n_matches + 32);
@@ -662,7 +675,13 @@ fn match_fuzzy_parts(
                     let batch_est = crate::dispatch::batch_ns_estimate(use_u8);
                     let pool_width = crate::parallelism::search_pool_threads();
                     let t_fan = std::time::Instant::now();
-                    if !crate::dispatch::parallel_batches(n_batches, batch_est, pool_width) {
+                    if no_batch_par
+                        || !crate::dispatch::parallel_batches(n_batches, batch_est, pool_width)
+                    {
+                        if timing {
+                            t_fan_serial
+                                .fetch_add(n_batches as u64, std::sync::atomic::Ordering::Relaxed);
+                        }
                         for ((ord, sc_out), ec_out) in order
                             .chunks(batch_sz)
                             .zip(ps_aligned.chunks_mut(batch_sz))
@@ -671,6 +690,10 @@ fn match_fuzzy_parts(
                             score_batch(ord, sc_out, ec_out);
                         }
                     } else {
+                        if timing {
+                            t_fan_parallel
+                                .fetch_add(n_batches as u64, std::sync::atomic::Ordering::Relaxed);
+                        }
                         crate::parallelism::run_on_search_pool(|| {
                             use rayon::prelude::*;
                             order
@@ -847,6 +870,9 @@ fn match_fuzzy_parts(
             let scalar_ms = t_scalar_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
             let prep_ms = t_prep_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
             let scatter_ms = t_scatter_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
+            let sort_ms = t_sort_us.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e3;
+            let fan_serial = t_fan_serial.load(std::sync::atomic::Ordering::Relaxed);
+            let fan_parallel = t_fan_parallel.load(std::sync::atomic::Ordering::Relaxed);
             if phase_timing() {
                 eprintln!(
                     "PHASE cand_ms={cand_ms:.1} wins_ms=0.0 samp_ms=0.0 collapsed=false n={}",
@@ -864,7 +890,7 @@ fn match_fuzzy_parts(
             }
             if phase_timing() {
                 eprintln!(
-                    "PHASE interseq prefilter_ms={prefilter_ms:.1} collect_ms={collect_ms:.1} batch_ms={batch_ms:.1} assemble_ms={assemble_ms:.1} n={} stage_ms={stage_ms:.1} xpose_ms={xpose_ms:.1} kernel_ms={kernel_ms:.1} scalar_ms={scalar_ms:.1} prep_ms={prep_ms:.1} scatter_ms={scatter_ms:.1}",
+                    "PHASE interseq prefilter_ms={prefilter_ms:.1} collect_ms={collect_ms:.1} batch_ms={batch_ms:.1} assemble_ms={assemble_ms:.1} n={} stage_ms={stage_ms:.1} xpose_ms={xpose_ms:.1} kernel_ms={kernel_ms:.1} scalar_ms={scalar_ms:.1} prep_ms={prep_ms:.1} scatter_ms={scatter_ms:.1} sort_ms={sort_ms:.1} fan_serial={fan_serial} fan_parallel={fan_parallel}",
                     matches.len()
                 );
             }
@@ -1806,6 +1832,7 @@ fn match_and_score_in_arena<'a>(
     let memo_active = std::env::var_os("FFF_NO_EVIDENCE_MEMO").is_none()
         && query_intent != crate::intent::QueryIntent::Path
         && context.current_file.is_none();
+    SCORE_PROF.store(phase_timing, std::sync::atomic::Ordering::Relaxed);
 
     // Current-file dir split once per query; penalties memoized per
     // parent dir in thread-local scratch (dirs repeat across candidates).
@@ -2106,9 +2133,15 @@ fn match_and_score_in_arena<'a>(
             };
             if heap.len() < page_cap {
                 heap.push(Reverse(entry));
+                if SCORE_PROF.load(std::sync::atomic::Ordering::Relaxed) {
+                    HEAP_PUSH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             } else if heap.peek().is_some_and(|Reverse(w)| entry > *w) {
                 heap.pop();
                 heap.push(Reverse(entry));
+                if SCORE_PROF.load(std::sync::atomic::Ordering::Relaxed) {
+                    HEAP_REPLACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         };
         if score_plan.threads < 2 {
@@ -2180,9 +2213,15 @@ fn match_and_score_in_arena<'a>(
                             };
                             if h.len() < page_cap {
                                 h.push(Reverse(entry));
+                                if SCORE_PROF.load(std::sync::atomic::Ordering::Relaxed) {
+                                    HEAP_PUSH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
                             } else if h.peek().is_some_and(|Reverse(w)| entry > *w) {
                                 h.pop();
                                 h.push(Reverse(entry));
+                                if SCORE_PROF.load(std::sync::atomic::Ordering::Relaxed) {
+                                    HEAP_REPLACE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
                             }
                         }
                         (h, skipped)
@@ -2215,6 +2254,13 @@ fn match_and_score_in_arena<'a>(
                 score_entrance_count,
                 skipped_topk,
             );
+            let hit = MEMO_HIT.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let miss = MEMO_MISS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let push = HEAP_PUSH.swap(0, std::sync::atomic::Ordering::Relaxed);
+            let repl = HEAP_REPLACE.swap(0, std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "PHASE scoreprof memo_hit={hit} memo_miss={miss} heap_push={push} heap_replace={repl}"
+            );
         }
         return (results, path_matches.len());
     }
@@ -2243,6 +2289,13 @@ fn match_and_score_in_arena<'a>(
             "PHASE score_us={} (full) n={}",
             t_score.elapsed().as_micros(),
             score_entrance_count
+        );
+        let hit = MEMO_HIT.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let miss = MEMO_MISS.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let push = HEAP_PUSH.swap(0, std::sync::atomic::Ordering::Relaxed);
+        let repl = HEAP_REPLACE.swap(0, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "PHASE scoreprof memo_hit={hit} memo_miss={miss} heap_push={push} heap_replace={repl}"
         );
     }
     (results, n)
@@ -2765,6 +2818,11 @@ thread_local! {
     )> = std::cell::RefCell::new((0, std::collections::HashMap::with_hasher(FxBuilder)));
 }
 static MEMO_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static SCORE_PROF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static MEMO_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static MEMO_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HEAP_PUSH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HEAP_REPLACE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 // Filename-keyed evidence cache. Sound only when evidence is a pure
 // function of (query, filename): non-Path intent with no open file, so
@@ -2791,10 +2849,16 @@ fn memoized_evidence(
         let h = std::hash::Hasher::finish(&h);
         if let Some(e) = m.1.get(&h) {
             if e.key.as_ref() == fb {
+                if SCORE_PROF.load(std::sync::atomic::Ordering::Relaxed) {
+                    MEMO_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 return e.ev;
             }
         }
         let ev = crate::intent::evidence_prepared(pq, "", fname, intent, None);
+        if SCORE_PROF.load(std::sync::atomic::Ordering::Relaxed) {
+            MEMO_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         m.1.insert(h, MemoEntry { key: fb.into(), ev });
         ev
     })
