@@ -1408,6 +1408,172 @@ mod tests {
     }
 
     #[test]
+    fn u8_matches_scalar_on_long_needles() {
+        // u8 lanes only engage for short needles in production; long
+        // needles must agree with scalar exactly (no saturation quirk).
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let p = params();
+        let needles: &[&[u8]] = &[
+            b"internationalization",
+            b"characterization",
+            b"controller",
+            b"file_picker",
+            b"rename VARIABLE42",
+        ];
+        let hays: &[&[u8]] = &[
+            b"src/i18n/internationalization.rs",
+            b"crates/fff-core/src/characterization_layer.rs",
+            b"sumo/dom0/controllers/NetworkController.cpp",
+            b"lua/fff/file_picker/init.lua",
+            b"a",
+            b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+            b"Characterization_of_VARIABLE42_in_DOCS.md",
+        ];
+        for needle in needles {
+            // Production never runs SIMD with n <= 8 (tails unpadded);
+            // mirror that: pad lanes past 8 so stale-tail reads can't fire.
+            let mut hays32: Vec<&[u8]> = hays.to_vec();
+            while hays32.len() < 12 {
+                hays32.extend_from_within(..);
+            }
+            hays32.truncate(24);
+            let n = hays32.len();
+            let max_len = hays32.iter().map(|h| h.len()).max().unwrap();
+            let soa = super::avx2::build_soa(&hays32, max_len, 32);
+            let mut simd_out = vec![0u16; n];
+            let mut simd_ecol = vec![0u16; n];
+            // Production-realistic mixed prefix mask (only some lanes).
+            let pmask: u32 = 0b101010101010101010101010;
+            unsafe {
+                super::avx2::score_batch_avx2_u8(
+                    needle,
+                    &soa,
+                    max_len,
+                    &p,
+                    pmask,
+                    &mut simd_out,
+                    &mut simd_ecol,
+                );
+            }
+            for (k, h) in hays32.iter().enumerate() {
+                let inc = pmask >> k & 1 == 1;
+                let (scalar_score, scalar_ecol) =
+                    score_one_scalar_full(needle, h, &p, inc);
+                if simd_out[k] != scalar_score || simd_ecol[k] != scalar_ecol {
+                    println!(
+                        "U8DIVERGE needle={:?} hay[{k}]={:?}: u8=({},{}) scalar=({},{})",
+                        needle, h, simd_out[k], simd_ecol[k], scalar_score, scalar_ecol
+                    );
+                }
+            }
+            // Const-unrolled dispatch must equal the general kernel on the
+            // same bytes (production calls dispatch, not general).
+            let mut disp_out = vec![0u16; n];
+            let mut disp_eco = vec![0u16; n];
+            unsafe {
+                super::avx2::score_batch_avx2_u8_dispatch(
+                    needle,
+                    &soa,
+                    max_len,
+                    &p,
+                    pmask,
+                    &mut disp_out,
+                    &mut disp_eco,
+                );
+            }
+            for (k, h) in hays32.iter().enumerate() {
+                if disp_out[k] != simd_out[k] || disp_eco[k] != simd_ecol[k] {
+                    println!(
+                        "DISPDIVERGE needle={:?} hay[{k}]={:?}: disp=({},{}) general=({},{})",
+                        needle, h, disp_out[k], disp_eco[k], simd_out[k], simd_ecol[k]
+                    );
+                }
+            }
+            // Same inputs through the u16 kernel: isolates the bug to u8.
+            let soa16 = super::avx2::build_soa(&hays32, max_len, 16);
+            let mut out16 = vec![0u16; n];
+            let mut eco16 = vec![0u16; n];
+            unsafe {
+                super::avx2::score_batch_avx2(
+                    needle,
+                    &soa16,
+                    max_len,
+                    &p,
+                    0b1010101010101010u16,
+                    &mut out16,
+                    &mut eco16,
+                );
+            }
+            for (k, h) in hays32.iter().enumerate() {
+                let inc = (0b1010101010101010u32 >> k) & 1 == 1;
+                let (scalar_score, scalar_ecol) =
+                    score_one_scalar_full(needle, h, &p, inc);
+                assert_eq!(
+                    out16[k], scalar_score,
+                    "needle={:?} hay[{k}]={:?}: u16={} scalar={}",
+                    needle, h, out16[k], scalar_score
+                );
+                assert_eq!(
+                    eco16[k], scalar_ecol,
+                    "needle={:?} hay[{k}]={:?}: u16_ecol={} scalar_ecol={}",
+                    needle, h, eco16[k], scalar_ecol
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn u8_fuzz_long_needles_all_kernels_agree() {
+        // Adversarial sweep: the production u8-vs-u16 checksum split on
+        // long needles must come from somewhere reproducible here.
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let p = params();
+        let mut state = 0xC0FFEEu32;
+        let mut next = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 16) as u8
+        };
+        // Byte soup with separators, digits, case, high bytes.
+        let alphabet: &[u8] = b"abcdefABCDEF0123456789/._- \x80\xff\x01\x7f";
+        for round in 0..300 {
+            let m = 16 + (next() as usize % 9);
+            let needle: Vec<u8> = (0..m).map(|_| alphabet[next() as usize % alphabet.len()]).collect();
+            let nlanes = 32;
+            let hays: Vec<Vec<u8>> = (0..nlanes)
+                .map(|_| {
+                    let len = 20 + (next() as usize % 230);
+                    (0..len).map(|_| alphabet[next() as usize % alphabet.len()]).collect()
+                })
+                .collect();
+            let hrefs: Vec<&[u8]> = hays.iter().map(|h| h.as_slice()).collect();
+            let max_len = hrefs.iter().map(|h| h.len()).max().unwrap();
+            let soa32 = super::avx2::build_soa(&hrefs, max_len, 32);
+            let soa16 = super::avx2::build_soa(&hrefs[..16], max_len, 16);
+            let mut o8 = vec![0u16; nlanes];
+            let mut e8 = vec![0u16; nlanes];
+            let mut o16 = vec![0u16; 16];
+            let mut e16 = vec![0u16; 16];
+            unsafe {
+                super::avx2::score_batch_avx2_u8(&needle, &soa32, max_len, &p, u32::MAX, &mut o8, &mut e8);
+                super::avx2::score_batch_avx2(&needle, &soa16, max_len, &p, u16::MAX, &mut o16, &mut e16);
+            }
+            for k in 0..nlanes {
+                let (ss, se) = score_one_scalar_full(&needle, hrefs[k], &p, true);
+                assert_eq!(o8[k], ss, "round {round} lane {k}: u8 vs scalar");
+                let _ = se;
+            }
+            for k in 0..16 {
+                let (ss, _) = score_one_scalar_full(&needle, hrefs[k], &p, true);
+                assert_eq!(o16[k], ss, "round {round} lane {k}: u16 vs scalar");
+            }
+        }
+    }
+
+    #[test]
     fn u8_bound_is_sound() {
         let lo = params();
         assert!(lo.u8_safe(3));

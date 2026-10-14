@@ -4420,6 +4420,41 @@ mod topk_prune_tests {
     }
 
     #[test]
+    fn u8_forced_matches_unforced_on_long_needle() {
+        // Production split isolated: same pipeline, only the u8 gate differs.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _held = ENV_LOCK.lock().unwrap();
+        let paths: Vec<String> = (0..5000)
+            .map(|i| {
+                format!(
+                    "src/{}/characterization_{}_{}.rs",
+                    ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"][i % 6],
+                    i % 137,
+                    ["test", "prod", "dev", "impl", "v2", "legacy", "tmp"][i % 7]
+                )
+            })
+            .collect();
+        let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        let (files, arena) = make_paths(&refs);
+        let run = |force: bool| {
+            if force {
+                unsafe { std::env::set_var("FFF_FORCE_U8", "1") };
+            } else {
+                unsafe { std::env::remove_var("FFF_FORCE_U8") };
+            }
+            let (items, scores) = search_with(&files, "characterization", arena, 4, None);
+            let names: Vec<String> = items;
+            let totals: Vec<i32> = scores.iter().map(|s| s.total).collect();
+            (names, totals)
+        };
+        let (off_names, off_totals) = run(false);
+        let (on_names, on_totals) = run(true);
+        unsafe { std::env::remove_var("FFF_FORCE_U8") };
+        assert_eq!(off_names, on_names, "items differ u8-forced vs not");
+        assert_eq!(off_totals, on_totals, "totals differ u8-forced vs not");
+    }
+
+    #[test]
     fn gate_prefilter_hatch_ranks_identically() {
         // Fused path honors FFF_NO_GATE_PREFILTER; pretest is sound so
         // both paths rank identically.
