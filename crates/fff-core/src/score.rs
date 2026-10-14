@@ -303,6 +303,9 @@ fn match_fuzzy_parts(
             // Probe hatch: serial batches inside each chunk (one task per
             // chunk instead of per batch). Sizes nested-fanout overhead.
             let no_batch_par = std::env::var_os("FFF_NO_BATCH_PAR").is_some();
+            // Probe hatch: short needles (m<=4) take the branchless bulk
+            // scalar instead of sort+stage+transpose+SIMD. Opt-in until A/B.
+            let tiny_on = std::env::var_os("FFF_TINY").is_some();
 
             // Sub-phase accounting, accumulated across rayon workers.
             let t_collect_us = std::sync::atomic::AtomicU64::new(0);
@@ -376,7 +379,10 @@ fn match_fuzzy_parts(
                 // Scalar lanes skip staging/SoA/order/par entirely: one serial
                 // pass over the trims with a reused window buffer. Same bytes in.
                 let scalar_direct = !use_simd;
-                if scalar_direct {
+                // Short needles skip the batch machinery too, on the tiny
+                // kernel (branchless, column bonuses hoisted). Same bytes.
+                let tiny_direct = tiny_on && (1..=4).contains(&needle.len());
+                if scalar_direct || tiny_direct {
                     thread_local! {
                         static SWIN: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
                     }
@@ -401,12 +407,21 @@ fn match_fuzzy_parts(
                             t.end as u32,
                             &mut win[..wlen],
                         );
-                        let (sc, ec) = crate::interseq_sw::score_one_scalar_full(
-                            needle,
-                            &win[..wlen],
-                            &p,
-                            t.include_prefix(),
-                        );
+                        let (sc, ec) = if tiny_direct {
+                            crate::interseq_sw::score_one_tiny(
+                                needle,
+                                &win[..wlen],
+                                &p,
+                                t.include_prefix(),
+                            )
+                        } else {
+                            crate::interseq_sw::score_one_scalar_full(
+                                needle,
+                                &win[..wlen],
+                                &p,
+                                t.include_prefix(),
+                            )
+                        };
                         scores[i] = sc;
                         end_cols[i] = ec;
                     }
@@ -2970,12 +2985,26 @@ mod tests {
                     ..Default::default()
                 };
                 let max_path = crate::matcher::max_path_len_of(&files);
-                let first =
-                    match_fuzzy_parts(&parts[..1], &working, &options, 1, arena, max_path, crate::parallelism::AbortToken::disabled());
+                let first = match_fuzzy_parts(
+                    &parts[..1],
+                    &working,
+                    &options,
+                    1,
+                    arena,
+                    max_path,
+                    crate::parallelism::AbortToken::disabled(),
+                );
                 let mut second_options = options;
                 second_options.max_typos = Some(max_typos.min(parts[1].len() as u16));
-                let second =
-                    match_fuzzy_parts(&parts[1..], &working, &second_options, 1, arena, max_path, crate::parallelism::AbortToken::disabled());
+                let second = match_fuzzy_parts(
+                    &parts[1..],
+                    &working,
+                    &second_options,
+                    1,
+                    arena,
+                    max_path,
+                    crate::parallelism::AbortToken::disabled(),
+                );
                 let mut expected: Vec<_> = first
                     .iter()
                     .filter_map(|a| {
@@ -2988,11 +3017,18 @@ mod tests {
                         ))
                     })
                     .collect();
-                let mut actual: Vec<_> =
-                    match_fuzzy_parts(&parts, &working, &options, 4, arena, max_path, crate::parallelism::AbortToken::disabled())
-                    .iter()
-                    .map(|m| (m.index, m.score, m.end_col, m.exact))
-                    .collect();
+                let mut actual: Vec<_> = match_fuzzy_parts(
+                    &parts,
+                    &working,
+                    &options,
+                    4,
+                    arena,
+                    max_path,
+                    crate::parallelism::AbortToken::disabled(),
+                )
+                .iter()
+                .map(|m| (m.index, m.score, m.end_col, m.exact))
+                .collect();
                 expected.sort_unstable();
                 actual.sort_unstable();
                 assert_eq!(actual, expected, "{parts:?}, typos={max_typos}");

@@ -379,6 +379,77 @@ fn score_one_scalar_stack(
     (last_row_max as u16, end_col)
 }
 
+// Bulk scalar for short needles (m<=4): column bonuses hoist out of the
+// cell loop and every per-cell branch is bool arithmetic, so the inner
+// is straight ALU. Falls back to the full scalar outside 1..=4.
+pub(crate) fn score_one_tiny(
+    needle: &[u8],
+    haystack: &[u8],
+    p: &SwParams,
+    include_prefix: bool,
+) -> (u16, u16) {
+    let m = needle.len();
+    if m == 0 || m > 4 {
+        return score_one_scalar_full(needle, haystack, p, include_prefix);
+    }
+    let gap_extend = p.gap_extend as i32;
+    let open_xtra = p.gap_open as i32 - gap_extend;
+    let match_add = p.match_score as i32;
+    let mismatch_pen = p.mismatch_penalty as i32;
+    let case_b = p.matching_case_bonus as i32;
+    let cap_b = p.capitalization_bonus as i32;
+    let delim_b = p.delimiter_bonus as i32;
+    let prefix_b = p.prefix_bonus as i32;
+    let mut nc = [0u8; 4];
+    let mut nf = [0u8; 4];
+    for i in 0..m {
+        nc[i] = needle[i];
+        nf[i] = flip_case(needle[i]);
+    }
+    let mut h_prev = [0i32; 5];
+    let mut e_prev = [0i32; 5];
+    let mut f_prev = [0i32; 5];
+    let mut h_curr = [0i32; 5];
+    let mut e_curr = [0i32; 5];
+    let mut f_curr = [0i32; 5];
+    let mut m_prev = [0i32; 5];
+    let mut m_curr = [0i32; 5];
+    let mut prev_lower = 0i32;
+    let mut prev_delim = 0i32;
+    let mut last_row_max = 0i32;
+    let mut end_col = 0u16;
+    for (j, &hb) in haystack.iter().enumerate() {
+        let hd = is_delimiter(hb) as i32;
+        let col = (hb.is_ascii_uppercase() as i32) * prev_lower * cap_b
+            + prev_delim * (1 - hd) * delim_b
+            + ((include_prefix && j == 0) as i32) * prefix_b;
+        for i in 1..=m {
+            let is_m = ((hb == nc[i - 1]) | (hb == nf[i - 1])) as i32;
+            let is_e = (hb == nc[i - 1]) as i32;
+            let s = is_m * (match_add + col + is_e * case_b) - (1 - is_m) * mismatch_pen;
+            let diag = h_prev[i - 1] + s;
+            let e = (h_prev[i] - (gap_extend + m_prev[i] * open_xtra)).max(e_prev[i] - gap_extend);
+            e_curr[i] = e;
+            let f = (h_curr[i - 1] - (gap_extend + m_curr[i - 1] * open_xtra))
+                .max(f_curr[i - 1] - gap_extend);
+            f_curr[i] = f;
+            h_curr[i] = diag.max(e).max(f).max(0);
+            m_curr[i] = is_m;
+        }
+        if h_curr[m] > last_row_max {
+            last_row_max = h_curr[m];
+            end_col = j as u16;
+        }
+        std::mem::swap(&mut h_prev, &mut h_curr);
+        std::mem::swap(&mut e_prev, &mut e_curr);
+        std::mem::swap(&mut f_prev, &mut f_curr);
+        std::mem::swap(&mut m_prev, &mut m_curr);
+        prev_lower = hb.is_ascii_lowercase() as i32;
+        prev_delim = hd;
+    }
+    (last_row_max as u16, end_col)
+}
+
 // Score-only wrapper; test oracle for the batch kernels.
 #[cfg(test)]
 pub(crate) fn score_one_scalar(
@@ -1198,6 +1269,81 @@ mod tests {
     }
 
     #[test]
+    fn tiny_matches_scalar_on_short_needles() {
+        // Parity battery for the branchless m<=4 kernel: score+end must
+        // agree with the scalar oracle on every shape it can meet.
+        let cases: &[(&str, &str)] = &[
+            ("n", "controllers/ne.rs"),
+            ("ne", "crates/fff-core/src/score.rs"),
+            ("net", "src/net/convert-traci.py"),
+            ("abcd", "aXbXcXd"),
+            ("aBc", "xaBcyz"),
+            ("ab", "AB"),
+            ("x", "xyz"),
+            ("zz", "abc"),
+            ("a/b", "src/a/b.rs"),
+            ("--", "--help-output"),
+        ];
+        for m in 1..=4 {
+            let p = SwParams::for_query(m % 2 == 0);
+            for &(n, h) in cases {
+                let needle = &n.as_bytes()[..m.min(n.len())];
+                if needle.is_empty() {
+                    continue;
+                }
+                for prefix in [false, true] {
+                    let want = score_one_scalar_full(needle, h.as_bytes(), &p, prefix);
+                    let got = score_one_tiny(needle, h.as_bytes(), &p, prefix);
+                    assert_eq!(
+                        got, want,
+                        "m={m} needle={needle:?} hay={h:?} prefix={prefix}"
+                    );
+                }
+            }
+        }
+        // Fallback outside 1..=4 delegates without diverging.
+        let p = params();
+        assert_eq!(
+            score_one_tiny(b"", b"abc", &p, true),
+            score_one_scalar_full(b"", b"abc", &p, true)
+        );
+        assert_eq!(
+            score_one_tiny(b"abcde", b"abcde", &p, true),
+            score_one_scalar_full(b"abcde", b"abcde", &p, true)
+        );
+    }
+
+    #[test]
+    fn tiny_fuzz_matches_scalar() {
+        // Differential fuzz over byte soup, both cases, both prefixes.
+        let mut state = 0x71B5u32;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(1664525)
+                .wrapping_add(1013904223);
+            state
+        };
+        for round in 0..400 {
+            let m = 1 + (next() % 4) as usize;
+            let n = (next() % 96) as usize;
+            let mut needle = vec![0u8; m];
+            let mut hay = vec![0u8; n];
+            for b in needle.iter_mut() {
+                *b = b"aA0/.-_"[(next() % 7) as usize];
+            }
+            for b in hay.iter_mut() {
+                *b = b"aAbB0/.-_x"[((next() >> 3) % 9) as usize];
+            }
+            let p = SwParams::for_query(round % 2 == 0);
+            let prefix = round % 3 == 0;
+            assert_eq!(
+                score_one_tiny(&needle, &hay, &p, prefix),
+                score_one_scalar_full(&needle, &hay, &p, prefix),
+                "round={round} m={m} n={n}"
+            );
+        }
+    }
+    #[test]
     fn max_sw_bound_holds_on_random() {
         // Falsification for pre-SW pruning: any violation kills the idea.
         // Batch kernels replicate scalar exactly (parity battery), so
@@ -1613,6 +1759,51 @@ mod tests {
             let (ss, se) = score_one_scalar_full(&needle, &hay, &p, true);
             assert_eq!(o8[0], ss, "score diverged at m={m}");
             assert_eq!(e8[0], se, "end_col diverged at m={m}");
+        }
+    }
+
+    #[test]
+    fn u8_agrees_with_scalar_through_safe_domain() {
+        // Wherever u8_safe admits a needle, the u8 kernel must equal the
+        // scalar oracle on exact-prefix hays (the highest-scoring shape).
+        // Divergence above the gate stays out of production by construction.
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for upper in [false, true] {
+            let p = SwParams::for_query(upper);
+            let base: Vec<u8> = if upper {
+                b"INTERNATIONALIZATION".to_vec()
+            } else {
+                b"internationalization".to_vec()
+            };
+            for m in 1..=32usize {
+                if !p.u8_safe(m) {
+                    continue;
+                }
+                let needle: Vec<u8> = base.iter().cycle().take(m).cloned().collect();
+                let mut hay = needle.clone();
+                hay.extend_from_slice(b"_trailing_junk_0123456789");
+                let n = 16;
+                let hrefs: Vec<&[u8]> = vec![hay.as_slice(); n];
+                let soa32 = super::avx2::build_soa(&hrefs, hay.len(), 32);
+                let mut o8 = vec![0u16; n];
+                let mut e8 = vec![0u16; n];
+                unsafe {
+                    super::avx2::score_batch_avx2_u8(
+                        &needle,
+                        &soa32,
+                        hay.len(),
+                        &p,
+                        u32::MAX,
+                        &mut o8,
+                        &mut e8,
+                    );
+                }
+                let (ss, se) = score_one_scalar_full(&needle, &hay, &p, true);
+                assert_eq!(o8[0], ss, "score diverged upper={upper} m={m}");
+                assert_eq!(e8[0], se, "end_col diverged upper={upper} m={m}");
+            }
         }
     }
 
