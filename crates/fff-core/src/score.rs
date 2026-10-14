@@ -55,6 +55,7 @@ fn match_fuzzy_parts(
     max_threads: usize,
     arena: ArenaPtr,
     max_path_len: usize,
+    abort: crate::parallelism::AbortToken<'_>,
 ) -> Vec<neo_frizbee::Match> {
     // Stack for the common 1-2 part queries; spills rarely.
     let valid_parts: SmallVec<[&str; 4]> = fuzzy_parts
@@ -805,6 +806,11 @@ fn match_fuzzy_parts(
                 });
             let n_groups = gate_n.div_ceil(file_chunk);
             let one_group = |g: usize| {
+                // Newer keystroke owns the box: drop this slice unpaid.
+                // The caller discards the partial result either way.
+                if abort.aborted() {
+                    return Vec::new();
+                }
                 let lo = g * file_chunk;
                 let hi = ((g + 1) * file_chunk).min(gate_n);
                 let t = std::time::Instant::now();
@@ -987,12 +993,14 @@ pub(crate) fn fuzzy_match_and_score_subset<'a>(
     _base_arena: ArenaPtr,
     _overflow_arena: ArenaPtr,
     max_path_len: usize,
+    abort: crate::parallelism::AbortToken<'_>,
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
     let (results, total) = match_and_score_in_arena(
         FileItems::Filtered { base, idx },
         context,
         _base_arena,
         max_path_len,
+        abort,
     );
     let mut out = sort_and_paginate(results, context, total);
     out.2 = total;
@@ -1008,6 +1016,7 @@ pub(crate) fn fuzzy_match_and_score_files<'a>(
     base_arena: ArenaPtr,
     overflow_arena: ArenaPtr,
     max_path_len: usize,
+    abort: crate::parallelism::AbortToken<'_>,
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
     fuzzy_match_and_score_files_impl(
         files,
@@ -1016,6 +1025,7 @@ pub(crate) fn fuzzy_match_and_score_files<'a>(
         base_arena,
         overflow_arena,
         max_path_len,
+        abort,
     )
 }
 
@@ -1026,6 +1036,7 @@ fn fuzzy_match_and_score_files_impl<'a>(
     base_arena: ArenaPtr,
     overflow_arena: ArenaPtr,
     max_path_len: usize,
+    abort: crate::parallelism::AbortToken<'_>,
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
     // Process overflow files first: newly added files (created after the
     // initial scan) live in the overflow arena and are more likely to be
@@ -1036,6 +1047,7 @@ fn fuzzy_match_and_score_files_impl<'a>(
             context,
             overflow_arena,
             max_path_len,
+            abort,
         );
 
         let (base_results, base_total) = match_and_score_in_arena(
@@ -1043,6 +1055,7 @@ fn fuzzy_match_and_score_files_impl<'a>(
             context,
             base_arena,
             max_path_len,
+            abort,
         );
         results.extend(base_results);
         total += base_total;
@@ -1053,6 +1066,7 @@ fn fuzzy_match_and_score_files_impl<'a>(
             context,
             base_arena,
             max_path_len,
+            abort,
         )
     };
 
@@ -1560,6 +1574,7 @@ fn match_and_score_in_arena<'a>(
     context: &ScoringContext,
     arena: ArenaPtr,
     max_path_len: usize,
+    abort: crate::parallelism::AbortToken<'_>,
 ) -> (Vec<(&'a FileItem, Score)>, usize) {
     if files.len() == 0 {
         return (vec![], 0);
@@ -1658,6 +1673,7 @@ fn match_and_score_in_arena<'a>(
         context.max_threads,
         arena,
         max_path_len,
+        abort,
     );
     let match_elapsed = t_match.elapsed();
     if phase_timing {
@@ -2955,11 +2971,11 @@ mod tests {
                 };
                 let max_path = crate::matcher::max_path_len_of(&files);
                 let first =
-                    match_fuzzy_parts(&parts[..1], &working, &options, 1, arena, max_path);
+                    match_fuzzy_parts(&parts[..1], &working, &options, 1, arena, max_path, crate::parallelism::AbortToken::disabled());
                 let mut second_options = options;
                 second_options.max_typos = Some(max_typos.min(parts[1].len() as u16));
                 let second =
-                    match_fuzzy_parts(&parts[1..], &working, &second_options, 1, arena, max_path);
+                    match_fuzzy_parts(&parts[1..], &working, &second_options, 1, arena, max_path, crate::parallelism::AbortToken::disabled());
                 let mut expected: Vec<_> = first
                     .iter()
                     .filter_map(|a| {
@@ -2973,7 +2989,7 @@ mod tests {
                     })
                     .collect();
                 let mut actual: Vec<_> =
-                    match_fuzzy_parts(&parts, &working, &options, 4, arena, max_path)
+                    match_fuzzy_parts(&parts, &working, &options, 4, arena, max_path, crate::parallelism::AbortToken::disabled())
                     .iter()
                     .map(|m| (m.index, m.score, m.end_col, m.exact))
                     .collect();
@@ -3042,10 +3058,10 @@ mod tests {
                 };
                 let max_path = crate::matcher::max_path_len_of(&files);
                 let (mut parallel, _) =
-                    match_and_score_in_arena(FileItems::All(&files), &context, arena, max_path);
+                    match_and_score_in_arena(FileItems::All(&files), &context, arena, max_path, crate::parallelism::AbortToken::disabled());
                 context.max_threads = 1;
                 let (mut sequential, _) =
-                    match_and_score_in_arena(FileItems::All(&files), &context, arena, max_path);
+                    match_and_score_in_arena(FileItems::All(&files), &context, arena, max_path, crate::parallelism::AbortToken::disabled());
                 parallel.sort_unstable_by_key(|(file, _)| file.modified);
                 sequential.sort_unstable_by_key(|(file, _)| file.modified);
                 assert_eq!(parallel.len(), sequential.len(), "{text}");
@@ -3432,6 +3448,7 @@ mod tests {
                 1,
                 arena,
                 crate::matcher::max_path_len_of(&files),
+                crate::parallelism::AbortToken::disabled(),
             )
             .iter()
             .map(|m| (m.index, m.score))
@@ -3639,6 +3656,7 @@ mod filename_bonus_tests {
             arena,
             arena,
             max_path_len_of(&files),
+            crate::parallelism::AbortToken::disabled(),
         );
         items
             .iter()
@@ -3888,6 +3906,7 @@ mod git_recency_scoring_tests {
             arena,
             arena,
             max_path_len_of(&files),
+            crate::parallelism::AbortToken::disabled(),
         );
         items
             .iter()
@@ -3984,6 +4003,7 @@ mod typo_resistance_tests {
             arena,
             arena,
             max_path_len_of(&files),
+            crate::parallelism::AbortToken::disabled(),
         );
         items.iter().map(|f| f.relative_path(arena)).collect()
     }
@@ -4101,6 +4121,7 @@ mod constraint_only_query_tests {
             arena,
             arena,
             max_path_len_of(&files),
+            crate::parallelism::AbortToken::disabled(),
         );
 
         assert_eq!(
@@ -4159,6 +4180,7 @@ mod constraint_only_query_tests {
             arena,
             arena,
             max_path_len_of(&files),
+            crate::parallelism::AbortToken::disabled(),
         );
 
         assert_eq!(total_matched, 1);
@@ -4232,6 +4254,7 @@ mod ranking_policy_tests {
             arena,
             arena,
             max_path_len_of(&files),
+            crate::parallelism::AbortToken::disabled(),
         );
         items.iter().map(|f| f.relative_path(arena)).collect()
     }
@@ -4420,6 +4443,7 @@ mod topk_prune_tests {
             arena,
             arena,
             max_path_len_of(files),
+            crate::parallelism::AbortToken::disabled(),
         );
         (
             items.iter().map(|f| f.relative_path(arena)).collect(),
@@ -4530,6 +4554,7 @@ mod topk_prune_tests {
                 arena,
                 arena,
                 max_path_len_of(&files),
+                crate::parallelism::AbortToken::disabled(),
             );
             assert!(total >= 4096, "fixture must trigger collapse, got {total}");
             (
@@ -4610,6 +4635,7 @@ mod topk_prune_tests {
                             arena,
                             arena,
                             max_path_len_of(&files),
+                            crate::parallelism::AbortToken::disabled(),
                         )
                     };
                     let (base_items, base_scores, base_total) = run();
@@ -4775,6 +4801,7 @@ mod topk_prune_tests {
                 arena,
                 arena,
                 max_path_len_of(files),
+                crate::parallelism::AbortToken::disabled(),
             );
             let mut pairs: Vec<(String, i32, u64)> = items
                 .iter()

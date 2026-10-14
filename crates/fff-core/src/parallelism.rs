@@ -168,7 +168,10 @@ pub static SEARCH_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads.max(1))
         .thread_name(|i| format!("fff-search-{i}"))
-        .start_handler(|_| pin_qos())
+        .start_handler(|_| {
+            pin_qos();
+            maybe_pin_search_thread();
+        })
         .build()
         .expect("failed to create search rayon pool")
 });
@@ -183,13 +186,6 @@ pub fn search_pool_threads() -> usize {
 #[cfg(test)]
 pub fn bg_pool_threads() -> usize {
     BACKGROUND_THREAD_POOL.current_num_threads().max(1)
-}
-
-/// Default `max_threads` when the caller passes 0: effective cores, not the
-/// Ambient pool size; collapses under nested installs. Test helper.
-#[cfg(test)]
-pub fn default_max_threads() -> usize {
-    effective_core_count().max(1)
 }
 
 // Interactive searches in flight. Background indexing yields while
@@ -212,6 +208,50 @@ impl QueryActiveGuard {
 impl Drop for QueryActiveGuard {
     fn drop(&mut self) {
         QUERY_ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+// Per-keystroke search epoch on the picker's own counter. Each fuzzy
+// search bumps it at entry; group loops abandon their slice when it
+// moves (a newer keystroke owns the box; its result is the one the UI
+// keeps). Per-picker so concurrent searches on different pickers never
+// abort each other. Single-flight cost is one load per group.
+pub(crate) fn begin_search(counter: &std::sync::atomic::AtomicU64) -> u64 {
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+// Cooperative per-keystroke abort. The token captures the epoch at
+// query entry; workers bail their slice when a newer query moves it.
+// Disabled tokens cost one bool check and keep tests deterministic.
+#[derive(Copy, Clone)]
+pub(crate) struct AbortToken<'a> {
+    epoch: u64,
+    enabled: bool,
+    counter: Option<&'a std::sync::atomic::AtomicU64>,
+}
+
+impl<'a> AbortToken<'a> {
+    pub(crate) fn disabled() -> Self {
+        Self {
+            epoch: 0,
+            enabled: false,
+            counter: None,
+        }
+    }
+
+    pub(crate) fn live(counter: &'a std::sync::atomic::AtomicU64) -> Self {
+        Self {
+            epoch: begin_search(counter),
+            enabled: std::env::var_os("FFF_NO_CANCEL").is_none(),
+            counter: Some(counter),
+        }
+    }
+
+    pub(crate) fn aborted(&self) -> bool {
+        self.enabled
+            && self
+                .counter
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed) != self.epoch)
     }
 }
 
@@ -341,6 +381,19 @@ mod tests {
     }
 
     #[test]
+    fn abort_token_fires_only_on_newer_search() {
+        let counter = std::sync::atomic::AtomicU64::new(0);
+        let t = AbortToken::disabled();
+        let _ = begin_search(&counter);
+        assert!(!t.aborted());
+        let live = AbortToken::live(&counter);
+        assert!(!live.aborted());
+        let _ = begin_search(&counter);
+        assert!(live.aborted());
+        assert!(!AbortToken::disabled().aborted());
+    }
+
+    #[test]
     fn pool_sizes_sane() {
         assert!(search_pool_threads() >= 1);
         assert!(search_pool_threads() <= effective_core_count().max(1));
@@ -417,4 +470,109 @@ mod tests {
                 .map(|&(name, count)| Some((name.to_owned(), count))),
         )
     }
+
+    #[test]
+    fn parses_affinity_masks() {
+        assert_eq!(parse_affinity_mask("0xff"), Some(0xff));
+        assert_eq!(parse_affinity_mask("0XFFF"), Some(0xfff));
+        assert_eq!(parse_affinity_mask("255"), Some(255));
+        assert_eq!(parse_affinity_mask(""), None);
+        assert_eq!(parse_affinity_mask("bogus"), None);
+        assert_eq!(parse_affinity_mask("0x"), None);
+    }
+}
+
+// Default `max_threads` when the caller passes 0: effective cores, not the
+// ambient pool size; collapses under nested installs. Test helper.
+#[cfg(test)]
+pub fn default_max_threads() -> usize {
+    effective_core_count().max(1)
+}
+
+// Opt-in search-thread affinity (`FFF_AFFINITY=mask`, hex or decimal).
+// Probe for the P/E placement lottery: pins every search worker into
+// the mask so the OS schedules the latency-bound kernel off E-cores.
+// Default off; uniform chips set a full mask (no-op). No new crate:
+// the two Win32 fns are declared manually below.
+pub(crate) fn maybe_pin_search_thread() {
+    let raw = match std::env::var("FFF_AFFINITY") {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let Some(mask) = parse_affinity_mask(raw.trim()) else {
+        return;
+    };
+    #[cfg(windows)]
+    unsafe {
+        SetThreadAffinityMask(GetCurrentThread(), mask);
+    }
+    #[cfg(not(windows))]
+    let _ = mask;
+}
+
+fn parse_affinity_mask(s: &str) -> Option<usize> {
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        if hex.is_empty() {
+            return None;
+        }
+        usize::from_str_radix(hex, 16).ok().filter(|m| *m != 0)
+    } else {
+        s.parse::<usize>().ok().filter(|m| *m != 0)
+    }
+}
+
+// (logical processor index, efficiency class) per cpu set. Empty on
+// failure or off Windows; backs the mask choice with ground truth.
+#[allow(dead_code)]
+pub(crate) fn cpu_set_classes() -> Vec<(u32, u8)> {
+    #[cfg(windows)]
+    unsafe {
+        let mut ret_len: u32 = 0;
+        GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &mut ret_len, 0, 0);
+        if ret_len == 0 {
+            return Vec::new();
+        }
+        let mut buf = vec![0u8; ret_len as usize];
+        if GetSystemCpuSetInformation(buf.as_mut_ptr(), ret_len, &mut ret_len, 0, 0) == 0 {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut off = 0usize;
+        while off + 8 <= buf.len() {
+            let size = u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+            let ty = u32::from_ne_bytes(buf[off + 4..off + 8].try_into().unwrap());
+            if size == 0 || off + size > buf.len() {
+                break;
+            }
+            // CpuSet variant: LogicalProcessorIndex at +12, EfficiencyClass
+            // at +20 (winnt.h layout); other types are skipped by Size.
+            if ty == 0 && size >= 24 {
+                let idx = u16::from_ne_bytes(buf[off + 12..off + 14].try_into().unwrap()) as u32;
+                out.push((idx, buf[off + 20]));
+            }
+            off += size;
+        }
+        out
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCurrentThread() -> usize;
+    fn SetThreadAffinityMask(h: usize, mask: usize) -> usize;
+    fn GetSystemCpuSetInformation(
+        info: *mut u8,
+        len: u32,
+        retlen: *mut u32,
+        proc: usize,
+        flags: u32,
+    ) -> u8;
 }

@@ -755,6 +755,10 @@ pub struct FilePicker {
     live: parking_lot::Mutex<LiveNarrow>,
     /// Bumped whenever the file set changes so live state is dropped.
     index_generation: std::sync::atomic::AtomicU64,
+    /// Per-keystroke search epoch: each fuzzy search bumps it at entry,
+    /// workers bail their slice when it moves. Per-picker so concurrent
+    /// searches on different pickers never abort each other.
+    search_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl FilePicker {
@@ -797,6 +801,10 @@ struct LiveNarrow {
     /// Recent hit sets by query: shortening the query (backspace) reuses
     /// the matching entry instead of rescanning. Bounded below.
     history: Vec<BackEntry>,
+    /// Visited prefixes for forward retype: history only serves exact
+    /// repeats, this serves any cached prefix of a new query. Small
+    /// selective sets only (bounded count and size).
+    prefix: Vec<BackEntry>,
 }
 
 struct BackEntry {
@@ -811,6 +819,30 @@ struct BackEntry {
 // skips at least 1/16 of the corpus, else scan directly.
 fn narrow_pays(subset_len: usize, files_len: usize) -> bool {
     (subset_len as u64) * 16 < (files_len as u64) * 15
+}
+
+// Longest cached prefix of `q` (same typos+generation): serves
+// retype-after-backspace, where history's exact match misses.
+fn longest_prefix<'a>(
+    cache: &'a [BackEntry],
+    q: &str,
+    max_typos: u16,
+    generation: u64,
+) -> Option<&'a [u32]> {
+    if std::env::var_os("FFF_NO_TRIE").is_some() {
+        return None;
+    }
+    cache
+        .iter()
+        .filter(|e| {
+            e.generation == generation
+                && e.max_typos == max_typos
+                && !e.query.is_empty()
+                && q.len() > e.query.len()
+                && q.starts_with(e.query.as_str())
+        })
+        .max_by_key(|e| e.query.len())
+        .map(|e| e.candidates.as_slice())
 }
 
 impl std::fmt::Debug for FilePicker {
@@ -1163,6 +1195,7 @@ impl FilePicker {
             trace_id,
             live: parking_lot::Mutex::new(LiveNarrow::default()),
             index_generation: std::sync::atomic::AtomicU64::new(0),
+            search_epoch: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -1343,6 +1376,7 @@ impl FilePicker {
         options: FuzzySearchOptions<'q>,
     ) -> SearchResult<'_> {
         let _query = crate::parallelism::QueryActiveGuard::new();
+        let abort = crate::parallelism::AbortToken::live(&self.search_epoch);
         let files = self.get_files();
 
         let total_files = self.live_file_count();
@@ -1584,6 +1618,34 @@ impl FilePicker {
                     } else {
                         NarrowPlan::Full
                     }
+                } else if let Some(cached) = longest_prefix(
+                    &live.prefix,
+                    context.effective_query(),
+                    max_typos,
+                    self.index_generation(),
+                ) {
+                    // Forward retype: a new query extending a visited
+                    // prefix matches a subset of that prefix's hits.
+                    let new_q = context.effective_query().as_bytes();
+                    let mut orig: Vec<u32> = Vec::with_capacity(cached.len());
+                    for &i in cached.iter() {
+                        if let Some(f) = files.get(i as usize) {
+                            let m = f.presence_mask();
+                            if m == 0 || crate::presence::allows(m, new_q, max_typos) {
+                                orig.push(i);
+                            }
+                        }
+                    }
+                    if cfg!(debug_assertions) || std::env::var_os("FFF_PHASE_TIMING").is_some() {
+                        eprintln!("TRIE_NARROW cand={} masked={}", cached.len(), orig.len());
+                    }
+                    if orig.is_empty() {
+                        NarrowPlan::Empty
+                    } else if narrow_pays(orig.len(), files.len()) {
+                        NarrowPlan::Narrow { orig }
+                    } else {
+                        NarrowPlan::Full
+                    }
                 } else {
                     NarrowPlan::Full
                 }
@@ -1601,6 +1663,7 @@ impl FilePicker {
                             base_arena,
                             overflow_arena,
                             self.max_path_len(),
+                            abort,
                         )
                     });
                     hit_buf.clear();
@@ -1615,6 +1678,7 @@ impl FilePicker {
                         base_arena,
                         overflow_arena,
                         self.max_path_len(),
+                        abort,
                     )
                 }),
             }
@@ -1645,6 +1709,23 @@ impl FilePicker {
                 });
                 while live.history.len() > 8 {
                     live.history.remove(0);
+                }
+            }
+            // Prefix cache for forward retype: small selective sets only
+            // (64k u32s ~= 256KB per entry, 8 entries ~= 2MB worst case).
+            if fuzzy_ran && !live.candidates.is_empty() && live.candidates.len() <= 65_536 {
+                live.prefix
+                    .retain(|e| e.query != q || e.max_typos != max_typos);
+                let generation = live.generation;
+                let snapshot = live.candidates.clone();
+                live.prefix.push(BackEntry {
+                    query: q.to_string(),
+                    max_typos,
+                    generation,
+                    candidates: snapshot,
+                });
+                while live.prefix.len() > 8 {
+                    live.prefix.remove(0);
                 }
             }
         }
@@ -3559,6 +3640,111 @@ mod tests {
         assert!(!narrow_pays(226_747, 227_405));
         assert!(!narrow_pays(227_405, 227_405));
         assert!(narrow_pays(2, 3));
+    }
+
+    #[test]
+    fn longest_prefix_picks_compatible_entry() {
+        let cache = vec![
+            BackEntry {
+                query: "al".into(),
+                max_typos: 2,
+                generation: 7,
+                candidates: vec![1],
+            },
+            BackEntry {
+                query: "alph".into(),
+                max_typos: 2,
+                generation: 7,
+                candidates: vec![1, 2],
+            },
+            BackEntry {
+                query: "alph".into(),
+                max_typos: 3,
+                generation: 7,
+                candidates: vec![9],
+            },
+            BackEntry {
+                query: "alph".into(),
+                max_typos: 2,
+                generation: 8,
+                candidates: vec![8],
+            },
+        ];
+        assert_eq!(
+            longest_prefix(&cache, "alphax", 2, 7),
+            Some(vec![1, 2].as_slice())
+        );
+        assert_eq!(
+            longest_prefix(&cache, "alph", 2, 7),
+            Some(vec![1].as_slice())
+        );
+        assert_eq!(longest_prefix(&cache, "beta", 2, 7), None);
+        assert_eq!(
+            longest_prefix(&cache, "alphax", 3, 7),
+            Some(vec![9].as_slice())
+        );
+        assert_eq!(longest_prefix(&cache, "alphax", 2, 9), None);
+    }
+
+    /// Forward retype after a sideways move reuses the cached prefix
+    /// instead of rescanning, and must agree with a fresh search.
+    #[test]
+    fn prefix_cache_serves_forward_retype() {
+        use crate::types::PaginationArgs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_buf = crate::path_utils::canonicalize(dir.path()).unwrap();
+        let base = base_buf.as_path();
+        for rel in ["src/alpha_1.rs", "src/alpha_2.rs", "src/beta.rs"] {
+            let path = base.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+        let mut fresh = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        fresh.collect_files().unwrap();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+
+        let opts = || FuzzySearchOptions {
+            max_threads: 1,
+            current_file: None,
+            project_path: None,
+            combo_boost_score_multiplier: 0,
+            min_combo_count: 0,
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 50,
+            },
+        };
+        let parser = fff_query_parser::QueryParser::default();
+        let run = |picker: &FilePicker, text: &str| {
+            let parsed = parser.parse(text);
+            let out = picker.fuzzy_search(&parsed, None, opts());
+            let names: Vec<String> = out.items.iter().map(|f| f.relative_path(picker)).collect();
+            let totals: Vec<i32> = out.scores.iter().map(|s| s.total).collect();
+            (out.total_matched, names, totals)
+        };
+
+        // "alp" primes the prefix cache; "alph" moves live on; "alpxyz"
+        // shares only the cached prefix (live/history both miss it).
+        assert_eq!(run(&picker, "alp"), run(&fresh, "alp"));
+        assert_eq!(run(&picker, "alph"), run(&fresh, "alph"));
+        assert!(!picker.live.lock().prefix.is_empty());
+        assert_eq!(
+            run(&picker, "alpxyz"),
+            run(&fresh, "alpxyz"),
+            "prefix retype diverged"
+        );
     }
 
     #[test]
