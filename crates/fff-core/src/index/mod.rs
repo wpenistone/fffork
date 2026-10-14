@@ -2,6 +2,9 @@
 pub mod bigram_filter;
 pub(crate) use bigram_filter::*;
 
+pub(crate) mod bigram_cache;
+pub(crate) use bigram_cache::*;
+
 mod bigram_query;
 pub use bigram_query::*;
 

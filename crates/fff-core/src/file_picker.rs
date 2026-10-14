@@ -190,6 +190,17 @@ impl ContentMaskStore {
         self.has_data.load(Ordering::Relaxed)
     }
 
+    // Snapshot for the persisted post-scan cache: raw slots + flag.
+    // Restore replays non-zero slots through `set` (same effects).
+    pub(crate) fn snapshot(&self) -> Option<(Vec<u64>, bool)> {
+        let slots = self.slots.get()?;
+        let mut out = Vec::with_capacity(slots.len());
+        for s in slots.iter() {
+            out.push(s.load(Ordering::Relaxed));
+        }
+        Some((out, self.has_data.load(Ordering::Relaxed)))
+    }
+
     /// `None` when the index is out of range or no mask was recorded.
     #[inline]
     pub(crate) fn get(&self, index: usize) -> Option<crate::types::ContentMask> {

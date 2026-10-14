@@ -363,6 +363,26 @@ impl ScanJob {
         if config.content_indexing {
             let indexable_count = unsafe_snapshot.indexable_count.min(files.len());
             let (indexable_files, non_indexable_files) = files.split_at(indexable_count);
+            // Persisted index from an unchanged corpus skips the whole
+            // content-read build (and the sniff: masks + binary flags
+            // restore with it). Fingerprint covers order, so indices align.
+            let cache_hit = !signals.cancelled.load(Ordering::Acquire)
+                && crate::index::bigram_cache::try_load(
+                    files,
+                    &unsafe_snapshot.base_path,
+                    arena,
+                    content_masks,
+                    |index| {
+                        if let Ok(mut guard) = shared_picker.write()
+                            && let Some(picker) = guard.as_mut()
+                        {
+                            picker.set_bigram_index(index);
+                        }
+                    },
+                );
+            if cache_hit {
+                return;
+            }
             let index = build_bigram_index(
                 indexable_files,
                 &unsafe_snapshot.base_path,
@@ -387,6 +407,24 @@ impl ScanJob {
                     arena,
                     &signals.cancelled,
                     None,
+                );
+            }
+
+            // Snapshot for the next startup (bg thread; nobody waits).
+            // Masks + binary flags are final only after the sniff above.
+            // Skipped when this session loaded the cache (nothing new).
+            if !cache_hit
+                && !signals.cancelled.load(Ordering::Acquire)
+                && let Ok(guard) = shared_picker.read()
+                && let Some(picker) = guard.as_ref()
+                && let Some(index) = picker.bigram_index()
+            {
+                crate::index::bigram_cache::save_after(
+                    files,
+                    &unsafe_snapshot.base_path,
+                    arena,
+                    index,
+                    content_masks,
                 );
             }
         } else {

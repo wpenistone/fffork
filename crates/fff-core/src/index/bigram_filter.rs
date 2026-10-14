@@ -850,6 +850,70 @@ impl BigramFilter {
         self.skip_index.as_deref()
     }
 
+    // Field views for the persisted post-scan cache (same crate only).
+    pub(crate) fn parts(
+        &self,
+    ) -> (
+        &[u16],
+        &[u64],
+        usize,
+        &[u32],
+        &[u8],
+        usize,
+        usize,
+        usize,
+        Option<&BigramFilter>,
+    ) {
+        (
+            &self.lookup,
+            &self.dense_data,
+            self.dense_count,
+            &self.sparse_offsets,
+            &self.sparse_data,
+            self.words,
+            self.file_count,
+            self.populated,
+            self.skip_index.as_deref(),
+        )
+    }
+
+    // Rebuild from persisted parts. Volumes are trusted (checksum +
+    // fingerprint verified by the caller); lengths still checked.
+    pub(crate) fn from_parts(
+        lookup: Vec<u16>,
+        dense_data: Vec<u64>,
+        dense_count: usize,
+        sparse_offsets: Vec<u32>,
+        sparse_data: Vec<u8>,
+        words: usize,
+        file_count: usize,
+        populated: usize,
+        skip: Option<BigramFilter>,
+    ) -> Option<Self> {
+        if dense_count > 0 && dense_data.len() != dense_count.checked_mul(words)? {
+            return None;
+        }
+        if sparse_offsets.is_empty() || *sparse_offsets.last()? as usize != sparse_data.len() {
+            return None;
+        }
+        let dense_data = match ColumnSlab::from_vec(dense_data) {
+            Some(slab) => slab,
+            None if dense_count == 0 => ColumnSlab::empty(),
+            None => return None,
+        };
+        Some(Self {
+            lookup,
+            dense_data,
+            dense_count,
+            sparse_offsets,
+            sparse_data,
+            words,
+            file_count,
+            populated,
+            skip_index: skip.map(Box::new),
+        })
+    }
+
     /// Create a new bigram filter from the internal data
     pub fn new(
         lookup: Vec<u16>,
