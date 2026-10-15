@@ -416,11 +416,8 @@ pub(crate) mod avx2 {
         soa
     }
 
-    // 8×8 byte matrix transpose via SSE2 unpack shuffles.
-    //
-    // `dst[j * dst_stride + i] = src[i * src_stride + j]` for i, j in 0..8.
-    // Reads 8 contiguous bytes from each of 8 source rows and writes 8
-    // contiguous bytes to each of 8 destination rows (AoS → SoA tiles).
+    // 8×8 byte transpose (AoS to SoA tiles) via SSE2 unpack shuffles:
+    // `dst[j * dst_stride + i] = src[i * src_stride + j]`, i, j in 0..8.
     //
     // # Safety
     // Caller must ensure `src` has 8 rows of `src_stride` readable bytes and
@@ -483,12 +480,8 @@ pub(crate) mod avx2 {
         }
     }
 
-    // Fill SoA from path-major staged bytes using 8×8 shuffle transpose tiles.
-    //
-    // `stage` is path-major: path `k` lives at `stage[k * rows + j]` and is
-    // zero-padded to `rows`. `out` is position-major SoA with `stride` lanes
-    // per row: `out[j * stride + k]`. `rows` and `stride` must both be
-    // multiples of 8 (`rows` = padded max trimmed len, `stride` = lane count).
+    // Fill position-major SoA from path-major stage via 8×8 tiles
+    // (`out[j*stride+k] = stage[k*rows+j]`; rows/stride multiples of 8).
     // Every SoA byte is written; no pre-zeroing of `out` is required.
     //
     // # Safety
@@ -517,12 +510,9 @@ pub(crate) mod avx2 {
         }
     }
 
-    // Score a batch of up to 16 pre-trimmed haystacks using inter-sequence AVX2 SW.
-    // `include_prefix` is a per-lane bitmask (bit i = lane i gets prefix bonus at j=0).
-    // Returns per-lane (score, end_col_local) where end_col_local is the last
-    // column in the trimmed slice where the last-row max occurs.
-    // Needle rows are dynamic up to 32 (arrays sized 33); longer needles
-    // take the scalar path (see `use_simd` in score.rs).
+    // Inter-sequence AVX2 SW over up to 16 pre-trimmed haystacks; returns
+    // per-lane (score, end_col_local). `include_prefix` is a per-lane bitmask.
+    // Needle rows are dynamic to 32 (longer needles stay scalar).
     //
     // # Safety
     // Caller must ensure AVX2 is available and `out.len() >= haystacks.len()`.
@@ -605,7 +595,7 @@ pub(crate) mod avx2 {
             let raw = _mm_loadu_si128(soa.as_ptr().add(j * LANES) as *const __m128i);
             let hay = _mm256_cvtepu8_epi16(raw);
 
-            let (is_lower, is_delim_st, cap_bonus, delim_bonus) = if need_case || need_delim {
+            let (is_lower, is_delim, cap_bonus, delim_bonus) = if need_case || need_delim {
                 let ge_a = _mm256_cmpgt_epi16(hay, a_lo);
                 let le_z = _mm256_cmpgt_epi16(z_hi, hay);
                 let is_upper = _mm256_and_si256(ge_a, le_z);
@@ -644,6 +634,10 @@ pub(crate) mod avx2 {
             e[nxt][0] = zero;
             f[nxt][0] = zero;
             match_state[nxt][0] = zero;
+            // Forward mm in a register: f_pen wants the previous
+            // iteration's mm, still in hand. Drops one vector
+            // load + store per cell, zero added ALU.
+            let mut prev_mm = zero;
 
             for i in 1..=m {
                 let eq_nc = _mm256_cmpeq_epi16(hay, nc_v[i]);
@@ -661,7 +655,7 @@ pub(crate) mod avx2 {
                 let e_ext = _mm256_subs_epu16(e[cur][i], gap_ext_v);
                 e[nxt][i] = _mm256_max_epu16(e_new, e_ext);
 
-                let f_pen = _mm256_blendv_epi8(gap_ext_v, gap_open_v, match_state[nxt][i - 1]);
+                let f_pen = _mm256_blendv_epi8(gap_ext_v, gap_open_v, prev_mm);
                 let f_new = _mm256_subs_epu16(h[nxt][i - 1], f_pen);
                 let f_ext = _mm256_subs_epu16(f[nxt][i - 1], gap_ext_v);
                 f[nxt][i] = _mm256_max_epu16(f_new, f_ext);
@@ -669,6 +663,7 @@ pub(crate) mod avx2 {
                 let h_val = _mm256_max_epu16(diag, e[nxt][i]);
                 let h_val = _mm256_max_epu16(h_val, f[nxt][i]);
                 h[nxt][i] = _mm256_max_epu16(h_val, zero);
+                prev_mm = mm;
             }
 
             let row_m = h[nxt][m];
@@ -680,7 +675,7 @@ pub(crate) mod avx2 {
 
             cur = nxt;
             prev_lower = is_lower;
-            prev_delim = is_delim_st;
+            prev_delim = is_delim;
         }
 
         // Extract per-lane scores and end_cols
@@ -694,9 +689,8 @@ pub(crate) mod avx2 {
         }
     }
 
-    // Score a batch of up to 32 pre-trimmed haystacks using inter-sequence AVX2 SW
-    // with u8 scores (32 lanes). Only valid when `score_fits_in_u8` is true
-    // (max score < 256). Same semantics as `score_batch_avx2` but 2x lanes.
+    // U8 scores over 32 lanes (2x throughput); valid only when scores fit
+    // in u8. Same semantics as `score_batch_avx2`.
     //
     // # Safety
     // Caller must ensure AVX2 is available. Scores must fit in u8.
@@ -799,7 +793,7 @@ pub(crate) mod avx2 {
 
             // Character class masks — skip entirely when case/delim bonuses are 0
             // (typical lowercase query). Saves ~10 SIMD ops per column.
-            let (is_lower, is_delim_unused, cap_bonus, delim_bonus) = if need_case || need_delim {
+            let (is_lower, is_delim, cap_bonus, delim_bonus) = if need_case || need_delim {
                 let ge_a = _mm256_cmpgt_epi8(hay, a_lo);
                 let le_z = _mm256_cmpgt_epi8(z_hi, hay);
                 let is_upper = _mm256_and_si256(ge_a, le_z);
@@ -879,7 +873,7 @@ pub(crate) mod avx2 {
 
             cur = nxt;
             prev_lower = is_lower;
-            prev_delim = is_delim_unused;
+            prev_delim = is_delim;
         }
 
         // Extract per-lane scores (u8 -> u16) and end_cols
@@ -1021,6 +1015,11 @@ pub(crate) mod avx2 {
         let sign_bias = _mm256_set1_epi8(-128);
 
         for j in 0..n {
+            // Saturation check before the load (general kernel order):
+            // a saturated batch is done, skip the fetch.
+            if j & 3 == 0 && _mm256_movemask_epi8(_mm256_cmpeq_epi8(last_row_max, ones)) == -1 {
+                break;
+            }
             let hay = _mm256_loadu_si256(soa.as_ptr().add(j * 32) as *const __m256i);
             if j + 2 < n {
                 unsafe {
@@ -1031,11 +1030,7 @@ pub(crate) mod avx2 {
                 }
             }
 
-            if j & 3 == 0 && _mm256_movemask_epi8(_mm256_cmpeq_epi8(last_row_max, ones)) == -1 {
-                break;
-            }
-
-            let (is_lower, is_delim_unused, cap_bonus, delim_bonus) = if need_case || need_delim {
+            let (is_lower, is_delim, cap_bonus, delim_bonus) = if need_case || need_delim {
                 let ge_a = _mm256_cmpgt_epi8(hay, a_lo);
                 let le_z = _mm256_cmpgt_epi8(z_hi, hay);
                 let is_upper = _mm256_and_si256(ge_a, le_z);
@@ -1116,7 +1111,7 @@ pub(crate) mod avx2 {
 
             cur = nxt;
             prev_lower = is_lower;
-            prev_delim = is_delim_unused;
+            prev_delim = is_delim;
         }
 
         let score_bytes: [u8; 32] = std::mem::transmute(last_row_max);
