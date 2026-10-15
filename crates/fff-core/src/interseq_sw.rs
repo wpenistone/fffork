@@ -1617,6 +1617,102 @@ mod tests {
     }
 
     #[test]
+    fn u8_transient_band_agrees_with_scalar() {
+        // u8_safe bounds the final (<256) but diag intermediates add up
+        // to +34 more, so cells in 222..255 can wrap even in-domain.
+        // Biased fuzz (exact runs + bonus chars) hunts that band.
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut state = 0x48u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 16) as u8
+        };
+        let bonus_alpha = b"aBcDeF_/012";
+        for round in 0..500 {
+            let upper = round % 2 == 0;
+            let p = SwParams::for_query(upper);
+            let m = if upper {
+                6 + (next() % 3) as usize
+            } else {
+                13 + (next() % 3) as usize
+            };
+            if !p.u8_safe(m) {
+                continue;
+            }
+            let needle: Vec<u8> = (0..m)
+                .map(|_| bonus_alpha[next() as usize % bonus_alpha.len()])
+                .collect();
+            let mut hay = Vec::new();
+            for _ in 0..(1 + next() % 3) {
+                hay.extend_from_slice(&needle[..(1 + next() as usize % m)]);
+            }
+            hay.extend_from_slice(b"_junk0123456789");
+            let n = 16;
+            let hrefs: Vec<&[u8]> = vec![hay.as_slice(); n];
+            let soa32 = super::avx2::build_soa(&hrefs, hay.len(), 32);
+            let mut o8 = vec![0u16; n];
+            let mut e8 = vec![0u16; n];
+            unsafe {
+                super::avx2::score_batch_avx2_u8(
+                    &needle,
+                    &soa32,
+                    hay.len(),
+                    &p,
+                    u32::MAX,
+                    &mut o8,
+                    &mut e8,
+                );
+            }
+            let (ss, se) = score_one_scalar_full(&needle, &hay, &p, true);
+            assert_eq!(
+                o8[0], ss,
+                "score diverged round={round} m={m} upper={upper}"
+            );
+            assert_eq!(
+                e8[0], se,
+                "end_col diverged round={round} m={m} upper={upper}"
+            );
+        }
+    }
+
+    #[test]
+    fn u8_late_best_end_col_agrees() {
+        // end_col tracks j as u8: best-ends past byte 255 must still
+        // agree with scalar inside the u8_safe domain.
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let p = params();
+        let needle = b"controller".to_vec();
+        assert!(p.u8_safe(needle.len()));
+        for &off in &[260usize, 300, 511] {
+            let mut hay = vec![b'q'; off + needle.len() + 8];
+            hay[off..off + needle.len()].copy_from_slice(&needle);
+            let n = 16;
+            let hrefs: Vec<&[u8]> = vec![hay.as_slice(); n];
+            let soa32 = super::avx2::build_soa(&hrefs, hay.len(), 32);
+            let mut o8 = vec![0u16; n];
+            let mut e8 = vec![0u16; n];
+            unsafe {
+                super::avx2::score_batch_avx2_u8(
+                    &needle,
+                    &soa32,
+                    hay.len(),
+                    &p,
+                    u32::MAX,
+                    &mut o8,
+                    &mut e8,
+                );
+            }
+            let (ss, se) = score_one_scalar_full(&needle, &hay, &p, true);
+            assert_eq!(o8[0], ss, "score diverged off={off}");
+            assert_eq!(e8[0], se, "end_col diverged off={off}");
+        }
+    }
+
+    #[test]
     fn u8_agrees_with_scalar_through_safe_domain() {
         // Wherever u8_safe admits a needle, the u8 kernel must equal the
         // scalar oracle on exact-prefix hays (the highest-scoring shape).
