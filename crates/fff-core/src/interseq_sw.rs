@@ -1679,15 +1679,17 @@ mod tests {
 
     #[test]
     fn u8_late_best_end_col_agrees() {
-        // end_col tracks j as u8: best-ends past byte 255 must still
-        // agree with scalar inside the u8_safe domain.
+        // Contract: u8 kernel while best-ends fit in a byte; longer
+        // windows take the exact u16 path (dispatch reroutes past 256B).
+        // Both must agree with scalar.
         if !is_x86_feature_detected!("avx2") {
             return;
         }
         let p = params();
         let needle = b"controller".to_vec();
         assert!(p.u8_safe(needle.len()));
-        for &off in &[260usize, 300, 511] {
+        // In-contract: best-ends 209/249 fit the byte column tracker.
+        for &off in &[200usize, 240] {
             let mut hay = vec![b'q'; off + needle.len() + 8];
             hay[off..off + needle.len()].copy_from_slice(&needle);
             let n = 16;
@@ -1709,6 +1711,30 @@ mod tests {
             let (ss, se) = score_one_scalar_full(&needle, &hay, &p, true);
             assert_eq!(o8[0], ss, "score diverged off={off}");
             assert_eq!(e8[0], se, "end_col diverged off={off}");
+        }
+        // Handoff: best-ends past byte 255 go u16, still exact.
+        for &off in &[260usize, 300, 511] {
+            let mut hay = vec![b'q'; off + needle.len() + 8];
+            hay[off..off + needle.len()].copy_from_slice(&needle);
+            let n = 16;
+            let hrefs: Vec<&[u8]> = vec![hay.as_slice(); n];
+            let soa16 = super::avx2::build_soa(&hrefs, hay.len(), 16);
+            let mut o16 = vec![0u16; n];
+            let mut e16 = vec![0u16; n];
+            unsafe {
+                super::avx2::score_batch_avx2(
+                    &needle,
+                    &soa16,
+                    hay.len(),
+                    &p,
+                    u16::MAX,
+                    &mut o16,
+                    &mut e16,
+                );
+            }
+            let (ss, se) = score_one_scalar_full(&needle, &hay, &p, true);
+            assert_eq!(o16[0], ss, "u16 score diverged off={off}");
+            assert_eq!(e16[0], se, "u16 end_col diverged off={off}");
         }
     }
 

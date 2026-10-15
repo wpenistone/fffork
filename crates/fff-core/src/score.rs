@@ -490,22 +490,25 @@ fn match_fuzzy_parts(
 
                     // One batch = one (ord, out) triple. A pure indexed map, so
                     // serial and parallel runs write bit-identical outputs.
-                    let score_batch = |ord: &[u32], sc_out: &mut [u16], ec_out: &mut [u16]| {
+                    // Width-parameterized batch core: u8 runs full
+                    // 32-wide, over-long pieces run exact u16 halves.
+                    let score_batch_w = |ord: &[u32],
+                                         sc_out: &mut [u16],
+                                         ec_out: &mut [u16],
+                                         width: usize,
+                                         max_len: usize| {
                         let n = ord.len();
-                        let mut max_len = 0usize;
-                        for &oi in ord.iter() {
-                            let (s, e) = (trims[oi as usize].start, trims[oi as usize].end);
-                            max_len = max_len.max((e - s) as usize);
-                        }
                         if max_len == 0 {
                             return;
                         }
+                        // u8 path only at full width; halves are u16.
+                        let u8path = use_u8 && width == 32;
                         let rows = max_len.div_ceil(8) * 8;
                         thread_local! {
                             static SOA: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
                             static STAGE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
                         }
-                        let buf_len = rows * batch_sz;
+                        let buf_len = rows * width;
                         let t_stage = std::time::Instant::now();
                         let mut stage = STAGE.with(|c| {
                             let mut b = c.borrow_mut();
@@ -517,7 +520,7 @@ fn match_fuzzy_parts(
                         stage.truncate(buf_len);
                         // Zero only the padding lanes (SIMD path reads them).
                         if n > 8 {
-                            for k in n..batch_sz {
+                            for k in n..width {
                                 stage[k * rows..(k + 1) * rows].fill(0);
                             }
                         }
@@ -599,7 +602,7 @@ fn match_fuzzy_parts(
                             soa.truncate(buf_len);
                             unsafe {
                                 crate::interseq_sw::avx2::soa_from_stage(
-                                    &stage, rows, batch_sz, &mut soa,
+                                    &stage, rows, width, &mut soa,
                                 );
                             }
                             if timing {
@@ -610,7 +613,7 @@ fn match_fuzzy_parts(
                             }
                             let t_kernel = std::time::Instant::now();
                             unsafe {
-                                if use_u8 {
+                                if u8path {
                                     crate::interseq_sw::avx2::score_batch_avx2_u8_dispatch(
                                         needle,
                                         &soa,
@@ -679,6 +682,30 @@ fn match_fuzzy_parts(
                             );
                         }
                         STAGE.with(|c| *c.borrow_mut() = stage);
+                    };
+                    // u8 end tracking wraps past byte 255: over-long
+                    // batches run the exact u16 path in 16-wide halves
+                    // (rare; windows average ~90B).
+                    let score_batch = |ord: &[u32], sc_out: &mut [u16], ec_out: &mut [u16]| {
+                        let mut max_len = 0usize;
+                        for &oi in ord.iter() {
+                            let (s, e) = (trims[oi as usize].start, trims[oi as usize].end);
+                            max_len = max_len.max((e - s) as usize);
+                        }
+                        if max_len == 0 {
+                            return;
+                        }
+                        if use_u8 && max_len > 256 {
+                            for ((o, s), e) in ord
+                                .chunks(16)
+                                .zip(sc_out.chunks_mut(16))
+                                .zip(ec_out.chunks_mut(16))
+                            {
+                                score_batch_w(o, s, e, 16, max_len);
+                            }
+                        } else {
+                            score_batch_w(ord, sc_out, ec_out, batch_sz, max_len);
+                        }
                     };
                     // Fan out only past Amdahl break-even at measured
                     // dispatch cost; inside pool workers the guard below
@@ -4580,6 +4607,35 @@ mod topk_prune_tests {
                 "page totals differ for {q:?}"
             );
         }
+    }
+
+    #[test]
+    fn wide_windows_split_to_u16_and_agree_across_threads() {
+        // Windows past 256B cannot run the u8 kernel (byte column
+        // tracking); dispatch splits them into exact u16 halves.
+        // Identical lanes must score identically (chunk/stride
+        // misalignment breaks symmetry) under any threading. Under
+        // FFF_FORCE_SCALAR the split is idle but plumbing still pins.
+        let long: String = format!("src/{}/file.rs", "a".repeat(280));
+        let paths: Vec<String> = (0..20).map(|_| long.clone()).collect();
+        let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        let (files, arena) = make_paths(&refs);
+        // "aa" with max_typos=2 has need==0: full-path windows (~290B).
+        let (a1, s1, t1) = search_limit(&files, "aa", arena, 1, None, 50);
+        assert_eq!(t1, 20, "all long files must match");
+        assert_eq!(a1.len(), 20);
+        assert!(s1.iter().all(|s| s.total > 0), "real scores, not zeroed");
+        assert!(
+            s1.windows(2).all(|w| w[0].total == w[1].total),
+            "identical lanes diverge: {s1:?}"
+        );
+        let (a4, s4, t4) = search_limit(&files, "aa", arena, 4, None, 50);
+        assert_eq!(t4, 20);
+        assert_eq!(a1, a4, "threading changed ranking");
+        assert!(
+            s1.iter().zip(s4.iter()).all(|(a, b)| a.total == b.total),
+            "threading changed scores"
+        );
     }
 
     #[test]
