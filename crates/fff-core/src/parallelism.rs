@@ -499,15 +499,15 @@ pub(crate) fn maybe_pin_search_thread() {
         Ok(v) => v,
         Err(_) => return,
     };
-    // Ground truth for the mask choice, logged once per process: logical
-    // processor index with its efficiency class (higher = faster core).
+    // Ground truth for the mask choice is measured, not parsed: pin
+    // each half (0xFFF vs 0xFF000 on 20-thread hybrids) and keep the
+    // faster. A hand-parsed CpuSet readout was tried and misaligned,
+    // so it was deleted rather than left printing confident garbage.
     #[cfg(windows)]
     {
         static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         LOGGED.get_or_init(|| {
-            let mut classes = cpu_set_classes();
-            classes.sort_unstable();
-            eprintln!("AFFINITY classes={classes:?}");
+            eprintln!("AFFINITY probe active (mask from FFF_AFFINITY)");
         });
     }
     let Some(mask) = parse_affinity_mask(raw.trim()) else {
@@ -535,55 +535,9 @@ fn parse_affinity_mask(s: &str) -> Option<usize> {
     }
 }
 
-// (logical processor index, efficiency class) per cpu set. Empty on
-// failure or off Windows; backs the mask choice with ground truth.
-#[allow(dead_code)]
-pub(crate) fn cpu_set_classes() -> Vec<(u32, u8)> {
-    #[cfg(windows)]
-    unsafe {
-        let mut ret_len: u32 = 0;
-        GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &mut ret_len, 0, 0);
-        if ret_len == 0 {
-            return Vec::new();
-        }
-        let mut buf = vec![0u8; ret_len as usize];
-        if GetSystemCpuSetInformation(buf.as_mut_ptr(), ret_len, &mut ret_len, 0, 0) == 0 {
-            return Vec::new();
-        }
-        let mut out = Vec::new();
-        let mut off = 0usize;
-        while off + 8 <= buf.len() {
-            let size = u32::from_ne_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
-            let ty = u32::from_ne_bytes(buf[off + 4..off + 8].try_into().unwrap());
-            if size == 0 || off + size > buf.len() {
-                break;
-            }
-            // CpuSet variant: LogicalProcessorIndex at +12, EfficiencyClass
-            // at +20 (winnt.h layout); other types are skipped by Size.
-            if ty == 0 && size >= 24 {
-                let idx = u16::from_ne_bytes(buf[off + 12..off + 14].try_into().unwrap()) as u32;
-                out.push((idx, buf[off + 20]));
-            }
-            off += size;
-        }
-        out
-    }
-    #[cfg(not(windows))]
-    {
-        Vec::new()
-    }
-}
-
 #[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetCurrentThread() -> usize;
     fn SetThreadAffinityMask(h: usize, mask: usize) -> usize;
-    fn GetSystemCpuSetInformation(
-        info: *mut u8,
-        len: u32,
-        retlen: *mut u32,
-        proc: usize,
-        flags: u32,
-    ) -> u8;
 }
