@@ -189,11 +189,69 @@ unsafe fn needle_byte_mask_shuf(chunk: &[u8], t0: &[u8; 16], t1: &[u8; 16]) -> u
     ((!_mm_movemask_epi8(nz)) as u16) & 0xFFFF
 }
 
+// ASCII-needle half: high table is all zero, so hay bytes >= 128
+// land on zero b0 entries. Same bits, 2 shuffles instead of 4.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "ssse3")]
+unsafe fn needle_byte_mask_ascii(chunk: &[u8], t0: &[u8; 16]) -> u16 {
+    use core::arch::x86_64::*;
+    let v = _mm_loadu_si128(chunk.as_ptr() as *const __m128i);
+    let lo = _mm_and_si128(v, _mm_set1_epi8(0x0F));
+    let hi = _mm_and_si128(_mm_srli_epi16(v, 4), _mm_set1_epi8(0x0F));
+    let a0 = _mm_shuffle_epi8(_mm_loadu_si128(t0.as_ptr() as *const __m128i), lo);
+    let b0 = _mm_shuffle_epi8(
+        _mm_set_epi8(0, 0, 0, 0, 0, 0, 0, 0, -128, 64, 32, 16, 8, 4, 2, 1),
+        hi,
+    );
+    let r = _mm_and_si128(a0, b0);
+    let nz = _mm_cmpeq_epi8(r, _mm_setzero_si128());
+    ((!_mm_movemask_epi8(nz)) as u16) & 0xFFFF
+}
+
+// 32B AVX2 step (opt-in `FFF_GATE_AVX2`): one shuffle pass per two
+// SSSE3 steps, u32 mask out. Same bits, coarser cut granularity.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn needle_byte_mask_avx2(chunk: &[u8; 32], t0: &[u8; 16], t1: &[u8; 16], ascii_only: bool) -> u32 {
+    use core::arch::x86_64::*;
+    let v = _mm256_loadu_si256(chunk.as_ptr() as *const __m256i);
+    let mask_0f = _mm256_set1_epi8(0x0F);
+    let lo = _mm256_and_si256(v, mask_0f);
+    let hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), mask_0f);
+    let lut0 = _mm256_broadcastsi128_si256(_mm_loadu_si128(t0.as_ptr() as *const __m128i));
+    let bit_lo = _mm256_setr_epi8(
+        1, 2, 4, 8, 16, 32, 64, -128, 0, 0, 0, 0, 0, 0, 0, 0,
+        1, 2, 4, 8, 16, 32, 64, -128, 0, 0, 0, 0, 0, 0, 0, 0,
+    );
+    let a0 = _mm256_shuffle_epi8(lut0, lo);
+    let b0 = _mm256_shuffle_epi8(bit_lo, hi);
+    let r = if ascii_only {
+        _mm256_and_si256(a0, b0)
+    } else {
+        let lut1 = _mm256_broadcastsi128_si256(_mm_loadu_si128(t1.as_ptr() as *const __m128i));
+        let bit_hi = _mm256_setr_epi8(
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 4, 8, 16, 32, 64, -128,
+            0, 0, 0, 0, 0, 0, 0, 0, 1, 2, 4, 8, 16, 32, 64, -128,
+        );
+        let a1 = _mm256_shuffle_epi8(lut1, lo);
+        let b1 = _mm256_shuffle_epi8(bit_hi, hi);
+        _mm256_or_si256(_mm256_and_si256(a0, b0), _mm256_and_si256(a1, b1))
+    };
+    let nz = _mm256_cmpeq_epi8(r, _mm256_setzero_si256());
+    !_mm256_movemask_epi8(nz) as u32
+}
+
 // Per-query nibble tables: `lo[l]`/`hi[l]` hold span rows for low nibble `l`.
 struct SpanTables {
     lo: [u8; 16],
     hi: [u8; 16],
     simd: bool,
+    // True when no needle byte is >= 128: the high-half tables are
+    // all zero, so the a1/b1 shuffle pair is redundant.
+    ascii_only: bool,
+    // Opt-in 32B gate steps (`FFF_GATE_AVX2`); default off pending
+    // adjudication (coarser cut granularity shifts windows).
+    avx2: bool,
 }
 
 impl SpanTables {
@@ -214,7 +272,8 @@ impl SpanTables {
         let simd = std::is_x86_feature_detected!("ssse3") && !force_scalar();
         #[cfg(not(target_arch = "x86_64"))]
         let simd = false;
-        Self { lo, hi, simd }
+        let ascii_only = hi == [0u8; 16];
+        Self { lo, hi, simd, ascii_only, avx2: false }
     }
 }
 
@@ -314,16 +373,32 @@ impl GateNeedle {
         let typos = (max_typos as usize).min(MAX_SKIPS);
         let m = needle.len();
         let mut pm = Box::new([0u64; 256]);
+        // Pre-folded both cases: the walk indexes raw bytes, no
+        // fold per hit. Uppercase needle bytes set both entries.
         for (i, &b) in needle.iter().enumerate().take(64) {
-            pm[fold_byte(b) as usize] |= 1u64 << i;
+            let lo = fold_byte(b);
+            pm[lo as usize] |= 1u64 << i;
+            if lo.is_ascii_lowercase() {
+                pm[(lo - 32) as usize] |= 1u64 << i;
+            }
         }
         // LCS is reversal-invariant, so the backward walk accepts exactly when forward does.
         let mut pm_rev = Box::new([0u64; 256]);
         for (i, &b) in needle.iter().rev().enumerate().take(64) {
-            pm_rev[fold_byte(b) as usize] |= 1u64 << i;
+            let lo = fold_byte(b);
+            pm_rev[lo as usize] |= 1u64 << i;
+            if lo.is_ascii_lowercase() {
+                pm_rev[(lo - 32) as usize] |= 1u64 << i;
+            }
         }
         let span = NeedleMask::new(needle);
-        let tables = SpanTables::new(&span);
+        let mut tables = SpanTables::new(&span);
+        #[cfg(target_arch = "x86_64")]
+        {
+            tables.avx2 = std::env::var_os("FFF_GATE_AVX2").is_some()
+                && std::is_x86_feature_detected!("avx2")
+                && !force_scalar();
+        }
         Self {
             span,
             tables,
@@ -344,16 +419,21 @@ impl GateNeedle {
     }
 
     #[cfg(test)]
+    fn set_avx2_32(&mut self, on: bool) {
+        self.tables.avx2 = on;
+    }
+
+    #[cfg(test)]
     fn set_cut(&mut self, on: bool) {
         self.cut = on;
     }
 
-    // One 16B step at `abs`: mask, extremes, Myers; chunk and flat differ only in fetch.
+    // One 16B step at `abs`: fold precomputed mask into extremes
+    // and Myers state. Callers pick the mask source (scalar table
+    // test or inlined shuffle); folding is identical either way.
     #[inline]
-    fn walk_step(&self, abs: usize, step: &[u8], st: &mut WalkState, want_cut: bool) {
-        let tables = &self.tables;
+    fn walk_step(&self, abs: usize, step: &[u8], mask: u16, st: &mut WalkState, want_cut: bool) {
         let pm = &*self.pm;
-        let mask = needle_byte_mask(step, &self.span, tables);
         let c = mask.count_ones() as usize;
         if c == 0 {
             return;
@@ -367,7 +447,7 @@ impl GateNeedle {
         while bits != 0 {
             let bit = bits.trailing_zeros() as usize;
             bits &= bits - 1;
-            let x = st.s | pm[fold_byte(step[bit]) as usize];
+            let x = st.s | pm[step[bit] as usize];
             let y = (st.s << 1) | 1;
             st.s = x & (x ^ x.wrapping_sub(y));
         }
@@ -380,9 +460,116 @@ impl GateNeedle {
         }
     }
 
+    // Range dispatch, once per walk: AVX2 32B when opted in, else
+    // the SSSE3 range (inlined shuffle, hoisted tables), scalar last.
+    fn walk_range(
+        &self,
+        file: &FileItem,
+        arena: ArenaPtr,
+        lo: usize,
+        hi: usize,
+        st: &mut WalkState,
+    ) {
+        #[cfg(target_arch = "x86_64")]
+        if self.tables.avx2 {
+            return unsafe { self.walk_range_avx2(file, arena, lo, hi, st) };
+        }
+        #[cfg(target_arch = "x86_64")]
+        if self.tables.simd {
+            return unsafe { self.walk_range_simd(file, arena, lo, hi, st) };
+        }
+        self.walk_range_scalar(file, arena, lo, hi, st)
+    }
+
+    // 32B step: same fold as 16B over a u32 mask. Cut granularity
+    // doubles, so windows may widen vs 16B (adjudicate on sets).
+    #[inline]
+    fn walk_step32(&self, abs: usize, step: &[u8], mask: u32, st: &mut WalkState, want_cut: bool) {
+        let pm = &*self.pm;
+        let c = mask.count_ones() as usize;
+        if c == 0 {
+            return;
+        }
+        if st.n == 0 {
+            st.first = abs + mask.trailing_zeros() as usize;
+        }
+        st.last = abs + (32 - mask.leading_zeros() as usize - 1);
+        let mut bits = mask;
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let x = st.s | pm[step[bit] as usize];
+            let y = (st.s << 1) | 1;
+            st.s = x & (x ^ x.wrapping_sub(y));
+        }
+        st.n += c;
+        if want_cut && st.end_cut == 0 && st.n >= self.need.max(1) {
+            if (st.s & self.len_mask).count_ones() >= self.need as u32 {
+                st.end_cut = abs + step.len();
+            }
+        }
+    }
+
+    // 32B range for the opt-in AVX2 path; partial tails go 16B.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn walk_range_avx2(
+        &self,
+        file: &FileItem,
+        arena: ArenaPtr,
+        lo: usize,
+        hi: usize,
+        st: &mut WalkState,
+    ) {
+        let byte_len = file.path.byte_len as usize;
+        let want_cut = self.cut && st.allow_cut;
+        let ascii = self.tables.ascii_only;
+        let (t0, t1) = (&self.tables.lo, &self.tables.hi);
+        file.path.for_each_chunk(arena, |off, chunk| {
+            if off >= hi {
+                return;
+            }
+            let mut end = (off + chunk.len()).min(byte_len).min(hi);
+            if st.end_cut != 0 {
+                if off >= st.end_cut {
+                    return;
+                }
+                end = end.min(st.end_cut);
+            }
+            let start = off.max(lo);
+            if start >= end {
+                return;
+            }
+            let view = &chunk[start - off..end - off];
+            let len = end - start;
+            let mut base = 0usize;
+            while base < len {
+                let step = 32.min(len - base);
+                let seg = &view[base..base + step];
+                if step == 32 {
+                    let arr = &*(seg.as_ptr() as *const [u8; 32]);
+                    let mask = needle_byte_mask_avx2(arr, t0, t1, ascii);
+                    self.walk_step32(start + base, seg, mask, st, want_cut);
+                } else {
+                    // Partial tail: 16B sub-steps (scalar mask
+                    // assumes <= 16B), same as the scalar range.
+                    let mut b2 = 0usize;
+                    while b2 < step {
+                        let s2 = 16.min(step - b2);
+                        let sg = &seg[b2..b2 + s2];
+                        let m2 = needle_byte_mask(sg, &self.span, &self.tables);
+                        self.walk_step(start + base + b2, sg, m2, st, want_cut);
+                        b2 += s2;
+                    }
+                }
+                base += step;
+            }
+        });
+    }
+
     // Walks path bytes in [lo, hi) via arena chunks into `st`.
     // Interior steps stay vectorized; cut stops recording past the first accepting prefix.
-    fn walk_range(
+    fn walk_range_scalar(
         &self,
         file: &FileItem,
         arena: ArenaPtr,
@@ -412,7 +599,61 @@ impl GateNeedle {
             let mut base = 0usize;
             while base < len {
                 let step = 16.min(len - base);
-                self.walk_step(start + base, &view[base..base + step], st, want_cut);
+                let seg = &view[base..base + step];
+                let mask = needle_byte_mask(seg, &self.span, &self.tables);
+                self.walk_step(start + base, seg, mask, st, want_cut);
+                base += step;
+            }
+        });
+    }
+
+    // Same walk with the shuffle inlined: tables stay in registers,
+    // no per-step call. ASCII needles skip the high-half pair.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "ssse3")]
+    unsafe fn walk_range_simd(
+        &self,
+        file: &FileItem,
+        arena: ArenaPtr,
+        lo: usize,
+        hi: usize,
+        st: &mut WalkState,
+    ) {
+        let byte_len = file.path.byte_len as usize;
+        let want_cut = self.cut && st.allow_cut;
+        let ascii = self.tables.ascii_only;
+        let (t0, t1) = (&self.tables.lo, &self.tables.hi);
+        file.path.for_each_chunk(arena, |off, chunk| {
+            if off >= hi {
+                return;
+            }
+            let mut end = (off + chunk.len()).min(byte_len).min(hi);
+            if st.end_cut != 0 {
+                if off >= st.end_cut {
+                    return;
+                }
+                end = end.min(st.end_cut);
+            }
+            let start = off.max(lo);
+            if start >= end {
+                return;
+            }
+            let view = &chunk[start - off..end - off];
+            let len = end - start;
+            let mut base = 0usize;
+            while base < len {
+                let step = 16.min(len - base);
+                let seg = &view[base..base + step];
+                let mask = if step == 16 {
+                    if ascii {
+                        needle_byte_mask_ascii(seg, t0)
+                    } else {
+                        needle_byte_mask_shuf(seg, t0, t1)
+                    }
+                } else {
+                    needle_byte_mask(seg, &self.span, &self.tables)
+                };
+                self.walk_step(start + base, seg, mask, st, want_cut);
                 base += step;
             }
         });
@@ -437,14 +678,14 @@ impl GateNeedle {
             while bits != 0 {
                 let bit = 15 - bits.leading_zeros() as usize;
                 bits &= !(1u16 << bit);
-                let x = s | pm[fold_byte(seg[bit]) as usize];
+                let x = s | pm[seg[bit] as usize];
                 let y = (s << 1) | 1;
                 s = x & (x ^ x.wrapping_sub(y));
             }
             if (s & self.len_mask).count_ones() >= self.need as u32 {
                 let mut r = s_before;
                 for (k, &b) in seg.iter().enumerate().rev() {
-                    let x = r | pm[fold_byte(b) as usize];
+                    let x = r | pm[b as usize];
                     let y = (r << 1) | 1;
                     r = x & (x ^ x.wrapping_sub(y));
                     if (r & self.len_mask).count_ones() >= self.need as u32 {
@@ -1177,6 +1418,104 @@ mod tests {
                 g.hit(&hay).is_some(),
                 "cut diverged from oracle n={needle:?} h={hay:?} t={t}"
             );
+        }
+    }
+
+    #[test]
+    fn avx_mask_matches_scalar_masks() {
+        // 32B AVX mask vs two scalar halves, over ASCII and high-byte
+        // chunks (file-level fixtures cannot carry high bytes: the
+        // store builder takes Strings, so lossy conversion would
+        // rewrite them; masks take slices directly).
+        let mut state = 0x9A7u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 16) as u16
+        };
+        for _ in 0..200 {
+            let nl = 2 + (next() % 10) as usize;
+            let needle: Vec<u8> = (0..nl)
+                .map(|_| {
+                    let v = b'a' + (next() % 6) as u8;
+                    if next() % 4 == 0 { v.wrapping_add(128) } else { v }
+                })
+                .collect();
+            let chunk: Vec<u8> = (0..32)
+                .map(|_| {
+                    let v = b'a' + (next() % 6) as u8;
+                    if next() % 4 == 0 { v.wrapping_add(128) } else { v }
+                })
+                .collect();
+            let g = GateNeedle::new(&needle, 2);
+            let arr: &[u8; 32] = chunk.as_slice().try_into().unwrap();
+            let a = unsafe {
+                needle_byte_mask_avx2(arr, &g.tables.lo, &g.tables.hi, g.tables.ascii_only)
+            };
+            let s0 = needle_byte_mask(&chunk[..16], &g.span, &g.tables) as u32;
+            let s1 = needle_byte_mask(&chunk[16..], &g.span, &g.tables) as u32;
+            assert_eq!(a, s0 | (s1 << 16), "mask diverged n={needle:?}");
+            // ASCII fast path must agree too when it applies.
+            if g.tables.ascii_only {
+                let h = unsafe { needle_byte_mask_ascii(&chunk[..16], &g.tables.lo) };
+                assert_eq!(h, s0 as u16, "ascii mask diverged n={needle:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn avx32_steps_match_oracle_windows() {
+        // 32B steps see the same bytes: accept-identical always. Cut
+        // off: window-identical (same extremes). Cut on: accept-equal
+        // with coarser cut firing later-or-equal. ASCII hays here
+        // (lossy fixtures rewrite high bytes); high bytes are covered
+        // at mask level in `avx_mask_matches_scalar_masks`.
+        use crate::simd_path::build_chunked_path_store_from_strings;
+        let mut state = 0xA32u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 16) as u16
+        };
+        for _ in 0..300 {
+            let nl = 2 + (next() % 12) as usize;
+            let hl = 1 + (next() % 100) as usize;
+            let needle: Vec<u8> = (0..nl).map(|_| b'a' + (next() % 6) as u8).collect();
+            let hay: Vec<u8> = (0..hl).map(|_| b'a' + (next() % 6) as u8).collect();
+            let t = (next() % 4) as u16;
+            let rel = String::from_utf8_lossy(&hay).to_string();
+            let files = vec![FileItem::new_raw(0, 0, 0, None, false)];
+            let (store, strings) = build_chunked_path_store_from_strings(&[rel], &files);
+            let mut file = files.into_iter().next().unwrap();
+            file.set_path(strings[0].clone());
+            let arena = store.as_arena_ptr();
+            for cut in [false, true] {
+                let mut g = GateNeedle::new(&needle, t);
+                g.set_cut(cut);
+                let plain = g.hit_file(&file, arena);
+                g.set_avx2_32(true);
+                let wide = g.hit_file(&file, arena);
+                let oracle = g.hit(&hay);
+                assert_eq!(
+                    oracle.is_some(),
+                    wide.is_some(),
+                    "avx diverged from oracle cut={cut} n={needle:?} h={hay:?} t={t}"
+                );
+                assert_eq!(
+                    plain.is_some(),
+                    wide.is_some(),
+                    "accept changed cut={cut} n={needle:?} h={hay:?} t={t}"
+                );
+                if let (Some(a), Some(b)) = (plain, wide) {
+                    if cut {
+                        // Coarser cut fires later-or-equal; same extremes.
+                        assert!(
+                            b.start == a.start && b.end >= a.end,
+                            "avx window broke order cut={cut} n={needle:?} t={t}"
+                        );
+                    } else {
+                        assert_eq!(a, b, "cut-off windows differ n={needle:?} t={t}");
+                    }
+                }
+            }
         }
     }
 

@@ -57,7 +57,9 @@ impl std::fmt::Debug for ArenaPtr {
     }
 }
 
-#[repr(C, align(16))]
+// 32B chunks stay inside one cache line; split 32B loads cost
+// extra fill-buffer entries on misses.
+#[repr(C, align(32))]
 #[derive(Clone, Copy)]
 pub(crate) struct SimdChunk(pub(crate) [u8; SIMD_CHUNK_BYTES]);
 
