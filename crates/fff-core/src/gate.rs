@@ -255,7 +255,7 @@ pub struct GateNeedle {
     // Nibble membership tables for the vectorized span test.
     tables: SpanTables,
     len_mask: u64,
-    // Right-tail cutoff (FFF_SPAN_CUT=1 opts in): stop the walk at the
+    // Right-tail cutoff (FFF_NO_SPAN_CUT escapes): stop the walk at the
     // first prefix whose LCS already reaches `need`. Sound by prefix
     // monotonicity (accept/reject never changes), but SW windows tighten
     // so scores may shift: adjudicate on match sets, not checksums.
@@ -344,7 +344,7 @@ impl GateNeedle {
             typos,
             need: m.saturating_sub(typos),
             pm,
-            cut: std::env::var_os("FFF_SPAN_CUT").is_some(),
+            cut: std::env::var_os("FFF_NO_SPAN_CUT").is_none(),
         }
     }
 
@@ -823,16 +823,17 @@ mod tests {
             let g = GateNeedle::new(&needle, t);
             let streamed = g.hit_file(&file, arena);
             let staged = g.hit(&hay);
+            // Cut tightens streamed windows by design; what must hold is
+            // accept-identity plus containment of the cut window.
             assert_eq!(
                 streamed.is_some(),
                 staged.is_some(),
                 "hit disagreement n={needle:?} h={hay:?} t={t}"
             );
-            if let (Some(a), Some(b)) = (streamed, staged) {
-                assert_eq!(
-                    (a.start, a.end, a.include_prefix),
-                    (b.start, b.end, b.include_prefix),
-                    "window disagreement n={needle:?} h={hay:?} t={t}"
+            if let (Some(a), Some(b)) = (staged, streamed) {
+                assert!(
+                    b.start >= a.start && b.end <= a.end,
+                    "window escape n={needle:?} h={hay:?} t={t}"
                 );
             }
         }
@@ -865,11 +866,19 @@ mod tests {
                     file.set_presence(crate::presence::mask_of(hay));
                     let arena = store.as_arena_ptr();
                     let g = GateNeedle::new(needle, t);
+                    let streamed = g.hit_file(&file, arena);
+                    let staged = g.hit(hay);
                     assert_eq!(
-                        g.hit_file(&file, arena),
-                        g.hit(hay),
+                        streamed.is_some(),
+                        staged.is_some(),
                         "n={needle:?} h={hay:?} t={t}"
                     );
+                    if let (Some(a), Some(b)) = (staged, streamed) {
+                        assert!(
+                            b.start >= a.start && b.end <= a.end,
+                            "window escape n={needle:?} h={hay:?} t={t}"
+                        );
+                    }
                 }
             }
         }
@@ -1049,7 +1058,10 @@ mod tests {
             b"averylongfilename",
         ] {
             for t in [0u16, 2, 4] {
-                let g = GateNeedle::new(needle, t);
+                let mut g = GateNeedle::new(needle, t);
+                // Cache-vs-direct must be window-identical: disable the
+                // cutoff (its step alignment differs by construction).
+                g.set_cut(false);
                 let mut cache = PrefixWalkCache::new();
                 for file in &files {
                     assert_eq!(
