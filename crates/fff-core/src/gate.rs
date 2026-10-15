@@ -252,6 +252,8 @@ pub struct GateNeedle {
     span: NeedleMask,
     // `pm[c]` = bitmask of needle positions holding folded byte `c`.
     pm: Box<[u64; 256]>,
+    // Reversed-needle masks for the backward trim walk.
+    pm_rev: Box<[u64; 256]>,
     // Nibble membership tables for the vectorized span test.
     tables: SpanTables,
     len_mask: u64,
@@ -261,6 +263,9 @@ pub struct GateNeedle {
     // so scores may shift: adjudicate on match sets, not checksums.
     // Checked per 16B step, never inside the bit loop.
     cut: bool,
+    // Left-trim prototype (FFF_TIGHT_SPAN): backward walk to the
+    // latest accepting start. Default off until adjudicated.
+    tight: bool,
 }
 
 // Mutable state of one gate walk; splittable at any byte so a cached
@@ -302,6 +307,8 @@ pub struct PrefixWalkCache {
     pub hits: u64,
     pub fills: u64,
     pub bytes_skipped: u64,
+    pub tight_trim: u64,
+    pub tight_files: u64,
 }
 
 impl PrefixWalkCache {
@@ -318,6 +325,8 @@ impl PrefixWalkCache {
             hits: 0,
             fills: 0,
             bytes_skipped: 0,
+            tight_trim: 0,
+            tight_files: 0,
         }
     }
 
@@ -334,6 +343,12 @@ impl GateNeedle {
         for (i, &b) in needle.iter().enumerate().take(64) {
             pm[fold_byte(b) as usize] |= 1u64 << i;
         }
+        // Reversed masks over the same bytes: LCS is reversal-invariant,
+        // so the backward walk accepts exactly when forward does.
+        let mut pm_rev = Box::new([0u64; 256]);
+        for (i, &b) in needle.iter().rev().enumerate().take(64) {
+            pm_rev[fold_byte(b) as usize] |= 1u64 << i;
+        }
         let span = NeedleMask::new(needle);
         let tables = SpanTables::new(&span);
         Self {
@@ -345,7 +360,14 @@ impl GateNeedle {
             need: m.saturating_sub(typos),
             pm,
             cut: std::env::var_os("FFF_NO_SPAN_CUT").is_none(),
+            pm_rev,
+            tight: std::env::var_os("FFF_TIGHT_SPAN").is_some(),
         }
+    }
+
+    #[cfg(test)]
+    fn set_tight(&mut self, on: bool) {
+        self.tight = on;
     }
 
     #[cfg(test)]
@@ -426,6 +448,89 @@ impl GateNeedle {
                 base += step;
             }
         });
+    }
+
+    // Latest window start still accepting: backward Myers walk with
+    // reversed masks. First accepting reversed prefix is the shortest
+    // accepting suffix. Step-granular accept, byte-exact refine within.
+    fn latest_start(&self, window: &[u8]) -> usize {
+        if self.need == 0 || window.is_empty() {
+            return 0;
+        }
+        let pm = &*self.pm_rev;
+        let mut s = 0u64;
+        let mut pos = window.len();
+        while pos > 0 {
+            let step = 16.min(pos);
+            let base = pos - step;
+            let seg = &window[base..pos];
+            let s_before = s;
+            let mask = needle_byte_mask(seg, &self.span, &self.tables);
+            let mut bits = mask;
+            while bits != 0 {
+                let bit = 15 - bits.leading_zeros() as usize;
+                bits &= !(1u16 << bit);
+                let x = s | pm[fold_byte(seg[bit]) as usize];
+                let y = (s << 1) | 1;
+                s = x & (x ^ x.wrapping_sub(y));
+            }
+            if (s & self.len_mask).count_ones() >= self.need as u32 {
+                let mut r = s_before;
+                for (k, &b) in seg.iter().enumerate().rev() {
+                    let x = r | pm[fold_byte(b) as usize];
+                    let y = (r << 1) | 1;
+                    r = x & (x ^ x.wrapping_sub(y));
+                    if (r & self.len_mask).count_ones() >= self.need as u32 {
+                        return base + k;
+                    }
+                }
+                return base;
+            }
+            pos = base;
+        }
+        0
+    }
+
+    // Left-trim an accepted window to its latest accepting start.
+    // Staged from the arena (LLC-hot, just walked); skipped unless the
+    // window can hold slack. Accept never changes, scores may shift.
+    fn maybe_tighten(
+        &self,
+        file: &FileItem,
+        arena: ArenaPtr,
+        hit: GateHit,
+        trim_out: Option<&mut u64>,
+    ) -> GateHit {
+        if !self.tight || self.needle.len() > 64 || self.need == 0 {
+            return hit;
+        }
+        let (start, end) = (hit.start as usize, hit.end as usize);
+        if end - start <= self.need {
+            return hit;
+        }
+        thread_local! {
+            static TWIN: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let cut = TWIN.with(|c| {
+            let mut b = c.borrow_mut();
+            let len = end - start;
+            if b.len() < len {
+                b.resize(len, 0);
+            }
+            file.path
+                .copy_window_to(arena, start as u32, end as u32, &mut b[..len]);
+            let a = self.latest_start(&b[..len]);
+            if let Some(out) = trim_out {
+                *out += a as u64;
+            }
+            a
+        });
+        let new_start = start + cut;
+        GateHit {
+            start: new_start as u32,
+            include_prefix: new_start == 0,
+            ..hit
+        }
     }
 
     // Shared accept/window tail for the walk entry points.
@@ -522,7 +627,8 @@ impl GateNeedle {
             // staging. Extremes come from the mask bits, not a per-hit loop.
             let mut st = WalkState::fresh(true);
             self.walk_range(file, arena, 0, byte_len, &mut st);
-            return self.finish(&st, byte_len);
+            let hit = self.finish(&st, byte_len)?;
+            return Some(self.maybe_tighten(file, arena, hit, None));
         }
         // Long needles need random access: stage the path, then skip-DP.
         thread_local! {
@@ -602,7 +708,11 @@ impl GateNeedle {
         } else {
             cache.bytes_skipped += (byte_len - split) as u64;
         }
-        self.finish(&st, byte_len)
+        let hit = self.finish(&st, byte_len)?;
+        let tight_before = hit.start;
+        let out = self.maybe_tighten(file, arena, hit, Some(&mut cache.tight_trim));
+        cache.tight_files += (out.start != tight_before) as u64;
+        Some(out)
     }
 }
 
@@ -1132,5 +1242,103 @@ mod tests {
                 "cut diverged from oracle n={needle:?} h={hay:?} t={t}"
             );
         }
+    }
+
+    #[test]
+    fn tight_span_keeps_accept_and_trims_left() {
+        // Backward walk accepts exactly when forward does; the window
+        // is the cut window left-trimmed to the latest accepting start.
+        use crate::simd_path::build_chunked_path_store_from_strings;
+        let mut state = 0x716u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 16) as u16
+        };
+        for _ in 0..300 {
+            let nl = 2 + (next() % 12) as usize;
+            let hl = 1 + (next() % 100) as usize;
+            let needle: Vec<u8> = (0..nl).map(|_| b'a' + (next() % 6) as u8).collect();
+            let hay: Vec<u8> = (0..hl).map(|_| b'a' + (next() % 6) as u8).collect();
+            let t = (next() % 4) as u16;
+            let rel = String::from_utf8_lossy(&hay).to_string();
+            let files = vec![FileItem::new_raw(0, 0, 0, None, false)];
+            let (store, strings) = build_chunked_path_store_from_strings(&[rel], &files);
+            let mut file = files.into_iter().next().unwrap();
+            file.set_path(strings[0].clone());
+            let arena = store.as_arena_ptr();
+            let mut g = GateNeedle::new(&needle, t);
+            g.set_cut(true);
+            let cut = g.hit_file(&file, arena);
+            g.set_tight(true);
+            let tight = g.hit_file(&file, arena);
+            assert_eq!(
+                cut.is_some(),
+                tight.is_some(),
+                "accept changed n={needle:?} h={hay:?} t={t}"
+            );
+            if let (Some(a), Some(b)) = (cut, tight) {
+                assert!(
+                    b.start >= a.start && b.end == a.end,
+                    "tight not left-trim n={needle:?} h={hay:?} t={t}"
+                );
+                // Oracle: trimmed window accepts, one byte further rejects.
+                if nl > t as usize {
+                    let w = &hay[a.start as usize..a.end as usize];
+                    let off = (b.start - a.start) as usize;
+                    assert!(g.decide(&w[off..]), "trimmed rejects n={needle:?} t={t}");
+                    if off + 1 < w.len() {
+                        assert!(!g.decide(&w[off + 1..]), "not latest n={needle:?} t={t}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tight_cached_matches_direct_and_counts() {
+        // Cached path trims identically and accounts trimmed bytes.
+        use crate::simd_path::build_chunked_path_store_from_strings;
+        let rels = ["src/aaa/one.rs", "src/aaa/two.rs", "src/bbb/three.rs"];
+        let owned: Vec<String> = rels.iter().map(|s| s.to_string()).collect();
+        let files = vec![FileItem::new_raw(0, 0, 0, None, false); 3];
+        let (store, strings) = build_chunked_path_store_from_strings(&owned, &files);
+        let mut vec: Vec<FileItem> = files.into_iter().collect();
+        let dirs = [11u32, 11, 22];
+        for (((file, s), rel), &d) in vec
+            .iter_mut()
+            .zip(strings.iter())
+            .zip(rels.iter())
+            .zip(dirs.iter())
+        {
+            file.set_path(s.clone());
+            file.parent_dir_index = d;
+            file.path.filename_offset =
+                (rel.rfind('/').map(|i| i + 1).unwrap_or(0) as u16).min(file.path.byte_len);
+        }
+        let arena = store.as_arena_ptr();
+        let mut g = GateNeedle::new(b"aaors", 2);
+        g.set_cut(true);
+        g.set_tight(true);
+        let mut cache = PrefixWalkCache::new();
+        let mut expect_trim = 0u64;
+        let mut expect_moved = 0u64;
+        for file in &vec {
+            let direct = g.hit_file(file, arena);
+            assert_eq!(
+                g.hit_file_cached(file, arena, &mut cache),
+                direct,
+                "cached diverged for {:?}",
+                file.path.byte_len,
+            );
+            g.set_tight(false);
+            let cut = g.hit_file(file, arena);
+            g.set_tight(true);
+            if let (Some(a), Some(b)) = (cut, direct) {
+                expect_trim += (b.start - a.start) as u64;
+                expect_moved += (b.start != a.start) as u64;
+            }
+        }
+        assert_eq!(cache.tight_trim, expect_trim, "trim miscounted");
+        assert_eq!(cache.tight_files, expect_moved, "file count off");
     }
 }

@@ -222,6 +222,8 @@ fn match_fuzzy_parts(
         let t_prefix_hits = std::sync::atomic::AtomicU64::new(0);
         let t_prefix_fills = std::sync::atomic::AtomicU64::new(0);
         let t_prefix_skip = std::sync::atomic::AtomicU64::new(0);
+        let t_tight_trim = std::sync::atomic::AtomicU64::new(0);
+        let t_tight_files = std::sync::atomic::AtomicU64::new(0);
         let prefilter_ms = t_prefilter.elapsed().as_secs_f64() * 1e3;
 
         // Phase 2: re-score with inter-sequence SW on trimmed windows.
@@ -854,6 +856,8 @@ fn match_fuzzy_parts(
                 t_prefix_hits.fetch_add(pcache.hits, std::sync::atomic::Ordering::Relaxed);
                 t_prefix_fills.fetch_add(pcache.fills, std::sync::atomic::Ordering::Relaxed);
                 t_prefix_skip.fetch_add(pcache.bytes_skipped, std::sync::atomic::Ordering::Relaxed);
+                t_tight_trim.fetch_add(pcache.tight_trim, std::sync::atomic::Ordering::Relaxed);
+                t_tight_files.fetch_add(pcache.tight_files, std::sync::atomic::Ordering::Relaxed);
                 t_gate_us.fetch_add(
                     t.elapsed().as_micros() as u64,
                     std::sync::atomic::Ordering::Relaxed,
@@ -916,6 +920,13 @@ fn match_fuzzy_parts(
                     "PHASE parts gate_us={gate_us} exact_us={exact_us} swslice_us={swslice_us} fuse_us={sw_us} threads={threads} n={} prefix_hit={prefix_hit} prefix_fill={prefix_fill} prefix_skip_kb={prefix_skip_kb}",
                     matches.len()
                 );
+                // Slack census for the tight-span prototype: mean trimmed
+                // bytes per acceptor sizes the SW prize. Zero-cost when off.
+                let tight_files = t_tight_files.load(std::sync::atomic::Ordering::Relaxed);
+                if tight_files > 0 {
+                    let trim = t_tight_trim.load(std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("PHASE tight files={tight_files} trim_kb={}", trim / 1024);
+                }
             }
             if phase_timing() {
                 eprintln!(
