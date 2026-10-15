@@ -511,14 +511,15 @@ pub(crate) mod avx2 {
         let zero = _mm256_setzero_si256();
         let ones = set1(u16::MAX);
 
-        let gap_open_v = set1(p.gap_open);
         let gap_ext_v = set1(p.gap_extend);
-        let match_add_v = set1(p.match_score + p.mismatch_penalty);
+        let gap_diff_v = set1(p.gap_open.wrapping_sub(p.gap_extend));
+        let match_score_v = set1(p.match_score);
         let mismatch_v = set1(p.mismatch_penalty);
         let delim_v = set1(p.delimiter_bonus);
         let cap_v = set1(p.capitalization_bonus);
         let case_v = set1(p.matching_case_bonus);
         let prefix_v = set1(p.prefix_bonus);
+        let bit20 = set1(0x20);
         let a_lo = set1(b'A' as u16 - 1);
         let z_hi = set1(b'Z' as u16 + 1);
         let la_lo = set1(b'a' as u16 - 1);
@@ -527,12 +528,16 @@ pub(crate) mod avx2 {
         let d9_hi = set1(b'9' as u16 + 1);
         let lt128 = set1(128);
         let need_case = p.capitalization_bonus != 0 || p.matching_case_bonus != 0;
-        let need_delim = p.delimiter_bonus != 0;
-        let mut nc_v = [zero; 33];
-        let mut nf_v = [zero; 33];
+        let mut n_fold_v = [zero; 32];
+        let mut nc_v = [zero; 32];
         for i in 0..m {
-            nc_v[i + 1] = set1(needle[i] as u16);
-            nf_v[i + 1] = set1(flip_case(needle[i]) as u16);
+            let b = needle[i] as u16;
+            n_fold_v[i] = set1(if (b as u8).is_ascii_uppercase() {
+                b + 32
+            } else {
+                b
+            });
+            nc_v[i] = set1(b);
         }
 
         let prefix_lanes = {
@@ -547,12 +552,10 @@ pub(crate) mod avx2 {
             _mm256_loadu_si256(arr.as_ptr() as *const __m256i)
         };
 
-        // DP rows ping-pong by index, not by swapping 1056B arrays.
-        let mut h = [[zero; 33]; 2];
-        let mut e = [[zero; 33]; 2];
-        let mut f = [[zero; 33]; 2];
-        let mut match_state = [[zero; 33]; 2];
-        let mut cur = 0usize; // read from [cur], write to [1-cur]
+        // 1D state with register-carried f/mm.
+        let mut h = [zero; 32];
+        let mut e = [zero; 32];
+        let mut match_prev = [zero; 32];
 
         let mut prev_lower = zero;
         let mut prev_delim = zero;
@@ -571,29 +574,30 @@ pub(crate) mod avx2 {
                 }
             }
 
-            let (is_lower, is_delim, cap_bonus, delim_bonus) = if need_case || need_delim {
-                let ge_a = _mm256_cmpgt_epi16(hay, a_lo);
-                let le_z = _mm256_cmpgt_epi16(z_hi, hay);
-                let is_upper = _mm256_and_si256(ge_a, le_z);
-                let ge_la = _mm256_cmpgt_epi16(hay, la_lo);
-                let le_lz = _mm256_cmpgt_epi16(lz_hi, hay);
-                let is_lower = _mm256_and_si256(ge_la, le_lz);
-                let ge_0 = _mm256_cmpgt_epi16(hay, d0_lo);
-                let le_9 = _mm256_cmpgt_epi16(d9_hi, hay);
-                let is_digit = _mm256_and_si256(ge_0, le_9);
-                let is_letter = _mm256_or_si256(is_upper, is_lower);
-                let alnum = _mm256_or_si256(is_letter, is_digit);
-                let not_alnum = _mm256_andnot_si256(alnum, ones);
-                let lt_128 = _mm256_cmpgt_epi16(lt128, hay);
-                let is_delim = _mm256_and_si256(not_alnum, lt_128);
-                let not_delim = _mm256_andnot_si256(is_delim, ones);
+            let ge_a = _mm256_cmpgt_epi16(hay, a_lo);
+            let le_z = _mm256_cmpgt_epi16(z_hi, hay);
+            let is_upper = _mm256_and_si256(ge_a, le_z);
+            // Fold once per column; cells test one compare.
+            let hay_fold = _mm256_add_epi16(hay, _mm256_and_si256(is_upper, bit20));
+            let ge_la = _mm256_cmpgt_epi16(hay, la_lo);
+            let le_lz = _mm256_cmpgt_epi16(lz_hi, hay);
+            let is_lower = _mm256_and_si256(ge_la, le_lz);
+            let ge_0 = _mm256_cmpgt_epi16(hay, d0_lo);
+            let le_9 = _mm256_cmpgt_epi16(d9_hi, hay);
+            let is_digit = _mm256_and_si256(ge_0, le_9);
+            let is_letter = _mm256_or_si256(is_upper, is_lower);
+            let alnum = _mm256_or_si256(is_letter, is_digit);
+            let not_alnum = _mm256_andnot_si256(alnum, ones);
+            let lt_128 = _mm256_cmpgt_epi16(lt128, hay);
+            let is_delim = _mm256_and_si256(not_alnum, lt_128);
+            let not_delim = _mm256_andnot_si256(is_delim, ones);
+            let delim_bonus = _mm256_and_si256(_mm256_and_si256(prev_delim, not_delim), delim_v);
+            // Capitalization needs the previous column's lowercase mask, carried in a register.
+            let (is_lower, cap_bonus) = if need_case {
                 let cap_mask = _mm256_and_si256(is_upper, prev_lower);
-                let cap_bonus = _mm256_and_si256(cap_mask, cap_v);
-                let dm = _mm256_and_si256(prev_delim, not_delim);
-                let delim_bonus = _mm256_and_si256(dm, delim_v);
-                (is_lower, is_delim, cap_bonus, delim_bonus)
+                (is_lower, _mm256_and_si256(cap_mask, cap_v))
             } else {
-                (zero, zero, zero, zero)
+                (zero, zero)
             };
             let prefix_bonus = if j == 0 {
                 _mm256_and_si256(prefix_v, prefix_lanes)
@@ -602,51 +606,53 @@ pub(crate) mod avx2 {
             };
             let bonus_base = _mm256_add_epi16(
                 _mm256_add_epi16(delim_bonus, cap_bonus),
-                _mm256_add_epi16(prefix_bonus, match_add_v),
+                _mm256_add_epi16(prefix_bonus, match_score_v),
             );
 
-            let nxt = 1 - cur;
-            h[nxt][0] = zero;
-            e[nxt][0] = zero;
-            f[nxt][0] = zero;
-            match_state[nxt][0] = zero;
-            // Forwards mm in a register, saving a load per cell.
+            // Register-carried recurrence; no 2D state or f array.
+            let mut h_diag = zero;
+            let mut h_up = zero;
+            let mut f_running = zero;
             let mut prev_mm = zero;
 
-            for i in 1..=m {
-                let eq_nc = _mm256_cmpeq_epi16(hay, nc_v[i]);
-                let eq_nf = _mm256_cmpeq_epi16(hay, nf_v[i]);
-                let mm = _mm256_or_si256(eq_nc, eq_nf);
-                match_state[nxt][i] = mm;
+            for i in 0..m {
+                let mm = _mm256_cmpeq_epi16(hay_fold, n_fold_v[i]);
+                let m_prev = match_prev[i];
+                match_prev[i] = mm;
 
-                let masked_bonus = _mm256_and_si256(bonus_base, mm);
-                let diag = _mm256_add_epi16(h[cur][i - 1], masked_bonus);
-                let diag = _mm256_subs_epu16(diag, mismatch_v);
-                let diag = _mm256_add_epi16(diag, _mm256_and_si256(eq_nc, case_v));
+                let mut match_gain = _mm256_and_si256(bonus_base, mm);
+                if need_case {
+                    let eq_nc = _mm256_cmpeq_epi16(hay, nc_v[i]);
+                    match_gain = _mm256_add_epi16(match_gain, _mm256_and_si256(eq_nc, case_v));
+                }
+                let mis_pen = _mm256_andnot_si256(mm, mismatch_v);
+                let diag = _mm256_add_epi16(_mm256_subs_epu16(h_diag, mis_pen), match_gain);
 
-                let e_pen = _mm256_blendv_epi8(gap_ext_v, gap_open_v, match_state[cur][i]);
-                let e_new = _mm256_subs_epu16(h[cur][i], e_pen);
-                let e_ext = _mm256_subs_epu16(e[cur][i], gap_ext_v);
-                e[nxt][i] = _mm256_max_epu16(e_new, e_ext);
+                let h_left = h[i];
+                h_diag = h_left;
 
-                let f_pen = _mm256_blendv_epi8(gap_ext_v, gap_open_v, prev_mm);
-                let f_new = _mm256_subs_epu16(h[nxt][i - 1], f_pen);
-                let f_ext = _mm256_subs_epu16(f[nxt][i - 1], gap_ext_v);
-                f[nxt][i] = _mm256_max_epu16(f_new, f_ext);
+                // Factored gap: open premium via mask, extend outside the max.
+                let e_open_extra = _mm256_and_si256(m_prev, gap_diff_v);
+                let e_pre = _mm256_max_epu16(_mm256_subs_epu16(h_left, e_open_extra), e[i]);
+                let e_val = _mm256_subs_epu16(e_pre, gap_ext_v);
+                e[i] = e_val;
 
-                let h_val = _mm256_max_epu16(diag, e[nxt][i]);
-                let h_val = _mm256_max_epu16(h_val, f[nxt][i]);
-                h[nxt][i] = _mm256_max_epu16(h_val, zero);
+                let f_open_extra = _mm256_and_si256(prev_mm, gap_diff_v);
+                let f_pre = _mm256_max_epu16(_mm256_subs_epu16(h_up, f_open_extra), f_running);
+                f_running = _mm256_subs_epu16(f_pre, gap_ext_v);
+
+                let h_val = _mm256_max_epu16(_mm256_max_epu16(diag, e_val), f_running);
+                h[i] = h_val;
+                h_up = h_val;
                 prev_mm = mm;
             }
 
-            let row_m = h[nxt][m];
+            let row_m = h_up;
             let gt_best = _mm256_cmpgt_epi16(row_m, last_row_max);
             let j_v = set1(j as u16);
             end_col_v = _mm256_blendv_epi8(end_col_v, j_v, gt_best);
             last_row_max = _mm256_max_epu16(last_row_max, row_m);
 
-            cur = nxt;
             prev_lower = is_lower;
             prev_delim = is_delim;
         }
@@ -686,23 +692,22 @@ pub(crate) mod avx2 {
         let zero = _mm256_setzero_si256();
         let ones = set1(u8::MAX);
 
-        let gap_open_v = set1(p.gap_open as u8);
         let gap_ext_v = set1(p.gap_extend as u8);
-        let match_add_v = set1((p.match_score + p.mismatch_penalty) as u8);
+        let gap_diff_v = set1(p.gap_open.wrapping_sub(p.gap_extend) as u8);
+        let match_score_v = set1(p.match_score as u8);
         let mismatch_v = set1(p.mismatch_penalty as u8);
         let delim_v = set1(p.delimiter_bonus as u8);
         let cap_v = set1(p.capitalization_bonus as u8);
         let case_v = set1(p.matching_case_bonus as u8);
         let prefix_v = set1(p.prefix_bonus as u8);
-        let a_lo = set1(b'A' - 1);
-        let z_hi = set1(b'Z' + 1);
-        let la_lo = set1(b'a' - 1);
-        let lz_hi = set1(b'z' + 1);
-        let d0_lo = set1(b'0' - 1);
-        let d9_hi = set1(b'9' + 1);
-        let hi80 = set1(0x80);
+        let bit20 = set1(0x20);
+        let add_upper = set1(127 - b'Z');
+        let thresh_upper = set1(101);
+        let add_letter = set1(127 - b'z');
+        let thresh_letter = set1(101);
+        let add_digit = set1(127 - b'9');
+        let thresh_digit = set1(117);
         let need_case = p.capitalization_bonus != 0 || p.matching_case_bonus != 0;
-        let need_delim = p.delimiter_bonus != 0;
 
         let prefix_lanes = {
             let mut arr = [0u8; 32];
@@ -716,18 +721,18 @@ pub(crate) mod avx2 {
             _mm256_loadu_si256(arr.as_ptr() as *const __m256i)
         };
 
-        let mut nc_v = [zero; 33];
-        let mut nf_v = [zero; 33];
+        let mut n_fold_v = [zero; 32];
+        let mut nc_v = [zero; 32];
         for i in 0..m {
-            nc_v[i + 1] = set1(needle[i]);
-            nf_v[i + 1] = set1(flip_case(needle[i]));
+            let b = needle[i];
+            n_fold_v[i] = set1(if b.is_ascii_uppercase() { b + 32 } else { b });
+            nc_v[i] = set1(b);
         }
 
-        let mut h = [[zero; 33]; 2];
-        let mut e = [[zero; 33]; 2];
-        let mut f = [[zero; 33]; 2];
-        let mut match_state = [[zero; 33]; 2];
-        let mut cur = 0usize;
+        // 1D state with register-carried f/mm.
+        let mut h = [zero; 32];
+        let mut e = [zero; 32];
+        let mut match_prev = [zero; 32];
 
         let mut prev_lower = zero;
         let mut prev_delim = zero;
@@ -753,30 +758,23 @@ pub(crate) mod avx2 {
             }
 
             // Skips class masks when case/delim bonuses are 0 (typical lowercase query).
-            let (is_lower, is_delim, cap_bonus, delim_bonus) = if need_case || need_delim {
-                let ge_a = _mm256_cmpgt_epi8(hay, a_lo);
-                let le_z = _mm256_cmpgt_epi8(z_hi, hay);
-                let is_upper = _mm256_and_si256(ge_a, le_z);
-                let ge_la = _mm256_cmpgt_epi8(hay, la_lo);
-                let le_lz = _mm256_cmpgt_epi8(lz_hi, hay);
-                let is_lower = _mm256_and_si256(ge_la, le_lz);
-                let ge_0 = _mm256_cmpgt_epi8(hay, d0_lo);
-                let le_9 = _mm256_cmpgt_epi8(d9_hi, hay);
-                let is_digit = _mm256_and_si256(ge_0, le_9);
-                let is_letter = _mm256_or_si256(is_upper, is_lower);
-                let alnum = _mm256_or_si256(is_letter, is_digit);
-                let not_alnum = _mm256_andnot_si256(alnum, ones);
-                let high_bit = _mm256_and_si256(hay, hi80);
-                let lt_128 = _mm256_cmpeq_epi8(high_bit, zero);
-                let is_delim = _mm256_and_si256(not_alnum, lt_128);
-                let not_delim = _mm256_andnot_si256(is_delim, ones);
+            // Signed-wrap range tests; bytes outside wrap negative or stay below threshold.
+            let is_upper = _mm256_cmpgt_epi8(_mm256_add_epi8(hay, add_upper), thresh_upper);
+            let hay_fold = _mm256_or_si256(hay, _mm256_and_si256(is_upper, bit20));
+            let is_letter = _mm256_cmpgt_epi8(_mm256_add_epi8(hay_fold, add_letter), thresh_letter);
+            let is_digit = _mm256_cmpgt_epi8(_mm256_add_epi8(hay, add_digit), thresh_digit);
+            let alnum = _mm256_or_si256(is_letter, is_digit);
+            let lt_128 = _mm256_cmpgt_epi8(hay, ones);
+            let is_delim = _mm256_andnot_si256(alnum, lt_128);
+            let dm = _mm256_andnot_si256(is_delim, prev_delim);
+            let delim_bonus = _mm256_and_si256(dm, delim_v);
+
+            let (is_lower, cap_bonus) = if need_case {
+                let is_lower = _mm256_andnot_si256(is_upper, is_letter);
                 let cap_mask = _mm256_and_si256(is_upper, prev_lower);
-                let cap_bonus = _mm256_and_si256(cap_mask, cap_v);
-                let dm = _mm256_and_si256(prev_delim, not_delim);
-                let delim_bonus = _mm256_and_si256(dm, delim_v);
-                (is_lower, is_delim, cap_bonus, delim_bonus)
+                (is_lower, _mm256_and_si256(cap_mask, cap_v))
             } else {
-                (zero, zero, zero, zero)
+                (zero, zero)
             };
             let prefix_bonus = if j == 0 {
                 _mm256_and_si256(prefix_v, prefix_lanes)
@@ -785,45 +783,49 @@ pub(crate) mod avx2 {
             };
             let bonus_base = _mm256_add_epi8(
                 _mm256_add_epi8(delim_bonus, cap_bonus),
-                _mm256_add_epi8(prefix_bonus, match_add_v),
+                _mm256_add_epi8(prefix_bonus, match_score_v),
             );
 
-            let nxt = 1 - cur;
-            h[nxt][0] = zero;
-            e[nxt][0] = zero;
-            f[nxt][0] = zero;
-            match_state[nxt][0] = zero;
-            // Forwards mm in a register, saving a load per cell.
+            // Register-carried recurrence; no 2D state or f array.
+            let mut h_diag = zero;
+            let mut h_up = zero;
+            let mut f_running = zero;
             let mut prev_mm = zero;
 
-            for i in 1..=m {
-                let eq_nc = _mm256_cmpeq_epi8(hay, nc_v[i]);
-                let eq_nf = _mm256_cmpeq_epi8(hay, nf_v[i]);
-                let mm = _mm256_or_si256(eq_nc, eq_nf);
-                match_state[nxt][i] = mm;
+            for i in 0..m {
+                let mm = _mm256_cmpeq_epi8(hay_fold, n_fold_v[i]);
+                let m_prev = match_prev[i];
+                match_prev[i] = mm;
 
-                let masked_bonus = _mm256_and_si256(bonus_base, mm);
-                let diag = _mm256_add_epi8(h[cur][i - 1], masked_bonus);
-                let diag = _mm256_subs_epu8(diag, mismatch_v);
-                let diag = _mm256_add_epi8(diag, _mm256_and_si256(eq_nc, case_v));
+                let mut match_gain = _mm256_and_si256(bonus_base, mm);
+                if need_case {
+                    let eq_nc = _mm256_cmpeq_epi8(hay, nc_v[i]);
+                    match_gain = _mm256_add_epi8(match_gain, _mm256_and_si256(eq_nc, case_v));
+                }
+                // Net gain first, then saturating add: transients never wrap past 255.
+                let mis_pen = _mm256_andnot_si256(mm, mismatch_v);
+                let diag = _mm256_adds_epu8(_mm256_subs_epu8(h_diag, mis_pen), match_gain);
 
-                let e_pen = _mm256_blendv_epi8(gap_ext_v, gap_open_v, match_state[cur][i]);
-                let e_new = _mm256_subs_epu8(h[cur][i], e_pen);
-                let e_ext = _mm256_subs_epu8(e[cur][i], gap_ext_v);
-                e[nxt][i] = _mm256_max_epu8(e_new, e_ext);
+                let h_left = h[i];
+                h_diag = h_left;
 
-                let f_pen = _mm256_blendv_epi8(gap_ext_v, gap_open_v, prev_mm);
-                let f_new = _mm256_subs_epu8(h[nxt][i - 1], f_pen);
-                let f_ext = _mm256_subs_epu8(f[nxt][i - 1], gap_ext_v);
-                f[nxt][i] = _mm256_max_epu8(f_new, f_ext);
+                // Factored gap: open premium via mask, extend outside the max.
+                let e_open_extra = _mm256_and_si256(m_prev, gap_diff_v);
+                let e_pre = _mm256_max_epu8(_mm256_subs_epu8(h_left, e_open_extra), e[i]);
+                let e_val = _mm256_subs_epu8(e_pre, gap_ext_v);
+                e[i] = e_val;
 
-                let h_val = _mm256_max_epu8(diag, e[nxt][i]);
-                let h_val = _mm256_max_epu8(h_val, f[nxt][i]);
-                h[nxt][i] = _mm256_max_epu8(h_val, zero);
+                let f_open_extra = _mm256_and_si256(prev_mm, gap_diff_v);
+                let f_pre = _mm256_max_epu8(_mm256_subs_epu8(h_up, f_open_extra), f_running);
+                f_running = _mm256_subs_epu8(f_pre, gap_ext_v);
+
+                let h_val = _mm256_max_epu8(_mm256_max_epu8(diag, e_val), f_running);
+                h[i] = h_val;
+                h_up = h_val;
                 prev_mm = mm;
             }
 
-            let row_m = h[nxt][m];
+            let row_m = h_up;
             let gt_best = _mm256_cmpgt_epi8(
                 _mm256_xor_si256(row_m, sign_bias),
                 _mm256_xor_si256(last_row_max, sign_bias),
@@ -832,7 +834,6 @@ pub(crate) mod avx2 {
             end_col_v = _mm256_blendv_epi8(end_col_v, j_v, gt_best);
             last_row_max = _mm256_max_epu8(last_row_max, row_m);
 
-            cur = nxt;
             prev_lower = is_lower;
             prev_delim = is_delim;
         }
@@ -916,23 +917,22 @@ pub(crate) mod avx2 {
         let zero = _mm256_setzero_si256();
         let ones = set1(u8::MAX);
 
-        let gap_open_v = set1(p.gap_open as u8);
         let gap_ext_v = set1(p.gap_extend as u8);
-        let match_add_v = set1((p.match_score + p.mismatch_penalty) as u8);
+        let gap_diff_v = set1(p.gap_open.wrapping_sub(p.gap_extend) as u8);
+        let match_score_v = set1(p.match_score as u8);
         let mismatch_v = set1(p.mismatch_penalty as u8);
         let delim_v = set1(p.delimiter_bonus as u8);
         let cap_v = set1(p.capitalization_bonus as u8);
         let case_v = set1(p.matching_case_bonus as u8);
         let prefix_v = set1(p.prefix_bonus as u8);
-        let a_lo = set1(b'A' - 1);
-        let z_hi = set1(b'Z' + 1);
-        let la_lo = set1(b'a' - 1);
-        let lz_hi = set1(b'z' + 1);
-        let d0_lo = set1(b'0' - 1);
-        let d9_hi = set1(b'9' + 1);
-        let hi80 = set1(0x80);
+        let bit20 = set1(0x20);
+        let add_upper = set1(127 - b'Z');
+        let thresh_upper = set1(101);
+        let add_letter = set1(127 - b'z');
+        let thresh_letter = set1(101);
+        let add_digit = set1(127 - b'9');
+        let thresh_digit = set1(117);
         let need_case = p.capitalization_bonus != 0 || p.matching_case_bonus != 0;
-        let need_delim = p.delimiter_bonus != 0;
 
         let prefix_lanes = {
             let mut arr = [0u8; 32];
@@ -946,18 +946,18 @@ pub(crate) mod avx2 {
             _mm256_loadu_si256(arr.as_ptr() as *const __m256i)
         };
 
-        let mut nc_v = [zero; 33];
-        let mut nf_v = [zero; 33];
+        let mut n_fold_v = [zero; 32];
+        let mut nc_v = [zero; 32];
         for i in 0..m {
-            nc_v[i + 1] = set1(needle[i]);
-            nf_v[i + 1] = set1(flip_case(needle[i]));
+            let b = needle[i];
+            n_fold_v[i] = set1(if b.is_ascii_uppercase() { b + 32 } else { b });
+            nc_v[i] = set1(b);
         }
 
-        let mut h = [[zero; 33]; 2];
-        let mut e = [[zero; 33]; 2];
-        let mut f = [[zero; 33]; 2];
-        let mut match_state = [[zero; 33]; 2];
-        let mut cur = 0usize;
+        // 1D state with register-carried f/mm; indices compile-time for SROA.
+        let mut h = [zero; 32];
+        let mut e = [zero; 32];
+        let mut match_prev = [zero; 32];
 
         let mut prev_lower = zero;
         let mut prev_delim = zero;
@@ -981,30 +981,23 @@ pub(crate) mod avx2 {
                 }
             }
 
-            let (is_lower, is_delim, cap_bonus, delim_bonus) = if need_case || need_delim {
-                let ge_a = _mm256_cmpgt_epi8(hay, a_lo);
-                let le_z = _mm256_cmpgt_epi8(z_hi, hay);
-                let is_upper = _mm256_and_si256(ge_a, le_z);
-                let ge_la = _mm256_cmpgt_epi8(hay, la_lo);
-                let le_lz = _mm256_cmpgt_epi8(lz_hi, hay);
-                let is_lower = _mm256_and_si256(ge_la, le_lz);
-                let ge_0 = _mm256_cmpgt_epi8(hay, d0_lo);
-                let le_9 = _mm256_cmpgt_epi8(d9_hi, hay);
-                let is_digit = _mm256_and_si256(ge_0, le_9);
-                let is_letter = _mm256_or_si256(is_upper, is_lower);
-                let alnum = _mm256_or_si256(is_letter, is_digit);
-                let not_alnum = _mm256_andnot_si256(alnum, ones);
-                let high_bit = _mm256_and_si256(hay, hi80);
-                let lt_128 = _mm256_cmpeq_epi8(high_bit, zero);
-                let is_delim = _mm256_and_si256(not_alnum, lt_128);
-                let not_delim = _mm256_andnot_si256(is_delim, ones);
+            // Signed-wrap range tests; bytes outside wrap negative or stay below threshold.
+            let is_upper = _mm256_cmpgt_epi8(_mm256_add_epi8(hay, add_upper), thresh_upper);
+            let hay_fold = _mm256_or_si256(hay, _mm256_and_si256(is_upper, bit20));
+            let is_letter = _mm256_cmpgt_epi8(_mm256_add_epi8(hay_fold, add_letter), thresh_letter);
+            let is_digit = _mm256_cmpgt_epi8(_mm256_add_epi8(hay, add_digit), thresh_digit);
+            let alnum = _mm256_or_si256(is_letter, is_digit);
+            let lt_128 = _mm256_cmpgt_epi8(hay, ones);
+            let is_delim = _mm256_andnot_si256(alnum, lt_128);
+            let dm = _mm256_andnot_si256(is_delim, prev_delim);
+            let delim_bonus = _mm256_and_si256(dm, delim_v);
+
+            let (is_lower, cap_bonus) = if need_case {
+                let is_lower = _mm256_andnot_si256(is_upper, is_letter);
                 let cap_mask = _mm256_and_si256(is_upper, prev_lower);
-                let cap_bonus = _mm256_and_si256(cap_mask, cap_v);
-                let dm = _mm256_and_si256(prev_delim, not_delim);
-                let delim_bonus = _mm256_and_si256(dm, delim_v);
-                (is_lower, is_delim, cap_bonus, delim_bonus)
+                (is_lower, _mm256_and_si256(cap_mask, cap_v))
             } else {
-                (zero, zero, zero, zero)
+                (zero, zero)
             };
             let prefix_bonus = if j == 0 {
                 _mm256_and_si256(prefix_v, prefix_lanes)
@@ -1013,46 +1006,49 @@ pub(crate) mod avx2 {
             };
             let bonus_base = _mm256_add_epi8(
                 _mm256_add_epi8(delim_bonus, cap_bonus),
-                _mm256_add_epi8(prefix_bonus, match_add_v),
+                _mm256_add_epi8(prefix_bonus, match_score_v),
             );
 
-            let nxt = 1 - cur;
-            h[nxt][0] = zero;
-            e[nxt][0] = zero;
-            f[nxt][0] = zero;
-            match_state[nxt][0] = zero;
-
-            // Forwards mm in a register, saving a load per cell.
+            // Register-carried recurrence; no 2D state or f array.
+            let mut h_diag = zero;
+            let mut h_up = zero;
+            let mut f_running = zero;
             let mut prev_mm = zero;
 
-            for i in 1..=M {
-                let eq_nc = _mm256_cmpeq_epi8(hay, nc_v[i]);
-                let eq_nf = _mm256_cmpeq_epi8(hay, nf_v[i]);
-                let mm = _mm256_or_si256(eq_nc, eq_nf);
-                match_state[nxt][i] = mm;
+            for i in 0..M {
+                let mm = _mm256_cmpeq_epi8(hay_fold, n_fold_v[i]);
+                let m_prev = match_prev[i];
+                match_prev[i] = mm;
 
-                let masked_bonus = _mm256_and_si256(bonus_base, mm);
-                let diag = _mm256_add_epi8(h[cur][i - 1], masked_bonus);
-                let diag = _mm256_subs_epu8(diag, mismatch_v);
-                let diag = _mm256_add_epi8(diag, _mm256_and_si256(eq_nc, case_v));
+                let mut match_gain = _mm256_and_si256(bonus_base, mm);
+                if need_case {
+                    let eq_nc = _mm256_cmpeq_epi8(hay, nc_v[i]);
+                    match_gain = _mm256_add_epi8(match_gain, _mm256_and_si256(eq_nc, case_v));
+                }
+                // Net gain first, then saturating add: transients never wrap past 255.
+                let mis_pen = _mm256_andnot_si256(mm, mismatch_v);
+                let diag = _mm256_adds_epu8(_mm256_subs_epu8(h_diag, mis_pen), match_gain);
 
-                let e_pen = _mm256_blendv_epi8(gap_ext_v, gap_open_v, match_state[cur][i]);
-                let e_new = _mm256_subs_epu8(h[cur][i], e_pen);
-                let e_ext = _mm256_subs_epu8(e[cur][i], gap_ext_v);
-                e[nxt][i] = _mm256_max_epu8(e_new, e_ext);
+                let h_left = h[i];
+                h_diag = h_left;
 
-                let f_pen = _mm256_blendv_epi8(gap_ext_v, gap_open_v, prev_mm);
-                let f_new = _mm256_subs_epu8(h[nxt][i - 1], f_pen);
-                let f_ext = _mm256_subs_epu8(f[nxt][i - 1], gap_ext_v);
-                f[nxt][i] = _mm256_max_epu8(f_new, f_ext);
+                // Factored gap: open premium via mask, extend outside the max.
+                let e_open_extra = _mm256_and_si256(m_prev, gap_diff_v);
+                let e_pre = _mm256_max_epu8(_mm256_subs_epu8(h_left, e_open_extra), e[i]);
+                let e_val = _mm256_subs_epu8(e_pre, gap_ext_v);
+                e[i] = e_val;
 
-                let h_val = _mm256_max_epu8(diag, e[nxt][i]);
-                let h_val = _mm256_max_epu8(h_val, f[nxt][i]);
-                h[nxt][i] = _mm256_max_epu8(h_val, zero);
+                let f_open_extra = _mm256_and_si256(prev_mm, gap_diff_v);
+                let f_pre = _mm256_max_epu8(_mm256_subs_epu8(h_up, f_open_extra), f_running);
+                f_running = _mm256_subs_epu8(f_pre, gap_ext_v);
+
+                let h_val = _mm256_max_epu8(_mm256_max_epu8(diag, e_val), f_running);
+                h[i] = h_val;
+                h_up = h_val;
                 prev_mm = mm;
             }
 
-            let row_m = h[nxt][M];
+            let row_m = h_up;
             let gt_best = _mm256_cmpgt_epi8(
                 _mm256_xor_si256(row_m, sign_bias),
                 _mm256_xor_si256(last_row_max, sign_bias),
@@ -1061,7 +1057,6 @@ pub(crate) mod avx2 {
             end_col_v = _mm256_blendv_epi8(end_col_v, j_v, gt_best);
             last_row_max = _mm256_max_epu8(last_row_max, row_m);
 
-            cur = nxt;
             prev_lower = is_lower;
             prev_delim = is_delim;
         }
