@@ -1,8 +1,4 @@
-//! Inter-sequence Smith-Waterman: lanes hold paths, haystack runs sequential.
-//!
-//! Replicates frizbee's gap model; score is the last row's max.
-
-// Scoring params matching frizbee defaults + fff overrides for lowercase queries.
+// Frizbee defaults with fff overrides for lowercase queries.
 #[derive(Clone, Copy)]
 pub(crate) struct SwParams {
     pub match_score: u16,
@@ -39,11 +35,8 @@ impl SwParams {
             < 256
     }
 
-    // Sound upper bound on any SW score for this needle: each alignment
-    // path takes at most one diagonal per column (gaps only subtract),
-    // so rows contribute at most `per` each, prefix once, exact once.
-    // Reserved for UB work (pre-SW prune needs a sound global threshold
-    // first); the fuzz test below pins it.
+    // Sound upper bound: one diagonal per column at most, so rows add
+    // at most `per` each, plus prefix and exact once.
     #[allow(dead_code)]
     pub(crate) fn max_sw_score(&self, m: usize) -> i32 {
         let per = self.match_score as i32
@@ -70,8 +63,7 @@ fn flip_case(b: u8) -> u8 {
     }
 }
 
-// Per-worker DP rows for long needles (m > 32). The scores below used to
-// allocate 8 vecs per call; reuse zeroed buffers instead. Same values.
+// Per-worker DP rows for long needles (m > 32); reused zeroed buffers.
 #[derive(Default)]
 struct LongScratch {
     h0: Vec<i32>,
@@ -118,12 +110,9 @@ thread_local! {
         }) };
 }
 
-// Scalar reference SW matching frizbee's exact semantics on a TRIMMED haystack.
-// `include_prefix` must be `true` iff the trimmed start == 0 (frizbee:
-// `haystack_start_pos == 0` after `trim_haystack`'s saturating_sub(1)).
-// Returns (score, end_col_local). end_col_local = LAST column in the trimmed
-// slice where the last-row max occurs (frizbee's match_end_col).
-// No exact_match_bonus — caller adds it when `include_exact && needle == trimmed`.
+// Reference SW on a TRIMMED haystack; `include_prefix` iff trimmed start == 0.
+// Returns (score, end_col_local): last-row max and its LAST column.
+// No exact_match_bonus; caller adds it when `include_exact && needle == trimmed`.
 pub(crate) fn score_one_scalar_full(
     needle: &[u8],
     haystack: &[u8],
@@ -135,8 +124,7 @@ pub(crate) fn score_one_scalar_full(
     if m == 0 || n == 0 {
         return (0, 0);
     }
-    // Stack scratch for common lengths: the 8 heap rows below cost more
-    // than the DP itself on short trims. Longer needles keep the Vec path.
+    // Stack rows for m <= 32; longer needles keep the Vec path.
     if m <= 32 {
         return score_one_scalar_stack(needle, haystack, p, include_prefix);
     }
@@ -158,9 +146,8 @@ fn score_one_scalar_vec(
     let match_add = p.match_score as i32;
     let mismatch_pen = p.mismatch_penalty as i32;
 
-    // match_prev[i]: was (i-1, j-1) a match?  (frizbee's shifted_match_mask)
-    // match_curr[i]: is (i-1, j) a match?
-    // Rows come from the worker-local scratch (zeroed on acquire).
+    // match_prev[i]/match_curr[i]: was (i-1, j-1)/(i-1, j) a match.
+    // Rows come zeroed from worker-local scratch.
     let mut scratch = LONG_SCRATCH.with(|c| {
         let mut s = c.borrow_mut();
         s.ensure(m + 1);
@@ -191,8 +178,7 @@ fn score_one_scalar_vec(
         } else {
             0
         };
-        // frizbee: delimiter_mask = prev_char_is_delimiter AND NOT curr_char_is_delimiter.
-        // prev starts as NOT-delimiter (Mask::zero()).
+        // Delimiter bonus needs prev-delim AND NOT curr-delim; prev starts clear.
         let delim_bonus = if prev_is_delim && !hb_delim {
             p.delimiter_bonus as i32
         } else {
@@ -216,7 +202,6 @@ fn score_one_scalar_vec(
             let is_exact = hb == nc;
             match_curr[i] = is_match;
 
-            // Diagonal: H[i-1][j-1] + s(i,j)
             let s = if is_match {
                 let mut v = match_add + delim_bonus + cap_bonus + prefix_bonus;
                 if is_exact {
@@ -228,8 +213,7 @@ fn score_one_scalar_vec(
             };
             let diag = h_prev[i - 1] + s;
 
-            // E (horizontal gap): frizbee's propagate_horizontal_gaps
-            // gap_open ONLY if previous cell (i, j-1) was a match
+            // E: gap_open only if (i, j-1) was a match.
             let e_pen = if match_prev[i] {
                 gap_open_only
             } else {
@@ -239,8 +223,7 @@ fn score_one_scalar_vec(
             let e_ext = e_prev[i] - gap_extend;
             e_curr[i] = e_new.max(e_ext);
 
-            // F (vertical gap): frizbee's up_scores
-            // gap_open ONLY if previous row (i-1, j) was a match
+            // F: gap_open only if (i-1, j) was a match.
             let f_pen = if match_curr[i - 1] {
                 gap_open_only
             } else {
@@ -250,7 +233,6 @@ fn score_one_scalar_vec(
             let f_ext = f_curr[i - 1] - gap_extend;
             f_curr[i] = f_new.max(f_ext);
 
-            // H[i][j] = max(0, diag, E, F)
             let h = diag.max(e_curr[i]).max(f_curr[i]).max(0);
             h_curr[i] = h;
         }
@@ -390,9 +372,6 @@ pub(crate) fn score_one_scalar(
     score_one_scalar_full(needle, haystack, p, include_prefix).0
 }
 
-// ---------------------------------------------------------------------------
-// AVX2 inter-sequence batch scorer: 16 paths per __m256i (u16 lanes).
-// ---------------------------------------------------------------------------
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod avx2 {
     use super::*;
@@ -400,9 +379,8 @@ pub(crate) mod avx2 {
 
     pub(crate) const LANES: usize = 16;
 
-    // Build SoA buffer: soa[j * stride + p] = haystack[p][j], padded with 0.
-    // `stride` must match the kernel's lane count (16 for u16, 32 for u8).
-    // Test oracle: production transposes straight from the stage buffer.
+    // Test oracle SoA: soa[j*stride+p] = haystack[p][j], zero-padded.
+    // `stride` must equal the kernel lane count.
     #[cfg(test)]
     pub(crate) fn build_soa(haystacks: &[&[u8]], max_len: usize, stride: usize) -> Vec<u8> {
         let n = haystacks.len().min(stride);
@@ -416,13 +394,9 @@ pub(crate) mod avx2 {
         soa
     }
 
-    // 8×8 byte transpose (AoS to SoA tiles) via SSE2 unpack shuffles:
-    // `dst[j * dst_stride + i] = src[i * src_stride + j]`, i, j in 0..8.
-    //
-    // # Safety
-    // Caller must ensure `src` has 8 rows of `src_stride` readable bytes and
-    // `dst` has 8 rows of `dst_stride` writable bytes; `dst` may alias `src`
-    // only when both strides are equal and the tiles coincide exactly.
+    // 8x8 AoS-to-SoA transpose: dst[j*dst_stride+i] = src[i*src_stride+j].
+    // Safety: `src` needs 8 rows of `src_stride` readable, `dst` 8 writable;
+    // aliasing only when strides match and tiles coincide.
     #[inline]
     #[target_feature(enable = "sse2")]
     pub(crate) unsafe fn transpose_8x8(
@@ -442,19 +416,16 @@ pub(crate) mod avx2 {
             let a6 = load(6);
             let a7 = load(7);
 
-            // Byte pairs (rows 0-1, 2-3, 4-5, 6-7).
             let p0 = _mm_unpacklo_epi8(a0, a1);
             let p1 = _mm_unpacklo_epi8(a2, a3);
             let p2 = _mm_unpacklo_epi8(a4, a5);
             let p3 = _mm_unpacklo_epi8(a6, a7);
 
-            // 16-bit interleave → 4-wide row groups at column quartets.
             let q0 = _mm_unpacklo_epi16(p0, p1);
             let q1 = _mm_unpackhi_epi16(p0, p1);
             let q2 = _mm_unpacklo_epi16(p2, p3);
             let q3 = _mm_unpackhi_epi16(p2, p3);
 
-            // 32-bit interleave → full 8-lane output rows packed two per register.
             let r0 = _mm_unpacklo_epi32(q0, q2); // rows 0, 1
             let r1 = _mm_unpackhi_epi32(q0, q2); // rows 2, 3
             let r2 = _mm_unpacklo_epi32(q1, q3); // rows 4, 5
@@ -480,14 +451,8 @@ pub(crate) mod avx2 {
         }
     }
 
-    // Fill position-major SoA from path-major stage via 8×8 tiles
-    // (`out[j*stride+k] = stage[k*rows+j]`; rows/stride multiples of 8).
-    // Every SoA byte is written; no pre-zeroing of `out` is required.
-    //
-    // # Safety
-    // Caller must ensure `stage.len() >= stride * rows` and
-    // `out.len() >= rows * stride`, and AVX2-capable target is not required
-    // (SSE2 only) but must not race with concurrent aliasing writes.
+    // Tiles path-major stage to position-major SoA; writes every byte.
+    // Safety: `stage`/`out` cover stride*rows; SSE2 only, no racy aliasing.
     #[target_feature(enable = "sse2")]
     pub(crate) unsafe fn soa_from_stage(stage: &[u8], rows: usize, stride: usize, out: &mut [u8]) {
         debug_assert_eq!(rows % 8, 0);
@@ -510,12 +475,9 @@ pub(crate) mod avx2 {
         }
     }
 
-    // Inter-sequence AVX2 SW over up to 16 pre-trimmed haystacks; returns
-    // per-lane (score, end_col_local). `include_prefix` is a per-lane bitmask.
-    // Needle rows are dynamic to 32 (longer needles stay scalar).
-    //
-    // # Safety
-    // Caller must ensure AVX2 is available and `out.len() >= haystacks.len()`.
+    // AVX2 SW over up to 16 pre-trimmed haystacks; per-lane (score, end_col).
+    // Needle rows dynamic to 32; longer needles stay scalar.
+    // Safety: AVX2 available; `out.len() >= haystacks.len()`.
     #[target_feature(enable = "avx2")]
     pub(crate) unsafe fn score_batch_avx2(
         needle: &[u8],
@@ -546,7 +508,6 @@ pub(crate) mod avx2 {
         let cap_v = set1(p.capitalization_bonus);
         let case_v = set1(p.matching_case_bonus);
         let prefix_v = set1(p.prefix_bonus);
-        // Hoist class/needle broadcasts out of the per-column loop.
         let a_lo = set1(b'A' as u16 - 1);
         let z_hi = set1(b'Z' as u16 + 1);
         let la_lo = set1(b'a' as u16 - 1);
@@ -563,7 +524,6 @@ pub(crate) mod avx2 {
             nf_v[i + 1] = set1(flip_case(needle[i]) as u16);
         }
 
-        // Per-lane prefix mask: lanes with include_prefix get prefix_bonus at j=0.
         let prefix_lanes = {
             let mut arr = [0u16; 16];
             for (i, a) in arr.iter_mut().enumerate() {
@@ -576,8 +536,7 @@ pub(crate) mod avx2 {
             _mm256_loadu_si256(arr.as_ptr() as *const __m256i)
         };
 
-        // DP state arrays (max 33 rows for m<=32). Ping-pong with an index
-        // instead of swapping 1056-byte arrays every column.
+        // DP rows ping-pong by index, not by swapping 1056B arrays.
         let mut h = [[zero; 33]; 2];
         let mut e = [[zero; 33]; 2];
         let mut f = [[zero; 33]; 2];
@@ -586,15 +545,12 @@ pub(crate) mod avx2 {
 
         let mut prev_lower = zero;
         let mut prev_delim = zero;
-        // Single best tracker: last-row max and end latch share it.
         let mut last_row_max = zero;
         let mut end_col_v = zero;
 
         for j in 0..n {
-            // Load 16 bytes at position j, zero-extend to 16 u16
             let raw = _mm_loadu_si128(soa.as_ptr().add(j * LANES) as *const __m128i);
             let hay = _mm256_cvtepu8_epi16(raw);
-            // Next column is sequential in SoA; same hint as u8.
             if j + 2 < n {
                 unsafe {
                     std::arch::x86_64::_mm_prefetch(
@@ -643,9 +599,7 @@ pub(crate) mod avx2 {
             e[nxt][0] = zero;
             f[nxt][0] = zero;
             match_state[nxt][0] = zero;
-            // Forward mm in a register: f_pen wants the previous
-            // iteration's mm, still in hand. Drops one vector
-            // load + store per cell, zero added ALU.
+            // Forwards mm in a register, saving a load per cell.
             let mut prev_mm = zero;
 
             for i in 1..=m {
@@ -660,8 +614,6 @@ pub(crate) mod avx2 {
                 let diag = _mm256_add_epi16(diag, _mm256_and_si256(eq_nc, case_v));
 
                 let e_pen = _mm256_blendv_epi8(gap_ext_v, gap_open_v, match_state[cur][i]);
-                // blendv is 1 op / 2 uops on Intel, slower on Zen; no
-                // vendor dispatch without a Zen box to measure it on.
                 let e_new = _mm256_subs_epu16(h[cur][i], e_pen);
                 let e_ext = _mm256_subs_epu16(e[cur][i], gap_ext_v);
                 e[nxt][i] = _mm256_max_epu16(e_new, e_ext);
@@ -688,7 +640,6 @@ pub(crate) mod avx2 {
             prev_delim = is_delim;
         }
 
-        // Extract per-lane scores and end_cols
         let scores: [u16; 16] = std::mem::transmute(last_row_max);
         let ecols: [u16; 16] = std::mem::transmute(end_col_v);
         for (i, (&s, &e)) in scores.iter().zip(ecols.iter()).enumerate() {
@@ -699,11 +650,8 @@ pub(crate) mod avx2 {
         }
     }
 
-    // U8 scores over 32 lanes (2x throughput); valid only when scores fit
-    // in u8. Same semantics as `score_batch_avx2`.
-    //
-    // # Safety
-    // Caller must ensure AVX2 is available. Scores must fit in u8.
+    // 32-lane u8 variant; same semantics, valid only when scores fit in u8.
+    // Safety: AVX2 available; scores must fit in u8.
     #[target_feature(enable = "avx2")]
     pub(crate) unsafe fn score_batch_avx2_u8(
         needle: &[u8],
@@ -735,7 +683,6 @@ pub(crate) mod avx2 {
         let cap_v = set1(p.capitalization_bonus as u8);
         let case_v = set1(p.matching_case_bonus as u8);
         let prefix_v = set1(p.prefix_bonus as u8);
-        // Class thresholds are constant across columns, so hoist them out.
         let a_lo = set1(b'A' - 1);
         let z_hi = set1(b'Z' + 1);
         let la_lo = set1(b'a' - 1);
@@ -758,7 +705,6 @@ pub(crate) mod avx2 {
             _mm256_loadu_si256(arr.as_ptr() as *const __m256i)
         };
 
-        // Broadcast each needle byte once per batch.
         let mut nc_v = [zero; 33];
         let mut nf_v = [zero; 33];
         for i in 0..m {
@@ -774,24 +720,18 @@ pub(crate) mod avx2 {
 
         let mut prev_lower = zero;
         let mut prev_delim = zero;
-        // Single best tracker: last-row max and end latch share it.
         let mut last_row_max = zero;
         let mut end_col_v = zero;
-        // Unsigned end tracking: scores pass 127, where the signed
-        // compare inverts (best looks negative, so every later column
-        // latches). XOR with 0x80 maps the order back. Scores use the
-        // unsigned max and are unaffected.
+        // 0x80 bias restores unsigned order for the signed compare past 127;
+        // scores use the unsigned max and are unaffected.
         let sign_bias = _mm256_set1_epi8(-128);
 
         for j in 0..n {
-            // Saturation check every 4th column (result-identical; last_row_max
-            // only grows, so skipping columns is safe).
+            // Saturated lanes stay saturated (max only grows); checking every 4th column is exact.
             if j & 3 == 0 && _mm256_movemask_epi8(_mm256_cmpeq_epi8(last_row_max, ones)) == -1 {
                 break;
             }
-            // Load 32 bytes at position j
             let hay = _mm256_loadu_si256(soa.as_ptr().add(j * LANES8) as *const __m256i);
-            // Prefetch the next column (position-major SoA is sequential).
             if j + 2 < n {
                 unsafe {
                     std::arch::x86_64::_mm_prefetch(
@@ -801,8 +741,7 @@ pub(crate) mod avx2 {
                 }
             }
 
-            // Character class masks — skip entirely when case/delim bonuses are 0
-            // (typical lowercase query). Saves ~10 SIMD ops per column.
+            // Skips class masks when case/delim bonuses are 0 (typical lowercase query).
             let (is_lower, is_delim, cap_bonus, delim_bonus) = if need_case || need_delim {
                 let ge_a = _mm256_cmpgt_epi8(hay, a_lo);
                 let le_z = _mm256_cmpgt_epi8(z_hi, hay);
@@ -833,7 +772,6 @@ pub(crate) mod avx2 {
             } else {
                 zero
             };
-            // The bonus pack is column-invariant, so build it once.
             let bonus_base = _mm256_add_epi8(
                 _mm256_add_epi8(delim_bonus, cap_bonus),
                 _mm256_add_epi8(prefix_bonus, match_add_v),
@@ -844,7 +782,7 @@ pub(crate) mod avx2 {
             e[nxt][0] = zero;
             f[nxt][0] = zero;
             match_state[nxt][0] = zero;
-            // Forward mm in a register (as in u16): drops one load per cell.
+            // Forwards mm in a register, saving a load per cell.
             let mut prev_mm = zero;
 
             for i in 1..=m {
@@ -859,8 +797,6 @@ pub(crate) mod avx2 {
                 let diag = _mm256_add_epi8(diag, _mm256_and_si256(eq_nc, case_v));
 
                 let e_pen = _mm256_blendv_epi8(gap_ext_v, gap_open_v, match_state[cur][i]);
-                // blendv is 1 op / 2 uops on Intel, slower on Zen; no
-                // vendor dispatch without a Zen box to measure it on.
                 let e_new = _mm256_subs_epu8(h[cur][i], e_pen);
                 let e_ext = _mm256_subs_epu8(e[cur][i], gap_ext_v);
                 e[nxt][i] = _mm256_max_epu8(e_new, e_ext);
@@ -890,7 +826,6 @@ pub(crate) mod avx2 {
             prev_delim = is_delim;
         }
 
-        // Extract per-lane scores (u8 -> u16) and end_cols
         let score_bytes: [u8; 32] = std::mem::transmute(last_row_max);
         let ecol_bytes: [u8; 32] = std::mem::transmute(end_col_v);
         for (i, (&s, &e)) in score_bytes.iter().zip(ecol_bytes.iter()).enumerate() {
@@ -901,11 +836,9 @@ pub(crate) mod avx2 {
         }
     }
 
-    // Dispatch to a const-unrolled specialization for common needle lengths.
-    // `M = 0` keeps the general runtime-m loop. Results are bit-identical.
-    //
-    // # Safety
-    // Caller must guarantee AVX2 (score.rs gates on simd_available).
+    // Dispatches common needle lengths to const-unrolled kernels; bit-identical.
+    // Other lengths keep the general runtime-m loop.
+    // Safety: AVX2 required (score.rs gates on simd_available).
     #[inline]
     #[target_feature(enable = "avx2")]
     pub(crate) unsafe fn score_batch_avx2_u8_dispatch(
@@ -947,9 +880,7 @@ pub(crate) mod avx2 {
         );
     }
 
-    // Same as [`score_batch_avx2_u8`] but with a compile-time needle length so
-    // the DP row loop is fully unrolled and the state arrays SROA to registers.
-    // Bit-identical to the general loop (asserted in tests).
+    // Compile-time needle length: unrolled row loop, SROA state; bit-identical.
     #[inline]
     #[target_feature(enable = "avx2")]
     unsafe fn score_batch_avx2_u8_const<const M: usize>(
@@ -1004,8 +935,6 @@ pub(crate) mod avx2 {
             _mm256_loadu_si256(arr.as_ptr() as *const __m256i)
         };
 
-        // Fixed max arrays; the row loop below has a const trip count so LLVM
-        // unrolls 1..=M and can keep the hot state in registers.
         let mut nc_v = [zero; 33];
         let mut nf_v = [zero; 33];
         for i in 0..m {
@@ -1021,16 +950,13 @@ pub(crate) mod avx2 {
 
         let mut prev_lower = zero;
         let mut prev_delim = zero;
-        // Single best tracker: last-row max and end latch share it.
         let mut last_row_max = zero;
         let mut end_col_v = zero;
-        // Unsigned end tracking (see general kernel above): 0x80 bias
-        // restores unsigned order for the signed compare.
+        // 0x80 bias restores unsigned order for the signed compare.
         let sign_bias = _mm256_set1_epi8(-128);
 
         for j in 0..n {
-            // Saturation check before the load (general kernel order):
-            // a saturated batch is done, skip the fetch.
+            // A saturated batch is done; skip the fetch before loading.
             if j & 3 == 0 && _mm256_movemask_epi8(_mm256_cmpeq_epi8(last_row_max, ones)) == -1 {
                 break;
             }
@@ -1074,7 +1000,6 @@ pub(crate) mod avx2 {
             } else {
                 zero
             };
-            // The bonus pack is column-invariant, so build it once.
             let bonus_base = _mm256_add_epi8(
                 _mm256_add_epi8(delim_bonus, cap_bonus),
                 _mm256_add_epi8(prefix_bonus, match_add_v),
@@ -1086,10 +1011,9 @@ pub(crate) mod avx2 {
             f[nxt][0] = zero;
             match_state[nxt][0] = zero;
 
-            // Forward mm in a register (as in u16): drops one load per cell.
+            // Forwards mm in a register, saving a load per cell.
             let mut prev_mm = zero;
 
-            // Const trip count (M is a const generic): fully unrolled.
             for i in 1..=M {
                 let eq_nc = _mm256_cmpeq_epi8(hay, nc_v[i]);
                 let eq_nf = _mm256_cmpeq_epi8(hay, nf_v[i]);
@@ -1102,8 +1026,6 @@ pub(crate) mod avx2 {
                 let diag = _mm256_add_epi8(diag, _mm256_and_si256(eq_nc, case_v));
 
                 let e_pen = _mm256_blendv_epi8(gap_ext_v, gap_open_v, match_state[cur][i]);
-                // blendv is 1 op / 2 uops on Intel, slower on Zen; no
-                // vendor dispatch without a Zen box to measure it on.
                 let e_new = _mm256_subs_epu8(h[cur][i], e_pen);
                 let e_ext = _mm256_subs_epu8(e[cur][i], gap_ext_v);
                 e[nxt][i] = _mm256_max_epu8(e_new, e_ext);
@@ -1155,8 +1077,7 @@ mod tests {
     // Serializes access to `FRIZBEE_SKIP_SW` across parallel tests.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    // Compare against frizbee's Matcher (the ground truth) using fff's
-    // scoring config (matching_case_bonus=0 for lowercase queries).
+    // Ground truth: frizbee Matcher under fff's scoring config.
     fn frizbee_score(needle: &str, haystack: &str) -> u16 {
         // Ensure skip_sw is OFF for the ground-truth measurement
 
@@ -1176,7 +1097,7 @@ mod tests {
         if matches.is_empty() {
             0
         } else {
-            // Subtract exact_match_bonus (added by smith_waterman_one, not score_haystack)
+            // Less exact_match_bonus, which score_haystack excludes.
             let exact = needle.eq_ignore_ascii_case(haystack);
             let bonus = if exact { 8u16 } else { 0 };
             matches[0].score.saturating_sub(bonus)
@@ -1213,9 +1134,7 @@ mod tests {
 
     #[test]
     fn max_sw_bound_holds_on_random() {
-        // Falsification for pre-SW pruning: any violation kills the idea.
-        // Batch kernels replicate scalar exactly (parity battery), so
-        // scalar coverage transfers.
+        // Any violation kills pre-SW pruning; parity lets scalar coverage transfer.
         let mut state = 0xBEEFu32;
         let mut next = move || {
             state = state
@@ -1437,8 +1356,7 @@ mod tests {
 
     #[test]
     fn u8_matches_scalar_on_long_needles() {
-        // u8 lanes only engage for short needles in production; long
-        // needles must agree with scalar exactly (no saturation quirk).
+        // Out-of-domain long needles must still agree with scalar exactly.
         if !is_x86_feature_detected!("avx2") {
             return;
         }
@@ -1460,8 +1378,7 @@ mod tests {
             b"Characterization_of_VARIABLE42_in_DOCS.md",
         ];
         for needle in needles {
-            // Production never runs SIMD with n <= 8 (tails unpadded);
-            // mirror that: pad lanes past 8 so stale-tail reads can't fire.
+            // Pad lanes past 8; shorter tails run scalar in production.
             let mut hays32: Vec<&[u8]> = hays.to_vec();
             while hays32.len() < 12 {
                 hays32.extend_from_within(..);
@@ -1472,7 +1389,6 @@ mod tests {
             let soa = super::avx2::build_soa(&hays32, max_len, 32);
             let mut simd_out = vec![0u16; n];
             let mut simd_ecol = vec![0u16; n];
-            // Production-realistic mixed prefix mask (only some lanes).
             let pmask: u32 = 0b101010101010101010101010;
             unsafe {
                 super::avx2::score_batch_avx2_u8(
@@ -1496,8 +1412,7 @@ mod tests {
                     );
                 }
             }
-            // Const-unrolled dispatch must equal the general kernel on the
-            // same bytes (production calls dispatch, not general).
+            // Dispatch must equal the general kernel (production calls dispatch).
             let mut disp_out = vec![0u16; n];
             let mut disp_eco = vec![0u16; n];
             unsafe {
@@ -1519,7 +1434,7 @@ mod tests {
                     );
                 }
             }
-            // Same inputs through the u16 kernel: isolates the bug to u8.
+            // Same inputs through u16 isolate divergence to u8.
             let soa16 = super::avx2::build_soa(&hays32, max_len, 16);
             let mut out16 = vec![0u16; n];
             let mut eco16 = vec![0u16; n];
@@ -1554,8 +1469,6 @@ mod tests {
 
     #[test]
     fn u8_fuzz_long_needles_all_kernels_agree() {
-        // Adversarial sweep: the production u8-vs-u16 checksum split on
-        // long needles must come from somewhere reproducible here.
         if !is_x86_feature_detected!("avx2") {
             return;
         }
@@ -1565,7 +1478,6 @@ mod tests {
             state = state.wrapping_mul(1664525).wrapping_add(1013904223);
             (state >> 16) as u8
         };
-        // Byte soup with separators, digits, case, high bytes.
         let alphabet: &[u8] = b"abcdefABCDEF0123456789/._- \x80\xff\x01\x7f";
         for round in 0..300 {
             let m = 16 + (next() as usize % 9);
@@ -1603,10 +1515,7 @@ mod tests {
 
     #[test]
     fn u8_end_col_survives_high_scores() {
-        // u8 agrees with scalar/u16 through m=18 exact; m>=20 exact
-        // diverges (diag transient saturation past 255 + end latch).
-        // Both are out of the u8 production domain (u8_safe gates m<=15
-        // lowercase); this pins the in-domain boundary plus margin.
+        // In-domain exact needles must agree; the loop pins the boundary plus margin.
         if !is_x86_feature_detected!("avx2") {
             return;
         }
@@ -1632,9 +1541,7 @@ mod tests {
 
     #[test]
     fn u8_transient_band_agrees_with_scalar() {
-        // u8_safe bounds the final (<256) but diag intermediates add up
-        // to +34 more, so cells in 222..255 can wrap even in-domain.
-        // Biased fuzz (exact runs + bonus chars) hunts that band.
+        // Diag intermediates can exceed the final, so in-domain cells can wrap; biased fuzz hunts that band.
         if !is_x86_feature_detected!("avx2") {
             return;
         }
@@ -1693,9 +1600,7 @@ mod tests {
 
     #[test]
     fn u8_late_best_end_col_agrees() {
-        // Contract: u8 kernel while best-ends fit in a byte; longer
-        // windows take the exact u16 path (dispatch reroutes past 256B).
-        // Both must agree with scalar.
+        // u8 while best-ends fit a byte; longer windows take u16. Both must agree with scalar.
         if !is_x86_feature_detected!("avx2") {
             return;
         }
@@ -1754,9 +1659,7 @@ mod tests {
 
     #[test]
     fn u8_agrees_with_scalar_through_safe_domain() {
-        // Wherever u8_safe admits a needle, the u8 kernel must equal the
-        // scalar oracle on exact-prefix hays (the highest-scoring shape).
-        // Divergence above the gate stays out of production by construction.
+        // Wherever u8_safe admits, u8 must equal scalar on exact-prefix hays.
         if !is_x86_feature_detected!("avx2") {
             return;
         }
@@ -1813,7 +1716,6 @@ mod tests {
 
     #[test]
     fn stack_scalar_matches_vec_path() {
-        // Stack (m<=32) must equal Vec path on identical inputs.
         let p = params();
         let mut state = 0xBEEFu32;
         let mut next = move || {
@@ -1831,7 +1733,6 @@ mod tests {
                 // Stack path only valid for m<=32 (fixed [T; 33] rows).
                 score_one_scalar_stack(n.as_bytes(), h.as_bytes(), &p, true)
             } else {
-                // Dispatch routes m>32 to Vec; must equal direct Vec call.
                 score_one_scalar_full(n.as_bytes(), h.as_bytes(), &p, true)
             };
             let vec = score_one_scalar_vec(n.as_bytes(), h.as_bytes(), &p, true);
@@ -1842,8 +1743,7 @@ mod tests {
 
     #[test]
     fn trimmed_no_prefix_matches_frizbee() {
-        // Use frizbee's own prefilter windows (via FRIZBEE_SKIP_SW encoding)
-        // and verify our trimmed SW matches frizbee's internal trimmed SW.
+        // Our trimmed SW must match frizbee's on frizbee's own prefilter windows.
         let p = params();
         let cases: &[(&str, &str)] = &[
             ("username.rs", "src/username.rs"),
@@ -1871,7 +1771,6 @@ mod tests {
             ..Default::default()
         };
         for &(needle, full) in cases {
-            // Get frizbee's prefilter window via skip_sw (hold env lock)
             let skip_matches = {
                 let sm = neo_frizbee::with_skip_sw(|| {
                     let mut m = neo_frizbee::Matcher::new(needle, &cfg);
@@ -1881,7 +1780,6 @@ mod tests {
                 sm
             };
 
-            // Get frizbee's real score (frizbee_score acquires env lock itself)
             let theirs = frizbee_score(needle, full);
 
             if skip_matches.is_empty() {
@@ -1966,7 +1864,6 @@ mod tests {
             let soa = super::avx2::build_soa(&hays, max_len, 16);
             let mut simd_out = vec![0u16; batch.len()];
             let mut simd_ecol = vec![0u16; batch.len()];
-            // All lanes get include_prefix=true (tests use include_prefix=true)
             let prefix_mask: u16 = if batch.len() >= 16 {
                 u16::MAX
             } else {
@@ -2006,7 +1903,7 @@ mod tests {
             return;
         }
         let p = params();
-        // M=20 exercises rows past the old 16-row domain.
+        // m=20 exercises rows past 16.
         let needle = b"internationalization";
         let hays: &[&str] = &[
             "src/internationalization/mod.rs",
@@ -2051,7 +1948,6 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn transpose_8x8_is_exact_matrix_transpose() {
-        // src[i][j] = i * 8 + j, differing src/dst strides.
         let mut src = [0u8; 8 * 11];
         for i in 0..8 {
             for j in 0..8 {
@@ -2071,7 +1967,6 @@ mod tests {
                 );
             }
         }
-        // Untouched dst bytes stay put.
         assert_eq!(dst[8], 0xAA);
         assert_eq!(dst[12], 0xAA);
     }
@@ -2127,7 +2022,6 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn soa_from_stage_dense_roundtrip_layout() {
-        // Unambiguous layout probe: stage[k * rows + j] = k * 16 + j (mod 256).
         let (rows, stride) = (16usize, 32usize);
         let mut stage = vec![0u8; rows * stride];
         for k in 0..stride {

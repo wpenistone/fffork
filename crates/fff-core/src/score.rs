@@ -42,8 +42,7 @@ fn simd_available() -> bool {
     })
 }
 
-// Measured break-even for per-file presence rechecks: expected reject
-// savings vs recheck cost, both timed on the probe sample. No tuning.
+// Break-even for per-file presence rechecks: reject savings vs recheck cost.
 fn presence_rechecks_pay(rate: f64, presence_ns: f64, gate_ns: f64) -> bool {
     (1.0 - rate) * gate_ns > presence_ns
 }
@@ -57,7 +56,7 @@ fn match_fuzzy_parts(
     max_path_len: usize,
     abort: crate::parallelism::AbortToken<'_>,
 ) -> Vec<neo_frizbee::Match> {
-    // Stack for the common 1-2 part queries; spills rarely.
+    // 1-2 part queries fit on the stack.
     let valid_parts: SmallVec<[&str; 4]> = fuzzy_parts
         .iter()
         .copied()
@@ -69,13 +68,10 @@ fn match_fuzzy_parts(
         return vec![];
     }
 
-    // Prefilter is an internal scan — parallelize even when the *search*
-    // is 1 thread (one query). Interseq SW already uses the bg pool this way.
-    // The cap comes from the machine profile (cores, bounded by LLC), not a
-    // literal: `.min(8)` starved 32-core servers and oversubscribed phones.
+    // Prefilter is an internal scan: parallelize even for 1-thread searches.
+    // Cap comes from the machine profile, not a literal.
     let scan_cap = crate::machine::scan_thread_cap();
-    // Two-part narrowing starts from the longer part (rejects more, so
-    // the second pass scans less); each part keeps its own-len typo cap.
+    // Narrow from the longer part (rejects more); each part keeps its own typo cap.
     let reverse_pair = valid_parts.len() == 2 && valid_parts[1].len() > valid_parts[0].len();
     let first_part: &str = if reverse_pair {
         valid_parts[1]
@@ -84,8 +80,7 @@ fn match_fuzzy_parts(
     };
     let mut first_options = *options;
     first_options.max_typos = options.max_typos.map(|t| t.min(first_part.len() as u16));
-    // Thread count comes from the work estimate alone (no size cutoffs); the
-    // picker's cached max path length keeps this O(1) per query.
+    // Thread count from the work estimate alone; cached max path length keeps it O(1).
     let threads = effective_match_threads(
         working_files.len(),
         first_part.len(),
@@ -94,22 +89,17 @@ fn match_fuzzy_parts(
         scan_cap.max(max_threads),
     );
 
-    // Inter-sequence SW: frizbee prefilter for match set + trim windows,
-    // then re-score with validated SW that replicates frizbee's gap model
-    // on the SAME trimmed slices with the SAME include_prefix semantics.
+    // Gate match-set + windows, then re-score with SW replicating frizbee's gap model
+    // on the same trimmed slices with the same include_prefix semantics.
     let first_part_matches = {
         let part_timing = phase_timing();
         let t_prefilter = std::time::Instant::now();
-        // Phase 1: gate match-set + windows. The skip_sw path
-        // encodes (start_pos_adj, end_pos) in (score, end_col).
+        // Gate match-set + windows; skip_sw encodes (start, end) in (score, end_col).
         let np = crate::presence::NeedlePresence::new(
             first_part.as_bytes(),
             first_options.max_typos.unwrap_or(u16::MAX),
         );
-        // Index reject before frizbee, gated by measurement: probe a
-        // dispatch-sized sample (~one fork/join), time presence vs gate,
-        // and scan fully only when reject savings win. Short/common
-        // needles probe ~100% pass and skip; small inputs skip outright.
+        // Probe a dispatch-sized sample; scan fully only when reject savings win.
         let gate_typos = first_options.max_typos.unwrap_or(u16::MAX);
         let gate_state = crate::gate::GateNeedle::new(first_part.as_bytes(), gate_typos);
         let mut cand: Vec<u32> = Vec::new();
@@ -118,8 +108,7 @@ fn match_fuzzy_parts(
         let avg_bytes = max_path_len.max(1);
         let big_enough =
             crate::dispatch::plan_files(n_files, avg_bytes, usize::MAX).threads > 1;
-        // Probe-measured presence economics (rate, presence_ns, gate_ns),
-        // set only when the gate probe was timed (empty probes stay selective).
+        // Presence economics, set only when the gate probe was timed.
         let mut presence_probe: Option<(f64, f64, f64)> = None;
         if big_enough && n_files > 0 {
             let n_probe = crate::dispatch::probe_len(n_files, avg_bytes);
@@ -129,8 +118,7 @@ fn match_fuzzy_parts(
             let t_probe = std::time::Instant::now();
             let mut pass = 0usize;
             let mut probed = 0usize;
-            // Passing probe indices for gate timing below (bounded: the
-            // probe itself must stay near one fork/join of cost).
+            // Passing probe indices reuse for gate timing; bounded to keep the probe cheap.
             let mut pass_idx: SmallVec<[u32; 32]> = SmallVec::new();
             for i in (0..n_files).step_by(stride) {
                 let f = working_files.index(i);
@@ -150,7 +138,6 @@ fn match_fuzzy_parts(
             }
             let presence_ns =
                 t_probe.elapsed().as_nanos() as f64 / probed.max(1) as f64;
-            // Time the gate on passing probe files for the savings estimate.
             let mut gate_ns = 0.0f64;
             if !pass_idx.is_empty() {
                 let t_gate = std::time::Instant::now();
@@ -164,10 +151,7 @@ fn match_fuzzy_parts(
             if !pass_idx.is_empty() {
                 presence_probe = Some((rate, presence_ns, gate_ns));
             }
-            // Serial-view break-even: rejects x gate cost vs full presence
-            // scan + in-group rechecks + dispatch. Empty probe passes mean
-            // groups all-reject cheaply on their own; a scan proving that
-            // would cost more than it saves.
+            // Fire only when reject savings beat scan + recheck + dispatch costs.
             let fire = pass > 0
                 && rate < 1.0
                 && (n_files as f64 * (1.0 - rate) * gate_ns
@@ -195,16 +179,12 @@ fn match_fuzzy_parts(
             }
         }
         let cand_ms = t_cand.elapsed().as_secs_f64() * 1e3;
-        // Dense re-index only helps when something was rejected;
-        // a full pass set would add indirection for no savings.
+        // Re-index only when something was rejected; a full pass adds indirection.
         let use_cand = !cand.is_empty() && cand.len() < n_files;
-        // TISG gate match-set + window without frizbee. `gate_n` is the
-        // gate's index space (candidates when the prefilter fired).
+        // `gate_n` is the gate's index space (candidates when the prefilter fired).
         let gate_n = if use_cand { cand.len() } else { n_files };
-        // Rechecks are a sound pretest, so skipping never changes results:
-        // scan members already passed the same test, and uniform queries
-        // (probe rate ~1) save less than rechecks cost (measured, no tuning).
-        // Honors `FFF_NO_GATE_PREFILTER`, as the test-only path does.
+        // Rechecks are a sound pretest: scan members already passed it, so skipping never changes results.
+        // Honors `FFF_NO_GATE_PREFILTER`.
         let check_presence = np.should_check()
             && std::env::var_os("FFF_NO_GATE_PREFILTER").is_none()
             && !use_cand
@@ -221,13 +201,11 @@ fn match_fuzzy_parts(
         let t_tight_files = std::sync::atomic::AtomicU64::new(0);
         let prefilter_ms = t_prefilter.elapsed().as_secs_f64() * 1e3;
 
-        // Phase 2: re-score with inter-sequence SW on trimmed windows.
         let has_upper = first_part.chars().any(|c| c.is_uppercase());
         let p = crate::interseq_sw::SwParams::for_query(has_upper);
         let needle = first_part.as_bytes();
 
-        // Query intent: `name.ext` — pin exact filename hits among the match
-        // set (not a full-corpus walk; score_one already ranks exact names).
+        // Pin exact filename hits for `name.ext` queries (not a full-corpus walk).
         let looks_like_filename = {
             let q = first_part;
             q.len() >= 4 && q.contains('.') && !q.contains('/')
@@ -236,8 +214,7 @@ fn match_fuzzy_parts(
             let mut hits: Vec<u32> = Vec::new();
             if looks_like_filename {
                 let qb = first_part.as_bytes();
-                // Reused scratch: `filename_cow` would heap-allocate per candidate
-                // whose filename straddles a chunk, and this loop walks every match.
+                // Reused scratch: `filename_cow` heap-allocates on chunk-straddling filenames.
                 let mut name_scratch = [0u8; crate::simd_path::PATH_BUF_SIZE];
                 for m in chunk_matches.iter() {
                     let f = working_files.index(m.index as usize);
@@ -250,21 +227,15 @@ fn match_fuzzy_parts(
                     }
                 }
             }
-            // Sorted for binary search in the assemble pass below, which
-            // applies the bump inline (no second pass, no hash set).
+            // Sorted for binary search in the assemble pass.
             hits.sort_unstable();
             hits
         };
 
-        // SW scoring (collapse removed: cheap rank disagreed with SW
-        // on real corpora; reordering would be a UX regression).
-        // (Phase counters print after the fused pass below, once the
-        // match count is known.)
+        // No cheap-rank collapse: it disagreed with SW and reordering regresses ranking.
         let t_sw = std::time::Instant::now();
         {
-            // Chunked scoring: metadata working set sized from the
-            // private L2 so TLS scratch stays resident (vs a full
-            // 227k-wide set of faults/RSS). See `sw_metadata_chunk`.
+            // Chunked scoring: L2-sized metadata keeps TLS scratch resident.
             thread_local! {
                 static TRIMS: std::cell::RefCell<Vec<crate::matcher::Trim>> =
                     const { std::cell::RefCell::new(Vec::new()) };
@@ -276,17 +247,14 @@ fn match_fuzzy_parts(
             }
             fn reclaim<T>(b: &mut Vec<T>, v: Vec<T>) {
                 *b = v;
-                // Cap retained capacity so one huge match set does not pin TLS
-                // forever, but keep a full chunk warm (avoids re-alloc/re-fault).
-                // Hysteresis is one extra SIMD batch past the chunk.
+                // Cap retained TLS at chunk + one batch; huge match sets must not pin it.
                 let retain = crate::dispatch::sw_metadata_chunk() + 64;
                 if b.capacity() > retain {
                     b.shrink_to(retain);
                 }
             }
 
-            // Portability: FFF_FORCE_SCALAR=1 skips AVX2 (SSE2/scalar path only).
-            // Used to measure low-spec chips; must stay result-identical.
+            // `FFF_FORCE_SCALAR=1` skips AVX2; must stay result-identical.
             let force_scalar = force_scalar();
             let avx2_ok = if force_scalar {
                 false
@@ -294,24 +262,20 @@ fn match_fuzzy_parts(
                 simd_available()
             };
 
-            // u8 fast path: 32 lanes, valid when the max repr. score < 256
-            // (u8_safe) and the needle fits the kernel's 32-row domain.
+            // u8 fast path: 32 lanes, valid when `u8_safe` and the needle fits 32 rows.
             let use_u8 = avx2_ok && needle.len() <= 32 && p.u8_safe(needle.len());
             let batch_sz: usize = if use_u8 { 32 } else { 16 };
             // u16 rows are dynamic to 32; longer needles stay scalar.
             let use_simd = avx2_ok && needle.len() <= 32;
-            // Probe hatch: serial batches inside each chunk (one task per
-            // chunk instead of per batch). Sizes nested-fanout overhead.
+            // `FFF_NO_BATCH_PAR`: serial batches per chunk (less fanout overhead).
             let no_batch_par = std::env::var_os("FFF_NO_BATCH_PAR").is_some();
-            // Memoized prefix walks for sibling files (FFF_NO_PREFIX_CACHE
-            // escapes to the plain per-file walk). Same results by design.
+            // Sibling prefix walks memoized (`FFF_NO_PREFIX_CACHE` escapes); same results.
             let prefix_cache_on = std::env::var_os("FFF_NO_PREFIX_CACHE").is_none();
 
-            // Sub-phase accounting, accumulated across rayon workers.
             let t_collect_us = std::sync::atomic::AtomicU64::new(0);
             let t_batch_us = std::sync::atomic::AtomicU64::new(0);
             let t_assemble_us = std::sync::atomic::AtomicU64::new(0);
-            // Diagnostic split of batch_ms; each add is timing-gated.
+            // Diagnostic batch split; each add is timing-gated.
             let t_stage_us = std::sync::atomic::AtomicU64::new(0);
             let t_xpose_us = std::sync::atomic::AtomicU64::new(0);
             let t_kernel_us = std::sync::atomic::AtomicU64::new(0);
@@ -324,9 +288,7 @@ fn match_fuzzy_parts(
             let timing = part_timing;
 
             // Chunks are disjoint with thread-local scratch, so fanout is safe.
-            // Fan out only past one chunk: fork/join alone measured ~8x the
-            // serial body (782us vs 97us). `outer_saturates` skips inner fanout
-            // when file chunks feed every worker (~29 CPU-ms saved on 116k).
+            // Fan out only past one chunk; outer saturation skips inner fanout.
             let sw_body = |matches_chunk: &mut [neo_frizbee::Match],
                            exact_hits: &[u32],
                            outer_saturates: bool| {
@@ -338,7 +300,6 @@ fn match_fuzzy_parts(
                 {
                     for (mi, m) in matches_chunk.iter().enumerate() {
                         let file = working_files.index(m.index as usize);
-                        // Prefetch next FileItem (sequential over this chunk).
                         #[cfg(target_arch = "x86_64")]
                         if mi + 1 < n_matches {
                             let nf = working_files.index(matches_chunk[mi + 1].index as usize);
@@ -363,17 +324,14 @@ fn match_fuzzy_parts(
                 }
 
                 let t_batch = std::time::Instant::now();
-                // 64-byte align the batch output buffers: batch_sz=32 u16 is
-                // exactly one cache line, so aligned batches do not false-share
-                // at par_chunks boundaries (MESI line ping-pong). Lengths are
-                // set without zero-fill; every lane is written before any read.
+                // 64B-align batch outputs: 32 u16 fills a cache line, so par_chunks never false-share.
+                // Lengths set without zero-fill; every lane is written before any read.
                 let mut scores = SCORES.with(|c| take_tls(c, n_matches + 32));
                 set_len_uninit(&mut scores, n_matches + 32);
                 let mut end_cols = ECOLS.with(|c| take_tls(c, n_matches + 32));
                 set_len_uninit(&mut end_cols, n_matches + 32);
 
-                // Scalar lanes skip staging/SoA/order/par entirely: one serial
-                // pass over the trims with a reused window buffer. Same bytes in.
+                // Scalar path: one serial pass over trims with a reused window buffer.
                 let scalar_direct = !use_simd;
                 if scalar_direct {
                     thread_local! {
@@ -421,14 +379,11 @@ fn match_fuzzy_parts(
                         );
                     }
                 } else {
-                    // Length-ordered batches within the chunk so per-batch max_len
-                    // stays close to the lanes' own lengths.
+                    // Length-ordered batches keep per-batch max_len near lane lengths.
                     let t_prep = std::time::Instant::now();
                     let mut order = ORDER.with(|c| take_tls(c, n_matches));
                     set_len_uninit(&mut order, n_matches);
-                    // Counting sort by trim length (stable, O(n)). Batch grouping only
-                    // affects SIMD max_len, not per-match scores. A single batch is
-                    // already one group, so identity order is the same grouping.
+                    // Counting sort by trim length; grouping affects only SIMD max_len, not scores.
                     let t_sort = std::time::Instant::now();
                     if n_matches > batch_sz {
                         let mut cnt = [0u32; 129];
@@ -479,10 +434,8 @@ fn match_fuzzy_parts(
                         );
                     }
 
-                    // One batch = one (ord, out) triple. A pure indexed map, so
-                    // serial and parallel runs write bit-identical outputs.
-                    // Width-parameterized batch core: u8 runs full
-                    // 32-wide, over-long pieces run exact u16 halves.
+                    // Pure indexed map: serial and parallel runs are bit-identical.
+                    // u8 runs full 32-wide; over-long pieces run exact u16 halves.
                     let score_batch_w = |ord: &[u32],
                                          sc_out: &mut [u16],
                                          ec_out: &mut [u16],
@@ -509,7 +462,6 @@ fn match_fuzzy_parts(
                             std::mem::take(&mut *b)
                         });
                         stage.truncate(buf_len);
-                        // Zero only the padding lanes (SIMD path reads them).
                         if n > 8 {
                             for k in n..width {
                                 stage[k * rows..(k + 1) * rows].fill(0);
@@ -541,8 +493,7 @@ fn match_fuzzy_parts(
                             let wlen = (e - s) as usize;
                             let dst = &mut stage[k * rows..k * rows + wlen];
                             file.path.copy_window_to(arena, s as u32, e as u32, dst);
-                            // Pad the rest of this lane to zeros (SoA expects it).
-                            // Scalar path never reads the tail; skip the memset.
+                            // Zero the lane tail for SoA; the scalar path skips it.
                             if n > 8 {
                                 stage[k * rows + wlen..(k + 1) * rows].fill(0);
                             }
@@ -557,8 +508,7 @@ fn match_fuzzy_parts(
                             );
                         }
 
-                        // Tiny trailing chunks cannot amortize a 32-wide
-                        // transpose + kernel; score them scalar from stage.
+                        // Tiny trailing chunks go scalar: they cannot amortize a 32-wide kernel.
                         if n <= 8 {
                             let t_scalar = std::time::Instant::now();
                             for (k, &oi) in ord.iter().enumerate() {
@@ -617,8 +567,7 @@ fn match_fuzzy_parts(
                                         &mut sc_out[..n],
                                         &mut ec_out[..n],
                                     );
-                                    // Safety net, dead while u8_safe holds: any
-                                    // saturated lane is rescored scalar.
+                                    // Saturated lanes rescore scalar; dead while `u8_safe` holds.
                                     if sc_out[..n].contains(&255) {
                                         for (k, &oi) in ord.iter().enumerate() {
                                             let tw = trims[oi as usize];
@@ -657,7 +606,6 @@ fn match_fuzzy_parts(
                             STAGE.with(|c| *c.borrow_mut() = stage);
                             return;
                         }
-                        // Scalar fallback when SIMD is unavailable for this query.
                         let t_scalar = std::time::Instant::now();
                         for (k, &oi) in ord.iter().enumerate() {
                             let tw = trims[oi as usize];
@@ -677,9 +625,7 @@ fn match_fuzzy_parts(
                         }
                         STAGE.with(|c| *c.borrow_mut() = stage);
                     };
-                    // u8 end tracking wraps past byte 255: over-long
-                    // batches run the exact u16 path in 16-wide halves
-                    // (rare; windows average ~90B).
+                    // Over-long batches run the exact u16 path in 16-wide halves.
                     let score_batch = |ord: &[u32], sc_out: &mut [u16], ec_out: &mut [u16]| {
                         let mut max_len = 0usize;
                         for &oi in ord.iter() {
@@ -701,11 +647,8 @@ fn match_fuzzy_parts(
                             score_batch_w(ord, sc_out, ec_out, batch_sz, max_len);
                         }
                     };
-                    // Fan out only past Amdahl break-even at measured
-                    // dispatch cost; inside pool workers the guard below
-                    // degrades to serial (no nested storm). Batch cost is
-                    // the running measured estimate (self-tuning per box);
-                    // each slice folds its mean back in.
+                    // Fan out only past break-even; inside workers degrade to serial.
+                    // Batch cost is the running measured estimate.
                     let n_batches = order.len().div_ceil(batch_sz);
                     let batch_est = crate::dispatch::batch_ns_estimate(use_u8);
                     let pool_width = crate::parallelism::search_pool_threads();
@@ -747,8 +690,7 @@ fn match_fuzzy_parts(
                         n_batches,
                     );
 
-                    // Inverse order map into the chunk-local score arrays.
-                    // Read from the 64-byte-aligned batch outputs (true per-line).
+                    // Scatter through the inverse order map into chunk-local scores.
                     let t_scatter = std::time::Instant::now();
                     for (i, &oi) in order.iter().enumerate() {
                         scores[oi as usize] = ps_aligned[i];
@@ -771,7 +713,6 @@ fn match_fuzzy_parts(
                     PERM_ECOLS.with(|c| reclaim(&mut c.borrow_mut(), perm_ecols));
                 }
 
-                // Assemble this chunk into the match structs (no full-size hold).
                 let t_asm = std::time::Instant::now();
                 for (i, m) in matches_chunk.iter_mut().enumerate() {
                     let t = trims[i];
@@ -803,15 +744,9 @@ fn match_fuzzy_parts(
                 SCORES.with(|c| reclaim(&mut c.borrow_mut(), scores));
                 ECOLS.with(|c| reclaim(&mut c.borrow_mut(), end_cols));
             };
-            // Fused groups: gate, exact, and SW per file chunk while the
-            // chunk's bytes are hot. Concatenated in file order; outputs
-            // are per-index, so the size cannot change results.
-            // Test-tunable (`FFF_SW_CHUNK`); production plans from the
-            // same work model as the thread estimator, capped at pool
-            // width: the gate is latency-bound (SMT siblings add MLP),
-            // so width here buys wall even past the LLC-bound scan cap.
-            // Small index spaces still serialize via the amortize rule.
-            // Same outputs for any chunk size.
+            // Fused groups: gate, exact, and SW per file chunk while bytes are hot.
+            // Outputs are per-index, so chunk size cannot change results.
+            // Test-tunable (`FFF_SW_CHUNK`); production sizes from the work model at pool width.
             let per_file = crate::dispatch::match_bytes_per_file(
                 first_part.len(),
                 max_path_len,
@@ -819,24 +754,19 @@ fn match_fuzzy_parts(
             );
             let pool = crate::parallelism::effective_core_count().max(1);
             let plan = crate::dispatch::plan_files(gate_n, per_file, pool);
-            // Serial cutoff comes from the plan, unchanged: below it the
-            // fork/join alone costs more than the whole body.
+            // Serial cutoff comes from the plan: fork/join costs more than the body.
             let serial = gate_n <= plan.chunk;
             let file_chunk: usize = std::env::var("FFF_SW_CHUNK")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .filter(|&n| n >= 1)
                 .unwrap_or_else(|| {
-                    // Over-partition past one task per worker: extra groups
-                    // give work-stealing slack against stragglers and keep
-                    // each group's bytes L2-resident. Measured 4x (2-4k
-                    // sweet spot on 227k); floor bounds per-group costs.
+                    // Over-partition for work-stealing slack; floor bounds per-group costs.
                     (plan.chunk / 4).max(1024)
                 });
             let n_groups = gate_n.div_ceil(file_chunk);
             let one_group = |g: usize| {
-                // Newer keystroke owns the box: drop this slice unpaid.
-                // The caller discards the partial result either way.
+                // Newer keystrokes own the box: drop aborted slices unpaid.
                 if abort.aborted() {
                     return Vec::new();
                 }
@@ -844,9 +774,7 @@ fn match_fuzzy_parts(
                 let hi = ((g + 1) * file_chunk).min(gate_n);
                 let t = std::time::Instant::now();
                 let mut m: Vec<neo_frizbee::Match> = Vec::new();
-                // Per-group prefix-walk cache: sibling files share prefix
-                // bytes, so the prefix Myers walk runs once per dir. One
-                // cache per group (groups run on different threads).
+                // Per-group prefix-walk cache (groups run on different threads).
                 let mut pcache = crate::gate::PrefixWalkCache::new();
                 pcache.set_enabled(prefix_cache_on);
                 for k in lo..hi {
@@ -941,8 +869,7 @@ fn match_fuzzy_parts(
                     "PHASE parts gate_us={gate_us} exact_us={exact_us} swslice_us={swslice_us} fuse_us={sw_us} threads={threads} n={} prefix_hit={prefix_hit} prefix_fill={prefix_fill} prefix_skip_kb={prefix_skip_kb}",
                     matches.len()
                 );
-                // Slack census for the tight-span prototype: mean trimmed
-                // bytes per acceptor sizes the SW prize. Zero-cost when off.
+                // Census: mean trimmed bytes per acceptor sizes the SW prize.
                 let tight_files = t_tight_files.load(std::sync::atomic::Ordering::Relaxed);
                 if tight_files > 0 {
                     let trim = t_tight_trim.load(std::sync::atomic::Ordering::Relaxed);
@@ -965,8 +892,7 @@ fn match_fuzzy_parts(
 
     let total_parts = valid_parts.len() as u32;
     let mut matches = first_part_matches;
-    // Narrowing order only affects speed. When the longer part ran first,
-    // narrow with the query-order first part and keep its end_col.
+    // Narrowing order affects only speed; keep the query-order first part's end_col.
     let rest: &[&str] = if reverse_pair {
         &valid_parts[..1]
     } else {
@@ -976,9 +902,8 @@ fn match_fuzzy_parts(
         let mut part_options = *options;
         part_options.max_typos = options.max_typos.map(|t| t.min(part.len() as u16));
 
-        // Match only the files that survived the previous round, addressed
-        // through the previous matches without collecting a subset.
-        // Serial cutoff lives in the estimator (amortize rule), not here.
+        // Match only survivors, addressed through previous matches without a subset.
+        // Serial cutoff lives in the estimator, not here.
         let survivors = &matches;
         let sub_threads = effective_match_threads(
             survivors.len(),
@@ -1006,7 +931,7 @@ fn match_fuzzy_parts(
             return vec![]; // break early!
         }
 
-        // Map sub_matches back to original indices, average scores across all parts.
+        // Map back to original indices; average scores across parts.
         matches = sub_matches
             .into_iter()
             .map(|sm| {
@@ -1032,8 +957,7 @@ fn match_fuzzy_parts(
     matches
 }
 
-/// Score only `idx` (indices into `base`) — used for typing live-narrow.
-/// `total_matched` is the subset hit count.
+// Scores only `idx` for typing live-narrow; `total_matched` is the subset hit count.
 pub(crate) fn fuzzy_match_and_score_subset<'a>(
     base: &'a [FileItem],
     idx: Vec<u32>,
@@ -1056,7 +980,7 @@ pub(crate) fn fuzzy_match_and_score_subset<'a>(
     out
 }
 
-/// Match + score across base and overflow files, each with their own arena.
+// Match + score base and overflow files, each with its own arena.
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub(crate) fn fuzzy_match_and_score_files<'a>(
     files: &'a [FileItem],
@@ -1087,9 +1011,7 @@ fn fuzzy_match_and_score_files_impl<'a>(
     max_path_len: usize,
     abort: crate::parallelism::AbortToken<'_>,
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
-    // Process overflow files first: newly added files (created after the
-    // initial scan) live in the overflow arena and are more likely to be
-    // relevant to the current search. Exact ties are broken by index order.
+    // Overflow files first; exact ties break by index order.
     let (results, total_matched) = if files.len() > base_count {
         let (mut results, mut total) = match_and_score_in_arena(
             FileItems::All(&files[base_count..]),
@@ -1149,9 +1071,7 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
         return ranges_by_item;
     }
 
-    // One flat buffer for every path instead of a `String` per item. The
-    // slices below borrow `flat`, which is a local that outlives them, so
-    // no borrow has to escape and nothing is thread-local.
+    // One flat buffer for every path; slices borrow this local, so nothing escapes.
     let mut flat: Vec<u8> = Vec::with_capacity(items.iter().map(|i| i.relative_path_len()).sum());
     let mut spans: Vec<(u32, u32)> = Vec::with_capacity(items.len());
     for item in items.iter() {
@@ -1167,8 +1087,7 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
             .copy_window_to(arena, 0, want as u32, &mut flat[start..]);
         spans.push((start as u32, want as u32));
     }
-    // SAFETY: arena path bytes are valid UTF-8, the same assumption
-    // `ChunkedString::read_to_buf` already makes.
+    // SAFETY: arena path bytes are valid UTF-8, as `read_to_buf` assumes.
     let path_strs: Vec<&str> = spans
         .iter()
         .map(|&(s, l)| unsafe {
@@ -1217,8 +1136,7 @@ pub(crate) fn fuzzy_match_byte_offsets_for_page<'q>(
 }
 
 fn char_indices_to_byte_offsets(line: &str, char_indices: &[u32]) -> SmallVec<[(u32, u32); 4]> {
-    // Single forward scan: map requested char indices to byte ranges without
-    // materializing a full per-char table.
+    // Map char indices to byte ranges without a full per-char table.
     if char_indices.is_empty() {
         return SmallVec::new();
     }
@@ -1279,7 +1197,7 @@ fn merge_byte_offsets(mut ranges: SmallVec<[(u32, u32); 4]>) -> SmallVec<[(u32, 
     ranges
 }
 
-/// Resolve a DirItem's chunked path into frizbee's pointer buffer.
+// Resolve a DirItem's chunked path into frizbee's pointer buffer.
 #[inline]
 fn resolve_dir_chunks(
     dir: &DirItem,
@@ -1295,8 +1213,7 @@ fn resolve_dir_chunks(
     crate::matcher::resolve_frizbee_bytes(&dir.path, arena, buf)
 }
 
-/// Run SIMD fuzzy match across directory items, narrowing the candidate set
-/// through each query part — same pipeline as file matching.
+// Dir matching: same pipeline as file matching, narrowed per query part.
 fn match_fuzzy_parts_dirs(
     fuzzy_parts: &[&str],
     working_dirs: &[&DirItem],
@@ -1305,7 +1222,7 @@ fn match_fuzzy_parts_dirs(
     arena: ArenaPtr,
     overflow_arena: ArenaPtr,
 ) -> Vec<neo_frizbee::Match> {
-    // Stack for the common 1-2 part queries; spills rarely.
+    // 1-2 part queries fit on the stack.
     let valid_parts: SmallVec<[&str; 4]> = fuzzy_parts
         .iter()
         .copied()
@@ -1350,10 +1267,7 @@ fn match_fuzzy_parts_dirs(
         let mut part_options = *options;
         part_options.max_typos = options.max_typos.map(|t| t.min(part.len() as u16));
 
-        // Match only the dirs that survived the previous round, addressed
-        // through the previous matches without collecting a subset.
-        // Bound by the corpus max (O(1)): over-estimate saturates the
-        // cap, never under-provisions.
+        // Match only surviving dirs without a subset; bound by the corpus max (O(1)).
         let survivors = &matches;
         let sub_dir_threads = effective_match_threads(
             survivors.len(),
@@ -1377,7 +1291,7 @@ fn match_fuzzy_parts_dirs(
             return vec![];
         }
 
-        // Map sub_matches back to original indices, average scores across all parts.
+        // Map back to original indices; average scores across parts.
         matches = sub_matches
             .into_iter()
             .map(|sm| {
@@ -1398,8 +1312,7 @@ fn match_fuzzy_parts_dirs(
     matches
 }
 
-/// Match + score directories against a fuzzy query.
-/// Scoring: base_score, frecency_boost, distance_penalty, dirname_bonus.
+// Match + score directories: base, frecency boost, distance penalty, dirname bonus.
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub(crate) fn fuzzy_match_and_score_dirs<'a>(
     dirs: &'a [DirItem],
@@ -1433,7 +1346,7 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
         }
     };
 
-    // Stack for the common 1-2 part queries; spills rarely.
+    // 1-2 part queries fit on the stack.
     let valid_parts: SmallVec<[&str; 4]> = fuzzy_parts
         .iter()
         .copied()
@@ -1486,7 +1399,6 @@ pub(crate) fn fuzzy_match_and_score_dirs<'a>(
             let base_score = path_match.score as i32;
             let frecency_boost = base_score.saturating_mul(dir.max_access_frecency()) / 100;
 
-            // Distance penalty from current file's directory.
             let distance_penalty = if context.current_file.is_some() {
                 dir.path.write_to_string(dir_arena, &mut dir_buf);
                 calculate_distance_penalty(context.current_file, &dir_buf)
@@ -1571,7 +1483,7 @@ fn score_dirs_by_frecency<'a>(
     sort_and_paginate_dirs(results, context)
 }
 
-/// Sort dir results by total score (descending) and apply pagination.
+// Sort dir results by total score (descending) and apply pagination.
 fn sort_and_paginate_dirs<'a>(
     mut results: Vec<(&'a DirItem, Score)>,
     context: &ScoringContext,
@@ -1680,8 +1592,7 @@ fn match_and_score_in_arena<'a>(
     let has_uppercase = fuzzy_parts
         .iter()
         .any(|p| p.chars().any(|c| c.is_uppercase()));
-    // Users type `/` regardless of platform. Checking the OS separator alone
-    // would miss forward-slash queries on Windows.
+    // Users type `/` on every platform; the OS separator alone misses Windows queries.
     let query_contains_path_separator = fuzzy_parts
         .iter()
         .any(|p| p.contains('/') || p.contains(MAIN_SEPARATOR));
@@ -1735,8 +1646,7 @@ fn match_and_score_in_arena<'a>(
         ));
     }
 
-    // Expose file indices for typing live-narrow (Match(longer,T) ⊆
-    // Match(shorter,T) when T is unchanged).
+    // Capture indices for live-narrow: Match(longer,T) is a subset of Match(shorter,T).
     let t_capture = std::time::Instant::now();
     crate::score::capture_hit_indices(
         path_matches
@@ -1748,8 +1658,7 @@ fn match_and_score_in_arena<'a>(
     let t_fallback = std::time::Instant::now();
     let main_needle = fuzzy_parts[0].as_bytes(); // safe
     let main_needle_len = main_needle.len() as u16;
-    // Collapsed queries force filename/evidence bonuses to 0, so the
-    // fallback matcher is skipped without changing ranking.
+    // Collapsed queries zero filename/evidence bonuses, so skipping fallback keeps ranking.
     let rank_collapsed = {
         let n_files = working_files.len().max(1);
         path_matches.len() >= 4096
@@ -1764,18 +1673,14 @@ fn match_and_score_in_arena<'a>(
     {
         vec![]
     } else if !path_matches.iter().any(|path_match| {
-        // Fallback only matters when the path hit ends before the
-        // filename; all filename hits means no fallback can fire.
+        // Fallback matters only when a path hit ends before the filename.
         let file = working_files.index(path_match.index as usize);
         let filename_start = file.filename_offset_in_relative_path() as u16;
         path_match.end_col.saturating_sub(main_needle_len - 1) < filename_start
     }) {
         vec![]
     } else {
-        // One reused buffer for all fallback filenames instead of a `Cow` per
-        // candidate. `filename_cow` heap-allocates whenever the filename
-        // straddles a 16-byte chunk boundary, and this loop runs over every
-        // match - ~125ns per candidate on a mid-sized corpus.
+        // One reused buffer for all fallback filenames; `Cow` heap-allocates on chunk straddle.
         let mut name_buf: Vec<u8> = Vec::new();
         let mut name_spans: Vec<(u32, u32)> = Vec::new();
 
@@ -1800,21 +1705,16 @@ fn match_and_score_in_arena<'a>(
         if name_spans.is_empty() {
             vec![]
         } else {
-            // Match on `&str` so frizbee reuses the instantiation its index
-            // resolver already emits instead of a separate `Cow<str>` copy.
+            // Match on `&str` to reuse frizbee's resolver instantiation, avoiding a `Cow` copy.
             let filename_strs: Vec<&str> = name_spans
                 .iter()
                 .map(|&(s, l)| {
                     let s = s as usize;
-                    // SAFETY: arena path bytes are valid UTF-8, the same
-                    // assumption `ChunkedString::read_to_buf` already makes.
+                    // SAFETY: arena path bytes are valid UTF-8, as `read_to_buf` assumes.
                     unsafe { std::str::from_utf8_unchecked(&name_buf[s..s + l as usize]) }
                 })
                 .collect();
-            // Thread count from the calibrated work estimate, which accounts
-            // for path length, needle length and typo budget. A bare match
-            // count leaves this serial on the mid-size corpora where the
-            // fallback actually runs.
+            // Thread count from the work estimate (lengths + typo budget), not a bare count.
             let fb_threads = effective_match_threads(
                 filename_strs.len(),
                 fuzzy_parts[0].len(),
@@ -1829,10 +1729,8 @@ fn match_and_score_in_arena<'a>(
         }
     };
 
-    // Map filename-fallback hits by path-match index for O(1) lookup
-    // in the scoring loop. Match-list order is irrelevant to the table.
-    // Skip the table entirely when nothing fell back — common on filename-hit
-    // queries like `file_picker_`.
+    // Index fallback hits by path-match index for O(1) lookup.
+    // Skip the table when nothing fell back.
     let fallback_us = t_fallback.elapsed().as_micros();
     if phase_timing {
         phase_log(format!(
@@ -1854,15 +1752,9 @@ fn match_and_score_in_arena<'a>(
         hit
     };
 
-    // Ranking demotion for files under a third-party dependency directory.
-    // Sized to outrank the bonuses a vendored namesake can accumulate
-    // (filename + evidence + path alignment) without displacing a genuinely
-    // better first-party match (see VENDORED_PATH_PENALTY).
+    // Demote third-party dirs: outranks vendored bonuses without displacing better first-party matches.
 
-    // Third buffer is the filename scratch. It has to be separate from
-    // `path_buf`: on the common path (`need_rel == false`) the filename is
-    // materialised here while `path_buf` stays free for a later relative-path
-    // read, and one buffer cannot serve both borrows at once.
+    // Separate filename scratch: one buffer cannot serve both borrows at once.
     type ScoreScratch = (
         String,
         [u8; crate::simd_path::PATH_BUF_SIZE],
@@ -1878,38 +1770,28 @@ fn match_and_score_in_arena<'a>(
         )
     };
 
-    // Ranking-feature collapse: when the query hit nearly every path, skip per-hit
-    // filename arena reads (filename_cow / special-entry) and intent evidence.
-    //
-    // This is a ratio, not a time budget, and that is deliberate. The ratio
-    // carries real signal: when ~99% of files match, per-candidate features
-    // cannot discriminate the top
-    // page, so the 25-40 ns each costs buys nothing. Measured: 7.9 ns/candidate
-    // collapsed vs 37.9 ns uncollapsed. The cliff between them is the cost.
+    // Ranking-feature collapse: when the query hits nearly every path, per-hit
+    // filename reads and intent evidence cannot discriminate the top page, so skip them.
     let query_intent =
         crate::intent::detect_intent(context.effective_query(), context.current_file, true);
     let main_needle_as_str = context.effective_query();
-    // Query-constant evidence state, built once instead of per candidate.
+    // Query-constant evidence state, built once.
     let prepared_query = crate::intent::PreparedQuery::new(main_needle_as_str);
-    // Combo target bytes are query-constant; hoist the view out of the
-    // per-candidate closure instead of re-deriving it per file.
+    // Combo target is query-constant; hoist it out of the per-candidate closure.
     let combo_last: Option<&[u8]> = context
         .last_same_query_match
         .as_ref()
         .map(|m| m.file_path.as_os_str().as_encoded_bytes());
-    // Evidence memo is exact only when evidence ignores the path: the
-    // proximity terms need an open file and the structure terms need
-    // Path intent, so both must be off. Epoch retires the table per query.
+    // Memo is exact only when evidence ignores the path: no open file, no Path intent.
+    // Epoch retires the table per query.
     let memo_epoch = MEMO_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let memo_active = std::env::var_os("FFF_NO_EVIDENCE_MEMO").is_none()
         && query_intent != crate::intent::QueryIntent::Path
         && context.current_file.is_none();
     SCORE_PROF.store(phase_timing, std::sync::atomic::Ordering::Relaxed);
 
-    // Current-file dir split once per query; penalties memoized per
-    // parent dir in thread-local scratch (dirs repeat across candidates).
+    // Split the current-file dir once; penalties memoized per parent dir.
     let cur_dir = CurrentDir::new(context.current_file);
-    // Pure query constants; hoisted out of the per-candidate closure.
     let need_rel_q = (query_contains_path_separator && main_needle.len() > 10)
         || context.last_same_query_match.is_some()
         || (!rank_collapsed
@@ -1960,25 +1842,15 @@ fn match_and_score_in_arena<'a>(
         let is_filename_match = end_col_filename_match || simd_filename_match.is_some();
         let fname_off = file.path.filename_offset as usize;
         let fname_len = file.path.byte_len as usize - fname_off;
-        // The full relative path is needed by the path-alignment suffix
-        // test, by the intent evidence (path intent or an open file) and by
-        // the combo test. Materialize it once and slice the filename out
-        // of it, instead of each consumer re-reading the path and the
-        // filename going through filename_cow (which heap-allocates
-        // whenever the filename straddles a chunk boundary).
-        // Only the suffix test, the combo test and path-shaped evidence
-        // need the full path; collapsed queries with only an open file skip it.
+        // The full path serves the suffix test, combo test, and path-shaped evidence;
+        // materialize it once and slice the filename out of it.
         let need_rel = need_rel_q;
         let rel: Option<&str> = if need_rel {
             Some(file.path.read_to_buf(arena, path_buf))
         } else {
             None
         };
-        // When nothing else needs the path, borrow the filename straight
-        // out of the arena when it fits a chunk and copy into scratch
-        // otherwise. `filename_cow` heap-allocated on that second path,
-        // which for a repo whose prefixes straddle chunk boundaries is every
-        // candidate - 47ns/candidate on linux-kernel vs 8ns on sumo.
+        // Otherwise borrow the filename from the arena, copying to scratch on chunk straddle.
         let fname: Option<&str> = if rank_collapsed {
             None
         } else if let Some(r) = rel {
@@ -2038,10 +1910,8 @@ fn match_and_score_in_arena<'a>(
             }
         };
 
-        // Path alignment bonus: when the query looks like a file path,
-        // reward candidates whose path closely matches the typed query.
-        // Uses suffix overlap — bytes matching from the end. A full prefix
-        // match is the 100% coverage case, so no separate branch is needed.
+        // Path alignment: reward suffix overlap with the typed query;
+        // a full prefix match is the 100% case, needing no separate branch.
         let path_alignment_bonus = if query_contains_path_separator && main_needle.len() > 10 {
             let path_bytes = rel.unwrap_or("").as_bytes();
             let common_suffix = main_needle
@@ -2066,9 +1936,7 @@ fn match_and_score_in_arena<'a>(
             0
         };
 
-        // Intent evidence: filename/ext/segments/role mixed per job.
-        // Memoized by filename when the path terms are dead (see
-        // memo_active): repeated names share one computation exactly.
+        // Intent evidence mixed per job; memoized by filename when path terms are dead.
         let evidence_bonus = if rank_collapsed {
             0
         } else if memo_active {
@@ -2140,9 +2008,7 @@ fn match_and_score_in_arena<'a>(
             },
         };
 
-        // Score-shape census: which terms actually fire. One branch when
-        // off; counts aim the remaining per-match cost (materialization
-        // vs ALU). Timing-gated like the rest of the profiler.
+        // Score-shape census: which terms fire; timing-gated like the profiler.
         if SCORE_PROF.load(std::sync::atomic::Ordering::Relaxed) {
             let bump = |c: &std::sync::atomic::AtomicU64| {
                 c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2165,9 +2031,7 @@ fn match_and_score_in_arena<'a>(
         (file, score)
     };
 
-    // Keep only the best `offset+limit` scored rows in a min-heap so we never
-    // materialize 200k+ Score structs for a 100-item page. total_matched is
-    // still the full path_matches count.
+    // Min-heap keeps only offset+limit rows; `total_matched` still counts every match.
     let page_cap = context
         .pagination
         .offset
@@ -2177,11 +2041,9 @@ fn match_and_score_in_arena<'a>(
             usize::MAX / 4
         })
         .saturating_add(1);
-    // Heap algorithm chosen on work alone (page-bounded: O(n log k) vs
-    // O(n log n)); serial vs parallel comes from the dispatch plan below.
+    // Heap on work alone (O(n log k) vs O(n log n)); serial vs parallel from dispatch.
     let use_topk = page_cap < path_matches.len();
-    // Per-match cost is the path bytes each item materializes plus the
-    // score struct; `max_threads == 1` forces serial, else pool width.
+    // Per-match cost is path bytes plus struct; `max_threads == 1` forces serial.
     let score_bytes =
         crate::dispatch::sampled_path_avg(&working_files) + std::mem::size_of::<Score>();
     let score_cap = if context.max_threads == 1 {
@@ -2257,11 +2119,8 @@ fn match_and_score_in_arena<'a>(
                 consider(&mut heap, item);
             }
         } else {
-            // Fold into per-worker heaps sized page_cap and reduce. Avoids
-            // materializing all Score structs only to keep the top 100.
-            // Ranking stays exact (same comparator).
-            // scratch stays per-thread via map_init — do NOT carry it in the
-            // fold accumulator (4 KB × rayon tree overflowed the worker stack).
+            // Per-worker heaps sized page_cap, reduced after; ranking stays exact.
+            // Scratch stays per-thread via map_init, never in the fold accumulator.
             let (par_heap, par_skipped) = crate::parallelism::run_on_search_pool(|| {
                 use rayon::prelude::*;
                 let chunk = score_plan.chunk.max(1);
@@ -2327,9 +2186,7 @@ fn match_and_score_in_arena<'a>(
             .into_iter()
             .map(|Reverse(r)| (r.file, r.score))
             .collect();
-        // The parallel top-k heap plus `sort_unstable_by` leaves equal-scored
-        // candidates in arbitrary order. Ordering among equals is not a ranking
-        // decision, so it only needs to be reproducible.
+        // Equal scores order arbitrarily; among equals only reproducibility matters.
         results.sort_unstable_by(|a, b| {
             b.1.total
                 .cmp(&a.1.total)
@@ -2400,8 +2257,7 @@ fn match_and_score_in_arena<'a>(
     (results, n)
 }
 
-/// Heap entry for page-bounded top-k: full `Ord` (total, modified, stamp)
-/// makes the kept set exact and deterministic; `stamp` is `path_rank`.
+// Top-k heap entry: full `Ord` (total, modified, stamp) keeps the set exact.
 struct Ranked<'a> {
     total: i32,
     stamp: u64,
@@ -2442,7 +2298,6 @@ fn merge<'a>(mut a: Heap<'a>, b: Heap<'a>, page_cap: usize) -> Heap<'a> {
     a
 }
 
-// Take a thread-local scratch buffer, sized for at least min_cap.
 fn take_tls<T: Default>(cell: &std::cell::RefCell<Vec<T>>, min_cap: usize) -> Vec<T> {
     let mut b = cell.borrow_mut();
     b.clear();
@@ -2452,9 +2307,8 @@ fn take_tls<T: Default>(cell: &std::cell::RefCell<Vec<T>>, min_cap: usize) -> Ve
     std::mem::take(&mut *b)
 }
 
-// Length without zero-fill (release): the caller must overwrite every lane
-// before any read. Debug builds zero-fill instead, so a missed write skews
-// parity tests rather than reading garbage.
+// Length without zero-fill: caller must overwrite every lane before any read.
+// Debug builds zero-fill instead, skewing parity tests on a missed write.
 fn set_len_uninit<T: Default>(v: &mut Vec<T>, n: usize) {
     debug_assert!(v.is_empty());
     v.reserve(n.saturating_sub(v.capacity()));
@@ -2468,9 +2322,7 @@ fn set_len_uninit<T: Default>(v: &mut Vec<T>, n: usize) {
     }
 }
 
-// Stable tie-break key for equal scores. `sort_unstable_by` gives no order
-// among equals, so without this the parallel path emitted different orderings
-// run to run (observed: two files at 144 swapping between runs of one binary).
+// Stable tie-break for equal scores; `sort_unstable_by` alone orders runs differently.
 #[inline]
 fn path_rank(file: &FileItem) -> u64 {
     file.path.rank_key()
@@ -2485,8 +2337,7 @@ fn evidence_ub_for(base: i32, intent: crate::intent::QueryIntent, collapsed: boo
     let base = base.max(1);
     match intent {
         crate::intent::QueryIntent::FileName => {
-            // exact_filename (+b) and filename_substring (+b/3) are
-            // if/else in evidence_bonus, so the exact branch dominates.
+            // Mirrors evidence_bonus, where the exact branch dominates the substring one.
             base + base / 5 + base / 4
         }
         crate::intent::QueryIntent::Path => base / 2 + base / 5 + base / 10 + base / 2,
@@ -2518,7 +2369,7 @@ fn ub_total_for(
         .saturating_add(combo)
 }
 
-/// Byte compare avoids materializing a `String` per scored match.
+// Byte compare avoids materializing a `String` per scored match.
 fn is_special_entry_point_bytes(filename: &[u8]) -> bool {
     matches!(
         filename,
@@ -2547,8 +2398,7 @@ fn score_filtered_by_frecency<'a>(
     context: &ScoringContext,
     arena: ArenaPtr,
 ) -> (Vec<(&'a FileItem, Score)>, usize) {
-    // Working-set queries are constant (""); build the query state once
-    // instead of per file inside `evidence_for`.
+    // Working-set queries are constant (""); build the state once.
     let pq = crate::intent::PreparedQuery::new("");
     let score_file = |file: &'a FileItem| {
         let total_frecency_score = file.access_frecency_score as i32
@@ -2609,9 +2459,8 @@ fn score_filtered_by_frecency<'a>(
         (file, score)
     };
 
-    // Sound upper bound from register-resident fields only: no arena
-    // walk, no path materialization. Penalties are <= 0, so ignoring them
-    // keeps the bound above every actual total (ranking stays exact).
+    // Sound upper bound from register fields only; ignored penalties are <= 0,
+    // so the bound stays above every actual total.
     let has_current = context.current_file.is_some();
     let ub_file = |file: &FileItem| {
         let freq = file.access_frecency_score as i32
@@ -2635,8 +2484,7 @@ fn score_filtered_by_frecency<'a>(
             .saturating_add(evidence)
     };
 
-    // Page-bounded top-k like the fuzzy path: never materialize n Scores
-    // for a 100-item page. `total` still counts every live file.
+    // Page-bounded top-k as in the fuzzy path; `total` still counts every live file.
     let page_cap = context
         .pagination
         .offset
@@ -2648,8 +2496,7 @@ fn score_filtered_by_frecency<'a>(
         .saturating_add(1);
     let use_topk = page_cap < files.len();
     let no_prune = std::env::var_os("FFF_NO_PRUNE").is_some();
-    // Dispatch plan shared by both frecency loops below: sampled path
-    // bytes plus the score struct per item.
+    // Dispatch plan shared by both frecency loops below.
     let fre_bytes =
         crate::dispatch::sampled_path_avg(files) + std::mem::size_of::<Score>();
     let fre_cap = if context.max_threads == 1 {
@@ -2810,9 +2657,7 @@ fn calculate_current_file_penalty(
     penalty
 }
 
-/// Sorts elements by total score (descending) and returns the requested page.
-/// Always returns results in descending order (best scores first).
-/// The UI layer handles rendering order based on prompt position.
+// Descending page; the UI handles prompt-position rendering order.
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 fn sort_and_paginate<'a>(
     results: Vec<(&'a FileItem, Score)>,
@@ -2830,7 +2675,6 @@ fn sort_and_paginate<'a>(
         total_matched
     };
 
-    // Check if offset is out of bounds
     if offset >= total_matched {
         tracing::warn!(
             offset = offset,
@@ -2842,10 +2686,8 @@ fn sort_and_paginate<'a>(
     }
 
     let items_needed = offset.saturating_add(limit).min(total_matched);
-    // Use partial sort if we need less than half the results and dataset is large
     let use_partial_sort = items_needed < total_matched / 2 && total_matched > 100;
-    // Rank on lightweight indices so the sort never moves fat Scores;
-    // same (total, modified) keys, so ordering is bit-identical.
+    // Rank on lightweight indices; same keys, so ordering is bit-identical.
     let mut order: Vec<u32> = (0..results.len() as u32).collect();
     let mut cmp_idx = |a: &u32, b: &u32| {
         let (fa, sa) = &results[*a as usize];
@@ -2853,22 +2695,17 @@ fn sort_and_paginate<'a>(
         sb.total
             .cmp(&sa.total)
             .then_with(|| fb.modified.cmp(&fa.modified))
-            // Total order: parallel matching yields scheduling-dependent
-            // input order, so ties fall back to file address (index order).
+            // Ties fall back to file address: parallel input order is scheduling-dependent.
             .then_with(|| std::ptr::from_ref(*fa).cmp(&std::ptr::from_ref(*fb)))
     };
-    // Always sort in descending order (best scores first)
     if use_partial_sort {
-        // Partition at position (items_needed - 1) with descending comparator
-        // This puts the highest N needed items at the front
         order.select_nth_unstable_by(items_needed - 1, &mut cmp_idx);
         order.truncate(items_needed);
     }
 
-    // select nth does not sort the results, we have to sort accordingly anyway
+    // select_nth only partitions; sort the head too.
     sort_with_buffer(&mut order, &mut cmp_idx);
 
-    // in the best scenario truncation happened in the select_nth step
     if offset > 0 {
         order.drain(..offset.min(order.len()));
     }
@@ -2929,10 +2766,8 @@ static PROF_EXACT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 static PROF_COMBO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PROF_SCORED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-// Filename-keyed evidence cache. Sound only when evidence is a pure
-// function of (query, filename): non-Path intent with no open file, so
-// the path-dependent terms are dead. Hash collisions just replace the
-// slot; the stored key is always verified, so outputs stay exact.
+// Filename-keyed evidence cache; sound only for pure (query, filename) evidence.
+// Collisions replace the slot; the stored key is always verified.
 fn memoized_evidence(
     epoch: u64,
     fname: &str,
@@ -2975,8 +2810,7 @@ mod tests {
     use crate::types::PaginationArgs;
     use fff_query_parser::QueryParser;
 
-    // Upstream-engine equality cannot hold here: this engine SW-rescores
-    // the first pass, so the narrowed pass mixes scales by design.
+    // Cross-engine equality cannot hold: this engine SW-rescores, mixing scales by design.
     #[ignore = "cross-path SW-vs-frizbee equality; engine mixes scales by design"]
     #[test]
     fn longer_second_part_preserves_matches_and_first_part_positions() {
@@ -3348,7 +3182,6 @@ mod tests {
 
     #[test]
     fn test_partial_sort_descending() {
-        // Create test data with known scores
         let (test_data, arena) = make_test_files(&[
             ("file1.rs", 100, 1000),
             ("file2.rs", 200, 2000),
@@ -3362,7 +3195,6 @@ mod tests {
             ("file10.rs", 90, 10000),
         ]);
 
-        // Convert to references like the actual function uses
         let results: Vec<(&FileItem, Score)> = test_data
             .iter()
             .map(|(file, score)| (file, score.clone()))
@@ -3386,18 +3218,15 @@ mod tests {
             },
         };
 
-        // Test with full sort - returns all results sorted descending
         let total = results.len();
         let (items, scores, total) = sort_and_paginate(results.clone(), &context, total);
 
-        // Should return all 10 items sorted by score descending
         assert_eq!(total, 10);
         assert_eq!(scores.len(), 10);
         assert_eq!(scores[0].total, 300, "First should be highest score");
         assert_eq!(scores[1].total, 250, "Second should be second highest");
         assert_eq!(scores[2].total, 200, "Third should be third highest");
 
-        // Verify the files match
         assert_eq!(items[0].relative_path(arena), "file4.rs");
         assert_eq!(items[1].relative_path(arena), "file6.rs");
         assert_eq!(items[2].relative_path(arena), "file2.rs");
@@ -3440,7 +3269,6 @@ mod tests {
         let n = results.len();
         let (items, scores, _) = sort_and_paginate(results, &context, n);
 
-        // Should return all 5 items sorted: 200(9000), 200(1000), 100(8000), 100(5000), 100(3000)
         assert_eq!(scores.len(), 5);
         assert_eq!(scores[0].total, 200);
         assert_eq!(items[0].modified, 9000, "First 200 should be newest");
@@ -3456,7 +3284,6 @@ mod tests {
 
     #[test]
     fn test_no_partial_sort_for_small_results() {
-        // When results.len() <= threshold, should use regular sort
         let (test_data, arena) = make_test_files(&[
             ("file1.rs", 100, 1000),
             ("file2.rs", 200, 2000),
@@ -3486,7 +3313,6 @@ mod tests {
             },
         };
 
-        // Returns all results sorted descending
         let n = results.len();
         let (items, scores, _) = sort_and_paginate(results, &context, n);
 
@@ -3515,8 +3341,7 @@ mod tests {
             sort: neo_frizbee::SortStrategy::Unsorted,
             ..Default::default()
         };
-        // Sorted (index, score) pairs per query order. end_col stays
-        // query-order-first by design, so it is excluded here.
+        // Pairs exclude end_col: it stays query-order-first by design.
         let run = |parts: &[&str]| {
             let mut pairs: Vec<(u32, u16)> = match_fuzzy_parts(
                 parts,
@@ -3700,7 +3525,7 @@ mod filename_bonus_tests {
         (result, arena)
     }
 
-    /// Run `fuzzy_match_and_score_files` with production-like max_typos scaling.
+    // Run `fuzzy_match_and_score_files` with production-like max_typos scaling.
     fn search(files: &[FileItem], query: &str, arena: ArenaPtr) -> Vec<(String, Score)> {
         let parser = QueryParser::default();
         let parsed = parser.parse(query);
@@ -3810,8 +3635,6 @@ mod filename_bonus_tests {
         );
     }
 
-    /// Regression: full-path query should rank the near-exact path match first.
-    /// https://x.com/mbarneyjr/status/2043474268390817861
     #[test]
     fn test_full_path_query_prefers_closer_filename_match() {
         let (files, arena) = make_files_with_frecency(&[
@@ -3861,10 +3684,8 @@ mod filename_bonus_tests {
         );
     }
 
-    /// Regression: PR #652 / field panic in pi-fff v0.9.6.
-    /// A path >512 bytes (but within PATH_MAX) overflows the fixed
-    /// `[*const u8; 32]` chunk-pointer buffer during scoring and panics with
-    /// "index out of bounds: the len is 32 but the index is 32".
+    // Paths past 512B overflowed the fixed 32 chunk-pointer buffer;
+    // must not panic and must still match.
     #[test]
     fn test_path_longer_than_512_bytes_does_not_panic_and_matches() {
         let mut long_path = String::new();
@@ -3876,7 +3697,6 @@ mod filename_bonus_tests {
 
         let (files, arena) = make_files(&[long_path.as_str(), "src/other.rs"]);
 
-        // Panics here on unfixed code: frizbee resolves chunk ptrs per file.
         let results = search(&files, "needle", arena);
 
         assert!(
@@ -3994,8 +3814,7 @@ mod git_recency_scoring_tests {
 
     #[test]
     fn recency_boost_breaks_ties_between_equal_fuzzy_matches() {
-        // Dir names share no letters with the query so both paths fuzzy-match
-        // identically and only the recency boost separates them.
+        // Dir names share no query letters, so only recency separates them.
         let (files, arena) = make_files(&[("src/xxx/handler.rs", 0), ("src/yyy/handler.rs", 5)]);
 
         let results = search(&files, "handler", arena);
@@ -4105,7 +3924,6 @@ mod typo_resistance_tests {
             "src/config/feature_flags.rs",
         ]);
 
-        // Exact substring — must always match
         let results = search_with_typos(&files, "bid_comparison", arena, 6);
         assert!(
             results
@@ -4114,10 +3932,6 @@ mod typo_resistance_tests {
             "exact substring 'bid_comparison' should match, got: {results:?}"
         );
 
-        // Concatenated query with typos — the real-world scenario.
-        // "bidcomparsionsupplierpartcostmodfiers" is a smushed version of
-        // "bid_comparison_supplier_part_cost_modifiers" with 2 typos
-        // (comparison → comparison, modifiers → modifiers).
         let results = search_with_typos(&files, "bidcomparsionsupplierpartcostmodfiers", arena, 6);
         assert!(
             results
@@ -4126,14 +3940,12 @@ mod typo_resistance_tests {
             "typo query 'bidcomparsionsupplierpartcostmodfiers' should match, got: {results:?}"
         );
 
-        // Shorter typo query
         let results = search_with_typos(&files, "bidcomp", arena, 4);
         assert!(
             results.iter().any(|p| p.contains("bid_comparison")),
             "'bidcomp' should match bid_comparison file, got: {results:?}"
         );
 
-        // Query with missing underscores
         let results = search_with_typos(&files, "supplierpartcost", arena, 6);
         assert!(
             results
@@ -4265,14 +4077,9 @@ mod constraint_only_query_tests {
     }
 }
 
-/// Executable ranking policy. If these fail, result order changed —
-/// update this spec deliberately, not as a side effect of a perf patch.
-///
-/// Policy (base = SW score):
-/// 1. exact filename match > fuzzy filename match > path-only match
-/// 2. at equal match quality, higher frecency wins
-/// 3. special entry-point names (mod.rs, index.ts, …) beat ordinary
-///    path-only matches but lose to filename hits
+// Ranking policy (base = SW score): exact filename > fuzzy filename > path-only;
+// at equal quality frecency wins; entry points beat path-only but lose to filename hits.
+// If these fail, update this spec deliberately, not as a perf side effect.
 #[cfg(test)]
 mod ranking_policy_tests {
     use super::*;
@@ -4369,7 +4176,7 @@ mod ranking_policy_tests {
         );
     }
 
-    /// Job: "I know the name + ext" — exact stem+ext wins over wrong ext.
+    // Job: "I know the name + ext" — exact stem+ext wins over wrong ext.
     #[test]
     fn filename_intent_prefers_matching_extension() {
         let (files, arena) = make(&[
@@ -4384,7 +4191,7 @@ mod ranking_policy_tests {
         );
     }
 
-    /// Job: "I know the path" — segment hits beat scattered letters.
+    // Job: "I know the path" — segment hits beat scattered letters.
     #[test]
     fn path_intent_prefers_segment_sequence() {
         let (files, arena) = make(&[("xsrc/xauth/xlogin.rs", 0), ("src/auth/login.rs", 0)]);
@@ -4395,7 +4202,7 @@ mod ranking_policy_tests {
         );
     }
 
-    /// Job: "I know the concept" — filename words beat path-only scatter.
+    // Job: "I know the concept" — filename words beat path-only scatter.
     #[test]
     fn concept_intent_prefers_filename_words() {
         let (files, arena) = make(&[("src/hidden/handler_util.rs", 0), ("src/api/handler.rs", 0)]);
@@ -4406,7 +4213,7 @@ mod ranking_policy_tests {
         );
     }
 
-    /// Job: "I want the test for this role" — role keyword ranks test files up.
+    // Job: "I want the test for this role" — role keyword ranks test files up.
     #[test]
     fn concept_test_role_ranks_test_files() {
         let (files, arena) = make(&[("src/user.rs", 0), ("src/user_test.rs", 0)]);
@@ -4416,7 +4223,7 @@ mod ranking_policy_tests {
             "role=test should prefer test file, got {order:?}"
         );
     }
-    /// MRR-style: first result must be the intended file for each job.
+    // MRR-style: first result must be the intended file for each job.
     #[test]
     fn mrr_jobs_first_result_is_intended() {
         let (files, arena) = make(&[
@@ -4468,8 +4275,7 @@ mod topk_prune_tests {
         (result, arena)
     }
 
-    // Frecency corpus with distinct totals (no ties): unique access scores,
-    // zero modification/git, identical mtimes. Empty query ranks by score.
+    // Frecency corpus with distinct totals; empty query ranks by score.
     fn make_frecency(n: usize) -> (Vec<FileItem>, ArenaPtr) {
         let paths: Vec<String> =
             (0..n).map(|i| format!("src/g{i}/data_{i}.log")).collect();
@@ -4602,16 +4408,13 @@ mod topk_prune_tests {
 
     #[test]
     fn wide_windows_split_to_u16_and_agree_across_threads() {
-        // Windows past 256B cannot run the u8 kernel (byte column
-        // tracking); dispatch splits them into exact u16 halves.
-        // Identical lanes must score identically (chunk/stride
-        // misalignment breaks symmetry) under any threading. Under
-        // FFF_FORCE_SCALAR the split is idle but plumbing still pins.
+        // Windows past 256B split into exact u16 halves; identical lanes must score
+        // identically under any threading.
         let long: String = format!("src/{}/file.rs", "a".repeat(280));
         let paths: Vec<String> = (0..20).map(|_| long.clone()).collect();
         let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
         let (files, arena) = make_paths(&refs);
-        // "aa" with max_typos=2 has need==0: full-path windows (~290B).
+        // "aa" with max_typos=2 has need==0: full-path windows.
         let (a1, s1, t1) = search_limit(&files, "aa", arena, 1, None, 50);
         assert_eq!(t1, 20, "all long files must match");
         assert_eq!(a1.len(), 20);
@@ -4631,8 +4434,7 @@ mod topk_prune_tests {
 
     #[test]
     fn collapsed_skips_filename_bonus() {
-        // Collapsed (>=4096 matches at >=85% rate, needle <=8) forces
-        // filename/evidence bonuses to 0, so the fallback skip is exact.
+        // Collapsed queries zero filename/evidence bonuses, so the fallback skip is exact.
         let mut paths = Vec::new();
         for i in 0..5000 {
             paths.push(format!("src/ab/file_{i}.rs"));
@@ -4687,7 +4489,6 @@ mod topk_prune_tests {
         for q in ["handler", "mod handler"] {
             for threads in [1usize, 4] {
                 let (on_items, on_scores) = search_with(&files, q, arena, threads, None);
-                // Both paths rank identically (asserted below).
                 unsafe {
                     std::env::set_var("FFF_NO_PRUNE", "1");
                 }
@@ -4704,9 +4505,7 @@ mod topk_prune_tests {
 
     #[test]
     fn evidence_memo_hatch_ranks_identically() {
-        // Memo shares evidence across repeated filenames; outputs must
-        // equal a fresh computation. Path intent and open-file legs run
-        // the memo-inactive path and must match too.
+        // Memo must equal fresh computation, including the memo-inactive legs.
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _held = ENV_LOCK.lock().unwrap();
         let mut paths = Vec::new();
@@ -4772,8 +4571,6 @@ mod topk_prune_tests {
     #[test]
     fn fused_groups_match_regardless_of_size() {
         // Group outputs are per-index, so group size cannot change results.
-        // Size 8 also covers the scalar lane path. Same race-safety
-        // argument as the hatch test above.
         let paths: Vec<String> = (0..1500)
             .map(|i| format!("src/mod{}/Handler_{}.rs", i % 37, i % 50))
             .collect();
@@ -4806,8 +4603,7 @@ mod topk_prune_tests {
 
     #[test]
     fn gate_prefilter_hatch_ranks_identically() {
-        // Fused path honors FFF_NO_GATE_PREFILTER; pretest is sound so
-        // both paths rank identically.
+        // Pretest is sound, so both prefilter settings rank identically.
         let paths: Vec<String> = (0..1500)
             .map(|i| format!("src/mod{}/Handler_{}.rs", i % 37, i % 50))
             .collect();
@@ -4832,9 +4628,7 @@ mod topk_prune_tests {
 
     #[test]
     fn frecency_topk_matches_full_ranking() {
-        // Empty query takes the frecency path. Heap page (limit 50) must
-        // equal the full-ranking prefix (limit 0), on both thread counts,
-        // with and without a current file (evidence on/off).
+        // Heap page must equal the full-ranking prefix, on both thread counts, with and without a current file.
         let (files, arena) = make_frecency(6000);
         for threads in [1usize, 4] {
             let (items, scores, total) = search_limit(&files, "", arena, threads, None, 50);
@@ -4874,8 +4668,7 @@ mod topk_prune_tests {
         }
     }
 
-    // Heap page must equal full-ranking page across queries, threads,
-    // pagination, current file, and corpus sizes above/below top-k cutoff.
+    // Heap page must equal the full-ranking page across shapes and configs.
     #[test]
     fn ranking_parity_across_shapes_and_configs() {
         fn page_as_set(
@@ -4942,9 +4735,7 @@ mod topk_prune_tests {
                                 &files, query, arena, threads, current, offset, limit,
                             );
                             assert_eq!(total, full_total, "totals n={n} q={query:?}");
-                            // Canonical order is total: upstream rank order
-                            // restricted to a strict key, so the page must be
-                            // the full list's slice.
+                            // The page must be the full list's slice under a strict key.
                             let want = full
                                 .iter()
                                 .skip(offset)
@@ -4962,7 +4753,6 @@ mod topk_prune_tests {
         }
     }
 
-    // Partial sort of hand-built unique-key input must equal full prefix.
     #[test]
     fn same_config_repeats_identically() {
         // Unique-key input; identical totals ordered by modified alone.
@@ -5061,8 +4851,7 @@ mod scratch_reuse_tests {
             }
             let cap = v.capacity();
             *cell.borrow_mut() = v;
-            // Re-take below capacity: same allocation, length reset.
-            // At or above the stored capacity the buffer may grow instead.
+            // Re-take below capacity reuses the allocation; above may grow.
             let want = n / 2 + 1;
             let w = take_tls(&cell, want);
             assert_eq!(w.len(), 0);

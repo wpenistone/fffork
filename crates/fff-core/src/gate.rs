@@ -1,9 +1,3 @@
-//! Tolerant subsequence gate: span reject, skip-DP accept, span window.
-//!
-//! Span bounds needle bytes; skip-DP accepts iff `LCS >= m - T`.
-//! Window is the needle-byte span. Sound: never rejects a true match;
-//! skip-DP is exact, so false accepts are impossible.
-
 use crate::simd_path::ArenaPtr;
 use crate::types::FileItem;
 
@@ -22,7 +16,7 @@ fn fold_byte(b: u8) -> u8 {
     if b.is_ascii_uppercase() { b + 32 } else { b }
 }
 
-/// Bitmask of needle bytes (case-folded) — 256 bits as 4×u64.
+/// Case-folded needle-byte bitmask: 256 bits as 4×u64.
 #[derive(Clone, Copy)]
 pub struct NeedleMask {
     w: [u64; 4],
@@ -46,7 +40,6 @@ impl NeedleMask {
     }
 }
 
-// Span of needle-bytes in `hay`. None if fewer than `need` such bytes.
 fn needle_span(mask: &NeedleMask, hay: &[u8], need: usize) -> Option<(usize, usize)> {
     if hay.len() < need {
         return None;
@@ -62,7 +55,7 @@ fn needle_span(mask: &NeedleMask, hay: &[u8], need: usize) -> Option<(usize, usi
             last = i;
             n += 1;
             if n >= need {
-                // keep scanning only for last…
+                // No early exit: still scanning for the last hit.
             }
         }
     }
@@ -72,9 +65,7 @@ fn needle_span(mask: &NeedleMask, hay: &[u8], need: usize) -> Option<(usize, usi
     Some((first.unwrap(), last))
 }
 
-// Exact skip-DP over the whole hay: true iff
-// `LCS(needle, hay) >= needle.len() - max_typos`.
-// Fallback for needles longer than one 64-bit word.
+// True iff `LCS(needle, hay) >= len - max_typos`; fallback past one 64-bit word.
 fn skip_dp_accept_slow(needle: &[u8], hay: &[u8], max_typos: usize) -> bool {
     let m = needle.len();
     if m == 0 {
@@ -99,11 +90,9 @@ fn skip_dp_accept_slow(needle: &[u8], hay: &[u8], max_typos: usize) -> bool {
             if cur == INF {
                 continue;
             }
-            // Delete this needle char (spend a typo).
             if s < t && cur < nxt[s + 1] {
                 nxt[s + 1] = cur;
             }
-            // Match this needle char at/after the cursor.
             if let Some(p) = find_byte_fold(hay, cur, c) {
                 let adv = p + 1;
                 if adv < nxt[s] {
@@ -116,9 +105,8 @@ fn skip_dp_accept_slow(needle: &[u8], hay: &[u8], max_typos: usize) -> bool {
     best[..=t].iter().any(|&p| p != INF)
 }
 
-// Hyyrö bit-parallel LCS length: one linear pass, no per-needle rescans.
-// `pm[c]` must hold the folded-byte position masks and `len_mask` the
-// low `needle.len()` bits. Exact for `needle.len() <= 64`.
+// Bit-parallel LCS length; exact for `needle.len() <= 64`.
+// `pm[c]` holds folded-byte masks, `len_mask` the low `len` bits.
 #[inline]
 fn lcs_len_bitparallel(pm: &[u64; 256], len_mask: u64, hay: &[u8]) -> usize {
     let mut s = 0u64;
@@ -134,7 +122,7 @@ fn lcs_len_bitparallel(pm: &[u64; 256], len_mask: u64, hay: &[u8]) -> usize {
 fn find_byte_fold(hay: &[u8], from: usize, needle_b: u8) -> Option<usize> {
     let target = fold_byte(needle_b);
     let slice = &hay[from..];
-    // Fast path: needle already lowercase (or hay) — memchr.
+    // Lowercase needle takes the memchr path.
     if target == needle_b {
         return memchr::memchr(needle_b, slice).map(|i| from + i);
     }
@@ -146,7 +134,7 @@ fn find_byte_fold(hay: &[u8], from: usize, needle_b: u8) -> Option<usize> {
     None
 }
 
-// Exact subsequence (T=0) — faster than skip-DP.
+// T=0 subsequence check; faster than skip-DP.
 fn is_subseq_fold(needle: &[u8], hay: &[u8]) -> bool {
     let mut hi = 0usize;
     for &nb in needle {
@@ -158,16 +146,14 @@ fn is_subseq_fold(needle: &[u8], hay: &[u8]) -> bool {
     true
 }
 
-// Bit i set when `chunk[i]` folds to a needle byte. Nibble lookup
-// tables cover all 256 byte values in constant ops per 16 bytes,
-// independent of distinct-needle count (SSSE3; scalar span test on
-// tails, non-x86, or no-SSSE3). Same bits as the scalar path.
+// Bit i set when `chunk[i]` folds to a needle byte, via nibble tables
+// (SSSE3; scalar on tails, non-x86, or no-SSSE3).
 #[inline]
 fn needle_byte_mask(chunk: &[u8], span: &NeedleMask, tables: &SpanTables) -> u16 {
     #[cfg(target_arch = "x86_64")]
     {
         if chunk.len() == 16 && tables.simd {
-            // SAFETY: SSSE3 verified in `GateNeedle::new`; 16 exact bytes.
+            // SAFETY: SSSE3 verified in `GateNeedle::new`; exactly 16 bytes.
             return unsafe { needle_byte_mask_shuf(chunk, &tables.lo, &tables.hi) };
         }
     }
@@ -180,8 +166,7 @@ fn needle_byte_mask(chunk: &[u8], span: &NeedleMask, tables: &SpanTables) -> u16
     m
 }
 
-// 16 parallel set-membership tests: `lo`/`hi` hold the span's high-nibble
-// rows, `B0T`/`B1T` select the tested half without a blend (SSE4.1).
+// 16 parallel membership tests; halves selected without a blend.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "ssse3")]
 unsafe fn needle_byte_mask_shuf(chunk: &[u8], t0: &[u8; 16], t1: &[u8; 16]) -> u16 {
@@ -204,8 +189,7 @@ unsafe fn needle_byte_mask_shuf(chunk: &[u8], t0: &[u8; 16], t1: &[u8; 16]) -> u
     ((!_mm_movemask_epi8(nz)) as u16) & 0xFFFF
 }
 
-// Per-query nibble tables for `needle_byte_mask_shuf`: `lo[l]`/`hi[l]`
-// hold the span's high-nibble rows for low nibble `l`.
+// Per-query nibble tables: `lo[l]`/`hi[l]` hold span rows for low nibble `l`.
 struct SpanTables {
     lo: [u8; 16],
     hi: [u8; 16],
@@ -234,42 +218,33 @@ impl SpanTables {
     }
 }
 
-// `FFF_FORCE_SCALAR=1` disables all runtime SIMD dispatch so scalar
-// fallbacks stay covered (same hatch as the SW kernels).
+// `FFF_FORCE_SCALAR=1` disables SIMD dispatch, covering scalar fallbacks.
 fn force_scalar() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var_os("FFF_FORCE_SCALAR").is_some())
 }
 
-/// Per-query gate state: span mask + bit-parallel LCS position masks.
-/// Built once per search so per-path work is a single linear pass.
+/// Per-query gate state, built once per search; per-path work is one linear pass.
 pub struct GateNeedle {
     needle: Box<[u8]>,
-    // Typo budget actually used (capped at `MAX_SKIPS`).
     typos: usize,
-    // `needle.len() - typos`.
     need: usize,
     span: NeedleMask,
     // `pm[c]` = bitmask of needle positions holding folded byte `c`.
     pm: Box<[u64; 256]>,
     // Reversed-needle masks for the backward trim walk.
     pm_rev: Box<[u64; 256]>,
-    // Nibble membership tables for the vectorized span test.
     tables: SpanTables,
     len_mask: u64,
-    // Right-tail cutoff (FFF_NO_SPAN_CUT escapes): stop the walk at the
-    // first prefix whose LCS already reaches `need`. Sound by prefix
-    // monotonicity (accept/reject never changes), but SW windows tighten
-    // so scores may shift: adjudicate on match sets, not checksums.
+    // Right-tail cutoff (`FFF_NO_SPAN_CUT` escapes): stops at the first accepting prefix.
+    // Sound for accept/reject by prefix monotonicity; windows tighten so scores may shift.
     // Checked per 16B step, never inside the bit loop.
     cut: bool,
-    // Left-trim prototype (FFF_TIGHT_SPAN): backward walk to the
-    // latest accepting start. Default off until adjudicated.
+    // Left-trim to the latest accepting start (`FFF_TIGHT_SPAN`); default off.
     tight: bool,
 }
 
-// Mutable state of one gate walk; splittable at any byte so a cached
-// prefix walk can seed a file's suffix walk with identical results.
+// One gate walk's state; splittable at any byte with identical results.
 struct WalkState {
     s: u64,
     first: usize,
@@ -292,9 +267,8 @@ impl WalkState {
     }
 }
 
-// Memoized prefix walk for sibling files: same dir means same prefix
-// bytes, so the prefix Myers walk runs once per dir, not per file.
-// Owned per sequential file loop (never shared across threads).
+// Memoized prefix walk: same-dir siblings share it, once per dir.
+// Owned per sequential file loop, never shared across threads.
 pub struct PrefixWalkCache {
     enabled: bool,
     dir: u32,
@@ -343,8 +317,7 @@ impl GateNeedle {
         for (i, &b) in needle.iter().enumerate().take(64) {
             pm[fold_byte(b) as usize] |= 1u64 << i;
         }
-        // Reversed masks over the same bytes: LCS is reversal-invariant,
-        // so the backward walk accepts exactly when forward does.
+        // LCS is reversal-invariant, so the backward walk accepts exactly when forward does.
         let mut pm_rev = Box::new([0u64; 256]);
         for (i, &b) in needle.iter().rev().enumerate().take(64) {
             pm_rev[fold_byte(b) as usize] |= 1u64 << i;
@@ -375,8 +348,7 @@ impl GateNeedle {
         self.cut = on;
     }
 
-    // One 16B step at absolute position `abs`: mask, extremes, Myers.
-    // Identical for chunk and flat sources; only the byte fetch differs.
+    // One 16B step at `abs`: mask, extremes, Myers; chunk and flat differ only in fetch.
     #[inline]
     fn walk_step(&self, abs: usize, step: &[u8], st: &mut WalkState, want_cut: bool) {
         let tables = &self.tables;
@@ -390,8 +362,7 @@ impl GateNeedle {
             st.first = abs + mask.trailing_zeros() as usize;
         }
         st.last = abs + (16 - mask.leading_zeros() as usize - 1);
-        // Myers bit-parallel LCS over hit bytes only; bytes outside the
-        // needle alphabet are identity updates.
+        // Myers over hit bytes only; other bytes are identity updates.
         let mut bits = mask;
         while bits != 0 {
             let bit = bits.trailing_zeros() as usize;
@@ -401,8 +372,7 @@ impl GateNeedle {
             st.s = x & (x ^ x.wrapping_sub(y));
         }
         st.n += c;
-        // Prefix already accepts: everything past this step is right-tail
-        // slack the SW window does not need.
+        // Past an accepting prefix, the tail is slack the SW window does not need.
         if want_cut && st.end_cut == 0 && st.n >= self.need.max(1) {
             if (st.s & self.len_mask).count_ones() >= self.need as u32 {
                 st.end_cut = abs + step.len();
@@ -410,10 +380,8 @@ impl GateNeedle {
         }
     }
 
-    // Walk path bytes in [lo, hi) via arena chunks, folding hits into
-    // `st`. Interior 16B steps stay vectorized; only range edges go
-    // scalar. With `cut`, the walk stops recording past the first
-    // accepting prefix (later steps still iterate chunks but skip work).
+    // Walks path bytes in [lo, hi) via arena chunks into `st`.
+    // Interior steps stay vectorized; cut stops recording past the first accepting prefix.
     fn walk_range(
         &self,
         file: &FileItem,
@@ -450,9 +418,8 @@ impl GateNeedle {
         });
     }
 
-    // Latest window start still accepting: backward Myers walk with
-    // reversed masks. First accepting reversed prefix is the shortest
-    // accepting suffix. Step-granular accept, byte-exact refine within.
+    // Latest still-accepting window start, via backward Myers on reversed masks.
+    // Step-granular accept, byte-exact refine within.
     fn latest_start(&self, window: &[u8]) -> usize {
         if self.need == 0 || window.is_empty() {
             return 0;
@@ -491,9 +458,8 @@ impl GateNeedle {
         0
     }
 
-    // Left-trim an accepted window to its latest accepting start.
-    // Staged from the arena (LLC-hot, just walked); skipped unless the
-    // window can hold slack. Accept never changes, scores may shift.
+    // Left-trims an accepted window to its latest accepting start.
+    // Accept never changes, scores may shift.
     fn maybe_tighten(
         &self,
         file: &FileItem,
@@ -533,7 +499,6 @@ impl GateNeedle {
         }
     }
 
-    // Shared accept/window tail for the walk entry points.
     fn finish(&self, st: &WalkState, byte_len: usize) -> Option<GateHit> {
         if (st.s & self.len_mask).count_ones() < self.need as u32 {
             return None;
@@ -549,7 +514,6 @@ impl GateNeedle {
         })
     }
 
-    // Exact accept test: `LCS(needle, hay) >= need`.
     #[inline]
     fn decide(&self, hay: &[u8]) -> bool {
         if self.needle.is_empty() {
@@ -594,9 +558,7 @@ impl GateNeedle {
         })
     }
 
-    /// Gate a `FileItem` directly: reads its chunk pointers from the arena and
-    /// streams the LCS in one pass. No path copy, no per-chunk callback —
-    /// the chunk walk is inlined here so the compiler can keep it in registers.
+    /// Gates a `FileItem` from arena chunks in one LCS pass, without copying the path.
     pub fn hit_file(&self, file: &FileItem, arena: ArenaPtr) -> Option<GateHit> {
         if file.is_deleted() || self.needle.is_empty() {
             return None;
@@ -605,16 +567,12 @@ impl GateNeedle {
         if byte_len == 0 {
             return None;
         }
-        // `LCS(needle, hay) <= min(needle_len, hay_len)`, so a path shorter than
-        // `need` cannot reach the threshold. Reject before touching a chunk:
-        // `byte_len` is already in a register and prefix-heavy corpora (short
-        // paths) hit this often.
+        // `LCS <= min` lengths, so `byte_len < need` rejects before any chunk load.
         if byte_len < self.need {
             return None;
         }
         if self.needle.len() <= 64 {
-            // Typos cover the whole needle: every path is a candidate and the
-            // window is the full path (same short-circuit as `hit`).
+            // `need == 0` accepts everything with a full-path window, as in `hit`.
             if self.need == 0 {
                 return Some(GateHit {
                     start: 0,
@@ -622,9 +580,8 @@ impl GateNeedle {
                     include_prefix: true,
                 });
             }
-            // Single adjudicating walk: per-hit Myers state is exact (skipped
-            // non-needle bytes are identity updates), so no second DP and no
-            // staging. Extremes come from the mask bits, not a per-hit loop.
+            // Single adjudicating walk is exact (skips are identity updates);
+            // extremes come from the mask bits.
             let mut st = WalkState::fresh(true);
             self.walk_range(file, arena, 0, byte_len, &mut st);
             let hit = self.finish(&st, byte_len)?;
@@ -650,11 +607,8 @@ impl GateNeedle {
         hit
     }
 
-    /// Gate with a memoized prefix walk: consecutive same-dir files share
-    /// prefix bytes, so the prefix Myers walk runs once per dir. Accept and
-    /// windows match `hit_file` (same ops, memoized; with FFF_SPAN_CUT the
-    /// cut point may differ by step alignment, still sound). `cache` is
-    /// owned per sequential file loop, never shared across threads.
+    /// Memoized prefix walk: same-dir files share it; accept matches `hit_file`.
+    /// Cut alignment may differ by step, still sound; cache is per-loop, never shared.
     pub fn hit_file_cached(
         &self,
         file: &FileItem,
@@ -702,8 +656,7 @@ impl GateNeedle {
                 cache.fills += 1;
             }
         }
-        // Prefix already accepted on its own: the window sits inside
-        // it and the suffix walk is pure overhead.
+        // An accepted prefix already contains the window; the suffix walk is overhead.
         if st.end_cut == 0 || st.end_cut > split {
             self.walk_range(file, arena, split, byte_len, &mut st);
         } else {
@@ -722,10 +675,8 @@ pub fn gate_hit(needle: &[u8], hay: &[u8], max_typos: u16) -> Option<GateHit> {
     GateNeedle::new(needle, max_typos).hit(hay)
 }
 
-/// Parallel match-set over FileItems. Emits frizbee-compatible
-/// `Match { score: start, end_col: end }` (skip_sw encoding).
-/// `file_at` resolves an index to its FileItem, `file_index` maps a
-/// position in `0..n` back to a candidate index.
+/// Parallel match-set over FileItems, emitting frizbee-compatible matches
+/// with (start, end) in (score, end_col). `file_index` maps 0..n to candidates.
 pub fn gate_match_range<'a, F, G>(
     needle: &[u8],
     n: usize,
@@ -739,18 +690,13 @@ where
     F: Fn(u32) -> u32 + Sync,
     G: Fn(u32) -> &'a FileItem + Sync,
 {
-    // Needle state (span mask + position masks) is per query: built once
-    // and shared by every path.
     let state = GateNeedle::new(needle, max_typos);
-    // Presence pretest: paths missing more needle bytes than the typo
-    // budget allows cannot match. Skipped below need 3.
-    // `FFF_NO_GATE_PREFILTER=1` disables the pretest.
+    // Sound pretest: paths missing more needle bytes than budget allows cannot match.
     let presence = crate::presence::NeedlePresence::new(needle, max_typos);
     let check_presence = presence.should_check()
         && std::env::var_os("FFF_NO_GATE_PREFILTER").is_none();
     let scan = |i: u32| -> Option<neo_frizbee::Match> {
-        // Warm the next candidate's path chunks: the gate is bound by arena
-        // load latency, not by the LCS arithmetic.
+        // Prefetch next path: the gate is bound by arena load latency.
         if i + 1 < n as u32 {
             file_at(i + 1).path.prefetch(arena);
         }
@@ -769,7 +715,6 @@ where
             end_col: hit.end as u16,
         })
     };
-    // Work estimate selects serial vs parallel; the gate honors it.
     if threads <= 1 {
         return (0..n as u32).filter_map(scan).collect();
     }
@@ -820,7 +765,6 @@ mod tests {
             let hay: Vec<u8> = (0..hl).map(|_| b'a' + (next() % 5) as u8).collect();
             let t = (next() % 3) as u16;
             let need = nl as i32 - t as i32;
-            // LCS via DP
             let mut dp = vec![0i32; hl + 1];
             for &nc in &needle {
                 let mut prev = 0i32;
@@ -864,7 +808,6 @@ mod tests {
                 .collect();
             let t = (next() % 3) as u16;
             let need = nl as i32 - t as i32;
-            // LCS
             let nbs = needle.as_bytes();
             let hbs = hay.as_bytes();
             let mut dp = vec![0i32; hl + 1];
@@ -916,8 +859,7 @@ mod tests {
 
     #[test]
     fn hit_file_matches_staged_hit_across_chunk_boundaries() {
-        // `hit_file` streams chunks from the arena; `hit` sees a flat slice.
-        // They must agree for every length that straddles a 16-byte chunk.
+        // Streamed chunks must agree with the flat slice across 16B boundaries.
         use crate::simd_path::build_chunked_path_store_from_strings;
         let mut state = 0x5EEDu32;
         let mut next = move || {
@@ -942,8 +884,7 @@ mod tests {
             let g = GateNeedle::new(&needle, t);
             let streamed = g.hit_file(&file, arena);
             let staged = g.hit(&hay);
-            // Cut tightens streamed windows by design; what must hold is
-            // accept-identity plus containment of the cut window.
+            // Cut preserves accept and only tightens the window.
             assert_eq!(
                 streamed.is_some(),
                 staged.is_some(),
@@ -960,8 +901,7 @@ mod tests {
 
     #[test]
     fn streamed_and_staged_agree_with_many_distinct_bytes() {
-        // Membership is a nibble-table lookup either way; windows must
-        // agree for many-distinct needles too.
+        // Many-distinct needles must agree too (nibble-table path).
         use crate::simd_path::build_chunked_path_store_from_strings;
         let needles: &[&[u8]] = &[
             b"abcdefghijklmnop",
@@ -1142,7 +1082,6 @@ mod tests {
 
     #[test]
     fn prefix_cache_matches_direct_walk() {
-        // Sequential same-dir files via hit_file_cached must equal hit_file.
         use crate::simd_path::build_chunked_path_store_from_strings;
         let rels = [
             "src/alpha/one.rs",
@@ -1178,8 +1117,7 @@ mod tests {
         ] {
             for t in [0u16, 2, 4] {
                 let mut g = GateNeedle::new(needle, t);
-                // Cache-vs-direct must be window-identical: disable the
-                // cutoff (its step alignment differs by construction).
+                // Disable cut: its step alignment differs by construction.
                 g.set_cut(false);
                 let mut cache = PrefixWalkCache::new();
                 for file in &files {
@@ -1190,8 +1128,6 @@ mod tests {
                         file.path.byte_len,
                     );
                 }
-                // need==0 short-circuits before the walk; otherwise every
-                // first-per-dir file must fill and siblings must hit.
                 if needle.len() > t as usize {
                     assert!(cache.fills > 0, "no dir fills recorded");
                     assert!(cache.hits > 0, "no sibling hits recorded");
@@ -1202,8 +1138,7 @@ mod tests {
 
     #[test]
     fn span_cut_keeps_accept_and_tightens_window() {
-        // Cut windows accept exactly when full windows do, and never
-        // extend past them. Fuzzed against the contiguous oracle.
+        // Cut keeps accept and never widens the window.
         use crate::simd_path::build_chunked_path_store_from_strings;
         let mut state = 0xC07u32;
         let mut next = move || {
@@ -1247,8 +1182,7 @@ mod tests {
 
     #[test]
     fn tight_span_keeps_accept_and_trims_left() {
-        // Backward walk accepts exactly when forward does; the window
-        // is the cut window left-trimmed to the latest accepting start.
+        // Tight left-trims to the latest accepting start, keeping accept.
         use crate::simd_path::build_chunked_path_store_from_strings;
         let mut state = 0x716u32;
         let mut next = move || {
@@ -1297,7 +1231,6 @@ mod tests {
 
     #[test]
     fn tight_cached_matches_direct_and_counts() {
-        // Cached path trims identically and accounts trimmed bytes.
         use crate::simd_path::build_chunked_path_store_from_strings;
         let rels = ["src/aaa/one.rs", "src/aaa/two.rs", "src/bbb/three.rs"];
         let owned: Vec<String> = rels.iter().map(|s| s.to_string()).collect();

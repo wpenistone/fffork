@@ -1,10 +1,5 @@
-//! Picks serial or parallel per call from measured cost.
-//! Estimates total work, divides by what one fork/join must amortize,
-//! and caps by pool width. Same rule at every call site.
-
 use std::sync::LazyLock;
 
-// Thread count and chunk size for one parallel loop.
 pub(crate) struct Plan {
     pub threads: usize,
     pub chunk: usize,
@@ -19,8 +14,7 @@ fn fork_join_measured() -> u64 {
         {
             return v;
         }
-        // Time an empty fan-out on the bg pool: exactly the cost a
-        // parallel loop must amortize. Median of 5 rejects a bad run.
+        // Empty fan-out cost a parallel loop must amortize; median of 5.
         let workers = crate::parallelism::effective_core_count().max(1);
         let mut reps = [0u64; 5];
         for r in reps.iter_mut() {
@@ -35,8 +29,7 @@ fn fork_join_measured() -> u64 {
         }
         reps.sort_unstable();
         let m = reps[2];
-        // Scheduler-physical guard: outside this the probe was
-        // descheduled; fall back to the historical measured value.
+        // Out-of-range probe means descheduling; fall back to the default.
         if (1_000..10_000_000).contains(&m) {
             m
         } else {
@@ -69,9 +62,8 @@ pub(crate) fn bytes_to_amortize() -> usize {
     *B
 }
 
-// Byte-equivalents of one gate file: DP cost over SIMD lanes scaled
-// by strictness, plus the memory walk itself. Shared by the thread
-// estimator and the group sizer so they cannot disagree.
+// Per-file byte-equivalents: DP cost over SIMD lanes scaled by strictness.
+// Shared by the thread estimator and the group sizer.
 pub(crate) fn match_bytes_per_file(
     needle_len: usize,
     max_haystack_len: usize,
@@ -82,16 +74,13 @@ pub(crate) fn match_bytes_per_file(
         None => 1.0,
         Some(t) => (nl + 1.0 - (t as f64).min(nl)) / (nl + 1.0),
     };
-    // 16 is the SIMD lane width the DP batches over; 512 caps the
-    // estimate so a few outlier paths cannot demand the whole pool.
+    // 16 is the SIMD lane width; 512 caps outliers from demanding the whole pool.
     let chunks = max_haystack_len.min(512).div_ceil(16).max(1) as f64;
     (nl * chunks * strict).max(1.0) as usize
 }
 
-// Plan a file-count loop. `bytes_per_file` is a conservative upper
-// bound (max path len scaled by query cost); over-estimate saturates
-// the cap, under-estimate serializes. Both directions cost at most
-// one fork/join of waste, never correctness.
+// `bytes_per_file` is an upper bound: over saturates the cap, under serializes.
+// Either way at most one fork/join of waste, never correctness.
 pub(crate) fn plan_files(n: usize, bytes_per_file: usize, cap: usize) -> Plan {
     let cap = cap.max(1);
     if n == 0 {
@@ -106,8 +95,7 @@ pub(crate) fn plan_files(n: usize, bytes_per_file: usize, cap: usize) -> Plan {
     }
 }
 
-// Plan a match-count loop (top-k, scoring). `bytes_per_match` covers
-// the score struct plus the path bytes each item touches.
+// Same rule for match-count loops; `bytes_per_match` covers struct plus path bytes.
 pub(crate) fn plan_matches(n: usize, bytes_per_match: usize, cap: usize) -> Plan {
     plan_files(n, bytes_per_match, cap)
 }
@@ -117,7 +105,7 @@ pub(crate) fn plan_matches(n: usize, bytes_per_match: usize, cap: usize) -> Plan
 pub(crate) fn sw_metadata_chunk() -> usize {
     static C: LazyLock<usize> = LazyLock::new(|| {
         let l2 = crate::machine::machine().l2_bytes;
-        // Trim (8 B) + scores/ecols/order/perm outputs per match.
+        // Per-match outputs: Trim plus score/ecol/order/perm slots.
         let per_match = std::mem::size_of::<crate::matcher::Trim>()
             + std::mem::size_of::<u16>() * 4
             + std::mem::size_of::<u32>();
@@ -129,15 +117,13 @@ pub(crate) fn sw_metadata_chunk() -> usize {
     *C
 }
 
-// Probe length whose cost is ~one fork/join (negligible). Floor is
-// sampling statistics (SE <= 9% on a proportion), not corpus tuning.
+// Probe costing ~one fork/join; floor is sampling statistics, not tuning.
 pub(crate) fn probe_len(n: usize, avg_bytes: usize) -> usize {
     let p = bytes_to_amortize().div_ceil(avg_bytes.max(1)).max(32);
     p.min(n)
 }
 
-// Mean path bytes over a strided sample (same statistics floor as
-// the probe). Scales per-match work estimates without walking 227k.
+// Mean path bytes over a strided sample; avoids walking the corpus.
 pub(crate) fn sampled_path_avg(files: &crate::matcher::FileItems<'_>) -> usize {
     let n = files.len();
     if n == 0 {
@@ -156,8 +142,7 @@ pub(crate) fn sampled_path_avg(files: &crate::matcher::FileItems<'_>) -> usize {
     sum.div_ceil(count.max(1)).max(1)
 }
 
-// Inner fan-out decision for fixed-size SIMD batches. Amdahl
-// break-even: parallel wins iff saved time exceeds dispatch.
+// Fixed-size SIMD batch fan-out: parallel wins iff saved time exceeds dispatch.
 pub(crate) fn parallel_batches(n_batches: usize, ns_per_batch: f64, threads: usize) -> bool {
     if n_batches < 2 || ns_per_batch <= 0.0 || threads < 2 {
         return false;
@@ -166,8 +151,7 @@ pub(crate) fn parallel_batches(n_batches: usize, ns_per_batch: f64, threads: usi
     (n_batches as f64) * ns_per_batch * (1.0 - 1.0 / t) > fork_join_ns() as f64
 }
 
-// Measured cost of one SW batch per lane class; seeds refine per slice,
-// so seed error only moves the serial/parallel boundary slightly.
+// Seed batch cost per lane class; slices refine it, so error only shifts the boundary.
 static BATCH_NS_U8: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(3_000);
 static BATCH_NS_U16: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(6_000);
 
@@ -180,8 +164,7 @@ pub(crate) fn batch_ns_estimate(u8_class: bool) -> f64 {
     cell.load(std::sync::atomic::Ordering::Relaxed) as f64
 }
 
-// Fold one slice's mean batch cost into the estimate (EWMA, /8).
-// Benign races: concurrent slices may drop samples, never corrupt.
+// Folds slice means into the estimate (EWMA /8); races drop samples, never corrupt.
 pub(crate) fn observe_batch_ns(u8_class: bool, slice_ns: f64, n_batches: usize) {
     if n_batches == 0 || slice_ns <= 0.0 {
         return;

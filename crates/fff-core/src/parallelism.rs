@@ -1,6 +1,5 @@
 use std::sync::LazyLock;
 
-// Override for background pool size (`FFF_BG_THREADS`).
 fn bg_threads_override() -> Option<usize> {
     std::env::var("FFF_BG_THREADS")
         .ok()
@@ -8,7 +7,6 @@ fn bg_threads_override() -> Option<usize> {
         .filter(|n| *n >= 1)
 }
 
-// Override for search pool size (`FFF_SEARCH_THREADS`).
 fn search_threads_override() -> Option<usize> {
     std::env::var("FFF_SEARCH_THREADS")
         .ok()
@@ -26,8 +24,7 @@ fn pin_qos() {
 /// Dedicated thread pool for background work (scan, warmup, bigram build).
 pub static BACKGROUND_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
     let total = effective_core_count();
-    // Background work is mostly syscall-bound; halving parallelism leaves
-    // cores for search/UI at negligible throughput cost.
+    // Syscall-bound work: half the cores leaves room for search/UI.
     let bg_threads = bg_threads_override().unwrap_or_else(|| (total / 2).max(2));
     rayon::ThreadPoolBuilder::new()
         .num_threads(bg_threads)
@@ -37,21 +34,12 @@ pub static BACKGROUND_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|
         .expect("failed to create background rayon pool")
 });
 
-/// Cores worth actually using for parallel work.
-///
-/// On Apple silicon the E-cores are ~2x slower and `open()` contends on a
-/// per-VFS lock past P-core count, so prefer the performance cores: on a 12P+4E
-/// M4 Max, grep runs 16t=6.2s vs 13t=4.9s. On Linux the cgroup CPU
-/// quota/cpuset caps this further so containers do not size pools off the host.
-///
-/// This is the single source of truth for "how many threads can this machine
-/// usefully run" - the pools below and `crate::machine` all derive from it, so
-/// they cannot disagree about core count.
+/// Cores worth using: performance cores on Apple silicon, cgroup-capped on Linux.
+/// Single source of truth for pool and machine sizing.
 pub fn effective_core_count() -> usize {
     #[cfg(target_os = "macos")]
     {
-        // Walk every perf level and exclude Efficiency cores: level 0
-        // alone undercounts on chips with named Super/Performance tiers.
+        // Walk every perf level; level 0 alone undercounts Super/Performance tiers.
         if let Some(n) = non_efficiency_core_count() {
             return n;
         }
@@ -88,7 +76,6 @@ pub(crate) fn cgroup_cpu_count() -> Option<usize> {
             tighten(&mut cap, (m / p).ceil() as usize);
         }
     }
-    // v1 quota/period pair.
     if let (Ok(q), Ok(p)) = (
         std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"),
         std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_period_us"),
@@ -98,7 +85,6 @@ pub(crate) fn cgroup_cpu_count() -> Option<usize> {
     {
         tighten(&mut cap, (qf / pf).ceil() as usize);
     }
-    // Cpuset size (v2, then v1).
     for path in [
         "/sys/fs/cgroup/cpuset.cpus.effective",
         "/sys/fs/cgroup/cpuset/cpuset.cpus",
@@ -118,8 +104,7 @@ fn parse_cpuset_len(s: &str) -> Option<usize> {
     cpuset_cpus_inner(s).map(|v| v.len())
 }
 
-// Allowed CPUs from the cpuset files, for pinning probe threads inside the
-// container instead of `t % host_ncpu` (which can address forbidden cores).
+// Container-local CPUs for pinning; host indexing can address forbidden cores.
 #[cfg(target_os = "linux")]
 pub(crate) fn cpuset_cpus() -> Option<Vec<usize>> {
     [
@@ -159,10 +144,8 @@ fn cpuset_cpus_inner(s: &str) -> Option<Vec<usize>> {
     if out.is_empty() { None } else { Some(out) }
 }
 
-/// Pool for grep content search: full effective cores, QoS-pinned on macOS.
-/// Grep is I/O-latency-bound (open+read per file), so unlike the
-/// LLC-capped scan pool it wants width to overlap stalls; `scan_thread_cap`
-/// stays with the background pool. `FFF_SEARCH_THREADS` forces a size.
+/// Grep pool: full effective cores, since I/O latency wants width to overlap stalls.
+/// `FFF_SEARCH_THREADS` forces a size.
 pub static SEARCH_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
     let threads = search_threads_override().unwrap_or_else(|| effective_core_count().max(1));
     rayon::ThreadPoolBuilder::new()
@@ -176,8 +159,7 @@ pub static SEARCH_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|| {
         .expect("failed to create search rayon pool")
 });
 
-/// Threads the search pool was built with. For non-owned call sites (grep
-/// chunking) that must not read ambient `current_num_threads`.
+/// Search pool size, for non-owned call sites that must not read ambient threads.
 pub fn search_pool_threads() -> usize {
     SEARCH_THREAD_POOL.current_num_threads().max(1)
 }
@@ -188,8 +170,7 @@ pub fn bg_pool_threads() -> usize {
     BACKGROUND_THREAD_POOL.current_num_threads().max(1)
 }
 
-// Interactive searches in flight. Background indexing yields while
-// nonzero so early queries get the cores and memory bandwidth.
+// In-flight searches; background indexing yields while nonzero.
 static QUERY_ACTIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub(crate) fn query_active() -> bool {
@@ -211,18 +192,13 @@ impl Drop for QueryActiveGuard {
     }
 }
 
-// Per-keystroke search epoch on the picker's own counter. Each fuzzy
-// search bumps it at entry; group loops abandon their slice when it
-// moves (a newer keystroke owns the box; its result is the one the UI
-// keeps). Per-picker so concurrent searches on different pickers never
-// abort each other. Single-flight cost is one load per group.
+// Per-picker search epoch; group loops abandon their slice when it moves.
+// Never aborts other pickers; one load per group.
 pub(crate) fn begin_search(counter: &std::sync::atomic::AtomicU64) -> u64 {
     counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
-// Cooperative per-keystroke abort. The token captures the epoch at
-// query entry; workers bail their slice when a newer query moves it.
-// Disabled tokens cost one bool check and keep tests deterministic.
+// Bails a slice when a newer query moves the epoch; disabled costs one bool check.
 #[derive(Copy, Clone)]
 pub(crate) struct AbortToken<'a> {
     epoch: u64,
@@ -255,13 +231,8 @@ impl<'a> AbortToken<'a> {
     }
 }
 
-/// Run `f` on `BACKGROUND_THREAD_POOL` unless we are already inside a rayon
-/// worker. Nested `install()` from a pool worker deadlocks on large scans
-/// (the spawn task occupies a worker while `install` waits for workers).
-///
-/// Covers `par_sort` too: the walk/indexable sorts must go through here, never
-/// a bare `BACKGROUND_THREAD_POOL.install`, so a sort issued from a worker
-/// degrades to serial instead of deadlocking.
+/// Runs on `BACKGROUND_THREAD_POOL`, or inline inside a rayon worker where
+/// nested `install()` deadlocks. Sorts must route here too, degrading to serial.
 pub fn run_on_bg_pool<R>(f: impl FnOnce() -> R + Send) -> R
 where
     R: Send,
@@ -273,9 +244,8 @@ where
     }
 }
 
-/// Same guard for `SEARCH_THREAD_POOL`. Every grep entry (`grep`, `multi_grep`)
-/// must route through here: an unconditional `install` deadlocks when grep is
-/// invoked from a pool worker, and inherits the wrong pool otherwise.
+/// Same guard for `SEARCH_THREAD_POOL`; every grep entry must route through here.
+/// Unconditional `install` deadlocks from a pool worker and inherits the wrong pool.
 pub fn run_on_search_pool<R>(f: impl FnOnce() -> R + Send) -> R
 where
     R: Send,
@@ -482,27 +452,19 @@ mod tests {
     }
 }
 
-// Default `max_threads` when the caller passes 0: effective cores, not the
-// ambient pool size; collapses under nested installs. Test helper.
+// Default `max_threads` (caller passed 0): effective cores, collapsing under nesting.
 #[cfg(test)]
 pub fn default_max_threads() -> usize {
     effective_core_count().max(1)
 }
 
 // Opt-in search-thread affinity (`FFF_AFFINITY=mask`, hex or decimal).
-// Probe for the P/E placement lottery: pins every search worker into
-// the mask so the OS schedules the latency-bound kernel off E-cores.
-// Default off; uniform chips set a full mask (no-op). No new crate:
-// the two Win32 fns are declared manually below.
+// Pins workers into the mask; default off, full mask is a no-op.
 pub(crate) fn maybe_pin_search_thread() {
     let raw = match std::env::var("FFF_AFFINITY") {
         Ok(v) => v,
         Err(_) => return,
     };
-    // Ground truth for the mask choice is measured, not parsed: pin
-    // each half (0xFFF vs 0xFF000 on 20-thread hybrids) and keep the
-    // faster. A hand-parsed CpuSet readout was tried and misaligned,
-    // so it was deleted rather than left printing confident garbage.
     #[cfg(windows)]
     {
         static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
@@ -514,7 +476,7 @@ pub(crate) fn maybe_pin_search_thread() {
         return;
     };
     #[cfg(windows)]
-    // SAFETY: thread pseudo-handle is valid; mask is nonzero; failure code ignored (best-effort probe).
+    // SAFETY: pseudo-handle valid, mask nonzero; failure ignored (best-effort).
     unsafe {
         SetThreadAffinityMask(GetCurrentThread(), mask);
     }
