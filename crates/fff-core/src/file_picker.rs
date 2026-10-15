@@ -1400,14 +1400,19 @@ impl FilePicker {
         let abort = crate::parallelism::AbortToken::live(&self.search_epoch);
         let files = self.get_files();
         // Suffix probe table, validated by index generation (mutations
-        // bump it, so a stale table never serves a new file set).
+        // bump it, so a stale table never serves a new file set). Read
+        // per query so same-binary A/B legs can toggle it per iter.
         let suffix_hold = self.suffix_proto.lock().clone();
         let generation = self.index_generation();
-        let suffix_proto: Option<&crate::suffix_proto::SuffixProto> =
-            match suffix_hold.as_deref() {
-                Some(p) if p.generation() == generation => Some(p),
-                _ => None,
-            };
+        let suffix_proto: Option<&crate::suffix_proto::SuffixProto> = match suffix_hold.as_deref() {
+            Some(p)
+                if p.generation() == generation
+                    && std::env::var_os("FFF_SUFFIX_PROTO").is_some() =>
+            {
+                Some(p)
+            }
+            _ => None,
+        };
 
         let total_files = self.live_file_count();
         let location = query.location;
