@@ -499,6 +499,17 @@ pub(crate) fn maybe_pin_search_thread() {
         Ok(v) => v,
         Err(_) => return,
     };
+    // Ground truth for the mask choice, logged once per process: logical
+    // processor index with its efficiency class (higher = faster core).
+    #[cfg(windows)]
+    {
+        static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        LOGGED.get_or_init(|| {
+            let mut classes = cpu_set_classes();
+            classes.sort_unstable();
+            eprintln!("AFFINITY classes={classes:?}");
+        });
+    }
     let Some(mask) = parse_affinity_mask(raw.trim()) else {
         return;
     };
