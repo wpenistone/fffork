@@ -428,30 +428,6 @@ impl GateNeedle {
         });
     }
 
-    // Walk flat bytes in [lo, hi) where `flat[i]` holds path byte
-    // `split + i`. Same step sequence as the chunk walk over the same
-    // range, so state folds identically with no chunk chasing.
-    fn walk_flat(
-        &self,
-        flat: &[u8],
-        split: usize,
-        lo: usize,
-        hi: usize,
-        st: &mut WalkState,
-    ) {
-        let want_cut = self.cut && st.allow_cut;
-        let mut pos = lo.max(split);
-        let end = hi;
-        while pos < end {
-            if st.end_cut != 0 && pos >= st.end_cut {
-                break;
-            }
-            let step = 16.min(end - pos);
-            self.walk_step(pos, &flat[pos - split..pos - split + step], st, want_cut);
-            pos += step;
-        }
-    }
-
     // Shared accept/window tail for the walk entry points.
     fn finish(&self, st: &WalkState, byte_len: usize) -> Option<GateHit> {
         if (st.s & self.len_mask).count_ones() < self.need as u32 {
@@ -577,7 +553,6 @@ impl GateNeedle {
         file: &FileItem,
         arena: ArenaPtr,
         cache: &mut PrefixWalkCache,
-        flat: Option<&[u8]>,
     ) -> Option<GateHit> {
         if file.is_deleted() || self.needle.is_empty() {
             return None;
@@ -623,10 +598,7 @@ impl GateNeedle {
         // Prefix already accepted on its own: the window sits inside
         // it and the suffix walk is pure overhead.
         if st.end_cut == 0 || st.end_cut > split {
-            match flat {
-                Some(bytes) => self.walk_flat(bytes, split, split, byte_len, &mut st),
-                None => self.walk_range(file, arena, split, byte_len, &mut st),
-            }
+            self.walk_range(file, arena, split, byte_len, &mut st);
         } else {
             cache.bytes_skipped += (byte_len - split) as u64;
         }
@@ -1101,7 +1073,7 @@ mod tests {
                 let mut cache = PrefixWalkCache::new();
                 for file in &files {
                     assert_eq!(
-                        g.hit_file_cached(file, arena, &mut cache, None),
+                        g.hit_file_cached(file, arena, &mut cache),
                         g.hit_file(file, arena),
                         "n={needle:?} t={t} f={:?}",
                         file.path.byte_len,
@@ -1115,98 +1087,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn flat_walk_matches_chunk_walk() {
-        // Same bytes in path order through the flat table must fold the
-        // same windows as the chunk walk, with and without the prefix
-        // cache and the cutoff.
-        use crate::simd_path::build_chunked_path_store_from_strings;
-        use crate::stable_vec::StableVec;
-        use crate::suffix_proto::SuffixProto;
-        let rels = [
-            "src/alpha/one.rs",
-            "src/alpha/two.rs",
-            "src/beta/three.rs",
-            "src/alpha/averylongfilename_that_crosses_chunks.rs",
-            "other/root.rs",
-        ];
-        let dirs = [11u32, 11, 22, 11, 33];
-        let files = vec![FileItem::new_raw(0, 0, 0, None, false); 5];
-        let owned: Vec<String> = rels.iter().map(|s| s.to_string()).collect();
-        let (store, strings) = build_chunked_path_store_from_strings(&owned, &files);
-        let mut vec: Vec<FileItem> = files.into_iter().collect();
-        for (((file, s), rel), &d) in vec
-            .iter_mut()
-            .zip(strings.iter())
-            .zip(owned.iter())
-            .zip(dirs.iter())
-        {
-            file.set_path(s.clone());
-            file.parent_dir_index = d;
-            file.path.filename_offset =
-                (rel.rfind('/').map(|i| i + 1).unwrap_or(0) as u16).min(file.path.byte_len);
-        }
-        let stable = StableVec::from_vec_with_reserve(vec, 0);
-        let arena = store.as_arena_ptr();
-        let proto = SuffixProto::build(&stable, arena, stable.len(), 7);
-        let files: &[FileItem] = &stable;
-        for needle in [&b"alpha"[..], b"handler", b"src", b"qq", b"rs"] {
-            for t in [0u16, 2, 4] {
-                for cut in [false, true] {
-                    let mut g = GateNeedle::new(needle, t);
-                    g.set_cut(cut);
-                    let mut cache = PrefixWalkCache::new();
-                    for file in files.iter() {
-                        let flat = proto.suffix_for(file);
-                        assert!(flat.is_some(), "proto must cover base files");
-                        let a =
-                            g.hit_file_cached(file, arena, &mut cache, flat);
-                        let b = g.hit_file(file, arena);
-                        // Flat and chunk walks see the same bytes: strictly
-                        // equal without the cutoff. With it, step alignment
-                        // may cut at different points (still sound), so only
-                        // accept-identity is pinned there.
-                        if cut {
-                            assert_eq!(
-                                a.is_some(),
-                                b.is_some(),
-                                "accept changed n={needle:?} t={t}",
-                            );
-                        } else {
-                            assert_eq!(a, b, "n={needle:?} t={t} cut={cut}");
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn suffix_proto_addressing_falls_back() {
-        // Overflow, foreign and resized views miss the table by address.
-        use crate::simd_path::build_chunked_path_store_from_strings;
-        use crate::stable_vec::StableVec;
-        use crate::suffix_proto::SuffixProto;
-        let owned = vec!["src/a/one.rs".to_string(), "src/a/two.rs".to_string()];
-        let files = vec![FileItem::new_raw(0, 0, 0, None, false); 2];
-        let (store, strings) = build_chunked_path_store_from_strings(&owned, &files);
-        let mut vec: Vec<FileItem> = files.into_iter().collect();
-        for ((file, s), rel) in vec.iter_mut().zip(strings.iter()).zip(owned.iter()) {
-            file.set_path(s.clone());
-            file.path.filename_offset =
-                (rel.rfind('/').map(|i| i + 1).unwrap_or(0) as u16).min(file.path.byte_len);
-        }
-        let stable = StableVec::from_vec_with_reserve(vec, 0);
-        let arena = store.as_arena_ptr();
-        let proto = SuffixProto::build(&stable, arena, 1, 7);
-        let files: &[FileItem] = &stable;
-        assert!(proto.suffix_for(&files[0]).is_some());
-        assert!(proto.suffix_for(&files[1]).is_none());
-        let foreign = FileItem::new_raw(0, 0, 0, None, false);
-        assert!(proto.suffix_for(&foreign).is_none());
-        assert_eq!(proto.generation(), 7);
     }
 
     #[test]
