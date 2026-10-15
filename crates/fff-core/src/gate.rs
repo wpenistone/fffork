@@ -255,6 +255,75 @@ pub struct GateNeedle {
     // Nibble membership tables for the vectorized span test.
     tables: SpanTables,
     len_mask: u64,
+    // Right-tail cutoff (FFF_SPAN_CUT=1 opts in): stop the walk at the
+    // first prefix whose LCS already reaches `need`. Sound by prefix
+    // monotonicity (accept/reject never changes), but SW windows tighten
+    // so scores may shift: adjudicate on match sets, not checksums.
+    // Checked per 16B step, never inside the bit loop.
+    cut: bool,
+}
+
+// Mutable state of one gate walk; splittable at any byte so a cached
+// prefix walk can seed a file's suffix walk with identical results.
+struct WalkState {
+    s: u64,
+    first: usize,
+    last: usize,
+    n: usize,
+    end_cut: usize,
+    allow_cut: bool,
+}
+
+impl WalkState {
+    fn fresh(allow_cut: bool) -> Self {
+        Self {
+            s: 0,
+            first: usize::MAX,
+            last: 0,
+            n: 0,
+            end_cut: 0,
+            allow_cut,
+        }
+    }
+}
+
+// Memoized prefix walk for sibling files: same dir means same prefix
+// bytes, so the prefix Myers walk runs once per dir, not per file.
+// Owned per sequential file loop (never shared across threads).
+pub struct PrefixWalkCache {
+    enabled: bool,
+    dir: u32,
+    split: usize,
+    s: u64,
+    first: Option<usize>,
+    last: usize,
+    n: usize,
+    end_cut: usize,
+    pub hits: u64,
+    pub fills: u64,
+    pub bytes_skipped: u64,
+}
+
+impl PrefixWalkCache {
+    pub fn new() -> Self {
+        Self {
+            enabled: true,
+            dir: u32::MAX,
+            split: 0,
+            s: 0,
+            first: None,
+            last: 0,
+            n: 0,
+            end_cut: 0,
+            hits: 0,
+            fills: 0,
+            bytes_skipped: 0,
+        }
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
 }
 
 impl GateNeedle {
@@ -275,7 +344,96 @@ impl GateNeedle {
             typos,
             need: m.saturating_sub(typos),
             pm,
+            cut: std::env::var_os("FFF_SPAN_CUT").is_some(),
         }
+    }
+
+    #[cfg(test)]
+    fn set_cut(&mut self, on: bool) {
+        self.cut = on;
+    }
+
+    // Walk path bytes in [lo, hi), folding hits into `st`. Interior 16B
+    // steps stay vectorized; only range edges go scalar. With `cut`, the
+    // walk stops recording past the first accepting prefix (later steps
+    // still iterate chunks but skip all work).
+    fn walk_range(
+        &self,
+        file: &FileItem,
+        arena: ArenaPtr,
+        lo: usize,
+        hi: usize,
+        st: &mut WalkState,
+    ) {
+        let byte_len = file.path.byte_len as usize;
+        let tables = &self.tables;
+        let pm = &*self.pm;
+        let want_cut = self.cut && st.allow_cut;
+        file.path.for_each_chunk(arena, |off, chunk| {
+            if off >= hi {
+                return;
+            }
+            let mut end = (off + chunk.len()).min(byte_len).min(hi);
+            if st.end_cut != 0 {
+                if off >= st.end_cut {
+                    return;
+                }
+                end = end.min(st.end_cut);
+            }
+            let start = off.max(lo);
+            if start >= end {
+                return;
+            }
+            let view = &chunk[start - off..end - off];
+            let len = end - start;
+            let mut base = 0usize;
+            while base < len {
+                let step = 16.min(len - base);
+                let mask = needle_byte_mask(&view[base..base + step], &self.span, tables);
+                let c = mask.count_ones() as usize;
+                if c != 0 {
+                    if st.n == 0 {
+                        st.first = start + base + mask.trailing_zeros() as usize;
+                    }
+                    st.last = start + base + (16 - mask.leading_zeros() as usize - 1);
+                    // Myers bit-parallel LCS over hit bytes only; bytes
+                    // outside the needle alphabet are identity updates.
+                    let mut bits = mask;
+                    while bits != 0 {
+                        let bit = bits.trailing_zeros() as usize;
+                        bits &= bits - 1;
+                        let x = st.s | pm[fold_byte(view[base + bit]) as usize];
+                        let y = (st.s << 1) | 1;
+                        st.s = x & (x ^ x.wrapping_sub(y));
+                    }
+                    st.n += c;
+                    // Prefix already accepts: everything past this step is
+                    // right-tail slack the SW window does not need.
+                    if want_cut && st.end_cut == 0 && st.n >= self.need.max(1) {
+                        if (st.s & self.len_mask).count_ones() >= self.need as u32 {
+                            st.end_cut = start + base + step;
+                        }
+                    }
+                }
+                base += step;
+            }
+        });
+    }
+
+    // Shared accept/window tail for the walk entry points.
+    fn finish(&self, st: &WalkState, byte_len: usize) -> Option<GateHit> {
+        if (st.s & self.len_mask).count_ones() < self.need as u32 {
+            return None;
+        }
+        let mut end = (st.last + 1).min(byte_len);
+        if st.end_cut != 0 {
+            end = end.min(st.end_cut);
+        }
+        Some(GateHit {
+            start: st.first as u32,
+            end: end as u32,
+            include_prefix: st.first == 0,
+        })
     }
 
     // Exact accept test: `LCS(needle, hay) >= need`.
@@ -351,55 +509,12 @@ impl GateNeedle {
                     include_prefix: true,
                 });
             }
-            let tables = &self.tables;
-            let pm = &*self.pm;
             // Single adjudicating walk: per-hit Myers state is exact (skipped
             // non-needle bytes are identity updates), so no second DP and no
             // staging. Extremes come from the mask bits, not a per-hit loop.
-            let mut s = 0u64;
-            let mut first = usize::MAX;
-            let mut last = 0usize;
-            let mut n = 0usize;
-            let path = &file.path;
-            path.for_each_chunk(arena, |off, chunk| {
-                let end = (off + chunk.len()).min(byte_len);
-                let len = end - off;
-                let view = &chunk[..len];
-                // One vector op per 16 bytes finds every needle-byte position;
-                // the Myers update stays serial but only runs on those.
-                let mut base = 0usize;
-                while base < len {
-                    let step = 16.min(len - base);
-                    let mask = needle_byte_mask(&view[base..base + step], &self.span, tables);
-                    let c = mask.count_ones() as usize;
-                    if c != 0 {
-                        if n == 0 {
-                            first = off + base + mask.trailing_zeros() as usize;
-                        }
-                        last = off + base + (16 - mask.leading_zeros() as usize - 1);
-                        // Myers bit-parallel LCS over hit bytes only; bytes
-                        // outside the needle alphabet are identity updates.
-                        let mut bits = mask;
-                        while bits != 0 {
-                            let bit = bits.trailing_zeros() as usize;
-                            bits &= bits - 1;
-                            let x = s | pm[fold_byte(view[base + bit]) as usize];
-                            let y = (s << 1) | 1;
-                            s = x & (x ^ x.wrapping_sub(y));
-                        }
-                        n += c;
-                    }
-                    base += step;
-                }
-            });
-            if (s & self.len_mask).count_ones() < self.need as u32 {
-                return None;
-            }
-            return Some(GateHit {
-                start: first as u32,
-                end: (last + 1).min(byte_len) as u32,
-                include_prefix: first == 0,
-            });
+            let mut st = WalkState::fresh(true);
+            self.walk_range(file, arena, 0, byte_len, &mut st);
+            return self.finish(&st, byte_len);
         }
         // Long needles need random access: stage the path, then skip-DP.
         thread_local! {
@@ -418,6 +533,68 @@ impl GateNeedle {
         let hit = self.hit(&hay[..byte_len]);
         HAY.with(|c| *c.borrow_mut() = hay);
         hit
+    }
+
+    /// Gate with a memoized prefix walk: consecutive same-dir files share
+    /// prefix bytes, so the prefix Myers walk runs once per dir. Accept and
+    /// windows match `hit_file` (same ops, memoized; with FFF_SPAN_CUT the
+    /// cut point may differ by step alignment, still sound). `cache` is
+    /// owned per sequential file loop, never shared across threads.
+    pub fn hit_file_cached(
+        &self,
+        file: &FileItem,
+        arena: ArenaPtr,
+        cache: &mut PrefixWalkCache,
+    ) -> Option<GateHit> {
+        if file.is_deleted() || self.needle.is_empty() {
+            return None;
+        }
+        let byte_len = file.path.byte_len as usize;
+        if byte_len == 0 || byte_len < self.need {
+            return None;
+        }
+        if self.needle.len() > 64 {
+            return self.hit_file(file, arena);
+        }
+        if self.need == 0 {
+            return Some(GateHit {
+                start: 0,
+                end: byte_len as u32,
+                include_prefix: true,
+            });
+        }
+        let split = (file.path.filename_offset as usize).min(byte_len);
+        let dir = file.parent_dir_index;
+        let mut st = WalkState::fresh(true);
+        if cache.enabled && cache.dir == dir && cache.split == split {
+            st.s = cache.s;
+            st.first = cache.first.unwrap_or(usize::MAX);
+            st.last = cache.last;
+            st.n = cache.n;
+            st.end_cut = cache.end_cut;
+            cache.hits += 1;
+            cache.bytes_skipped += split as u64;
+        } else {
+            self.walk_range(file, arena, 0, split, &mut st);
+            if cache.enabled {
+                cache.dir = dir;
+                cache.split = split;
+                cache.s = st.s;
+                cache.first = (st.n > 0).then_some(st.first);
+                cache.last = st.last;
+                cache.n = st.n;
+                cache.end_cut = st.end_cut;
+                cache.fills += 1;
+            }
+        }
+        // Prefix already accepted on its own: the window sits inside
+        // it and the suffix walk is pure overhead.
+        if st.end_cut == 0 || st.end_cut > split {
+            self.walk_range(file, arena, split, byte_len, &mut st);
+        } else {
+            cache.bytes_skipped += (byte_len - split) as u64;
+        }
+        self.finish(&st, byte_len)
     }
 }
 
@@ -796,6 +973,144 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn range_walk_matches_full_walk_at_any_split() {
+        // A walk split at any byte must fold identical state (cut off).
+        use crate::simd_path::build_chunked_path_store_from_strings;
+        let mut state = 0x5E1Fu32;
+        let mut next = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 16) as u16
+        };
+        for _ in 0..200 {
+            let nl = 2 + (next() % 18) as usize;
+            let hl = 1 + (next() % 120) as usize;
+            let needle: Vec<u8> = (0..nl).map(|_| b'a' + (next() % 6) as u8).collect();
+            let hay: Vec<u8> = (0..hl).map(|_| b'a' + (next() % 6) as u8).collect();
+            let t = (next() % 4) as u16;
+            let split = (next() as usize) % (hl + 1);
+            let rel = String::from_utf8_lossy(&hay).to_string();
+            let files = vec![FileItem::new_raw(0, 0, 0, None, false)];
+            let (store, strings) = build_chunked_path_store_from_strings(&[rel], &files);
+            let mut file = files.into_iter().next().unwrap();
+            file.set_path(strings[0].clone());
+            let arena = store.as_arena_ptr();
+            let g = GateNeedle::new(&needle, t);
+            let mut whole = WalkState::fresh(false);
+            g.walk_range(&file, arena, 0, hl, &mut whole);
+            let mut halves = WalkState::fresh(false);
+            g.walk_range(&file, arena, 0, split, &mut halves);
+            g.walk_range(&file, arena, split, hl, &mut halves);
+            assert_eq!(
+                (whole.s, whole.first, whole.last, whole.n),
+                (halves.s, halves.first, halves.last, halves.n),
+                "split={split} n={needle:?} h={hay:?} t={t}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_cache_matches_direct_walk() {
+        // Sequential same-dir files via hit_file_cached must equal hit_file.
+        use crate::simd_path::build_chunked_path_store_from_strings;
+        let rels = [
+            "src/alpha/one.rs",
+            "src/alpha/two.rs",
+            "src/beta/three.rs",
+            "src/alpha/four.rs",
+            "src/alpha/averylongfilename_that_crosses_chunks.rs",
+            "other/root.rs",
+        ];
+        let dirs = [11u32, 11, 22, 11, 11, 33];
+        let files = vec![FileItem::new_raw(0, 0, 0, None, false); 6];
+        let owned: Vec<String> = rels.iter().map(|s| s.to_string()).collect();
+        let (store, strings) = build_chunked_path_store_from_strings(&owned, &files);
+        let mut files: Vec<FileItem> = files.into_iter().collect();
+        for (((file, s), rel), &d) in files
+            .iter_mut()
+            .zip(strings.iter())
+            .zip(owned.iter())
+            .zip(dirs.iter())
+        {
+            file.set_path(s.clone());
+            file.parent_dir_index = d;
+            file.path.filename_offset =
+                (rel.rfind('/').map(|i| i + 1).unwrap_or(0) as u16).min(file.path.byte_len);
+        }
+        let arena = store.as_arena_ptr();
+        for needle in [
+            &b"alpha"[..],
+            b"handler",
+            b"src",
+            b"qq",
+            b"averylongfilename",
+        ] {
+            for t in [0u16, 2, 4] {
+                let g = GateNeedle::new(needle, t);
+                let mut cache = PrefixWalkCache::new();
+                for file in &files {
+                    assert_eq!(
+                        g.hit_file_cached(file, arena, &mut cache),
+                        g.hit_file(file, arena),
+                        "n={needle:?} t={t} f={:?}",
+                        file.path.byte_len,
+                    );
+                }
+                // need==0 short-circuits before the walk; otherwise every
+                // first-per-dir file must fill and siblings must hit.
+                if needle.len() > t as usize {
+                    assert!(cache.fills > 0, "no dir fills recorded");
+                    assert!(cache.hits > 0, "no sibling hits recorded");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn span_cut_keeps_accept_and_tightens_window() {
+        // Cut windows accept exactly when full windows do, and never
+        // extend past them. Fuzzed against the contiguous oracle.
+        use crate::simd_path::build_chunked_path_store_from_strings;
+        let mut state = 0xC07u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 16) as u16
+        };
+        for _ in 0..300 {
+            let nl = 2 + (next() % 14) as usize;
+            let hl = 1 + (next() % 100) as usize;
+            let needle: Vec<u8> = (0..nl).map(|_| b'a' + (next() % 6) as u8).collect();
+            let hay: Vec<u8> = (0..hl).map(|_| b'a' + (next() % 6) as u8).collect();
+            let t = (next() % 4) as u16;
+            let rel = String::from_utf8_lossy(&hay).to_string();
+            let files = vec![FileItem::new_raw(0, 0, 0, None, false)];
+            let (store, strings) = build_chunked_path_store_from_strings(&[rel], &files);
+            let mut file = files.into_iter().next().unwrap();
+            file.set_path(strings[0].clone());
+            let arena = store.as_arena_ptr();
+            let mut g = GateNeedle::new(&needle, t);
+            let plain = g.hit_file(&file, arena);
+            g.set_cut(true);
+            let cut = g.hit_file(&file, arena);
+            assert_eq!(
+                plain.is_some(),
+                cut.is_some(),
+                "accept changed n={needle:?} h={hay:?} t={t}"
+            );
+            if let (Some(a), Some(b)) = (plain, cut) {
+                assert!(
+                    b.start >= a.start && b.end <= a.end,
+                    "cut window not inside plain n={needle:?} h={hay:?} t={t}"
+                );
+            }
+            assert_eq!(
+                cut.is_some(),
+                g.hit(&hay).is_some(),
+                "cut diverged from oracle n={needle:?} h={hay:?} t={t}"
+            );
         }
     }
 }

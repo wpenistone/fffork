@@ -219,6 +219,9 @@ fn match_fuzzy_parts(
         let t_gate_us = std::sync::atomic::AtomicU64::new(0);
         let t_exact_us = std::sync::atomic::AtomicU64::new(0);
         let t_swslice_us = std::sync::atomic::AtomicU64::new(0);
+        let t_prefix_hits = std::sync::atomic::AtomicU64::new(0);
+        let t_prefix_fills = std::sync::atomic::AtomicU64::new(0);
+        let t_prefix_skip = std::sync::atomic::AtomicU64::new(0);
         let prefilter_ms = t_prefilter.elapsed().as_secs_f64() * 1e3;
 
         // Phase 2: re-score with inter-sequence SW on trimmed windows.
@@ -303,6 +306,9 @@ fn match_fuzzy_parts(
             // Probe hatch: serial batches inside each chunk (one task per
             // chunk instead of per batch). Sizes nested-fanout overhead.
             let no_batch_par = std::env::var_os("FFF_NO_BATCH_PAR").is_some();
+            // Memoized prefix walks for sibling files (FFF_NO_PREFIX_CACHE
+            // escapes to the plain per-file walk). Same results by design.
+            let prefix_cache_on = std::env::var_os("FFF_NO_PREFIX_CACHE").is_none();
 
             // Sub-phase accounting, accumulated across rayon workers.
             let t_collect_us = std::sync::atomic::AtomicU64::new(0);
@@ -815,6 +821,11 @@ fn match_fuzzy_parts(
                 let hi = ((g + 1) * file_chunk).min(gate_n);
                 let t = std::time::Instant::now();
                 let mut m: Vec<neo_frizbee::Match> = Vec::new();
+                // Per-group prefix-walk cache: sibling files share prefix
+                // bytes, so the prefix Myers walk runs once per dir. One
+                // cache per group (groups run on different threads).
+                let mut pcache = crate::gate::PrefixWalkCache::new();
+                pcache.set_enabled(prefix_cache_on);
                 for k in lo..hi {
                     let (idx, file) = if use_cand {
                         let ci = cand[k];
@@ -831,7 +842,7 @@ fn match_fuzzy_parts(
                     {
                         continue;
                     }
-                    if let Some(hit) = gate_state.hit_file(file, arena) {
+                    if let Some(hit) = gate_state.hit_file_cached(file, arena, &mut pcache) {
                         m.push(neo_frizbee::Match {
                             score: hit.start as u16,
                             index: idx,
@@ -840,6 +851,9 @@ fn match_fuzzy_parts(
                         });
                     }
                 }
+                t_prefix_hits.fetch_add(pcache.hits, std::sync::atomic::Ordering::Relaxed);
+                t_prefix_fills.fetch_add(pcache.fills, std::sync::atomic::Ordering::Relaxed);
+                t_prefix_skip.fetch_add(pcache.bytes_skipped, std::sync::atomic::Ordering::Relaxed);
                 t_gate_us.fetch_add(
                     t.elapsed().as_micros() as u64,
                     std::sync::atomic::Ordering::Relaxed,
@@ -894,9 +908,12 @@ fn match_fuzzy_parts(
             let gate_us = t_gate_us.load(std::sync::atomic::Ordering::Relaxed);
             let exact_us = t_exact_us.load(std::sync::atomic::Ordering::Relaxed);
             let swslice_us = t_swslice_us.load(std::sync::atomic::Ordering::Relaxed);
+            let prefix_hit = t_prefix_hits.load(std::sync::atomic::Ordering::Relaxed);
+            let prefix_fill = t_prefix_fills.load(std::sync::atomic::Ordering::Relaxed);
+            let prefix_skip_kb = t_prefix_skip.load(std::sync::atomic::Ordering::Relaxed) / 1024;
             if part_timing {
                 eprintln!(
-                    "PHASE parts gate_us={gate_us} exact_us={exact_us} swslice_us={swslice_us} fuse_us={sw_us} threads={threads} n={}",
+                    "PHASE parts gate_us={gate_us} exact_us={exact_us} swslice_us={swslice_us} fuse_us={sw_us} threads={threads} n={} prefix_hit={prefix_hit} prefix_fill={prefix_fill} prefix_skip_kb={prefix_skip_kb}",
                     matches.len()
                 );
             }
