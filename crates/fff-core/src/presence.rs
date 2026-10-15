@@ -3,28 +3,45 @@
 //! Sound pretest for `LCS >= |needle| - max_typos`; lossy fold may pass
 //! non-matches, but never rejects a true match.
 
+// Fold table: byte -> bit in `0..64`, uppercase pre-folded.
+// Single load; identical mapping to the match below.
+const FOLD_BIT_LUT: [u8; 256] = {
+    let mut lut = [0u8; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let raw = i as u8;
+        let b = if raw >= b'A' && raw <= b'Z' {
+            raw + 32
+        } else {
+            raw
+        };
+        lut[i] = match b {
+            b'a'..=b'z' => b - b'a',
+            b'0'..=b'9' => 26 + (b - b'0'),
+            b'.' => 36,
+            b'_' => 37,
+            b'-' => 38,
+            b'/' => 39,
+            b'\\' => 40,
+            b' ' => 41,
+            b',' => 42,
+            b'@' => 43,
+            b'#' => 44,
+            b'(' => 45,
+            b')' => 46,
+            b'[' => 47,
+            _ => 48 + (b & 15),
+        };
+        i += 1;
+    }
+    lut
+};
+
 // Map a byte to a bit in `0..64`; uppercase folds to lowercase so the
 // pretest stays sound. Overflow bits only cost selectivity.
 #[inline(always)]
 pub(crate) fn fold_bit(b: u8) -> u32 {
-    let b = if b.is_ascii_uppercase() { b + 32 } else { b };
-    match b {
-        b'a'..=b'z' => (b - b'a') as u32,
-        b'0'..=b'9' => 26 + (b - b'0') as u32,
-        b'.' => 36,
-        b'_' => 37,
-        b'-' => 38,
-        b'/' => 39,
-        b'\\' => 40,
-        b' ' => 41,
-        b',' => 42,
-        b'@' => 43,
-        b'#' => 44,
-        b'(' => 45,
-        b')' => 46,
-        b'[' => 47,
-        _ => 48 + (b & 15) as u32,
-    }
+    FOLD_BIT_LUT[b as usize] as u32
 }
 
 // Build the presence mask for a path (relative path bytes, any case).
@@ -37,17 +54,18 @@ pub(crate) fn mask_of(path: &[u8]) -> u64 {
     m
 }
 
-// Precomputed per-query presence check. The needle fold is built once
-// instead of per path (227k calls in the prefilter hot loop).
+// Precomputed per-query presence check. Needle multiplicities split
+// into four bit planes; hits are four popcounts, no per-byte loop.
 #[derive(Clone, Copy)]
 pub(crate) struct NeedlePresence {
     need: usize,
     min_len: usize,
-    needle_mask: u64,
+    mask_1: u64,
+    mask_2: u64,
+    mask_3: u64,
+    mask_4: u64,
     dup: bool,
-    dup_fold: [u8; 32],
-    dup_n: u8,
-    dup_full: bool,
+    has_gt4: bool,
 }
 
 impl NeedlePresence {
@@ -56,34 +74,35 @@ impl NeedlePresence {
         let typos = max_typos as usize;
         let need = needle.len().saturating_sub(typos);
         let min_len = need; // LCS ≤ path_len
-        let mut needle_mask = 0u64;
-        let mut dup = false;
-        let mut dup_fold = [0u8; 32];
-        let mut dup_n = 0u8;
+        let mut mask_1 = 0u64;
+        let mut mask_2 = 0u64;
+        let mut mask_3 = 0u64;
+        let mut mask_4 = 0u64;
+        let mut has_gt4 = false;
         for &b in needle {
             let bit = 1u64 << fold_bit(b);
-            if needle_mask & bit != 0 {
-                dup = true;
-                break;
-            }
-            needle_mask |= bit;
-        }
-        // Dup needles re-fold every byte per candidate; cache the folds
-        // once per query (common queries like `test` are all dup).
-        if dup {
-            for &b in needle.iter().take(32) {
-                dup_fold[dup_n as usize] = fold_bit(b) as u8;
-                dup_n += 1;
+            if mask_4 & bit != 0 {
+                has_gt4 = true;
+            } else if mask_3 & bit != 0 {
+                mask_4 |= bit;
+            } else if mask_2 & bit != 0 {
+                mask_3 |= bit;
+            } else if mask_1 & bit != 0 {
+                mask_2 |= bit;
+            } else {
+                mask_1 |= bit;
             }
         }
+        let dup = mask_2 != 0;
         Self {
             need,
             min_len,
-            needle_mask,
+            mask_1,
+            mask_2,
+            mask_3,
+            mask_4,
             dup,
-            dup_fold,
-            dup_n,
-            dup_full: dup_n as usize == needle.len(),
+            has_gt4,
         }
     }
 
@@ -106,20 +125,19 @@ impl NeedlePresence {
             return true;
         }
         if !self.dup {
-            return (path_mask & self.needle_mask).count_ones() as usize >= self.need;
+            return (path_mask & self.mask_1).count_ones() as usize >= self.need;
         }
-        if self.dup_full {
-            let mut hits = 0usize;
-            for &f in &self.dup_fold[..self.dup_n as usize] {
-                if path_mask & (1u64 << f) != 0 {
-                    hits += 1;
-                    if hits >= self.need {
-                        return true;
-                    }
-                }
-            }
-            return false;
+        // Multiplicity as popcount planes: bit b in mask_k iff the
+        // needle holds b at least k times, so summed popcounts equal
+        // the exact per-byte hit total. Branchless, no early exit needed.
+        if !self.has_gt4 {
+            let hits = (path_mask & self.mask_1).count_ones()
+                + (path_mask & self.mask_2).count_ones()
+                + (path_mask & self.mask_3).count_ones()
+                + (path_mask & self.mask_4).count_ones();
+            return hits as usize >= self.need;
         }
+        // Past 4 repetitions (rare): exact per-byte loop.
         let mut hits = 0usize;
         for &b in needle {
             if path_mask & (1u64 << fold_bit(b)) != 0 {
@@ -244,5 +262,69 @@ mod tests {
         assert_eq!(fold_bit(b'A'), fold_bit(b'a'));
         assert_eq!(fold_bit(b'Z'), fold_bit(b'z'));
         assert_ne!(fold_bit(b'a'), fold_bit(b'b'));
+    }
+
+    #[test]
+    fn fold_lut_covers_all_bytes() {
+        // Every byte maps in range; case pairs agree; classes stay distinct.
+        for b in 0..=255u8 {
+            assert!(fold_bit(b) < 64, "bit out of range for {b}");
+        }
+        for b in b'A'..=b'Z' {
+            assert_eq!(fold_bit(b), fold_bit(b + 32));
+        }
+        let distinct = [b'a', b'0', b'.', b'_', b'-', b'/', b' ', b',', b'@', b'#'];
+        for (i, &x) in distinct.iter().enumerate() {
+            for &y in &distinct[i + 1..] {
+                assert_ne!(fold_bit(x), fold_bit(y), "{x} vs {y}");
+            }
+        }
+        // Overflow folding stays a nibble function of the raw byte.
+        for b in [b':', b';', 0x80u8, 0xFFu8, 0x01u8] {
+            let up = if b.is_ascii_uppercase() { b + 32 } else { b };
+            assert_eq!(fold_bit(b), 48 + (up & 15) as u32);
+        }
+    }
+
+    #[test]
+    fn planes_agree_with_naive_counts() {
+        // Naive oracle: per-byte hits with multiplicity, no planes.
+        let naive = |mask: u64, needle: &[u8], need: usize| {
+            let mut hits = 0usize;
+            for &b in needle {
+                hits += ((mask >> fold_bit(b)) & 1) as usize;
+            }
+            hits >= need
+        };
+        let mut state = 0x1234_5678_9ABCu64;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (state >> 33) as u32
+        };
+        // Alphabet biased to repetitions, forcing dup and gt4 paths.
+        let alphabet = b"aaaabbbccde";
+        for _ in 0..5000 {
+            let nlen = (next() % 16) as usize + 1;
+            let needle: Vec<u8> = (0..nlen)
+                .map(|_| alphabet[(next() as usize) % alphabet.len()])
+                .collect();
+            let typos = (next() % 4) as u16;
+            let np = NeedlePresence::new(&needle, typos);
+            let mask = ((next() as u64) << 32) | next() as u64;
+            assert_eq!(
+                np.allows(mask, &needle),
+                naive(mask, &needle, np.need),
+                "needle={:?} typos={typos} mask={mask:016x}",
+                String::from_utf8_lossy(&needle),
+            );
+        }
+        // Pinned gt4 shapes: 5+ repetitions take the fallback loop.
+        for needle in [&b"aaaaa"[..], b"aaaaaaaa", b"aabaaaabaaa"] {
+            let np = NeedlePresence::new(needle, 0);
+            assert!(np.has_gt4, "{needle:?} should flag gt4");
+            for mask in [0u64, 1u64, u64::MAX, mask_of(b"a"), mask_of(b"b")] {
+                assert_eq!(np.allows(mask, needle), naive(mask, needle, np.need));
+            }
+        }
     }
 }
