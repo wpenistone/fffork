@@ -759,6 +759,9 @@ pub struct FilePicker {
     /// workers bail their slice when it moves. Per-picker so concurrent
     /// searches on different pickers never abort each other.
     search_epoch: std::sync::atomic::AtomicU64,
+    /// Flat filename table for the gate suffix walk (FFF_SUFFIX_PROTO
+    /// probe only). Rebuilt per scan; validated by index generation.
+    suffix_proto: parking_lot::Mutex<Option<std::sync::Arc<crate::suffix_proto::SuffixProto>>>,
 }
 
 impl FilePicker {
@@ -1196,6 +1199,7 @@ impl FilePicker {
             live: parking_lot::Mutex::new(LiveNarrow::default()),
             index_generation: std::sync::atomic::AtomicU64::new(0),
             search_epoch: std::sync::atomic::AtomicU64::new(0),
+            suffix_proto: parking_lot::Mutex::new(None),
         })
     }
 
@@ -1305,6 +1309,23 @@ impl FilePicker {
         self.sync_data = sync;
         self.bump_index_generation();
 
+        // Suffix-walk probe table: flat filenames built once per scan so
+        // the gate reads linearly instead of chasing arena chunks.
+        if std::env::var_os("FFF_SUFFIX_PROTO").is_some() {
+            let generation = self.index_generation();
+            let arena = self.sync_data.arena_base_ptr();
+            let base_count = self.sync_data.base_count;
+            let proto = crate::suffix_proto::SuffixProto::build(
+                &self.sync_data.files,
+                arena,
+                base_count,
+                generation,
+            );
+            *self.suffix_proto.lock() = Some(std::sync::Arc::new(proto));
+        } else {
+            *self.suffix_proto.lock() = None;
+        }
+
         // Spawn the status read once the live count is known, so
         // mega-repos skip it instead of joining a uselessly long read.
         let skip_git = should_skip_git(
@@ -1378,6 +1399,15 @@ impl FilePicker {
         let _query = crate::parallelism::QueryActiveGuard::new();
         let abort = crate::parallelism::AbortToken::live(&self.search_epoch);
         let files = self.get_files();
+        // Suffix probe table, validated by index generation (mutations
+        // bump it, so a stale table never serves a new file set).
+        let suffix_hold = self.suffix_proto.lock().clone();
+        let generation = self.index_generation();
+        let suffix_proto: Option<&crate::suffix_proto::SuffixProto> =
+            match suffix_hold.as_deref() {
+                Some(p) if p.generation() == generation => Some(p),
+                _ => None,
+            };
 
         let total_files = self.live_file_count();
         let location = query.location;
@@ -1664,6 +1694,7 @@ impl FilePicker {
                             overflow_arena,
                             self.max_path_len(),
                             abort,
+                            suffix_proto,
                         )
                     });
                     hit_buf.clear();
@@ -1679,6 +1710,7 @@ impl FilePicker {
                         overflow_arena,
                         self.max_path_len(),
                         abort,
+                        suffix_proto,
                     )
                 }),
             }

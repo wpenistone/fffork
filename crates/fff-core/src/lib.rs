@@ -165,6 +165,7 @@ pub use intent::{
 };
 mod gate;
 pub use gate::{GateHit, gate_hit};
+pub(crate) mod suffix_proto;
 pub(crate) mod dispatch;
 pub(crate) mod interseq_sw;
 mod matcher;
