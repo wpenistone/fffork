@@ -372,6 +372,17 @@ pub(crate) fn score_one_scalar(
     score_one_scalar_full(needle, haystack, p, include_prefix).0
 }
 
+// Portable AoS-to-SoA transpose: out[j*stride+k] = stage[k*rows+j].
+// Byte loop at memcpy speed; ARM uses this (no SSE2 tiles there).
+// x86 keeps the shuffle tiles.
+pub(crate) fn soa_from_stage_scalar(stage: &[u8], rows: usize, stride: usize, out: &mut [u8]) {
+    for j in 0..rows {
+        for k in 0..stride {
+            out[j * stride + k] = stage[k * rows + j];
+        }
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod avx2 {
     use super::*;
@@ -1066,6 +1077,208 @@ pub(crate) mod avx2 {
     }
 }
 
+// 16-lane u8 SW kernel for AArch64 NEON: same recurrence and exact
+// semantics as the AVX2 u8 kernel (factored gap form, 1D state with
+// register-carried f/mm, folded-needle single compare). NEON compares
+// are natively unsigned, so no sign-bias trick is needed.
+//
+// # Safety
+// Caller must be AArch64 (NEON is baseline there). Scores must fit in
+// u8 (`u8_safe` domain). Windows must be at most 256 bytes: end
+// tracking is byte-wide, so longer windows stay scalar by dispatch.
+#[cfg(target_arch = "aarch64")]
+pub(crate) mod neon {
+    use super::*;
+    use std::arch::aarch64::*;
+
+    pub(crate) const LANES8: usize = 16;
+
+    #[target_feature(enable = "neon")]
+    pub(crate) unsafe fn score_batch_neon_u8(
+        needle: &[u8],
+        soa: &[u8],
+        max_len: usize,
+        p: &SwParams,
+        include_prefix_mask: u16,
+        out: &mut [u16],
+        end_cols: &mut [u16],
+    ) {
+        let m = needle.len().min(32);
+        let n = max_len;
+        if m == 0 || n == 0 {
+            out.iter_mut().for_each(|s| *s = 0);
+            end_cols.iter_mut().for_each(|s| *s = 0);
+            return;
+        }
+
+        let zero = vdupq_n_u8(0);
+        let ones = vdupq_n_u8(0xFF);
+        let gap_ext_v = vdupq_n_u8(p.gap_extend as u8);
+        let gap_diff_v = vdupq_n_u8(p.gap_open.wrapping_sub(p.gap_extend) as u8);
+        let match_score_v = vdupq_n_u8(p.match_score as u8);
+        let mismatch_v = vdupq_n_u8(p.mismatch_penalty as u8);
+        let delim_v = vdupq_n_u8(p.delimiter_bonus as u8);
+        let cap_v = vdupq_n_u8(p.capitalization_bonus as u8);
+        let case_v = vdupq_n_u8(p.matching_case_bonus as u8);
+        let prefix_v = vdupq_n_u8(p.prefix_bonus as u8);
+        let bit20 = vdupq_n_u8(0x20);
+        // Signed-wrap range tests: 'A'..='Z' iff hay+37 > 101, etc.
+        // Bytes outside the range wrap negative or stay below threshold.
+        let add_upper = vdupq_n_u8(127 - b'Z');
+        let thresh_upper = vdupq_n_u8(101);
+        let add_letter = vdupq_n_u8(127 - b'z');
+        let thresh_letter = vdupq_n_u8(101);
+        let add_digit = vdupq_n_u8(127 - b'9');
+        let thresh_digit = vdupq_n_u8(117);
+        let need_case = p.capitalization_bonus != 0 || p.matching_case_bonus != 0;
+
+        let prefix_lanes = {
+            let mut arr = [0u8; 16];
+            for (i, a) in arr.iter_mut().enumerate() {
+                *a = if include_prefix_mask & (1u16 << i) != 0 {
+                    0xFF
+                } else {
+                    0
+                };
+            }
+            vld1q_u8(arr.as_ptr())
+        };
+
+        let mut n_fold_v = [zero; 32];
+        let mut nc_v = [zero; 32];
+        for i in 0..m {
+            let b = needle[i];
+            n_fold_v[i] = vdupq_n_u8(if b.is_ascii_uppercase() { b + 32 } else { b });
+            nc_v[i] = vdupq_n_u8(b);
+        }
+
+        // 1D in-place state: indices are compile-time after unrolling,
+        // so no ping-pong dimension is needed for e, h, or match masks.
+        let mut h = [zero; 32];
+        let mut e = [zero; 32];
+        let mut match_prev = [zero; 32];
+        let mut prev_lower = zero;
+        let mut prev_delim = zero;
+        let mut last_row_max = zero;
+        let mut end_col_v = zero;
+
+        for j in 0..n {
+            // Saturated lanes stay saturated; checking every 4th column is exact.
+            if j & 3 == 0 && vmaxvq_u8(last_row_max) == 0xFF {
+                break;
+            }
+            let hay = vld1q_u8(soa.as_ptr().add(j * LANES8));
+            let is_upper = vcgtq_s8(
+                vreinterpretq_s8_u8(vaddq_u8(hay, add_upper)),
+                vreinterpretq_s8_u8(thresh_upper),
+            );
+            let hay_fold = vorrq_u8(hay, vandq_u8(is_upper, bit20));
+            let is_letter = vcgtq_s8(
+                vreinterpretq_s8_u8(vaddq_u8(hay_fold, add_letter)),
+                vreinterpretq_s8_u8(thresh_letter),
+            );
+            let is_digit = vcgtq_s8(
+                vreinterpretq_s8_u8(vaddq_u8(hay, add_digit)),
+                vreinterpretq_s8_u8(thresh_digit),
+            );
+            let alnum = vorrq_u8(is_letter, is_digit);
+            let lt_128 = vcltq_u8(hay, vdupq_n_u8(128));
+            let is_delim = vbicq_u8(lt_128, alnum);
+            let dm = vbicq_u8(prev_delim, is_delim);
+            let delim_bonus = vandq_u8(dm, delim_v);
+
+            let (is_lower, cap_bonus) = if need_case {
+                let is_lower = vbicq_u8(is_letter, is_upper);
+                let cap_mask = vandq_u8(is_upper, prev_lower);
+                (is_lower, vandq_u8(cap_mask, cap_v))
+            } else {
+                (zero, zero)
+            };
+
+            let prefix_bonus = if j == 0 {
+                vandq_u8(prefix_v, prefix_lanes)
+            } else {
+                zero
+            };
+            let bonus_base = vaddq_u8(
+                vaddq_u8(delim_bonus, cap_bonus),
+                vaddq_u8(prefix_bonus, match_score_v),
+            );
+
+            let mut h_diag = zero;
+            let mut h_up = zero;
+            let mut f_running = zero;
+            let mut prev_mm = zero;
+
+            for i in 0..m {
+                let mm = vceqq_u8(hay_fold, n_fold_v[i]);
+                let m_prev = match_prev[i];
+                match_prev[i] = mm;
+
+                let mut match_gain = vandq_u8(bonus_base, mm);
+                if need_case {
+                    let eq_nc = vceqq_u8(hay, nc_v[i]);
+                    match_gain = vaddq_u8(match_gain, vandq_u8(eq_nc, case_v));
+                }
+                // Net gain first, then saturating add: transient sums
+                // can never wrap past 255 before the mismatch is out.
+                let mis_pen = vbicq_u8(mismatch_v, mm);
+                let diag = vqaddq_u8(vqsubq_u8(h_diag, mis_pen), match_gain);
+
+                let h_left = h[i];
+                h_diag = h_left;
+
+                let e_open_extra = vandq_u8(m_prev, gap_diff_v);
+                let e_pre = vmaxq_u8(vqsubq_u8(h_left, e_open_extra), e[i]);
+                let e_val = vqsubq_u8(e_pre, gap_ext_v);
+                e[i] = e_val;
+
+                let f_open_extra = vandq_u8(prev_mm, gap_diff_v);
+                let f_pre = vmaxq_u8(vqsubq_u8(h_up, f_open_extra), f_running);
+                f_running = vqsubq_u8(f_pre, gap_ext_v);
+
+                let h_val = vmaxq_u8(vmaxq_u8(diag, e_val), f_running);
+                h[i] = h_val;
+                h_up = h_val;
+                prev_mm = mm;
+            }
+
+            let row_m = h_up;
+            let gt_best = vcgtq_u8(row_m, last_row_max);
+            end_col_v = vbslq_u8(gt_best, vdupq_n_u8(j as u8), end_col_v);
+            last_row_max = vmaxq_u8(last_row_max, row_m);
+
+            prev_lower = is_lower;
+            prev_delim = is_delim;
+        }
+
+        let mut sb = [0u8; 16];
+        let mut eb = [0u8; 16];
+        vst1q_u8(sb.as_mut_ptr(), last_row_max);
+        vst1q_u8(eb.as_mut_ptr(), end_col_v);
+        for i in 0..16 {
+            if i < out.len() {
+                out[i] = sb[i] as u16;
+            }
+            if i < end_cols.len() {
+                end_cols[i] = eb[i] as u16;
+            }
+        }
+    }
+
+    // Test-only SoA builder (mirrors the avx2 test oracle layout).
+    #[cfg(test)]
+    pub(crate) fn build_soa16(haystacks: &[&[u8]], max_len: usize) -> Vec<u8> {
+        let mut soa = vec![0u8; max_len * 16];
+        for (p, h) in haystacks.iter().enumerate().take(16) {
+            for (j, &b) in h.iter().enumerate() {
+                soa[j * 16 + p] = b;
+            }
+        }
+        soa
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1192,6 +1405,7 @@ mod tests {
     }
 
     #[cfg(target_arch = "x86_64")]
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx2_u8_matches_scalar() {
         if !is_x86_feature_detected!("avx2") {
@@ -1307,6 +1521,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx2_u8_dispatch_matches_general_unrolled() {
         if !is_x86_feature_detected!("avx2") {
@@ -1354,6 +1569,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn u8_matches_scalar_on_long_needles() {
         // Out-of-domain long needles must still agree with scalar exactly.
@@ -1467,6 +1683,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn u8_fuzz_long_needles_all_kernels_agree() {
         if !is_x86_feature_detected!("avx2") {
@@ -1513,6 +1730,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn u8_end_col_survives_high_scores() {
         // In-domain exact needles must agree; the loop pins the boundary plus margin.
@@ -1539,6 +1757,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn u8_transient_band_agrees_with_scalar() {
         // Diag intermediates can exceed the final, so in-domain cells can wrap; biased fuzz hunts that band.
@@ -1598,6 +1817,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn u8_late_best_end_col_agrees() {
         // u8 while best-ends fit a byte; longer windows take u16. Both must agree with scalar.
@@ -1657,6 +1877,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn u8_agrees_with_scalar_through_safe_domain() {
         // Wherever u8_safe admits, u8 must equal scalar on exact-prefix hays.
@@ -1712,6 +1933,59 @@ mod tests {
         assert!(hi.u8_safe(8));
         assert!(!hi.u8_safe(9));
         assert!(!hi.u8_safe(14));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn neon_u8_agrees_with_scalar() {
+        // First-class ARM parity: NEON u8 kernel vs scalar oracle over
+        // the u8_safe domain, exact-prefix plus biased-bonus fuzz
+        // shapes (transient band included). Runs on ARM hardware.
+        let mut state = 0x9E01u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 16) as u8
+        };
+        let alpha = b"aBcDeF_/012";
+        for round in 0..300 {
+            let upper = round % 2 == 0;
+            let p = SwParams::for_query(upper);
+            let m = if upper {
+                3 + (next() % 6) as usize
+            } else {
+                5 + (next() % 11) as usize
+            };
+            if !p.u8_safe(m) {
+                continue;
+            }
+            let needle: Vec<u8> = (0..m)
+                .map(|_| alpha[next() as usize % alpha.len()])
+                .collect();
+            let mut hay = Vec::new();
+            for _ in 0..(1 + next() % 3) {
+                hay.extend_from_slice(&needle[..(1 + next() as usize % m)]);
+            }
+            hay.extend_from_slice(b"_junk0123456789");
+            let n = 16;
+            let hrefs: Vec<&[u8]> = vec![hay.as_slice(); n];
+            let soa = super::neon::build_soa16(&hrefs, hay.len());
+            let mut o = vec![0u16; n];
+            let mut e = vec![0u16; n];
+            unsafe {
+                super::neon::score_batch_neon_u8(
+                    &needle,
+                    &soa,
+                    hay.len(),
+                    &p,
+                    u16::MAX,
+                    &mut o,
+                    &mut e,
+                );
+            }
+            let (ss, se) = score_one_scalar_full(&needle, &hay, &p, true);
+            assert_eq!(o[0], ss, "neon score diverged round={round} m={m} upper={upper}");
+            assert_eq!(e[0], se, "neon end_col diverged round={round} m={m} upper={upper}");
+        }
     }
 
     #[test]
@@ -1814,6 +2088,7 @@ mod tests {
     }
 
     #[cfg(target_arch = "x86_64")]
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx2_matches_scalar() {
         if !is_x86_feature_detected!("avx2") {
@@ -1897,6 +2172,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn avx2_u16_matches_scalar_long_needle() {
         if !is_x86_feature_detected!("avx2") {
@@ -1946,6 +2222,7 @@ mod tests {
     }
 
     #[cfg(target_arch = "x86_64")]
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn transpose_8x8_is_exact_matrix_transpose() {
         let mut src = [0u8; 8 * 11];
@@ -1971,6 +2248,7 @@ mod tests {
         assert_eq!(dst[12], 0xAA);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn soa_from_stage_matches_build_soa() {
@@ -2019,6 +2297,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn soa_from_stage_dense_roundtrip_layout() {

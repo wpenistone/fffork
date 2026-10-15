@@ -263,10 +263,31 @@ fn match_fuzzy_parts(
             };
 
             // u8 fast path: 32 lanes, valid when `u8_safe` and the needle fits 32 rows.
+            // ARM NEON is a first-class path too: 16 lanes, same `u8_safe`
+            // gate (NEON is baseline on aarch64, no detection needed).
+            #[cfg(target_arch = "x86_64")]
             let use_u8 = avx2_ok && needle.len() <= 32 && p.u8_safe(needle.len());
+            #[cfg(target_arch = "x86_64")]
             let batch_sz: usize = if use_u8 { 32 } else { 16 };
+            #[cfg(target_arch = "aarch64")]
+            let use_u8 = false;
+            #[cfg(target_arch = "aarch64")]
+            let batch_sz: usize = 16;
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            let use_u8 = false;
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            let batch_sz: usize = 16;
             // u16 rows are dynamic to 32; longer needles stay scalar.
+            #[cfg(target_arch = "x86_64")]
             let use_simd = avx2_ok && needle.len() <= 32;
+            #[cfg(not(target_arch = "x86_64"))]
+            let _ = avx2_ok;
+            // NEON tracks end columns byte-wide like u8: over-long chunks
+            // go scalar below (x86 splits them to exact u16 halves).
+            #[cfg(target_arch = "aarch64")]
+            let use_simd = !force_scalar && needle.len() <= 32 && p.u8_safe(needle.len());
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            let use_simd = false;
             // `FFF_NO_BATCH_PAR`: serial batches per chunk (less fanout overhead).
             let no_batch_par = std::env::var_os("FFF_NO_BATCH_PAR").is_some();
             // Sibling prefix walks memoized (`FFF_NO_PREFIX_CACHE` escapes); same results.
@@ -332,16 +353,22 @@ fn match_fuzzy_parts(
                 set_len_uninit(&mut end_cols, n_matches + 32);
 
                 // Scalar path: one serial pass over trims with a reused window buffer.
+                let mut max_trim = 0usize;
+                for t in trims.iter() {
+                    max_trim = max_trim.max((t.end - t.start) as usize);
+                }
+                // NEON tracks end columns byte-wide like u8 with no wide
+                // fallback on ARM, so over-long chunks stay scalar here
+                // (x86 splits them to exact u16 halves in dispatch).
+                #[cfg(target_arch = "aarch64")]
+                let scalar_direct = !use_simd || max_trim > 256;
+                #[cfg(not(target_arch = "aarch64"))]
                 let scalar_direct = !use_simd;
                 if scalar_direct {
                     thread_local! {
                         static SWIN: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
                     }
                     let t_scalar = std::time::Instant::now();
-                    let mut max_trim = 0usize;
-                    for t in trims.iter() {
-                        max_trim = max_trim.max((t.end - t.start) as usize);
-                    }
                     let mut win = SWIN.with(|c| take_tls(c, max_trim));
                     set_len_uninit(&mut win, max_trim);
                     for (i, t) in trims.iter().enumerate() {
@@ -594,6 +621,71 @@ fn match_fuzzy_parts(
                                         &mut sc_out[..n],
                                         &mut ec_out[..n],
                                     );
+                                }
+                            }
+                            if timing {
+                                t_kernel_us.fetch_add(
+                                    t_kernel.elapsed().as_micros() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                            SOA.with(|c| *c.borrow_mut() = soa);
+                            STAGE.with(|c| *c.borrow_mut() = stage);
+                            return;
+                        }
+                        // First-class ARM path: scalar transpose (no SSE2
+                        // tiles), NEON u8 kernel, same saturation rescore.
+                        // Chunk-level max_trim gate above keeps max_len in
+                        // byte range, so no wide fallback is needed here.
+                        #[cfg(target_arch = "aarch64")]
+                        if use_simd {
+                            let t_xpose = std::time::Instant::now();
+                            let mut soa = SOA.with(|c| {
+                                let mut b = c.borrow_mut();
+                                if b.len() < buf_len {
+                                    b.resize(buf_len, 0);
+                                }
+                                std::mem::take(&mut *b)
+                            });
+                            soa.truncate(buf_len);
+                            crate::interseq_sw::soa_from_stage_scalar(
+                                &stage, rows, width, &mut soa,
+                            );
+                            if timing {
+                                t_xpose_us.fetch_add(
+                                    t_xpose.elapsed().as_micros() as u64,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                            let t_kernel = std::time::Instant::now();
+                            // SAFETY: NEON is baseline on aarch64; outputs
+                            // are sized to the lane count.
+                            unsafe {
+                                crate::interseq_sw::neon::score_batch_neon_u8(
+                                    needle,
+                                    &soa,
+                                    max_len,
+                                    &p,
+                                    prefix_mask as u16,
+                                    &mut sc_out[..n],
+                                    &mut ec_out[..n],
+                                );
+                                // Saturated lanes rescore scalar; dead while
+                                // `u8_safe` holds, same as the x86 net.
+                                if sc_out[..n].contains(&255) {
+                                    for (k, &oi) in ord.iter().enumerate() {
+                                        let tw = trims[oi as usize];
+                                        let wlen = (tw.end - tw.start) as usize;
+                                        let src = &stage[k * rows..k * rows + wlen];
+                                        let (sc, ec) = crate::interseq_sw::score_one_scalar_full(
+                                            needle,
+                                            src,
+                                            &p,
+                                            tw.include_prefix(),
+                                        );
+                                        sc_out[k] = sc;
+                                        ec_out[k] = ec;
+                                    }
                                 }
                             }
                             if timing {
