@@ -829,6 +829,11 @@ fn match_fuzzy_parts(
                 // cache per group (groups run on different threads).
                 let mut pcache = crate::gate::PrefixWalkCache::new();
                 pcache.set_enabled(prefix_cache_on);
+                // Group-local tallies: shared atomics stay out of the per
+                // file loop (a fetch_add per file over 227k files across
+                // 20 workers is a MESI storm that dwarfs the work itself).
+                let mut flat_files = 0u64;
+                let mut flat_bytes = 0u64;
                 for k in lo..hi {
                     let (idx, file) = if use_cand {
                         let ci = cand[k];
@@ -847,13 +852,10 @@ fn match_fuzzy_parts(
                     }
                     let flat = proto.and_then(|p| p.suffix_for(file));
                     if flat.is_some() {
-                        t_suffix_flat.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        flat_files += 1;
                         let split =
                             (file.path.filename_offset as usize).min(file.path.byte_len as usize);
-                        t_suffix_skip.fetch_add(
-                            (file.path.byte_len as usize - split) as u64,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
+                        flat_bytes += (file.path.byte_len as usize - split) as u64;
                     }
                     if let Some(hit) = gate_state.hit_file_cached(file, arena, &mut pcache, flat) {
                         m.push(neo_frizbee::Match {
@@ -867,6 +869,8 @@ fn match_fuzzy_parts(
                 t_prefix_hits.fetch_add(pcache.hits, std::sync::atomic::Ordering::Relaxed);
                 t_prefix_fills.fetch_add(pcache.fills, std::sync::atomic::Ordering::Relaxed);
                 t_prefix_skip.fetch_add(pcache.bytes_skipped, std::sync::atomic::Ordering::Relaxed);
+                t_suffix_flat.fetch_add(flat_files, std::sync::atomic::Ordering::Relaxed);
+                t_suffix_skip.fetch_add(flat_bytes, std::sync::atomic::Ordering::Relaxed);
                 t_gate_us.fetch_add(
                     t.elapsed().as_micros() as u64,
                     std::sync::atomic::Ordering::Relaxed,
