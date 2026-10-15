@@ -306,6 +306,9 @@ fn match_fuzzy_parts(
             // Probe hatch: short needles (m<=4) take the branchless bulk
             // scalar instead of sort+stage+transpose+SIMD. Opt-in until A/B.
             let tiny_on = std::env::var_os("FFF_TINY").is_some();
+            // Probe hatch: gather windows straight into SoA columns via a
+            // stack block, skipping the STAGE round-trip. Opt-in until A/B.
+            let soa_direct = std::env::var_os("FFF_SOA_DIRECT").is_some();
 
             // Sub-phase accounting, accumulated across rayon workers.
             let t_collect_us = std::sync::atomic::AtomicU64::new(0);
@@ -513,17 +516,21 @@ fn match_fuzzy_parts(
                             static STAGE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
                         }
                         let buf_len = rows * batch_sz;
+                        // Fused probe: needs a full SIMD batch (n>8 pads
+                        // assume SoA) and the SIMD path itself.
+                        let fused = soa_direct && n > 8 && use_simd;
+                        let mut fused_soa: Option<Vec<u8>> = None;
                         let t_stage = std::time::Instant::now();
                         let mut stage = STAGE.with(|c| {
                             let mut b = c.borrow_mut();
-                            if b.len() < buf_len {
+                            if !fused && b.len() < buf_len {
                                 b.resize(buf_len, 0);
                             }
                             std::mem::take(&mut *b)
                         });
-                        stage.truncate(buf_len);
+                        stage.truncate(if fused { 0 } else { buf_len });
                         // Zero only the padding lanes (SIMD path reads them).
-                        if n > 8 {
+                        if !fused && n > 8 {
                             for k in n..batch_sz {
                                 stage[k * rows..(k + 1) * rows].fill(0);
                             }
@@ -531,7 +538,66 @@ fn match_fuzzy_parts(
 
                         let mut prefix_mask: u32 = 0;
                         let mut next_ptrs = [std::ptr::null::<u8>(); MAX_PATH_CHUNKS];
+                        if fused {
+                            // Gather windows straight into SoA columns via a
+                            // stack block: same bytes the transpose would
+                            // write, without the STAGE round-trip.
+                            let mut take = SOA.with(|c| {
+                                let mut b = c.borrow_mut();
+                                if b.len() < buf_len {
+                                    b.resize(buf_len, 0);
+                                }
+                                std::mem::take(&mut *b)
+                            });
+                            take.truncate(buf_len);
+                            take.fill(0);
+                            let mut block = [0u8; 512];
+                            for (k, &oi) in ord.iter().enumerate() {
+                                let t = trims[oi as usize];
+                                let (fi, s, e, inc_prefix) =
+                                    (t.file_idx, t.start, t.end, t.include_prefix());
+                                let file = working_files.index(fi as usize);
+                                #[cfg(target_arch = "x86_64")]
+                                if k + 1 < n {
+                                    let nf = working_files
+                                        .index(trims[ord[k + 1] as usize].file_idx as usize);
+                                    let nptrs = nf.path.resolve_ptrs(arena, &mut next_ptrs);
+                                    for &p in nptrs.iter().take(4) {
+                                        unsafe {
+                                            std::arch::x86_64::_mm_prefetch(
+                                                p as *const i8,
+                                                std::arch::x86_64::_MM_HINT_T0,
+                                            );
+                                        }
+                                    }
+                                }
+                                let wlen = (e - s) as usize;
+                                let mut off = 0usize;
+                                while off < wlen {
+                                    let chunk = (wlen - off).min(512);
+                                    file.path.copy_window_to(
+                                        arena,
+                                        (s as usize + off) as u32,
+                                        (s as usize + off + chunk) as u32,
+                                        &mut block[..chunk],
+                                    );
+                                    for j in 0..chunk {
+                                        take[(off + j) * batch_sz + k] = block[j];
+                                    }
+                                    off += chunk;
+                                }
+                                if inc_prefix {
+                                    prefix_mask |= 1u32 << k;
+                                }
+                            }
+                            fused_soa = Some(take);
+                        }
                         for (k, &oi) in ord.iter().enumerate() {
+                            // Fused probe filled SoA above; the staged loop
+                            // is skipped so its traffic is really gone.
+                            if fused {
+                                break;
+                            }
                             let t = trims[oi as usize];
                             let (fi, s, e, inc_prefix) =
                                 (t.file_idx, t.start, t.end, t.include_prefix());
@@ -596,19 +662,25 @@ fn match_fuzzy_parts(
                         #[cfg(target_arch = "x86_64")]
                         if use_simd {
                             let t_xpose = std::time::Instant::now();
-                            let mut soa = SOA.with(|c| {
-                                let mut b = c.borrow_mut();
-                                if b.len() < buf_len {
-                                    b.resize(buf_len, 0);
+                            let mut soa = match fused_soa.take() {
+                                Some(v) => v,
+                                None => {
+                                    let mut soa = SOA.with(|c| {
+                                        let mut b = c.borrow_mut();
+                                        if b.len() < buf_len {
+                                            b.resize(buf_len, 0);
+                                        }
+                                        std::mem::take(&mut *b)
+                                    });
+                                    soa.truncate(buf_len);
+                                    unsafe {
+                                        crate::interseq_sw::avx2::soa_from_stage(
+                                            &stage, rows, batch_sz, &mut soa,
+                                        );
+                                    }
+                                    soa
                                 }
-                                std::mem::take(&mut *b)
-                            });
-                            soa.truncate(buf_len);
-                            unsafe {
-                                crate::interseq_sw::avx2::soa_from_stage(
-                                    &stage, rows, batch_sz, &mut soa,
-                                );
-                            }
+                            };
                             if timing {
                                 t_xpose_us.fetch_add(
                                     t_xpose.elapsed().as_micros() as u64,
@@ -633,14 +705,35 @@ fn match_fuzzy_parts(
                                         for (k, &oi) in ord.iter().enumerate() {
                                             let tw = trims[oi as usize];
                                             let wlen = (tw.end - tw.start) as usize;
-                                            let src = &stage[k * rows..k * rows + wlen];
-                                            let (sc, ec) =
+                                            let (sc, ec) = if fused {
+                                                // No STAGE copy in fused mode;
+                                                // re-gather the lane (fires ~never).
+                                                let file =
+                                                    working_files.index(tw.file_idx as usize);
+                                                let mut tmp = vec![0u8; wlen];
+                                                if wlen > 0 {
+                                                    file.path.copy_window_to(
+                                                        arena,
+                                                        tw.start as u32,
+                                                        tw.end as u32,
+                                                        &mut tmp,
+                                                    );
+                                                }
+                                                crate::interseq_sw::score_one_scalar_full(
+                                                    needle,
+                                                    &tmp,
+                                                    &p,
+                                                    tw.include_prefix(),
+                                                )
+                                            } else {
+                                                let src = &stage[k * rows..k * rows + wlen];
                                                 crate::interseq_sw::score_one_scalar_full(
                                                     needle,
                                                     src,
                                                     &p,
                                                     tw.include_prefix(),
-                                                );
+                                                )
+                                            };
                                             sc_out[k] = sc;
                                             ec_out[k] = ec;
                                         }
@@ -3093,11 +3186,21 @@ mod tests {
                     pagination: PaginationArgs::default(),
                 };
                 let max_path = crate::matcher::max_path_len_of(&files);
-                let (mut parallel, _) =
-                    match_and_score_in_arena(FileItems::All(&files), &context, arena, max_path, crate::parallelism::AbortToken::disabled());
+                let (mut parallel, _) = match_and_score_in_arena(
+                    FileItems::All(&files),
+                    &context,
+                    arena,
+                    max_path,
+                    crate::parallelism::AbortToken::disabled(),
+                );
                 context.max_threads = 1;
-                let (mut sequential, _) =
-                    match_and_score_in_arena(FileItems::All(&files), &context, arena, max_path, crate::parallelism::AbortToken::disabled());
+                let (mut sequential, _) = match_and_score_in_arena(
+                    FileItems::All(&files),
+                    &context,
+                    arena,
+                    max_path,
+                    crate::parallelism::AbortToken::disabled(),
+                );
                 parallel.sort_unstable_by_key(|(file, _)| file.modified);
                 sequential.sort_unstable_by_key(|(file, _)| file.modified);
                 assert_eq!(parallel.len(), sequential.len(), "{text}");
@@ -4752,6 +4855,32 @@ mod topk_prune_tests {
                 let (hatch_items, hatch_scores) = search_with(&files, q, arena, threads, None);
                 unsafe {
                     std::env::remove_var("FFF_NO_GATE_PREFILTER");
+                }
+                assert_eq!(base_items, hatch_items, "items differ for {q:?} t={threads}");
+                let totals = |s: Vec<Score>| s.into_iter().map(|x| x.total).collect::<Vec<_>>();
+                assert_eq!(totals(base_scores), totals(hatch_scores), "totals differ");
+            }
+        }
+    }
+
+    #[test]
+    fn soa_direct_hatch_ranks_identically() {
+        // Fused gather writes the same SoA bytes the stage+transpose
+        // would, so both paths rank identically.
+        let paths: Vec<String> = (0..1500)
+            .map(|i| format!("src/mod{}/Handler_{}.rs", i % 37, i % 50))
+            .collect();
+        let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        let (files, arena) = make_paths(&refs);
+        for q in ["handler", "mod7 Handler_7"] {
+            for threads in [1usize, 4] {
+                let (base_items, base_scores) = search_with(&files, q, arena, threads, None);
+                unsafe {
+                    std::env::set_var("FFF_SOA_DIRECT", "1");
+                }
+                let (hatch_items, hatch_scores) = search_with(&files, q, arena, threads, None);
+                unsafe {
+                    std::env::remove_var("FFF_SOA_DIRECT");
                 }
                 assert_eq!(base_items, hatch_items, "items differ for {q:?} t={threads}");
                 let totals = |s: Vec<Score>| s.into_iter().map(|x| x.total).collect::<Vec<_>>();
