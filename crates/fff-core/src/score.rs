@@ -106,15 +106,10 @@ fn match_fuzzy_parts(
             first_part.as_bytes(),
             first_options.max_typos.unwrap_or(u16::MAX),
         );
-        // Index reject before frizbee: only resolve paths that pass
-        // length+presence. Only worth the extra scan when the needle can
-        // actually reject (longer / typed letters). Common short queries
-        // match almost everything — skip so we don't scan twice.
-        // Adaptive candidate prefilter: probe a dispatch-sized sample
-        // (cost ~= one fork/join), time presence and gate on it, and fire
-        // the full parallel scan only when measured reject savings beat
-        // the scan. Short/common needles probe at ~100% pass and skip by
-        // measurement; small inputs skip (no parallel scan amortizes).
+        // Index reject before frizbee, gated by measurement: probe a
+        // dispatch-sized sample (~one fork/join), time presence vs gate,
+        // and scan fully only when reject savings win. Short/common
+        // needles probe ~100% pass and skip; small inputs skip outright.
         let gate_typos = first_options.max_typos.unwrap_or(u16::MAX);
         let gate_state = crate::gate::GateNeedle::new(first_part.as_bytes(), gate_typos);
         let mut cand: Vec<u32> = Vec::new();
@@ -328,15 +323,10 @@ fn match_fuzzy_parts(
             let t_fan_parallel = std::sync::atomic::AtomicU64::new(0);
             let timing = part_timing;
 
-            // Chunks are disjoint slices of `matches` and every scratch buffer is
-            // thread-local, so this fans out safely.
-            //
-            // Only fan out when there is more than one chunk: a single chunk has
-            // nothing to split, and the fork/join alone measured ~8x the whole
-            // serial body on a few-hundred-match corpus (782us vs 97us).
-            // `outer_saturates` skips the inner fanout when file chunks alone
-            // feed every worker: nested dispatch then only adds join/task
-            // overhead (measured ~29 CPU-ms on 116k) for no wall gain.
+            // Chunks are disjoint with thread-local scratch, so fanout is safe.
+            // Fan out only past one chunk: fork/join alone measured ~8x the
+            // serial body (782us vs 97us). `outer_saturates` skips inner fanout
+            // when file chunks feed every worker (~29 CPU-ms saved on 116k).
             let sw_body = |matches_chunk: &mut [neo_frizbee::Match],
                            exact_hits: &[u32],
                            outer_saturates: bool| {
@@ -352,6 +342,7 @@ fn match_fuzzy_parts(
                         #[cfg(target_arch = "x86_64")]
                         if mi + 1 < n_matches {
                             let nf = working_files.index(matches_chunk[mi + 1].index as usize);
+                            // SAFETY: `nf` is a live reference; prefetch never faults.
                             unsafe {
                                 std::arch::x86_64::_mm_prefetch(
                                     (nf as *const crate::types::FileItem).cast::<i8>(),
@@ -538,6 +529,7 @@ fn match_fuzzy_parts(
                                     .index(trims[ord[k + 1] as usize].file_idx as usize);
                                 let nptrs = nf.path.resolve_ptrs(arena, &mut next_ptrs);
                                 for &p in nptrs.iter().take(4) {
+                                    // SAFETY: `p` points into live arena chunks; prefetch never faults.
                                     unsafe {
                                         std::arch::x86_64::_mm_prefetch(
                                             p as *const i8,
@@ -600,6 +592,7 @@ fn match_fuzzy_parts(
                                 std::mem::take(&mut *b)
                             });
                             soa.truncate(buf_len);
+                            // SAFETY: both buffers hold exactly rows*width bytes; rows/width are multiples of 8.
                             unsafe {
                                 crate::interseq_sw::avx2::soa_from_stage(
                                     &stage, rows, width, &mut soa,
@@ -612,6 +605,7 @@ fn match_fuzzy_parts(
                                 );
                             }
                             let t_kernel = std::time::Instant::now();
+                            // SAFETY: AVX2 gated by `use_simd`; outputs are sized to the lane count.
                             unsafe {
                                 if u8path {
                                     crate::interseq_sw::avx2::score_batch_avx2_u8_dispatch(
@@ -623,7 +617,7 @@ fn match_fuzzy_parts(
                                         &mut sc_out[..n],
                                         &mut ec_out[..n],
                                     );
-                                    // Dead net while u8_safe holds: any
+                                    // Safety net, dead while u8_safe holds: any
                                     // saturated lane is rescored scalar.
                                     if sc_out[..n].contains(&255) {
                                         for (k, &oi) in ord.iter().enumerate() {
@@ -1654,6 +1648,7 @@ fn match_and_score_in_arena<'a>(
                         let idx: Vec<u32> = filtered
                             .iter()
                             .map(|f| {
+                                // SAFETY: `filtered` borrows from `all`; both ends lie in one allocation.
                                 let off =
                                     unsafe { (*f as *const FileItem).offset_from(all.as_ptr()) };
                                 debug_assert!(off >= 0);
@@ -1974,11 +1969,6 @@ fn match_and_score_in_arena<'a>(
         // Only the suffix test, the combo test and path-shaped evidence
         // need the full path; collapsed queries with only an open file skip it.
         let need_rel = need_rel_q;
-        // When nothing else needs the path, borrow the filename straight
-        // out of the arena when it fits a chunk and copy into the scratch
-        // buffer otherwise. `filename_cow` heap-allocated on that second
-        // path, which for a repo whose prefixes straddle chunks is every
-        // candidate - 47ns/candidate on linux-kernel vs 8ns on sumo.
         let rel: Option<&str> = if need_rel {
             Some(file.path.read_to_buf(arena, path_buf))
         } else {
@@ -2472,14 +2462,15 @@ fn set_len_uninit<T: Default>(v: &mut Vec<T>, n: usize) {
     #[cfg(debug_assertions)]
     v.resize_with(n, T::default);
     #[cfg(not(debug_assertions))]
+    // SAFETY: capacity reserved above; every lane is overwritten before read.
     unsafe {
         v.set_len(n);
     }
 }
 
-/// Stable tie-break key for equal scores. `sort_unstable_by` gives no order
-/// among equals, so without this the parallel path emitted different orderings
-/// run to run (observed: two files at 144 swapping between runs of one binary).
+// Stable tie-break key for equal scores. `sort_unstable_by` gives no order
+// among equals, so without this the parallel path emitted different orderings
+// run to run (observed: two files at 144 swapping between runs of one binary).
 #[inline]
 fn path_rank(file: &FileItem) -> u64 {
     file.path.rank_key()

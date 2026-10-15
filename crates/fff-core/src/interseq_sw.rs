@@ -586,14 +586,23 @@ pub(crate) mod avx2 {
 
         let mut prev_lower = zero;
         let mut prev_delim = zero;
+        // Single best tracker: last-row max and end latch share it.
         let mut last_row_max = zero;
         let mut end_col_v = zero;
-        let mut best_score_v = zero;
 
         for j in 0..n {
             // Load 16 bytes at position j, zero-extend to 16 u16
             let raw = _mm_loadu_si128(soa.as_ptr().add(j * LANES) as *const __m128i);
             let hay = _mm256_cvtepu8_epi16(raw);
+            // Next column is sequential in SoA; same hint as u8.
+            if j + 2 < n {
+                unsafe {
+                    std::arch::x86_64::_mm_prefetch(
+                        soa.as_ptr().add((j + 2) * LANES) as *const i8,
+                        std::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+            }
 
             let (is_lower, is_delim, cap_bonus, delim_bonus) = if need_case || need_delim {
                 let ge_a = _mm256_cmpgt_epi16(hay, a_lo);
@@ -651,6 +660,8 @@ pub(crate) mod avx2 {
                 let diag = _mm256_add_epi16(diag, _mm256_and_si256(eq_nc, case_v));
 
                 let e_pen = _mm256_blendv_epi8(gap_ext_v, gap_open_v, match_state[cur][i]);
+                // blendv is 1 op / 2 uops on Intel, slower on Zen; no
+                // vendor dispatch without a Zen box to measure it on.
                 let e_new = _mm256_subs_epu16(h[cur][i], e_pen);
                 let e_ext = _mm256_subs_epu16(e[cur][i], gap_ext_v);
                 e[nxt][i] = _mm256_max_epu16(e_new, e_ext);
@@ -667,10 +678,9 @@ pub(crate) mod avx2 {
             }
 
             let row_m = h[nxt][m];
-            let gt_best = _mm256_cmpgt_epi16(row_m, best_score_v);
+            let gt_best = _mm256_cmpgt_epi16(row_m, last_row_max);
             let j_v = set1(j as u16);
             end_col_v = _mm256_blendv_epi8(end_col_v, j_v, gt_best);
-            best_score_v = _mm256_max_epu16(best_score_v, row_m);
             last_row_max = _mm256_max_epu16(last_row_max, row_m);
 
             cur = nxt;
@@ -764,9 +774,9 @@ pub(crate) mod avx2 {
 
         let mut prev_lower = zero;
         let mut prev_delim = zero;
+        // Single best tracker: last-row max and end latch share it.
         let mut last_row_max = zero;
         let mut end_col_v = zero;
-        let mut best_score_v = zero;
         // Unsigned end tracking: scores pass 127, where the signed
         // compare inverts (best looks negative, so every later column
         // latches). XOR with 0x80 maps the order back. Scores use the
@@ -834,6 +844,8 @@ pub(crate) mod avx2 {
             e[nxt][0] = zero;
             f[nxt][0] = zero;
             match_state[nxt][0] = zero;
+            // Forward mm in a register (as in u16): drops one load per cell.
+            let mut prev_mm = zero;
 
             for i in 1..=m {
                 let eq_nc = _mm256_cmpeq_epi8(hay, nc_v[i]);
@@ -847,11 +859,13 @@ pub(crate) mod avx2 {
                 let diag = _mm256_add_epi8(diag, _mm256_and_si256(eq_nc, case_v));
 
                 let e_pen = _mm256_blendv_epi8(gap_ext_v, gap_open_v, match_state[cur][i]);
+                // blendv is 1 op / 2 uops on Intel, slower on Zen; no
+                // vendor dispatch without a Zen box to measure it on.
                 let e_new = _mm256_subs_epu8(h[cur][i], e_pen);
                 let e_ext = _mm256_subs_epu8(e[cur][i], gap_ext_v);
                 e[nxt][i] = _mm256_max_epu8(e_new, e_ext);
 
-                let f_pen = _mm256_blendv_epi8(gap_ext_v, gap_open_v, match_state[nxt][i - 1]);
+                let f_pen = _mm256_blendv_epi8(gap_ext_v, gap_open_v, prev_mm);
                 let f_new = _mm256_subs_epu8(h[nxt][i - 1], f_pen);
                 let f_ext = _mm256_subs_epu8(f[nxt][i - 1], gap_ext_v);
                 f[nxt][i] = _mm256_max_epu8(f_new, f_ext);
@@ -859,16 +873,16 @@ pub(crate) mod avx2 {
                 let h_val = _mm256_max_epu8(diag, e[nxt][i]);
                 let h_val = _mm256_max_epu8(h_val, f[nxt][i]);
                 h[nxt][i] = _mm256_max_epu8(h_val, zero);
+                prev_mm = mm;
             }
 
             let row_m = h[nxt][m];
             let gt_best = _mm256_cmpgt_epi8(
                 _mm256_xor_si256(row_m, sign_bias),
-                _mm256_xor_si256(best_score_v, sign_bias),
+                _mm256_xor_si256(last_row_max, sign_bias),
             );
             let j_v = set1(j as u8);
             end_col_v = _mm256_blendv_epi8(end_col_v, j_v, gt_best);
-            best_score_v = _mm256_max_epu8(best_score_v, row_m);
             last_row_max = _mm256_max_epu8(last_row_max, row_m);
 
             cur = nxt;
@@ -1007,9 +1021,9 @@ pub(crate) mod avx2 {
 
         let mut prev_lower = zero;
         let mut prev_delim = zero;
+        // Single best tracker: last-row max and end latch share it.
         let mut last_row_max = zero;
         let mut end_col_v = zero;
-        let mut best_score_v = zero;
         // Unsigned end tracking (see general kernel above): 0x80 bias
         // restores unsigned order for the signed compare.
         let sign_bias = _mm256_set1_epi8(-128);
@@ -1072,6 +1086,9 @@ pub(crate) mod avx2 {
             f[nxt][0] = zero;
             match_state[nxt][0] = zero;
 
+            // Forward mm in a register (as in u16): drops one load per cell.
+            let mut prev_mm = zero;
+
             // Const trip count (M is a const generic): fully unrolled.
             for i in 1..=M {
                 let eq_nc = _mm256_cmpeq_epi8(hay, nc_v[i]);
@@ -1085,11 +1102,13 @@ pub(crate) mod avx2 {
                 let diag = _mm256_add_epi8(diag, _mm256_and_si256(eq_nc, case_v));
 
                 let e_pen = _mm256_blendv_epi8(gap_ext_v, gap_open_v, match_state[cur][i]);
+                // blendv is 1 op / 2 uops on Intel, slower on Zen; no
+                // vendor dispatch without a Zen box to measure it on.
                 let e_new = _mm256_subs_epu8(h[cur][i], e_pen);
                 let e_ext = _mm256_subs_epu8(e[cur][i], gap_ext_v);
                 e[nxt][i] = _mm256_max_epu8(e_new, e_ext);
 
-                let f_pen = _mm256_blendv_epi8(gap_ext_v, gap_open_v, match_state[nxt][i - 1]);
+                let f_pen = _mm256_blendv_epi8(gap_ext_v, gap_open_v, prev_mm);
                 let f_new = _mm256_subs_epu8(h[nxt][i - 1], f_pen);
                 let f_ext = _mm256_subs_epu8(f[nxt][i - 1], gap_ext_v);
                 f[nxt][i] = _mm256_max_epu8(f_new, f_ext);
@@ -1097,16 +1116,16 @@ pub(crate) mod avx2 {
                 let h_val = _mm256_max_epu8(diag, e[nxt][i]);
                 let h_val = _mm256_max_epu8(h_val, f[nxt][i]);
                 h[nxt][i] = _mm256_max_epu8(h_val, zero);
+                prev_mm = mm;
             }
 
             let row_m = h[nxt][M];
             let gt_best = _mm256_cmpgt_epi8(
                 _mm256_xor_si256(row_m, sign_bias),
-                _mm256_xor_si256(best_score_v, sign_bias),
+                _mm256_xor_si256(last_row_max, sign_bias),
             );
             let j_v = set1(j as u8);
             end_col_v = _mm256_blendv_epi8(end_col_v, j_v, gt_best);
-            best_score_v = _mm256_max_epu8(best_score_v, row_m);
             last_row_max = _mm256_max_epu8(last_row_max, row_m);
 
             cur = nxt;

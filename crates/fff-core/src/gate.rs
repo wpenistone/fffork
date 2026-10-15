@@ -639,6 +639,7 @@ impl GateNeedle {
             if b.len() < byte_len {
                 b.resize(byte_len, 0);
             } else {
+                // SAFETY: shrink-only within initialized length.
                 unsafe { b.set_len(byte_len) };
             }
             std::mem::take(&mut *b)
@@ -738,8 +739,8 @@ where
     F: Fn(u32) -> u32 + Sync,
     G: Fn(u32) -> &'a FileItem + Sync,
 {
-    // Needle state (span mask + bit-parallel position masks) is per query, so
-    // Built once per query and shared by every path.
+    // Needle state (span mask + position masks) is per query: built once
+    // and shared by every path.
     let state = GateNeedle::new(needle, max_typos);
     // Presence pretest: paths missing more needle bytes than the typo
     // budget allows cannot match. Skipped below need 3.

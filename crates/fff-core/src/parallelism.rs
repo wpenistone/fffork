@@ -514,6 +514,7 @@ pub(crate) fn maybe_pin_search_thread() {
         return;
     };
     #[cfg(windows)]
+    // SAFETY: thread pseudo-handle is valid; mask is nonzero; failure code ignored (best-effort probe).
     unsafe {
         SetThreadAffinityMask(GetCurrentThread(), mask);
     }
