@@ -374,14 +374,24 @@ impl ChunkedString {
         let total = (self.byte_len as usize).min(buf.len());
         let indices = self.indices(arena);
         let chunks_to_copy = total.div_ceil(SIMD_CHUNK_BYTES).min(indices.len());
-
-        for (i, &idx) in indices[..chunks_to_copy].iter().enumerate() {
-            let dst_offset = i * SIMD_CHUNK_BYTES;
-            let take = SIMD_CHUNK_BYTES.min(total - dst_offset);
-
+        // Full chunks copy a constant 32B: one straight-line vector
+        // load/store pair, no per-chunk length branch tree. Tail only.
+        let full_chunks = total / SIMD_CHUNK_BYTES;
+        for (i, &idx) in indices[..full_chunks].iter().enumerate() {
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     arena.chunk_ptr(idx),
+                    buf.as_mut_ptr().add(i * SIMD_CHUNK_BYTES),
+                    SIMD_CHUNK_BYTES,
+                );
+            }
+        }
+        if full_chunks < chunks_to_copy {
+            let dst_offset = full_chunks * SIMD_CHUNK_BYTES;
+            let take = total - dst_offset;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    arena.chunk_ptr(indices[full_chunks]),
                     buf.as_mut_ptr().add(dst_offset),
                     take,
                 );
@@ -552,15 +562,12 @@ impl ChunkedPathStoreBuilder {
             let mut chunk_bytes = [0u8; SIMD_CHUNK_BYTES];
             chunk_bytes[..chunk.len()].copy_from_slice(chunk);
 
-            let arena_idx = match self.chunk_dedup.get(&chunk_bytes) {
-                Some(&idx) => idx,
-                None => {
-                    let idx = self.arena.len() as u32;
-                    self.arena.push(SimdChunk(chunk_bytes));
-                    self.chunk_dedup.insert(chunk_bytes, idx);
-                    idx
-                }
-            };
+            // One hash probe: entry holds the chunk while the miss path pushes.
+            let arena_idx = *self.chunk_dedup.entry(chunk_bytes).or_insert_with(|| {
+                let idx = self.arena.len() as u32;
+                self.arena.push(SimdChunk(chunk_bytes));
+                idx
+            });
 
             self.indices.push(arena_idx);
         }
