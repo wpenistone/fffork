@@ -462,13 +462,109 @@ pub(crate) mod avx2 {
         }
     }
 
+    // Dual 8x8 to 8x16 step: lanes [0..8] fill the low 128 bits,
+    // lanes [8..16] the high, one unpack chain across 256-bit lanes.
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn transpose_16x8_avx2(
+        src_lo: *const u8,
+        src_hi: *const u8,
+        src_stride: usize,
+        dst: *mut u8,
+        dst_stride: usize,
+    ) {
+        unsafe {
+            let load_pair = |i: usize| {
+                let lo = _mm_loadl_epi64(src_lo.add(i * src_stride) as *const __m128i);
+                let hi = _mm_loadl_epi64(src_hi.add(i * src_stride) as *const __m128i);
+                _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(lo), hi)
+            };
+            let a0 = load_pair(0);
+            let a1 = load_pair(1);
+            let a2 = load_pair(2);
+            let a3 = load_pair(3);
+            let a4 = load_pair(4);
+            let a5 = load_pair(5);
+            let a6 = load_pair(6);
+            let a7 = load_pair(7);
+
+            let p0 = _mm256_unpacklo_epi8(a0, a1);
+            let p1 = _mm256_unpacklo_epi8(a2, a3);
+            let p2 = _mm256_unpacklo_epi8(a4, a5);
+            let p3 = _mm256_unpacklo_epi8(a6, a7);
+
+            let q0 = _mm256_unpacklo_epi16(p0, p1);
+            let q1 = _mm256_unpackhi_epi16(p0, p1);
+            let q2 = _mm256_unpacklo_epi16(p2, p3);
+            let q3 = _mm256_unpackhi_epi16(p2, p3);
+
+            let r0 = _mm256_unpacklo_epi32(q0, q2);
+            let r1 = _mm256_unpackhi_epi32(q0, q2);
+            let r2 = _mm256_unpacklo_epi32(q1, q3);
+            let r3 = _mm256_unpackhi_epi32(q1, q3);
+
+            // Lane permute [0, 2, 1, 3]: low 128 hold the even row, high the odd.
+            let s01 = _mm256_permute4x64_epi64::<0xD8>(r0);
+            let s23 = _mm256_permute4x64_epi64::<0xD8>(r1);
+            let s45 = _mm256_permute4x64_epi64::<0xD8>(r2);
+            let s67 = _mm256_permute4x64_epi64::<0xD8>(r3);
+
+            _mm_storeu_si128(dst as *mut __m128i, _mm256_castsi256_si128(s01));
+            _mm_storeu_si128(
+                dst.add(dst_stride) as *mut __m128i,
+                _mm256_extracti128_si256::<1>(s01),
+            );
+            _mm_storeu_si128(
+                dst.add(2 * dst_stride) as *mut __m128i,
+                _mm256_castsi256_si128(s23),
+            );
+            _mm_storeu_si128(
+                dst.add(3 * dst_stride) as *mut __m128i,
+                _mm256_extracti128_si256::<1>(s23),
+            );
+            _mm_storeu_si128(
+                dst.add(4 * dst_stride) as *mut __m128i,
+                _mm256_castsi256_si128(s45),
+            );
+            _mm_storeu_si128(
+                dst.add(5 * dst_stride) as *mut __m128i,
+                _mm256_extracti128_si256::<1>(s45),
+            );
+            _mm_storeu_si128(
+                dst.add(6 * dst_stride) as *mut __m128i,
+                _mm256_castsi256_si128(s67),
+            );
+            _mm_storeu_si128(
+                dst.add(7 * dst_stride) as *mut __m128i,
+                _mm256_extracti128_si256::<1>(s67),
+            );
+        }
+    }
+
     // Tiles path-major stage to position-major SoA; writes every byte.
-    // Safety: `stage`/`out` cover stride*rows; SSE2 only, no racy aliasing.
-    #[target_feature(enable = "sse2")]
+    // Safety: `stage`/`out` cover stride*rows; AVX2 only, no racy aliasing.
+    #[target_feature(enable = "avx2")]
     pub(crate) unsafe fn soa_from_stage(stage: &[u8], rows: usize, stride: usize, out: &mut [u8]) {
         debug_assert_eq!(rows % 8, 0);
         debug_assert_eq!(stride % 8, 0);
         let mut k0 = 0usize;
+        while k0 + 16 <= stride {
+            let mut j0 = 0usize;
+            while j0 < rows {
+                unsafe {
+                    transpose_16x8_avx2(
+                        stage.as_ptr().add(k0 * rows + j0),
+                        stage.as_ptr().add((k0 + 8) * rows + j0),
+                        rows,
+                        out.as_mut_ptr().add(j0 * stride + k0),
+                        stride,
+                    );
+                }
+                j0 += 8;
+            }
+            k0 += 16;
+        }
+        // Narrow-stride tail keeps the old 8-wide contract.
         while k0 < stride {
             let mut j0 = 0usize;
             while j0 < rows {
@@ -2247,6 +2343,9 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn soa_from_stage_matches_build_soa() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
         let cases: &[&[&str]] = &[
             &["a", "", "bb", "ccc", "dddd", "eeeee", "ffffff", "ggggggg"],
             &[
@@ -2271,7 +2370,7 @@ mod tests {
             ],
         ];
         for batch in cases {
-            for &stride in &[16usize, 32] {
+            for &stride in &[8usize, 16, 32] {
                 let max_len = batch.iter().map(|h| h.len()).max().unwrap_or(0);
                 let rows = max_len.div_ceil(8) * 8;
                 if rows == 0 {
@@ -2296,6 +2395,9 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn soa_from_stage_dense_roundtrip_layout() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
         let (rows, stride) = (16usize, 32usize);
         let mut stage = vec![0u8; rows * stride];
         for k in 0..stride {
