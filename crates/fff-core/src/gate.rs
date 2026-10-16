@@ -283,6 +283,13 @@ fn force_scalar() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("FFF_FORCE_SCALAR").is_some())
 }
 
+// `FFF_GATE_AVX2=1` opts into 32B gate steps; cached, not per-query.
+#[cfg(target_arch = "x86_64")]
+fn gate_avx2_opt_in() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("FFF_GATE_AVX2").is_some())
+}
+
 /// Per-query gate state, built once per search; per-path work is one linear pass.
 pub struct GateNeedle {
     needle: Box<[u8]>,
@@ -395,9 +402,8 @@ impl GateNeedle {
         let mut tables = SpanTables::new(&span);
         #[cfg(target_arch = "x86_64")]
         {
-            tables.avx2 = std::env::var_os("FFF_GATE_AVX2").is_some()
-                && std::is_x86_feature_detected!("avx2")
-                && !force_scalar();
+            tables.avx2 =
+                gate_avx2_opt_in() && std::is_x86_feature_detected!("avx2") && !force_scalar();
         }
         Self {
             span,
