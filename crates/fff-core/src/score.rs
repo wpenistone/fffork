@@ -318,6 +318,10 @@ fn match_fuzzy_parts(
                 let n_matches = matches_chunk.len();
                 let mut trims = TRIMS.with(|c| take_tls(c, n_matches));
                 trims.clear();
+                // Fused histogram: trim lengths are in registers here, so
+                // the sort/input-size passes below read them, never rebuild.
+                let mut cnt = [0u32; 129];
+                let mut max_trim = 0usize;
                 {
                     for (mi, m) in matches_chunk.iter().enumerate() {
                         let file = working_files.index(m.index as usize);
@@ -333,7 +337,11 @@ fn match_fuzzy_parts(
                             }
                         }
                         let w = decode_match_window(m, file.path.byte_len as usize);
-                        trims.push(crate::matcher::Trim::from_window(w));
+                        let trim = crate::matcher::Trim::from_window(w);
+                        let wlen = (trim.end - trim.start) as usize;
+                        cnt[wlen.min(128)] += 1;
+                        max_trim = max_trim.max(wlen);
+                        trims.push(trim);
                     }
                 }
                 let _ = t_chunk;
@@ -353,10 +361,7 @@ fn match_fuzzy_parts(
                 set_len_uninit(&mut end_cols, n_matches + 32);
 
                 // Scalar path: one serial pass over trims with a reused window buffer.
-                let mut max_trim = 0usize;
-                for t in trims.iter() {
-                    max_trim = max_trim.max((t.end - t.start) as usize);
-                }
+                // (`max_trim` fused into the collect loop above.)
                 // NEON tracks end columns byte-wide like u8 with no wide
                 // fallback on ARM, so over-long chunks stay scalar here
                 // (x86 splits them to exact u16 halves in dispatch).
@@ -413,12 +418,7 @@ fn match_fuzzy_parts(
                     // Counting sort by trim length; grouping affects only SIMD max_len, not scores.
                     let t_sort = std::time::Instant::now();
                     if n_matches > batch_sz {
-                        let mut cnt = [0u32; 129];
-                        for i in 0..n_matches {
-                            let (s, e) = (trims[i].start, trims[i].end);
-                            let l = (e - s).min(128) as usize;
-                            cnt[l] += 1;
-                        }
+                        // Histogram fused into the collect loop above.
                         let mut start = [0u32; 129];
                         let mut acc = 0u32;
                         for l in 0..129 {
@@ -812,9 +812,15 @@ fn match_fuzzy_parts(
                         (t.file_idx, t.start as u32, t.end as u32, t.include_exact());
                     let exact = include_exact && {
                         let file = working_files.index(fi as usize);
-                        let hay = file.path.read_to_buf(arena, &mut path_buf);
-                        needle.eq_ignore_ascii_case(hay.as_bytes())
-                            && (end_pos as usize) == hay.len()
+                        // Lengths mismatch first: the gather truncates at
+                        // the buffer, so compare against its visible length.
+                        let hlen =
+                            (file.path.byte_len as usize).min(crate::simd_path::PATH_BUF_SIZE);
+                        (end_pos as usize) == needle.len() && hlen == needle.len() && {
+                                let hay = file.path.read_to_buf(arena, &mut path_buf);
+                                needle.eq_ignore_ascii_case(hay.as_bytes())
+                                    && (end_pos as usize) == hay.len()
+                            }
                     };
                     let bonus = if exact { 8u16 } else { 0 };
                     m.score = scores[i].saturating_add(bonus);
