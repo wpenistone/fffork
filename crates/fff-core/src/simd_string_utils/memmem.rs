@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 // memmem itself, and grep calls `find` once per file.
 #[cfg(target_arch = "x86_64")]
 #[inline]
-fn has_avx2() -> bool {
+pub(crate) fn has_avx2() -> bool {
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| std::is_x86_feature_detected!("avx2"))
 }
@@ -66,21 +66,16 @@ fn select_rare_pair(needle_lower: &[u8]) -> (usize, usize) {
     (i1, i2)
 }
 
-/// Extract a 16-bit bitmask from a NEON comparison result (each byte 0x00 or 0xFF)
-/// Bit *i* of the result corresponds to byte *i* of the input vector
+/// Collapse a 16-byte comparison result (bytes 0x00/0xFF) into a 64-bit
+/// nibble mask: nibble *i* is 0xF iff byte *i* matched. One narrowing
+/// shift, no horizontal reduction or vector-to-GPR round trip.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[inline]
-unsafe fn neon_movemask(v: core::arch::aarch64::uint8x16_t) -> u16 {
+unsafe fn neon_nibble_mask(v: core::arch::aarch64::uint8x16_t) -> u64 {
     use core::arch::aarch64::*;
-
-    // AND each byte with its bit-position mask, then horizontally sum each half.
-    static BITS: [u8; 16] = [1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128];
-    let bit_mask = unsafe { vld1q_u8(BITS.as_ptr()) };
-    let masked = vandq_u8(v, bit_mask);
-    let lo = vaddv_u8(vget_low_u8(masked));
-    let hi = vaddv_u8(vget_high_u8(masked));
-    (lo as u16) | ((hi as u16) << 8)
+    let narrowed = vshrn_n_u16::<4>(vreinterpretq_u16_u8(v));
+    vget_lane_u64::<0>(vreinterpret_u64_u8(narrowed))
 }
 
 /// AVX2 packed-pair kernel: scan 32 haystack positions per iteration,
@@ -234,10 +229,11 @@ unsafe fn find_packed_pair_neon(
         let eq1 = vorrq_u8(vceqq_u8(chunk1, v1_lo), vceqq_u8(chunk1, v1_hi));
         let eq2 = vorrq_u8(vceqq_u8(chunk2, v2_lo), vceqq_u8(chunk2, v2_hi));
 
-        let mut mask = unsafe { neon_movemask(vandq_u8(eq1, eq2)) };
-
+        let mut mask = unsafe { neon_nibble_mask(vandq_u8(eq1, eq2)) };
+        // Nibble iteration visits candidates in position order, so the
+        // first verified candidate is the leftmost match.
         while mask != 0 {
-            let bit = mask.trailing_zeros() as usize;
+            let bit = (mask.trailing_zeros() >> 2) as usize;
             let candidate = offset + bit;
             if candidate > last_start {
                 return None;
@@ -245,7 +241,7 @@ unsafe fn find_packed_pair_neon(
             if unsafe { eq_lowered_case(ptr.add(candidate), needle_lower) } {
                 return Some(candidate);
             }
-            mask &= mask - 1;
+            mask &= !(0xFu64 << (bit * 4));
         }
 
         offset += 16;

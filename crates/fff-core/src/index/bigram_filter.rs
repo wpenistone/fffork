@@ -940,30 +940,27 @@ fn normalize_bytes_scalar(src: &[u8], dst: &mut [u8]) {
     }
 }
 
-/// AVX2 normalize: 32 bytes/iter. AVX2 only has signed cmp, so unsigned
-/// range checks use `min(max(v, lo), hi) == v`.
+/// AVX2 normalize: 32 bytes/iter. Signed wrap maps each unsigned
+/// interval to the top of i8, so one add+compare tests membership.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn normalize_bytes_avx2(src: &[u8], dst: &mut [u8]) {
     use std::arch::x86_64::*;
     let len = src.len();
     let mut i = 0;
-    let p_lo = _mm256_set1_epi8(32);
-    let p_hi = _mm256_set1_epi8(126u8 as i8);
-    let u_lo = _mm256_set1_epi8(b'A' as i8);
-    let u_hi = _mm256_set1_epi8(b'Z' as i8);
+    // [32, 126] + 1 -> [33, 127], exactly the i8 values above 32.
+    let add_p = _mm256_set1_epi8(1);
+    let thr_p = _mm256_set1_epi8(32);
+    // [65, 90] + 37 -> [102, 127], exactly the i8 values above 101.
+    let add_u = _mm256_set1_epi8(37);
+    let thr_u = _mm256_set1_epi8(101);
     let or20 = _mm256_set1_epi8(0x20);
     while i + 32 <= len {
         unsafe {
             let v = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
-            // printable_mask: v in [32, 126]
-            let clamp_p = _mm256_min_epu8(_mm256_max_epu8(v, p_lo), p_hi);
-            let printable = _mm256_cmpeq_epi8(v, clamp_p);
-            // is_upper_mask: v in [65, 90]
-            let clamp_u = _mm256_min_epu8(_mm256_max_epu8(v, u_lo), u_hi);
-            let is_upper = _mm256_cmpeq_epi8(v, clamp_u);
-            let or_bits = _mm256_and_si256(is_upper, or20);
-            let lower = _mm256_or_si256(v, or_bits);
+            let printable = _mm256_cmpgt_epi8(_mm256_add_epi8(v, add_p), thr_p);
+            let is_upper = _mm256_cmpgt_epi8(_mm256_add_epi8(v, add_u), thr_u);
+            let lower = _mm256_or_si256(v, _mm256_and_si256(is_upper, or20));
             let out = _mm256_and_si256(lower, printable);
             _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, out);
         }
