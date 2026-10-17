@@ -174,6 +174,7 @@ pub fn expand_suite(suite: &str, repo_id: &str) -> Vec<Cell> {
             cells.extend(family_grep_pagination(repo_id));
             cells
         }
+        "perf-page" => family_pagination_representative(repo_id),
         "typing" => family_typing(repo_id),
         "calls" => family_call_kinds(repo_id),
         "constraints" => family_constraints(repo_id),
