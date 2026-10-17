@@ -68,6 +68,9 @@ pub struct CalibrateOut {
     /// Per-pack exterior sensor availability on this host.
     #[serde(default)]
     pub sensor_packs: Vec<crate::sensors::PackProbe>,
+    /// Two-snapshot wall per pack selection; the cost each op pays outside its interval.
+    #[serde(default)]
+    pub snapshot_overhead_us_by_pack: std::collections::BTreeMap<String, f64>,
 }
 
 pub fn validate_manifest(path: &Path) -> ValidateOut {
@@ -504,16 +507,11 @@ pub fn calibrate() -> CalibrateOut {
         min_ns = 1;
     }
     // Snapshot overhead: empty sensor snap pair wall.
-    let sensors = crate::sensors::Sensors::from_packs("mem,cpu");
-    let mut overs = Vec::new();
-    for _ in 0..50 {
-        let t0 = Instant::now();
-        let a = sensors.snapshot();
-        let b = sensors.snapshot();
-        let _ = sensors.delta(&a, &b);
-        overs.push(t0.elapsed().as_micros() as f64);
+    let overhead = snap_pair_us("mem,cpu", 50);
+    let mut by_pack = std::collections::BTreeMap::new();
+    for p in ["cpu", "cycles", "cpu,cycles", "io", "mem", "all"] {
+        by_pack.insert(p.to_string(), snap_pair_us(p, 20));
     }
-    let overhead = overs.iter().sum::<f64>() / overs.len() as f64;
     let busy = crate::noise::host_cpu_busy_pct();
     let sensor_packs = crate::sensors::probe_packs();
     let packs_digest: String = sensor_packs
@@ -541,7 +539,24 @@ pub fn calibrate() -> CalibrateOut {
             avail.join(",")
         ),
         sensor_packs,
+        snapshot_overhead_us_by_pack: by_pack,
     }
+}
+
+/// Wall (µs) of one empty snapshot pair + delta for a pack selection.
+fn snap_pair_us(packs: &str, n: usize) -> f64 {
+    use std::time::Instant;
+    let sensors = crate::sensors::Sensors::from_packs(packs);
+    let _ = sensors.snapshot();
+    let mut overs = Vec::with_capacity(n);
+    for _ in 0..n {
+        let t0 = Instant::now();
+        let a = sensors.snapshot();
+        let b = sensors.snapshot();
+        let _ = sensors.delta(&a, &b);
+        overs.push(t0.elapsed().as_micros() as f64);
+    }
+    overs.iter().sum::<f64>() / overs.len() as f64
 }
 
 pub fn current_evaluator() -> evaluator::EvaluatorIdentity {

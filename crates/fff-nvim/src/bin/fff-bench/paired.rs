@@ -81,6 +81,8 @@ pub struct PairedConfig {
     pub seed: u64,
     /// Applied to every subprocess measure (`--load-profile`).
     pub load_profile: String,
+    /// Sensor packs requested from every block (`--sample`).
+    pub sample_packs: String,
 }
 
 pub fn run_paired(cfg: &PairedConfig) -> Result<PairedRunOut, String> {
@@ -156,7 +158,7 @@ pub fn stream_spec_for_block(cfg: &PairedConfig, block: usize) -> BlockSpec {
         iters: cfg.iterations_per_block,
         warmup: cfg.warmup,
         load_profile: cfg.load_profile.clone(),
-        sample: "mem,cpu".into(),
+        sample: cfg.sample_packs.clone(),
         slim: true,
         patch: "none".into(),
         timeout_secs: 600,
@@ -249,9 +251,9 @@ fn run_blocks(
     fs::create_dir_all(&cfg.log_dir).map_err(|e| e.to_string())?;
     let blocks = cfg.blocks.max(1).min(BLOCK_ORDER.len());
     let mut block_log = Vec::new();
-    // role -> cell_key -> vec of wall p95 per block
-    let mut base_walls: BTreeMap<String, Vec<f64>> = BTreeMap::new();
-    let mut cand_walls: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    // role -> cell_key -> per-block p95 series for each compared sensor
+    let mut base_walls: BTreeMap<String, CellSeries> = BTreeMap::new();
+    let mut cand_walls: BTreeMap<String, CellSeries> = BTreeMap::new();
     let mut base_meta: Option<BenchReport> = None;
     let mut cand_meta: Option<BenchReport> = None;
     // Per-block geometric mean ratio inputs across cells
@@ -514,14 +516,31 @@ fn measure_subject_inner(
     serde_json::from_str(&s).map_err(|e| format!("parse report: {e}"))
 }
 
-fn ingest(map: &mut BTreeMap<String, Vec<f64>>, report: &BenchReport) {
+/// Per-block p95 series for each compared sensor of one cell.
+#[derive(Default, Clone)]
+struct CellSeries {
+    wall: Vec<f64>,
+    cpu_total: Vec<f64>,
+    cycles: Vec<f64>,
+    faults: Vec<f64>,
+}
+
+fn ingest(map: &mut BTreeMap<String, CellSeries>, report: &BenchReport) {
     for c in &report.cells {
         if c.family == "quality" || c.scenario_id.starts_with("gate") {
             continue;
         }
-        map.entry(c.cell_key.clone())
-            .or_default()
-            .push(c.cost.wall_us.p95);
+        let e = map.entry(c.cell_key.clone()).or_default();
+        e.wall.push(c.cost.wall_us.p95);
+        if let Some(d) = c.cost.cpu_total_us.as_ref() {
+            e.cpu_total.push(d.p95);
+        }
+        if let Some(d) = c.cost.cpu_cycles.as_ref() {
+            e.cycles.push(d.p95 as f64);
+        }
+        if let Some(d) = c.cost.page_faults.as_ref() {
+            e.faults.push(d.p95 as f64);
+        }
     }
 }
 
@@ -552,30 +571,42 @@ fn block_mean_pair(base: &BenchReport, cand: &BenchReport) -> Option<(f64, f64)>
     Some((bsum / n as f64, csum / n as f64))
 }
 
-fn rewrite_cells_from_blocks(report: &mut BenchReport, walls: &BTreeMap<String, Vec<f64>>) {
+/// Single-transient rejection: with few blocks p95 is the max, so one
+/// descheduled block defines the cell (seen: +44% while min/median held).
+fn block_dist(vs: &[f64]) -> Dist {
+    let mut vals = vs.to_vec();
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    if vals.len() >= 4 {
+        let top = vals.len() - 1;
+        if vals[top] > vals[top - 1] * 1.25 {
+            vals.pop();
+        }
+    }
+    Dist::from_values(vals)
+}
+
+fn opt_dist(vs: &[f64]) -> Option<Dist> {
+    if vs.is_empty() {
+        None
+    } else {
+        Some(block_dist(vs))
+    }
+}
+
+fn rewrite_cells_from_blocks(report: &mut BenchReport, series: &BTreeMap<String, CellSeries>) {
     for c in &mut report.cells {
-        if let Some(vs) = walls.get(&c.cell_key) {
-            // Single-transient rejection: with few blocks, p95 is the max,
-            // so one descheduled block defines the cell (seen: +44% on a
-            // cell whose min/median never moved). Drop a lone outlier.
-            let mut vals = vs.clone();
-            vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            if vals.len() >= 4 {
-                let top = vals.len() - 1;
-                if vals[top] > vals[top - 1] * 1.25 {
-                    vals.pop();
-                }
-            }
-            let dist = Dist::from_values(vals);
+        if let Some(s) = series.get(&c.cell_key) {
             c.cost = CostSummary {
-                wall_us: dist,
+                wall_us: block_dist(&s.wall),
                 threads_configured: c.cost.threads_configured,
                 primary_span: c.cost.primary_span.clone(),
                 qps_derived: c.cost.qps_derived,
-                cpu_total_us: c.cost.cpu_total_us.clone(),
+                cpu_total_us: opt_dist(&s.cpu_total),
+                cpu_cycles: opt_dist(&s.cycles),
+                page_faults: opt_dist(&s.faults),
                 ..c.cost.clone()
             };
-            c.iterations_logged = vs.len();
+            c.iterations_logged = s.wall.len();
         }
     }
 }
@@ -621,6 +652,7 @@ mod tests {
             log_dir: PathBuf::from("/logs"),
             seed: PAIRED_SEED,
             load_profile: "quiet_v1".into(),
+            sample_packs: "mem,cpu".into(),
         };
         let spec = stream_spec_for_block(&cfg, 2);
         assert_eq!(spec.suite, "agent-confirm");
@@ -826,14 +858,26 @@ mod tests {
     fn lone_outlier_block_is_trimmed() {
         let mut report = treport(vec![tcell("k1", "search", 0.0)]);
         let mut walls = std::collections::BTreeMap::new();
-        walls.insert("k1".to_string(), vec![615.0, 650.0, 670.0, 995.0]);
+        walls.insert(
+            "k1".to_string(),
+            CellSeries {
+                wall: vec![615.0, 650.0, 670.0, 995.0],
+                ..Default::default()
+            },
+        );
         rewrite_cells_from_blocks(&mut report, &walls);
         // 995 > 670 * 1.25 trims to [615, 650, 670]: p95 must drop.
         assert!(report.cells[0].cost.wall_us.p95 < 900.0);
         // No outlier: all four kept.
         let mut report2 = treport(vec![tcell("k1", "search", 0.0)]);
         let mut walls2 = std::collections::BTreeMap::new();
-        walls2.insert("k1".to_string(), vec![600.0, 650.0, 670.0, 690.0]);
+        walls2.insert(
+            "k1".to_string(),
+            CellSeries {
+                wall: vec![600.0, 650.0, 670.0, 690.0],
+                ..Default::default()
+            },
+        );
         rewrite_cells_from_blocks(&mut report2, &walls2);
         assert!(report2.cells[0].cost.wall_us.p95 >= 690.0);
     }

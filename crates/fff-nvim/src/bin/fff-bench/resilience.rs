@@ -132,6 +132,7 @@ pub fn run_resilience_paired(
             log_dir: cfg.log_dir.join(pid),
             seed: paired::PAIRED_SEED ^ identity_hash(pid),
             load_profile: pid.clone(),
+            sample_packs: "mem,cpu,cycles".into(),
         };
         let out = paired::run_paired(&pcfg)?;
         let treat_valid = out
