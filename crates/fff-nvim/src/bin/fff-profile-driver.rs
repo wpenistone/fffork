@@ -200,27 +200,37 @@ fn main() {
 
     let s0 = sensors::snap();
     let started = Instant::now();
+    let mut per_op: Vec<f64> = Vec::with_capacity(iterations);
     for _ in 0..iterations {
+        let t = Instant::now();
         checksum = checksum.wrapping_add(search());
+        per_op.push(t.elapsed().as_secs_f64() * 1_000_000.0);
     }
     let elapsed = started.elapsed();
     let s1 = sensors::snap();
 
     let n = iterations as f64;
     let us_per_op = elapsed.as_secs_f64() * 1_000_000.0 / n;
+    per_op.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let pct = |q: f64| per_op[((per_op.len() - 1) as f64 * q).round() as usize];
+    let (p50, p90, p99, max_us) = if per_op.is_empty() {
+        (0.0, 0.0, 0.0, 0.0)
+    } else {
+        (pct(0.50), pct(0.90), pct(0.99), per_op[per_op.len() - 1])
+    };
     let cpu_us_per_op = (s1.cpu_100ns.saturating_sub(s0.cpu_100ns) as f64) / 10.0 / n;
     let cycles_per_op = (s1.cycles.saturating_sub(s0.cycles) as f64) / n;
     let read_b_op = (s1.read_bytes.saturating_sub(s0.read_bytes) as f64) / n;
     let faults_per_100k = (s1.faults.saturating_sub(s0.faults) as f64) / n * 100_000.0;
 
     println!(
-        "query={query} threads={threads} iterations={iterations} us_per_op={us_per_op:.3} cpu_us_per_op={cpu_us_per_op:.3} cycles_per_op={cycles_per_op:.0} read_b_op={read_b_op:.2} faults_per_100k={faults_per_100k:.1} peak_rss_mb={:.2} checksum={checksum} total_matched={last_total} items_len={last_len}",
+        "query={query} threads={threads} iterations={iterations} us_per_op={us_per_op:.3} p50_us={p50:.3} p90_us={p90:.3} p99_us={p99:.3} max_us={max_us:.3} cpu_us_per_op={cpu_us_per_op:.3} cycles_per_op={cycles_per_op:.0} read_b_op={read_b_op:.2} faults_per_100k={faults_per_100k:.1} peak_rss_mb={:.2} checksum={checksum} total_matched={last_total} items_len={last_len}",
         s1.rss_mb
     );
 
     if let Some(path) = jsonl {
         let line = format!(
-            "{{\"query\":\"{query}\",\"threads\":{threads},\"iterations\":{iterations},\"us_per_op\":{us_per_op:.3},\"cpu_us_per_op\":{cpu_us_per_op:.3},\"cycles_per_op\":{cycles_per_op:.0},\"read_bytes\":{},\"faults\":{},\"peak_rss_mb\":{:.2},\"checksum\":{checksum}}}",
+            "{{\"query\":\"{query}\",\"threads\":{threads},\"iterations\":{iterations},\"us_per_op\":{us_per_op:.3},\"p50_us\":{p50:.3},\"p90_us\":{p90:.3},\"p99_us\":{p99:.3},\"max_us\":{max_us:.3},\"cpu_us_per_op\":{cpu_us_per_op:.3},\"cycles_per_op\":{cycles_per_op:.0},\"read_bytes\":{},\"faults\":{},\"peak_rss_mb\":{:.2},\"checksum\":{checksum}}}",
             s1.read_bytes.saturating_sub(s0.read_bytes),
             s1.faults.saturating_sub(s0.faults),
             s1.rss_mb
