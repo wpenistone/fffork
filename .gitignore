@@ -1,6 +1,7 @@
 doc/tags
 big-repo
 target/
+target-prof/
 .archive.lua
 _*.lua
 .lazy.lua
