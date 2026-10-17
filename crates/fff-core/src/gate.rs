@@ -318,6 +318,7 @@ struct WalkState {
     n: usize,
     end_cut: usize,
     allow_cut: bool,
+    walked: u64,
 }
 
 impl WalkState {
@@ -329,6 +330,7 @@ impl WalkState {
             n: 0,
             end_cut: 0,
             allow_cut,
+            walked: 0,
         }
     }
 }
@@ -349,6 +351,7 @@ pub struct PrefixWalkCache {
     pub bytes_skipped: u64,
     pub tight_trim: u64,
     pub tight_files: u64,
+    pub walked: u64,
 }
 
 impl PrefixWalkCache {
@@ -367,6 +370,7 @@ impl PrefixWalkCache {
             bytes_skipped: 0,
             tight_trim: 0,
             tight_files: 0,
+            walked: 0,
         }
     }
 
@@ -531,6 +535,7 @@ impl GateNeedle {
         let want_cut = self.cut && st.allow_cut;
         let ascii = self.tables.ascii_only;
         let (t0, t1) = (&self.tables.lo, &self.tables.hi);
+        let counted = crate::score::phase_timing();
         file.path.for_each_chunk(arena, |off, chunk| {
             if off >= hi {
                 return;
@@ -548,6 +553,9 @@ impl GateNeedle {
             }
             let view = &chunk[start - off..end - off];
             let len = end - start;
+            if counted {
+                st.walked += len as u64;
+            }
             let mut base = 0usize;
             while base < len {
                 let step = 32.min(len - base);
@@ -585,6 +593,7 @@ impl GateNeedle {
     ) {
         let byte_len = file.path.byte_len as usize;
         let want_cut = self.cut && st.allow_cut;
+        let counted = crate::score::phase_timing();
         file.path.for_each_chunk(arena, |off, chunk| {
             if off >= hi {
                 return;
@@ -602,6 +611,9 @@ impl GateNeedle {
             }
             let view = &chunk[start - off..end - off];
             let len = end - start;
+            if counted {
+                st.walked += len as u64;
+            }
             let mut base = 0usize;
             while base < len {
                 let step = 16.min(len - base);
@@ -629,6 +641,7 @@ impl GateNeedle {
         let want_cut = self.cut && st.allow_cut;
         let ascii = self.tables.ascii_only;
         let (t0, t1) = (&self.tables.lo, &self.tables.hi);
+        let counted = crate::score::phase_timing();
         file.path.for_each_chunk(arena, |off, chunk| {
             if off >= hi {
                 return;
@@ -646,6 +659,9 @@ impl GateNeedle {
             }
             let view = &chunk[start - off..end - off];
             let len = end - start;
+            if counted {
+                st.walked += len as u64;
+            }
             let mut base = 0usize;
             while base < len {
                 let step = 16.min(len - base);
@@ -909,6 +925,7 @@ impl GateNeedle {
         } else {
             cache.bytes_skipped += (byte_len - split) as u64;
         }
+        cache.walked += st.walked;
         let hit = self.finish(&st, byte_len)?;
         let tight_before = hit.start;
         let out = self.maybe_tighten(file, arena, hit, Some(&mut cache.tight_trim));

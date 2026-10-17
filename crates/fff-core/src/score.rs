@@ -21,7 +21,7 @@ static AVX2_PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static PHASE_TIMING_FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static FORCE_SCALAR_FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-fn phase_timing() -> bool {
+pub(crate) fn phase_timing() -> bool {
     *PHASE_TIMING_FLAG.get_or_init(|| std::env::var_os("FFF_PHASE_TIMING").is_some())
 }
 
@@ -205,6 +205,11 @@ fn match_fuzzy_parts(
             });
         let t_gate_us = std::sync::atomic::AtomicU64::new(0);
         let t_exact_us = std::sync::atomic::AtomicU64::new(0);
+        let t_gate_files = std::sync::atomic::AtomicU64::new(0);
+        let t_gate_accepts = std::sync::atomic::AtomicU64::new(0);
+        let t_gate_path_bytes = std::sync::atomic::AtomicU64::new(0);
+        let t_gate_walked = std::sync::atomic::AtomicU64::new(0);
+        let t_presence_rejects = std::sync::atomic::AtomicU64::new(0);
         let t_swslice_us = std::sync::atomic::AtomicU64::new(0);
         let t_prefix_hits = std::sync::atomic::AtomicU64::new(0);
         let t_prefix_fills = std::sync::atomic::AtomicU64::new(0);
@@ -891,6 +896,10 @@ fn match_fuzzy_parts(
                 // Per-group prefix-walk cache (groups run on different threads).
                 let mut pcache = crate::gate::PrefixWalkCache::new();
                 pcache.set_enabled(prefix_cache_on);
+                let mut g_files = 0u64;
+                let mut g_accepts = 0u64;
+                let mut g_path = 0u64;
+                let mut g_prej = 0u64;
                 for k in lo..hi {
                     let (idx, file) = if use_cand {
                         let ci = cand[k];
@@ -905,9 +914,19 @@ fn match_fuzzy_parts(
                             first_part.as_bytes(),
                         )
                     {
+                        if part_timing {
+                            g_prej += 1;
+                        }
                         continue;
                     }
+                    if part_timing {
+                        g_files += 1;
+                        g_path += file.path.byte_len as u64;
+                    }
                     if let Some(hit) = gate_state.hit_file_cached(file, arena, &mut pcache) {
+                        if part_timing {
+                            g_accepts += 1;
+                        }
                         m.push(neo_frizbee::Match {
                             score: hit.start as u16,
                             index: idx,
@@ -921,6 +940,11 @@ fn match_fuzzy_parts(
                 t_prefix_skip.fetch_add(pcache.bytes_skipped, std::sync::atomic::Ordering::Relaxed);
                 t_tight_trim.fetch_add(pcache.tight_trim, std::sync::atomic::Ordering::Relaxed);
                 t_tight_files.fetch_add(pcache.tight_files, std::sync::atomic::Ordering::Relaxed);
+                t_gate_files.fetch_add(g_files, std::sync::atomic::Ordering::Relaxed);
+                t_gate_accepts.fetch_add(g_accepts, std::sync::atomic::Ordering::Relaxed);
+                t_gate_path_bytes.fetch_add(g_path, std::sync::atomic::Ordering::Relaxed);
+                t_gate_walked.fetch_add(pcache.walked, std::sync::atomic::Ordering::Relaxed);
+                t_presence_rejects.fetch_add(g_prej, std::sync::atomic::Ordering::Relaxed);
                 t_gate_us.fetch_add(
                     t.elapsed().as_micros() as u64,
                     std::sync::atomic::Ordering::Relaxed,
@@ -993,9 +1017,14 @@ fn match_fuzzy_parts(
             let prefix_hit = t_prefix_hits.load(std::sync::atomic::Ordering::Relaxed);
             let prefix_fill = t_prefix_fills.load(std::sync::atomic::Ordering::Relaxed);
             let prefix_skip_kb = t_prefix_skip.load(std::sync::atomic::Ordering::Relaxed) / 1024;
+            let gate_files = t_gate_files.load(std::sync::atomic::Ordering::Relaxed);
+            let gate_acc = t_gate_accepts.load(std::sync::atomic::Ordering::Relaxed);
+            let pres_rej = t_presence_rejects.load(std::sync::atomic::Ordering::Relaxed);
+            let gate_walk_kb = t_gate_walked.load(std::sync::atomic::Ordering::Relaxed) / 1024;
+            let gate_path_kb = t_gate_path_bytes.load(std::sync::atomic::Ordering::Relaxed) / 1024;
             if part_timing {
                 eprintln!(
-                    "PHASE parts gate_us={gate_us} exact_us={exact_us} swslice_us={swslice_us} fuse_us={sw_us} threads={threads} n={} prefix_hit={prefix_hit} prefix_fill={prefix_fill} prefix_skip_kb={prefix_skip_kb}",
+                    "PHASE parts gate_us={gate_us} exact_us={exact_us} swslice_us={swslice_us} fuse_us={sw_us} threads={threads} n={} files_n={n_files} use_cand={use_cand} cand_n={gate_n} gate_files={gate_files} gate_acc={gate_acc} pres_rej={pres_rej} gate_walk_kb={gate_walk_kb} gate_path_kb={gate_path_kb} prefix_hit={prefix_hit} prefix_fill={prefix_fill} prefix_skip_kb={prefix_skip_kb}",
                     matches.len()
                 );
                 // Census: mean trimmed bytes per acceptor sizes the SW prize.
