@@ -158,6 +158,8 @@ pub struct CostSummary {
     pub cpu_parallelism: Option<Dist>,
     pub rss_peak_mb: Option<f64>,
     pub rss_mb_end: Option<Dist>,
+    #[serde(default)]
+    pub page_faults: Option<Dist>,
     pub disk_read_bytes: Option<Dist>,
     pub energy_j: Option<Dist>,
     /// Peak OS thread count observed across samples.
@@ -181,6 +183,7 @@ impl Default for CostSummary {
             cpu_parallelism: None,
             rss_peak_mb: None,
             rss_mb_end: None,
+            page_faults: None,
             disk_read_bytes: None,
             energy_j: None,
             threads_observed_peak: None,
@@ -214,6 +217,10 @@ impl CostSummary {
             .filter_map(|s| s.cpu_parallelism.filter(|p| *p > 0.0))
             .collect();
         let rss_end: Vec<f64> = samples.iter().filter_map(|s| s.rss_mb).collect();
+        let faults: Vec<f64> = samples
+            .iter()
+            .filter_map(|s| s.page_faults.map(|v| v as f64))
+            .collect();
         let disk: Vec<f64> = samples
             .iter()
             .filter_map(|s| s.disk_read_bytes.map(|v| v as f64))
@@ -281,6 +288,11 @@ impl CostSummary {
                 None
             } else {
                 Some(Dist::from_values(rss_end))
+            },
+            page_faults: if faults.is_empty() {
+                None
+            } else {
+                Some(Dist::from_values(faults))
             },
             disk_read_bytes: if disk.is_empty() {
                 None

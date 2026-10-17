@@ -34,6 +34,9 @@ pub struct CellDelta {
     pub wall_us_p95_rel: Option<f64>,
     pub wall_us_p95_abs: Option<f64>,
     pub cpu_total_us_p95_rel: Option<f64>,
+    /// Process cycle delta (Windows QueryProcessCycleTime); drift-immune vs wall.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_cycles_p95_rel: Option<f64>,
     pub rank_target_base: Option<usize>,
     pub rank_target_cur: Option<usize>,
     pub quality_regressed: bool,
@@ -293,6 +296,13 @@ fn compare_with_grade(baseline: &BenchReport, current: &BenchReport, grade: &str
     } else {
         Some(rels.iter().sum::<f64>() / rels.len() as f64)
     };
+    // Cycle delta is drift-immune; reported alongside wall when the pack is on.
+    let cyc_rels: Vec<f64> = deltas.iter().filter_map(|d| d.cpu_cycles_p95_rel).collect();
+    let cycles_mean = if cyc_rels.is_empty() {
+        None
+    } else {
+        Some(cyc_rels.iter().sum::<f64>() / cyc_rels.len() as f64)
+    };
 
     // Bootstrap on p95 pairs (history baseline acts as paired observation proxy).
     let pairs: Vec<(f64, f64)> = deltas
@@ -357,7 +367,7 @@ fn compare_with_grade(baseline: &BenchReport, current: &BenchReport, grade: &str
     }
 
     let summary = format!(
-        "verdict={verdict}; wall_p95_rel_mean={wall_mean:?}; improved_cells={improved}; regressed_cells={regressed}; caps_failed={caps_failed}; grade={grade}; ci={:?}",
+        "verdict={verdict}; wall_p95_rel_mean={wall_mean:?}; cycles_p95_rel_mean={cycles_mean:?}; improved_cells={improved}; regressed_cells={regressed}; caps_failed={caps_failed}; grade={grade}; ci={:?}",
         wall_ci.as_ref().map(|c| (c.low, c.high, c.point))
     );
 
@@ -474,7 +484,7 @@ fn cell_deltas(
             continue;
         }
         let b = baseline.cells.iter().find(|x| x.cell_key == c.cell_key);
-        let (wall_rel, wall_abs, cpu_rel) = if let Some(b) = b {
+        let (wall_rel, wall_abs, cpu_rel, cyc_rel) = if let Some(b) = b {
             let wr = if b.cost.wall_us.p95 > 0.0 {
                 Some((c.cost.wall_us.p95 - b.cost.wall_us.p95) / b.cost.wall_us.p95)
             } else {
@@ -485,7 +495,11 @@ fn cell_deltas(
                 (Some(cc), Some(bc)) if bc.p95 > 0.0 => Some((cc.p95 - bc.p95) / bc.p95),
                 _ => None,
             };
-            (wr, wa, cr)
+            let cy = match (c.cost.cpu_cycles.as_ref(), b.cost.cpu_cycles.as_ref()) {
+                (Some(cc), Some(bc)) if bc.p95 > 0.0 => Some((cc.p95 - bc.p95) / bc.p95),
+                _ => None,
+            };
+            (wr, wa, cr, cy)
         } else {
             // Missing baseline cell: for screen grade we skip; for strict confirm mark incomplete.
             continue;
@@ -512,6 +526,7 @@ fn cell_deltas(
             wall_us_p95_rel: wall_rel,
             wall_us_p95_abs: wall_abs,
             cpu_total_us_p95_rel: cpu_rel,
+            cpu_cycles_p95_rel: cyc_rel,
             rank_target_base: b.and_then(|x| x.rank_target),
             rank_target_cur: c.rank_target,
             quality_regressed,

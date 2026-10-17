@@ -303,6 +303,12 @@ enum Commands {
         iters_per_block: usize,
         #[arg(
             long,
+            default_value = "mem,cpu,cycles",
+            help = "Sensor packs per block: mem,cpu,io,cycles,power"
+        )]
+        sample: String,
+        #[arg(
+            long,
             help = "Force legacy one-shot spawns instead of persistent subjects"
         )]
         no_persistent_subjects: bool,
@@ -1527,6 +1533,7 @@ fn real_main() -> ExitCode {
                     log_dir: confirm_log.clone().unwrap(),
                     seed: paired::PAIRED_SEED,
                     load_profile: "quiet_v1".into(),
+                    sample_packs: "mem,cpu,cycles".into(),
                 };
                 let paired_out = if no_persistent_subjects {
                     paired::run_paired_oneshot(&cfg)
@@ -1652,6 +1659,7 @@ fn real_main() -> ExitCode {
             content_index,
             blocks,
             iters_per_block,
+            sample,
             no_persistent_subjects,
         } => {
             let hist = history_dir.unwrap_or_else(default_history_dir);
@@ -1786,6 +1794,7 @@ fn real_main() -> ExitCode {
                     log_dir: log.clone(),
                     seed: paired::PAIRED_SEED,
                     load_profile: load_profile.clone(),
+                    sample_packs: sample.clone(),
                 };
                 let paired_out = if no_persistent_subjects {
                     paired::run_paired_oneshot(&cfg)
@@ -2304,8 +2313,11 @@ fn real_main() -> ExitCode {
                 println!("{}", out.summary_for_agent);
                 for d in &out.cell_deltas {
                     println!(
-                        "  wall_rel={:?} cpu_rel={:?} qreg={}",
-                        d.wall_us_p95_rel, d.cpu_total_us_p95_rel, d.quality_regressed
+                        "  wall_rel={:?} cpu_rel={:?} cyc_rel={:?} qreg={}",
+                        d.wall_us_p95_rel,
+                        d.cpu_total_us_p95_rel,
+                        d.cpu_cycles_p95_rel,
+                        d.quality_regressed
                     );
                 }
             }
