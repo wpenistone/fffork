@@ -168,7 +168,9 @@ fn main() {
 
     let parser = QueryParser::<FileSearchConfig>::default();
     let parsed = parser.parse(query);
-    let search = || {
+    let mut last_total = 0usize;
+    let mut last_len = 0usize;
+    let mut search = || {
         let guard = shared_picker.read().expect("picker lock");
         let picker = guard.as_ref().expect("picker");
         let result = picker.fuzzy_search(
@@ -186,6 +188,8 @@ fn main() {
                 },
             },
         );
+        last_total = result.total_matched;
+        last_len = result.items.len();
         result.total_matched ^ result.items.len()
     };
 
@@ -210,7 +214,7 @@ fn main() {
     let faults_per_100k = (s1.faults.saturating_sub(s0.faults) as f64) / n * 100_000.0;
 
     println!(
-        "query={query} threads={threads} iterations={iterations} us_per_op={us_per_op:.3} cpu_us_per_op={cpu_us_per_op:.3} cycles_per_op={cycles_per_op:.0} read_b_op={read_b_op:.2} faults_per_100k={faults_per_100k:.1} peak_rss_mb={:.2} checksum={checksum}",
+        "query={query} threads={threads} iterations={iterations} us_per_op={us_per_op:.3} cpu_us_per_op={cpu_us_per_op:.3} cycles_per_op={cycles_per_op:.0} read_b_op={read_b_op:.2} faults_per_100k={faults_per_100k:.1} peak_rss_mb={:.2} checksum={checksum} total_matched={last_total} items_len={last_len}",
         s1.rss_mb
     );
 
