@@ -68,9 +68,7 @@ fn match_fuzzy_parts(
         return vec![];
     }
 
-    // Prefilter is an internal scan: parallelize even for 1-thread searches.
-    // Cap comes from the machine profile, not a literal.
-    let scan_cap = crate::machine::scan_thread_cap();
+    // Requested width bounds the matcher; the work estimate below narrows it further.
     // Narrow from the longer part (rejects more); each part keeps its own typo cap.
     let reverse_pair = valid_parts.len() == 2 && valid_parts[1].len() > valid_parts[0].len();
     let first_part: &str = if reverse_pair {
@@ -86,7 +84,7 @@ fn match_fuzzy_parts(
         first_part.len(),
         max_path_len,
         first_options.max_typos,
-        scan_cap.max(max_threads),
+        max_threads.max(1),
     );
 
     // Gate match-set + windows, then re-score with SW replicating frizbee's gap model
@@ -106,8 +104,7 @@ fn match_fuzzy_parts(
         let t_cand = std::time::Instant::now();
         let n_files = working_files.len();
         let avg_bytes = max_path_len.max(1);
-        let big_enough =
-            crate::dispatch::plan_files(n_files, avg_bytes, usize::MAX).threads > 1;
+        let big_enough = crate::dispatch::plan_files(n_files, avg_bytes, usize::MAX).threads > 1;
         // Presence economics, set only when the gate probe was timed.
         let mut presence_probe: Option<(f64, f64, f64)> = None;
         if big_enough && n_files > 0 {
@@ -136,8 +133,7 @@ fn match_fuzzy_parts(
                     break;
                 }
             }
-            let presence_ns =
-                t_probe.elapsed().as_nanos() as f64 / probed.max(1) as f64;
+            let presence_ns = t_probe.elapsed().as_nanos() as f64 / probed.max(1) as f64;
             let mut gate_ns = 0.0f64;
             if !pass_idx.is_empty() {
                 let t_gate = std::time::Instant::now();
@@ -159,23 +155,39 @@ fn match_fuzzy_parts(
                         + crate::dispatch::fork_join_ns() as f64
                         + n_files as f64 * rate * presence_ns);
             if fire {
-                use rayon::prelude::*;
-                cand = crate::parallelism::run_on_search_pool(|| {
-                    (0..n_files)
-                        .into_par_iter()
-                        .filter_map(|i| {
-                            let f = working_files.index(i);
-                            if (f.path.byte_len as usize) < min_len {
-                                return None;
-                            }
-                            let mask = f.presence_mask();
-                            if mask != 0 && !np.allows(mask, needle_b) {
-                                return None;
-                            }
-                            Some(i as u32)
-                        })
-                        .collect()
-                });
+                let keep = |i: usize| {
+                    let f = working_files.index(i);
+                    if (f.path.byte_len as usize) < min_len {
+                        return None;
+                    }
+                    let mask = f.presence_mask();
+                    if mask != 0 && !np.allows(mask, needle_b) {
+                        return None;
+                    }
+                    Some(i as u32)
+                };
+                cand = if max_threads < crate::parallelism::search_pool_threads() {
+                    // Binding width: one planned chunk per task, at most max_threads tasks.
+                    let span = crate::dispatch::plan_files(n_files, avg_bytes, max_threads.max(1))
+                        .chunk
+                        .max(1);
+                    let n_chunks = n_files.div_ceil(span);
+                    crate::parallelism::run_on_search_pool(|| {
+                        let parts: Vec<Vec<u32>> = (0..n_chunks)
+                            .into_par_iter()
+                            .map(|c| {
+                                let lo = c * span;
+                                let hi = ((c + 1) * span).min(n_files);
+                                (lo..hi).filter_map(&keep).collect()
+                            })
+                            .collect();
+                        parts.into_iter().flatten().collect()
+                    })
+                } else {
+                    crate::parallelism::run_on_search_pool(|| {
+                        (0..n_files).into_par_iter().filter_map(&keep).collect()
+                    })
+                };
             }
         }
         let cand_ms = t_cand.elapsed().as_secs_f64() * 1e3;
@@ -740,10 +752,14 @@ fn match_fuzzy_parts(
                         }
                     };
                     // Fan out only past break-even; inside workers degrade to serial.
-                    // Batch cost is the running measured estimate.
+                    // A width-bounded request spends its workers on groups, not batches.
                     let n_batches = order.len().div_ceil(batch_sz);
                     let batch_est = crate::dispatch::batch_ns_estimate(use_u8);
-                    let pool_width = crate::parallelism::search_pool_threads();
+                    let pool_width = if max_threads < crate::parallelism::search_pool_threads() {
+                        1
+                    } else {
+                        crate::parallelism::search_pool_threads()
+                    };
                     let t_fan = std::time::Instant::now();
                     if no_batch_par
                         || outer_saturates
@@ -817,10 +833,10 @@ fn match_fuzzy_parts(
                         let hlen =
                             (file.path.byte_len as usize).min(crate::simd_path::PATH_BUF_SIZE);
                         (end_pos as usize) == needle.len() && hlen == needle.len() && {
-                                let hay = file.path.read_to_buf(arena, &mut path_buf);
-                                needle.eq_ignore_ascii_case(hay.as_bytes())
-                                    && (end_pos as usize) == hay.len()
-                            }
+                            let hay = file.path.read_to_buf(arena, &mut path_buf);
+                            needle.eq_ignore_ascii_case(hay.as_bytes())
+                                && (end_pos as usize) == hay.len()
+                        }
                     };
                     let bonus = if exact { 8u16 } else { 0 };
                     m.score = scores[i].saturating_add(bonus);
@@ -843,8 +859,8 @@ fn match_fuzzy_parts(
                 ECOLS.with(|c| reclaim(&mut c.borrow_mut(), end_cols));
             };
             // Fused groups: gate, exact, and SW per file chunk while bytes are hot.
-            // Outputs are per-index, so chunk size cannot change results.
-            // Test-tunable (`FFF_SW_CHUNK`); production sizes from the work model at pool width.
+            // The split is planned at pool width; the requested width bounds execution,
+            // never the partition (gate windows must not move with it). FFF_SW_CHUNK overrides.
             let per_file = crate::dispatch::match_bytes_per_file(
                 first_part.len(),
                 max_path_len,
@@ -928,12 +944,27 @@ fn match_fuzzy_parts(
                 for g in 0..n_groups {
                     matches.extend(one_group(g));
                 }
-            } else {
+            } else if max_threads >= crate::parallelism::search_pool_threads() {
                 use rayon::prelude::*;
                 let scored: Vec<Vec<neo_frizbee::Match>> =
                     (0..n_groups).into_par_iter().map(one_group).collect();
                 for v in scored {
                     matches.extend(v);
+                }
+            } else {
+                // A binding request runs the same groups in waves of at most
+                // `max_threads`: width changes concurrency, not the split.
+                use rayon::prelude::*;
+                let width = max_threads.max(1);
+                let mut g0 = 0;
+                while g0 < n_groups {
+                    let g1 = (g0 + width).min(n_groups);
+                    let scored: Vec<Vec<neo_frizbee::Match>> =
+                        (g0..g1).into_par_iter().map(|g| one_group(g)).collect();
+                    for v in scored {
+                        matches.extend(v);
+                    }
+                    g0 = g1;
                 }
             }
 
@@ -1008,7 +1039,7 @@ fn match_fuzzy_parts(
             part.len(),
             max_path_len,
             part_options.max_typos,
-            scan_cap.max(max_threads),
+            max_threads.max(1),
         );
         let sub_np = crate::presence::NeedlePresence::new(
             part.as_bytes(),
@@ -1331,7 +1362,6 @@ fn match_fuzzy_parts_dirs(
         return vec![];
     }
 
-    let scan_cap = crate::machine::scan_thread_cap();
     // Dir haystack bound sampled, not estimated: dirs are few.
     let max_dir_len = working_dirs
         .iter()
@@ -1343,7 +1373,7 @@ fn match_fuzzy_parts_dirs(
         valid_parts[0].len(),
         max_dir_len,
         options.max_typos,
-        scan_cap.max(max_threads),
+        max_threads.max(1),
     );
     let first_part_matches = with_cached_matcher(valid_parts[0], options, |matcher| {
         matcher.match_range_parallel_resolved(
@@ -1372,7 +1402,7 @@ fn match_fuzzy_parts_dirs(
             part.len(),
             max_dir_len,
             part_options.max_typos,
-            scan_cap.max(max_threads),
+            max_threads.max(1),
         );
         let sub_matches = with_cached_matcher(part, &part_options, |matcher| {
             matcher.match_range_parallel_resolved(
@@ -1765,67 +1795,65 @@ fn match_and_score_in_arena<'a>(
     };
 
     let mut fallback_indices: Vec<u32> = Vec::new();
-    let filename_fallback_matches = if query_contains_path_separator
-        || path_matches.len() > 15_000
-        || rank_collapsed
-    {
-        vec![]
-    } else if !path_matches.iter().any(|path_match| {
-        // Fallback matters only when a path hit ends before the filename.
-        let file = working_files.index(path_match.index as usize);
-        let filename_start = file.filename_offset_in_relative_path() as u16;
-        path_match.end_col.saturating_sub(main_needle_len - 1) < filename_start
-    }) {
-        vec![]
-    } else {
-        // One reused buffer for all fallback filenames; `Cow` heap-allocates on chunk straddle.
-        let mut name_buf: Vec<u8> = Vec::new();
-        let mut name_spans: Vec<(u32, u32)> = Vec::new();
-
-        for (i, path_match) in path_matches.iter().enumerate() {
+    let filename_fallback_matches =
+        if query_contains_path_separator || path_matches.len() > 15_000 || rank_collapsed {
+            vec![]
+        } else if !path_matches.iter().any(|path_match| {
+            // Fallback matters only when a path hit ends before the filename.
             let file = working_files.index(path_match.index as usize);
             let filename_start = file.filename_offset_in_relative_path() as u16;
-            let match_start_approx = path_match.end_col.saturating_sub(main_needle_len - 1);
-
-            if match_start_approx < filename_start {
-                let off = file.path.filename_offset as u32;
-                let end = file.path.byte_len as u32;
-                let start = name_buf.len() as u32;
-                let len = end.saturating_sub(off) as usize;
-                name_buf.resize(start as usize + len, 0);
-                file.path
-                    .copy_window_to(arena, off, end, &mut name_buf[start as usize..]);
-                fallback_indices.push(i as u32);
-                name_spans.push((start, len as u32));
-            }
-        }
-
-        if name_spans.is_empty() {
+            path_match.end_col.saturating_sub(main_needle_len - 1) < filename_start
+        }) {
             vec![]
         } else {
-            // Match on `&str` to reuse frizbee's resolver instantiation, avoiding a `Cow` copy.
-            let filename_strs: Vec<&str> = name_spans
-                .iter()
-                .map(|&(s, l)| {
-                    let s = s as usize;
-                    // SAFETY: arena path bytes are valid UTF-8, as `read_to_buf` assumes.
-                    unsafe { std::str::from_utf8_unchecked(&name_buf[s..s + l as usize]) }
-                })
-                .collect();
-            // Thread count from the work estimate (lengths + typo budget), not a bare count.
-            let fb_threads = effective_match_threads(
-                filename_strs.len(),
-                fuzzy_parts[0].len(),
-                max_path_len,
-                options.max_typos,
-                crate::machine::scan_thread_cap().max(context.max_threads),
-            );
-            let matches = with_cached_matcher(fuzzy_parts[0], &options, |matcher| {
-                matcher.match_list_parallel(&filename_strs, fb_threads)
-            });
-            matches
-        }
-    };
+            // One reused buffer for all fallback filenames; `Cow` heap-allocates on chunk straddle.
+            let mut name_buf: Vec<u8> = Vec::new();
+            let mut name_spans: Vec<(u32, u32)> = Vec::new();
+
+            for (i, path_match) in path_matches.iter().enumerate() {
+                let file = working_files.index(path_match.index as usize);
+                let filename_start = file.filename_offset_in_relative_path() as u16;
+                let match_start_approx = path_match.end_col.saturating_sub(main_needle_len - 1);
+
+                if match_start_approx < filename_start {
+                    let off = file.path.filename_offset as u32;
+                    let end = file.path.byte_len as u32;
+                    let start = name_buf.len() as u32;
+                    let len = end.saturating_sub(off) as usize;
+                    name_buf.resize(start as usize + len, 0);
+                    file.path
+                        .copy_window_to(arena, off, end, &mut name_buf[start as usize..]);
+                    fallback_indices.push(i as u32);
+                    name_spans.push((start, len as u32));
+                }
+            }
+
+            if name_spans.is_empty() {
+                vec![]
+            } else {
+                // Match on `&str` to reuse frizbee's resolver instantiation, avoiding a `Cow` copy.
+                let filename_strs: Vec<&str> = name_spans
+                    .iter()
+                    .map(|&(s, l)| {
+                        let s = s as usize;
+                        // SAFETY: arena path bytes are valid UTF-8, as `read_to_buf` assumes.
+                        unsafe { std::str::from_utf8_unchecked(&name_buf[s..s + l as usize]) }
+                    })
+                    .collect();
+                // Thread count from the work estimate (lengths + typo budget), not a bare count.
+                let fb_threads = effective_match_threads(
+                    filename_strs.len(),
+                    fuzzy_parts[0].len(),
+                    max_path_len,
+                    options.max_typos,
+                    context.max_threads.max(1),
+                );
+                let matches = with_cached_matcher(fuzzy_parts[0], &options, |matcher| {
+                    matcher.match_list_parallel(&filename_strs, fb_threads)
+                });
+                matches
+            }
+        };
 
     // Index fallback hits by path-match index for O(1) lookup.
     // Skip the table when nothing fell back.
@@ -2141,16 +2169,14 @@ fn match_and_score_in_arena<'a>(
         .saturating_add(1);
     // Heap on work alone (O(n log k) vs O(n log n)); serial vs parallel from dispatch.
     let use_topk = page_cap < path_matches.len();
-    // Per-match cost is path bytes plus struct; `max_threads == 1` forces serial.
+    // Per-match cost is path bytes plus struct; the requested width caps the stage.
     let score_bytes =
         crate::dispatch::sampled_path_avg(&working_files) + std::mem::size_of::<Score>();
-    let score_cap = if context.max_threads == 1 {
-        1
-    } else {
-        crate::parallelism::search_pool_threads()
-    };
-    let score_plan =
-        crate::dispatch::plan_matches(path_matches.len(), score_bytes, score_cap);
+    let score_cap = context
+        .max_threads
+        .max(1)
+        .min(crate::parallelism::search_pool_threads());
+    let score_plan = crate::dispatch::plan_matches(path_matches.len(), score_bytes, score_cap);
     let t_score = std::time::Instant::now();
     let score_entrance_count = path_matches.len();
 
@@ -2321,6 +2347,25 @@ fn match_and_score_in_arena<'a>(
             .enumerate()
             .map(|(match_idx, path_match)| score_one(&mut scratch, match_idx, path_match))
             .collect()
+    } else if context.max_threads < crate::parallelism::search_pool_threads() {
+        // Binding width: one planned chunk per task, at most max_threads tasks.
+        crate::parallelism::run_on_search_pool(|| {
+            let span = score_plan.chunk.max(1);
+            let n_chunks = path_matches.len().div_ceil(span);
+            let parts: Vec<Vec<_>> = (0..n_chunks)
+                .into_par_iter()
+                .map_init(make_scratch, |scratch, c| {
+                    let lo = c * span;
+                    let hi = ((c + 1) * span).min(path_matches.len());
+                    let mut out = Vec::with_capacity(hi - lo);
+                    for match_idx in lo..hi {
+                        out.push(score_one(scratch, match_idx, &path_matches[match_idx]));
+                    }
+                    out
+                })
+                .collect();
+            parts.into_iter().flatten().collect()
+        })
     } else {
         crate::parallelism::run_on_search_pool(|| {
             path_matches
@@ -2569,11 +2614,7 @@ fn score_filtered_by_frecency<'a>(
             0
         };
         let evidence = if has_current {
-            evidence_ub_for(
-                freq.max(8),
-                crate::intent::QueryIntent::WorkingSet,
-                false,
-            )
+            evidence_ub_for(freq.max(8), crate::intent::QueryIntent::WorkingSet, false)
         } else {
             0
         };
@@ -2595,17 +2636,38 @@ fn score_filtered_by_frecency<'a>(
     let use_topk = page_cap < files.len();
     let no_prune = std::env::var_os("FFF_NO_PRUNE").is_some();
     // Dispatch plan shared by both frecency loops below.
-    let fre_bytes =
-        crate::dispatch::sampled_path_avg(files) + std::mem::size_of::<Score>();
-    let fre_cap = if context.max_threads == 1 {
-        1
-    } else {
-        crate::parallelism::search_pool_threads()
-    };
+    let fre_bytes = crate::dispatch::sampled_path_avg(files) + std::mem::size_of::<Score>();
+    let fre_cap = context
+        .max_threads
+        .max(1)
+        .min(crate::parallelism::search_pool_threads());
     let fre_plan = crate::dispatch::plan_matches(files.len(), fre_bytes, fre_cap);
 
     if !use_topk {
         let scored: Vec<(&'a FileItem, Score)> = match files {
+            FileItems::All(s)
+                if fre_plan.threads >= 2
+                    && context.max_threads < crate::parallelism::search_pool_threads() =>
+            {
+                // Binding width: one planned chunk per task, at most max_threads tasks.
+                let span = fre_plan.chunk.max(1);
+                let n_chunks = s.len().div_ceil(span);
+                let parts: Vec<Vec<(&'a FileItem, Score)>> = (0..n_chunks)
+                    .into_par_iter()
+                    .map(|c| {
+                        let lo = c * span;
+                        let hi = ((c + 1) * span).min(s.len());
+                        s[lo..hi]
+                            .iter()
+                            .filter_map(|f| {
+                                let live = !f.is_deleted();
+                                live.then_some(score_file(f))
+                            })
+                            .collect()
+                    })
+                    .collect();
+                parts.into_iter().flatten().collect()
+            }
             FileItems::All(s) if fre_plan.threads >= 2 => s
                 .par_iter()
                 .filter_map(|f| {
@@ -2668,7 +2730,9 @@ fn score_filtered_by_frecency<'a>(
             insert_ranked(&mut heap, page_cap, score_file(f));
         }
         return (
-            heap.into_iter().map(|Reverse(r)| (r.file, r.score)).collect(),
+            heap.into_iter()
+                .map(|Reverse(r)| (r.file, r.score))
+                .collect(),
             total,
         );
     }
@@ -2694,7 +2758,9 @@ fn score_filtered_by_frecency<'a>(
             insert_ranked(&mut heap, page_cap, score_file(f));
         }
         return (
-            heap.into_iter().map(|Reverse(r)| (r.file, r.score)).collect(),
+            heap.into_iter()
+                .map(|Reverse(r)| (r.file, r.score))
+                .collect(),
             total,
         );
     }
@@ -2732,7 +2798,9 @@ fn score_filtered_by_frecency<'a>(
             )
     });
     (
-        heap.into_iter().map(|Reverse(r)| (r.file, r.score)).collect(),
+        heap.into_iter()
+            .map(|Reverse(r)| (r.file, r.score))
+            .collect(),
         total,
     )
 }
@@ -3101,6 +3169,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn width_bounded_stages_match_serial_results() {
+        let paths: Vec<_> = (0..20_000)
+            .map(|index| format!("src/components/group_{}/controller_{index}.ts", index / 100))
+            .collect();
+        let mut files: Vec<_> = paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let mut file = FileItem::new_raw(
+                    path.rfind('/').unwrap() as u16 + 1,
+                    0,
+                    index as u64,
+                    None,
+                    false,
+                );
+                file.access_frecency_score = (index % 41) as i16;
+                file.modification_frecency_score = (index % 17) as i16;
+                file
+            })
+            .collect();
+        let (store, strings) =
+            crate::simd_path::build_chunked_path_store_from_strings(&paths, &files);
+        for (file, path) in files.iter_mut().zip(strings) {
+            file.set_path(path);
+        }
+        let arena = store.as_arena_ptr();
+        let parser = QueryParser::default();
+        let max_path = crate::matcher::max_path_len_of(&files);
+        for text in ["controller", "mo", "src controller", "group_7"] {
+            let query = parser.parse(text);
+            let mut context = ScoringContext {
+                query: &query,
+                max_threads: 1,
+                max_typos: 2,
+                project_path: None,
+                current_file: None,
+                last_same_query_match: None,
+                combo_boost_score_multiplier: 0,
+                min_combo_count: 0,
+                pagination: PaginationArgs::default(),
+            };
+            let (mut base, base_total) = match_and_score_in_arena(
+                FileItems::All(&files),
+                &context,
+                arena,
+                max_path,
+                crate::parallelism::AbortToken::disabled(),
+            );
+            base.sort_unstable_by_key(|(file, _)| file.modified);
+            for width in [2usize, 3, 5, 8] {
+                context.max_threads = width;
+                let (mut got, got_total) = match_and_score_in_arena(
+                    FileItems::All(&files),
+                    &context,
+                    arena,
+                    max_path,
+                    crate::parallelism::AbortToken::disabled(),
+                );
+                assert_eq!(got_total, base_total, "{text} width={width}");
+                got.sort_unstable_by_key(|(file, _)| file.modified);
+                assert_eq!(got.len(), base.len(), "{text} width={width}");
+                for ((a, a_score), (b, b_score)) in got.iter().zip(&base) {
+                    assert!(
+                        std::ptr::eq(*a, *b),
+                        "{text} width={width} files {} vs {}",
+                        a.modified,
+                        b.modified
+                    );
+                    assert_eq!(
+                        format!("{a_score:?}"),
+                        format!("{b_score:?}"),
+                        "{text} width={width}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn pagination_matches_full_ranking() {
@@ -4375,8 +4521,7 @@ mod topk_prune_tests {
 
     // Frecency corpus with distinct totals; empty query ranks by score.
     fn make_frecency(n: usize) -> (Vec<FileItem>, ArenaPtr) {
-        let paths: Vec<String> =
-            (0..n).map(|i| format!("src/g{i}/data_{i}.log")).collect();
+        let paths: Vec<String> = (0..n).map(|i| format!("src/g{i}/data_{i}.log")).collect();
         let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
         let (mut files, arena) = make_paths(&refs);
         for (i, file) in files.iter_mut().enumerate() {
@@ -4551,7 +4696,10 @@ mod topk_prune_tests {
                 project_path: None,
                 combo_boost_score_multiplier: 100,
                 min_combo_count: 3,
-                pagination: PaginationArgs { offset: 0, limit: 50 },
+                pagination: PaginationArgs {
+                    offset: 0,
+                    limit: 50,
+                },
             };
             let (items, scores, total) = fuzzy_match_and_score_files(
                 &files,
@@ -4564,7 +4712,10 @@ mod topk_prune_tests {
             );
             assert!(total >= 4096, "fixture must trigger collapse, got {total}");
             (
-                items.iter().map(|f| f.relative_path(arena)).collect::<Vec<_>>(),
+                items
+                    .iter()
+                    .map(|f| f.relative_path(arena))
+                    .collect::<Vec<_>>(),
                 scores,
             )
         };
@@ -4629,7 +4780,10 @@ mod topk_prune_tests {
                             project_path: None,
                             combo_boost_score_multiplier: 100,
                             min_combo_count: 3,
-                            pagination: PaginationArgs { offset: 0, limit: 50 },
+                            pagination: PaginationArgs {
+                                offset: 0,
+                                limit: 50,
+                            },
                         };
                         fuzzy_match_and_score_files(
                             &files,
@@ -4650,7 +4804,10 @@ mod topk_prune_tests {
                         std::env::remove_var("FFF_NO_EVIDENCE_MEMO");
                     }
                     let names = |items: Vec<&FileItem>| {
-                        items.iter().map(|f| f.relative_path(arena)).collect::<Vec<_>>()
+                        items
+                            .iter()
+                            .map(|f| f.relative_path(arena))
+                            .collect::<Vec<_>>()
                     };
                     assert_eq!(
                         names(base_items),
@@ -4658,8 +4815,7 @@ mod topk_prune_tests {
                         "items differ for {q:?} t={threads} cur={current:?}"
                     );
                     assert_eq!(base_total, hatch_total, "total differs");
-                    let totals =
-                        |s: Vec<Score>| s.into_iter().map(|x| x.total).collect::<Vec<_>>();
+                    let totals = |s: Vec<Score>| s.into_iter().map(|x| x.total).collect::<Vec<_>>();
                     assert_eq!(totals(base_scores), totals(hatch_scores), "totals differ");
                 }
             }
@@ -4717,7 +4873,10 @@ mod topk_prune_tests {
                 unsafe {
                     std::env::remove_var("FFF_NO_GATE_PREFILTER");
                 }
-                assert_eq!(base_items, hatch_items, "items differ for {q:?} t={threads}");
+                assert_eq!(
+                    base_items, hatch_items,
+                    "items differ for {q:?} t={threads}"
+                );
                 let totals = |s: Vec<Score>| s.into_iter().map(|x| x.total).collect::<Vec<_>>();
                 assert_eq!(totals(base_scores), totals(hatch_scores), "totals differ");
             }
@@ -4738,7 +4897,11 @@ mod topk_prune_tests {
             assert_eq!(items, &full_items[..50]);
             assert_eq!(
                 scores.iter().map(|s| s.total).collect::<Vec<_>>(),
-                full_scores.iter().take(50).map(|s| s.total).collect::<Vec<_>>(),
+                full_scores
+                    .iter()
+                    .take(50)
+                    .map(|s| s.total)
+                    .collect::<Vec<_>>(),
             );
         }
         // With a current file, evidence can tie totals; compare as sets.
@@ -4823,15 +4986,21 @@ mod topk_prune_tests {
             for (i, file) in files.iter_mut().enumerate() {
                 file.modified = 1_700_000_000 + i as u64;
             }
-            for query in ["handler", "Handler", "src/mod", "MOD Handler", "handler_", ""] {
+            for query in [
+                "handler",
+                "Handler",
+                "src/mod",
+                "MOD Handler",
+                "handler_",
+                "",
+            ] {
                 for threads in [0usize, 1, 4] {
                     for current in [None, Some("src/mod7/other.rs")] {
                         let (full, full_total) =
                             page_as_set(&files, query, arena, threads, current, 0, 0);
                         for (offset, limit) in [(0usize, 50usize), (20, 30)] {
-                            let (page, total) = page_as_set(
-                                &files, query, arena, threads, current, offset, limit,
-                            );
+                            let (page, total) =
+                                page_as_set(&files, query, arena, threads, current, offset, limit);
                             assert_eq!(total, full_total, "totals n={n} q={query:?}");
                             // The page must be the full list's slice under a strict key.
                             let want = full
@@ -4854,8 +5023,9 @@ mod topk_prune_tests {
     #[test]
     fn same_config_repeats_identically() {
         // Unique-key input; identical totals ordered by modified alone.
-        let paths: Vec<String> =
-            (0..200).map(|i| format!("src/mod{}/f{i}.rs", i % 37)).collect();
+        let paths: Vec<String> = (0..200)
+            .map(|i| format!("src/mod{}/f{i}.rs", i % 37))
+            .collect();
         let items: Vec<FileItem> = paths
             .iter()
             .map(|p| {
@@ -4898,12 +5068,13 @@ mod topk_prune_tests {
             min_combo_count: 3,
             pagination: PaginationArgs { offset: 0, limit },
         };
-        let (items50, _, total50) =
-            sort_and_paginate(results.clone(), &ctx(50), results.len());
-        let (items0, _, total0) =
-            sort_and_paginate(results.clone(), &ctx(0), results.len());
+        let (items50, _, total50) = sort_and_paginate(results.clone(), &ctx(50), results.len());
+        let (items0, _, total0) = sort_and_paginate(results.clone(), &ctx(0), results.len());
         let names = |items: Vec<&FileItem>| {
-            items.iter().map(|f| f.relative_path(arena)).collect::<Vec<_>>()
+            items
+                .iter()
+                .map(|f| f.relative_path(arena))
+                .collect::<Vec<_>>()
         };
         let n50 = names(items50);
         let n0 = names(items0);
