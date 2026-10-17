@@ -23,7 +23,15 @@ This project does not have a traditional test suite. Testing is done through:
 - `make format` - Format all code 
 - `make test` - Run unit tests (limited coverage, primarily integration testing)
 
-When doing code make sure to REDUCE SIZE OF COMMENTS. This is very important. Every comment should be concise 1-2 liner maximum 4 lines if describes really extensive and unnatural concept.
+### Comments philosophy
+
+Comments describe the code as it is, never its history. Write the
+contract, the invariant, or the non-obvious why — one to two lines,
+four max for a genuinely unnatural concept. Never narrate process
+(added/removed/measured/reverted), never restate straightforward code,
+never reference commits, sessions, or benchmarks. Numbers and history
+belong in scratch logs, not in source. If a comment only makes sense
+with development context, delete it. Shorter after every edit.
 
 ### Important coding rules
 
