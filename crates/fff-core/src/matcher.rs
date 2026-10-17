@@ -301,6 +301,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn requested_width_caps_plan() {
+        let (n, max_path) = (200_000, 120);
+        for w in [1usize, 2, 3, 4, 8] {
+            let t = effective_match_threads(n, 3, max_path, Some(2), w);
+            assert!(t >= 1 && t <= w, "threads {t} exceed request {w}");
+        }
+        // Tiny item counts stay serial regardless of a wide request.
+        assert_eq!(effective_match_threads(1, 3, max_path, Some(2), 20), 1);
+    }
+
+    #[test]
     fn cached_matcher_agrees_with_fresh() {
         let paths = ["src/score.rs", "src/gate.rs", "README.md", "src/main.rs"];
         for needle in ["abc", "score", "src", "UserName", "item.rs"] {
