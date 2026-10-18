@@ -183,6 +183,33 @@ impl ChunkedString {
         }
     }
 
+    /// Same visit but hands over the full 32B arena entry; bytes past
+    /// `valid_len` are zero, so 16B window loads never leave the entry.
+    #[inline]
+    pub fn for_each_chunk32(
+        &self,
+        arena: ArenaPtr,
+        mut f: impl FnMut(usize, usize, &[u8; SIMD_CHUNK_BYTES]),
+    ) {
+        let total = self.byte_len as usize;
+        if total == 0 {
+            return;
+        }
+        let indices = self.indices(arena);
+        let mut off = 0usize;
+        for &idx in indices.iter() {
+            if off >= total {
+                break;
+            }
+            let take = SIMD_CHUNK_BYTES.min(total - off);
+            // SAFETY: arena entries are alive and immutable while the store
+            // is borrowed; the entry is a fully initialized `SimdChunk`.
+            let chunk = unsafe { &*(arena.chunk_ptr(idx) as *const [u8; SIMD_CHUNK_BYTES]) };
+            f(off, take, chunk);
+            off += take;
+        }
+    }
+
     #[inline]
     pub(crate) fn common_suffix_len_ignore_ascii_case(
         &self,

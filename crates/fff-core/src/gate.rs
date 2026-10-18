@@ -451,16 +451,19 @@ impl GateNeedle {
         if st.n == 0 {
             st.first = abs + mask.trailing_zeros() as usize;
         }
-        st.last = abs + (16 - mask.leading_zeros() as usize - 1);
         // Myers over hit bytes only; other bytes are identity updates.
+        // The scan is LSB->MSB, so its last bit is the mask's highest.
         let mut bits = mask;
+        let mut last_bit = 0u32;
         while bits != 0 {
-            let bit = bits.trailing_zeros() as usize;
+            let bit = bits.trailing_zeros();
+            last_bit = bit;
             bits &= bits - 1;
-            let x = st.s | pm[step[bit] as usize];
+            let x = st.s | pm[step[bit as usize] as usize];
             let y = (st.s << 1) | 1;
             st.s = x & (x ^ x.wrapping_sub(y));
         }
+        st.last = abs + last_bit as usize;
         st.n += c;
         // Past an accepting prefix, the tail is slack the SW window does not need.
         if want_cut && st.end_cut == 0 && st.n >= self.need.max(1) {
@@ -503,15 +506,18 @@ impl GateNeedle {
         if st.n == 0 {
             st.first = abs + mask.trailing_zeros() as usize;
         }
-        st.last = abs + (32 - mask.leading_zeros() as usize - 1);
+        // The Myers scan is LSB->MSB, so its last bit is the mask's highest.
         let mut bits = mask;
+        let mut last_bit = 0u32;
         while bits != 0 {
-            let bit = bits.trailing_zeros() as usize;
+            let bit = bits.trailing_zeros();
+            last_bit = bit;
             bits &= bits - 1;
-            let x = st.s | pm[step[bit] as usize];
+            let x = st.s | pm[step[bit as usize] as usize];
             let y = (st.s << 1) | 1;
             st.s = x & (x ^ x.wrapping_sub(y));
         }
+        st.last = abs + last_bit as usize;
         st.n += c;
         if want_cut && st.end_cut == 0 && st.n >= self.need.max(1) {
             if (st.s & self.len_mask).count_ones() >= self.need as u32 {
@@ -536,11 +542,11 @@ impl GateNeedle {
         let ascii = self.tables.ascii_only;
         let (t0, t1) = (&self.tables.lo, &self.tables.hi);
         let counted = crate::score::phase_timing();
-        file.path.for_each_chunk(arena, |off, chunk| {
+        file.path.for_each_chunk32(arena, |off, take, chunk| {
             if off >= hi {
                 return;
             }
-            let mut end = (off + chunk.len()).min(byte_len).min(hi);
+            let mut end = (off + take).min(byte_len).min(hi);
             if st.end_cut != 0 {
                 if off >= st.end_cut {
                     return;
@@ -551,7 +557,6 @@ impl GateNeedle {
             if start >= end {
                 return;
             }
-            let view = &chunk[start - off..end - off];
             let len = end - start;
             if counted {
                 st.walked += len as u64;
@@ -559,20 +564,34 @@ impl GateNeedle {
             let mut base = 0usize;
             while base < len {
                 let step = 32.min(len - base);
-                let seg = &view[base..base + step];
+                let p = start - off + base;
                 if step == 32 {
-                    let arr = &*(seg.as_ptr() as *const [u8; 32]);
-                    let mask = needle_byte_mask_avx2(arr, t0, t1, ascii);
-                    self.walk_step32(start + base, seg, mask, st, want_cut);
+                    let mask = needle_byte_mask_avx2(chunk, t0, t1, ascii);
+                    self.walk_step32(off + p, &chunk[p..p + step], mask, st, want_cut);
                 } else {
-                    // Partial tail: 16B sub-steps (scalar mask
-                    // assumes <= 16B), same as the scalar range.
+                    // Partial tail: 16B sub-steps, same as the scalar range;
+                    // sub-16B sub-steps take a 16B load inside the entry.
                     let mut b2 = 0usize;
                     while b2 < step {
                         let s2 = 16.min(step - b2);
-                        let sg = &seg[b2..b2 + s2];
-                        let m2 = needle_byte_mask(sg, &self.span, &self.tables);
-                        self.walk_step(start + base + b2, sg, m2, st, want_cut);
+                        let q = p + b2;
+                        let sg = &chunk[q..q + s2];
+                        let m2 = if s2 == 16 {
+                            if ascii {
+                                needle_byte_mask_ascii(sg, t0)
+                            } else {
+                                needle_byte_mask_shuf(sg, t0, t1)
+                            }
+                        } else {
+                            let src = q.min(16);
+                            let m = if ascii {
+                                needle_byte_mask_ascii(&chunk[src..src + 16], t0)
+                            } else {
+                                needle_byte_mask_shuf(&chunk[src..src + 16], t0, t1)
+                            };
+                            (m >> (q - src)) & (u16::MAX >> (16 - s2))
+                        };
+                        self.walk_step(off + q, sg, m2, st, want_cut);
                         b2 += s2;
                     }
                 }
@@ -642,11 +661,11 @@ impl GateNeedle {
         let ascii = self.tables.ascii_only;
         let (t0, t1) = (&self.tables.lo, &self.tables.hi);
         let counted = crate::score::phase_timing();
-        file.path.for_each_chunk(arena, |off, chunk| {
+        file.path.for_each_chunk32(arena, |off, take, chunk| {
             if off >= hi {
                 return;
             }
-            let mut end = (off + chunk.len()).min(byte_len).min(hi);
+            let mut end = (off + take).min(byte_len).min(hi);
             if st.end_cut != 0 {
                 if off >= st.end_cut {
                     return;
@@ -657,15 +676,17 @@ impl GateNeedle {
             if start >= end {
                 return;
             }
-            let view = &chunk[start - off..end - off];
             let len = end - start;
             if counted {
                 st.walked += len as u64;
             }
+            // Step boundaries match the slicing walk. Sub-16B tails take a
+            // 16B load at min(p, 16) (inside the entry) and keep their bits.
             let mut base = 0usize;
             while base < len {
                 let step = 16.min(len - base);
-                let seg = &view[base..base + step];
+                let p = start - off + base;
+                let seg = &chunk[p..p + step];
                 let mask = if step == 16 {
                     if ascii {
                         needle_byte_mask_ascii(seg, t0)
@@ -673,9 +694,15 @@ impl GateNeedle {
                         needle_byte_mask_shuf(seg, t0, t1)
                     }
                 } else {
-                    needle_byte_mask(seg, &self.span, &self.tables)
+                    let src = p.min(16);
+                    let m = if ascii {
+                        needle_byte_mask_ascii(&chunk[src..src + 16], t0)
+                    } else {
+                        needle_byte_mask_shuf(&chunk[src..src + 16], t0, t1)
+                    };
+                    (m >> (p - src)) & (u16::MAX >> (16 - step))
                 };
-                self.walk_step(start + base, seg, mask, st, want_cut);
+                self.walk_step(off + p, seg, mask, st, want_cut);
                 base += step;
             }
         });
@@ -1340,6 +1367,46 @@ mod tests {
                 (whole.s, whole.first, whole.last, whole.n),
                 (halves.s, halves.first, halves.last, halves.n),
                 "split={split} n={needle:?} h={hay:?} t={t}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn simd_range_matches_scalar_range_with_cut() {
+        // Vector tails must fold the byte loop's state: same masks, step
+        // boundaries, and cut byte.
+        use crate::simd_path::build_chunked_path_store_from_strings;
+        let mut state = 0x51EDu32;
+        let mut next = move || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 16) as u16
+        };
+        for _ in 0..300 {
+            let nl = 2 + (next() % 18) as usize;
+            let hl = 1 + (next() % 120) as usize;
+            let needle: Vec<u8> = (0..nl).map(|_| b'a' + (next() % 6) as u8).collect();
+            let hay: Vec<u8> = (0..hl).map(|_| b'a' + (next() % 6) as u8).collect();
+            let t = (next() % 4) as u16;
+            let rel = String::from_utf8_lossy(&hay).to_string();
+            let files = vec![FileItem::new_raw(0, 0, 0, None, false)];
+            let (store, strings) = build_chunked_path_store_from_strings(&[rel], &files);
+            let mut file = files.into_iter().next().unwrap();
+            file.set_path(strings[0].clone());
+            let arena = store.as_arena_ptr();
+            let mut g = GateNeedle::new(&needle, t);
+            if !g.tables.simd {
+                return;
+            }
+            g.set_cut(true);
+            let mut a = WalkState::fresh(true);
+            unsafe { g.walk_range_simd(&file, arena, 0, hl, &mut a) };
+            let mut b = WalkState::fresh(true);
+            g.walk_range_scalar(&file, arena, 0, hl, &mut b);
+            assert_eq!(
+                (a.s, a.first, a.last, a.n, a.end_cut, g.finish(&a, hl)),
+                (b.s, b.first, b.last, b.n, b.end_cut, g.finish(&b, hl)),
+                "n={needle:?} h={hay:?} t={t}"
             );
         }
     }
