@@ -431,7 +431,7 @@ fn unix_snap(snap: &mut SensorSnap, s: &Sensors) {
 fn read_proc_stat_cpu() -> Option<(u64, u64)> {
     let s = std::fs::read_to_string("/proc/self/stat").ok()?;
     let rparen = s.rfind(')')?;
-    let rest = s.get(rparen + 2)?;
+    let rest = s.get(rparen + 2..)?;
     let parts: Vec<&str> = rest.split_whitespace().collect();
     let utime: u64 = parts.get(11)?.parse().ok()?;
     let stime: u64 = parts.get(12)?.parse().ok()?;
@@ -466,8 +466,8 @@ fn read_proc_rss_and_peak_mb() -> Option<(f64, f64)> {
 #[cfg(target_os = "linux")]
 fn read_proc_context_switches() -> Option<u64> {
     let s = std::fs::read_to_string("/proc/self/status").ok()?;
-    let mut vol = None;
-    let mut non = None;
+    let mut vol: Option<u64> = None;
+    let mut non: Option<u64> = None;
     for line in s.lines() {
         if let Some(v) = line.strip_prefix("voluntary_ctxt_switches:") {
             vol = v.trim().parse().ok();
@@ -503,7 +503,7 @@ fn read_proc_rss_and_peak_mb() -> Option<(f64, f64)> {
 fn read_proc_faults() -> Option<u64> {
     let s = std::fs::read_to_string("/proc/self/stat").ok()?;
     let rparen = s.rfind(')')?;
-    let rest = s.get(rparen + 2)?;
+    let rest = s.get(rparen + 2..)?;
     let parts: Vec<&str> = rest.split_whitespace().collect();
     let min: u64 = parts.get(7)?.parse().ok()?;
     let maj: u64 = parts.get(9)?.parse().ok()?;

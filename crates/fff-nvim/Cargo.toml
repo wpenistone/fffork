@@ -54,6 +54,11 @@ name = "fff-bench"
 path = "src/bin/fff-bench/main.rs"
 
 [[bin]]
+name = "bench_ci_memmem"
+path = "src/bin/bench_ci_memmem.rs"
+required-features = ["ripgrep"]
+
+[[bin]]
 name = "fff-profile-driver"
 path = "src/bin/fff-profile-driver.rs"
 

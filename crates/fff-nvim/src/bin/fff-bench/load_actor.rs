@@ -635,7 +635,7 @@ fn windows_process_cpu_us(pid: u32) -> Option<u64> {
 fn linux_process_cpu_us(pid: u32) -> Option<u64> {
     let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let rparen = s.rfind(')')?;
-    let rest = s.get(rparen + 2)?;
+    let rest = s.get(rparen + 2..)?;
     let parts: Vec<&str> = rest.split_whitespace().collect();
     let utime: u64 = parts.get(11)?.parse().ok()?;
     let stime: u64 = parts.get(12)?.parse().ok()?;
