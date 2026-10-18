@@ -892,6 +892,7 @@ fn normalize_byte_scalar(b: u8) -> u8 {
 /// build's baseline SIMD; on x86_64 we runtime-dispatch to AVX2.
 /// Caller guarantees `dst.len() >= src.len()`.
 // Cache CPUID once. `is_x86_feature_detected!` is not free on every call.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn has_avx2_cached() -> bool {
     #[cfg(target_feature = "avx2")]
