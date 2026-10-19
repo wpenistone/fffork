@@ -24,6 +24,15 @@ pub(super) fn strip_line_terminators(bytes: &[u8]) -> &[u8] {
     &bytes[..len]
 }
 
+// Borrow when valid UTF-8, allocate via lossy only on error.
+#[inline]
+pub(super) fn lossy_owned(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_owned(),
+        Err(_) => String::from_utf8_lossy(bytes).into_owned(),
+    }
+}
+
 pub(super) struct SinkState<'a> {
     pub(super) file: &'a crate::types::FileItem,
     pub(super) definition_mode: super::DefinitionMode,
@@ -111,7 +120,7 @@ impl SinkState<'_> {
                     line
                 };
                 let truncated = truncate_display_bytes(line);
-                before.push(String::from_utf8_lossy(truncated).into_owned());
+                before.push(lossy_owned(truncated));
                 pos = line_start;
                 lines_found += 1;
             }
@@ -136,7 +145,7 @@ impl SinkState<'_> {
                     line
                 };
                 let truncated = truncate_display_bytes(line);
-                after.push(String::from_utf8_lossy(truncated).into_owned());
+                after.push(lossy_owned(truncated));
                 pos = if line_end < buffer.len() {
                     line_end + 1 // skip past \n
                 } else {
@@ -173,11 +182,53 @@ pub(super) fn split_multiline_blob(display_bytes: &[u8]) -> (&[u8], Vec<String>)
             let first = strip_line_terminators(&display_bytes[..pos + 1]);
             let extra = display_bytes[pos + 1..]
                 .split(|&b| b == b'\n')
-                .map(|l| String::from_utf8_lossy(strip_line_terminators(l)).into_owned())
+                .map(|l| lossy_owned(strip_line_terminators(l)))
                 .collect();
             (first, extra)
         }
     }
+}
+
+// frizbee returns sorted char positions; walk the chars once, converting
+// on the fly and merging runs. Adjacent chars share one byte range.
+// Callers must pass sorted indices (fuzzy does: `sort_unstable` above).
+pub(super) fn char_indices_to_byte_offsets(
+    line: &str,
+    char_indices: &[u32],
+) -> SmallVec<[(u32, u32); 4]> {
+    debug_assert!(char_indices.windows(2).all(|w| w[0] <= w[1]));
+    let mut result: SmallVec<[(u32, u32); 4]> = SmallVec::with_capacity(char_indices.len());
+    if char_indices.is_empty() {
+        return result;
+    }
+
+    let mut chars = line.char_indices().enumerate();
+    let mut cur = chars.next();
+    for &w in char_indices {
+        let w = w as usize;
+        while let Some((ci, _)) = cur {
+            if ci >= w {
+                break;
+            }
+            cur = chars.next();
+        }
+        let Some((ci, (start, ch))) = cur else {
+            continue;
+        };
+        if ci != w {
+            continue;
+        }
+        let (s, e) = (start as u32, start as u32 + ch.len_utf8() as u32);
+        if let Some(last) = result.last_mut()
+            && last.1 == s
+        {
+            last.1 = e;
+            continue;
+        }
+        result.push((s, e));
+    }
+
+    result
 }
 
 // copied from the rust u8 private method

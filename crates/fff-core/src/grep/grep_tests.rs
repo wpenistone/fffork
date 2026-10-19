@@ -897,6 +897,39 @@ fn regex_fallback_keeps_file_path_scope_issue_756() {
     );
 }
 
+/// Page-full early-stop must not change the first page: the match sequence
+/// returned for `page_limit = N` is byte-identical to the prefix of the
+/// unlimited search. Covers both the plain-text path (`perform_grep`) and the
+/// fuzzy path (`fuzzy_grep_search`).
+fn assert_page_identity<F>(label: &str, page_limit: usize, run: F)
+where
+    F: Fn(usize) -> Vec<(String, u64, usize, String)>,
+{
+    let unlimited = run(usize::MAX);
+    let page = run(page_limit);
+
+    assert!(
+        page.len() >= page_limit.min(unlimited.len()),
+        "{label}: page_limit={page_limit} returned {} matches, expected at least {}",
+        page.len(),
+        page_limit.min(unlimited.len())
+    );
+    assert!(
+        page.len() <= unlimited.len(),
+        "{label}: page has more matches ({}) than unlimited ({})",
+        page.len(),
+        unlimited.len()
+    );
+
+    // The page must be an exact prefix of the unlimited result (order + content).
+    for (i, (p, u)) in page.iter().zip(unlimited.iter()).enumerate() {
+        assert_eq!(
+            p, u,
+            "{label}: page_limit={page_limit} diverges from unlimited at match {i}"
+        );
+    }
+}
+
 #[test]
 fn multi_grep_keeps_files_for_a_pattern_without_bigrams() {
     let dir = tempfile::tempdir().unwrap();
@@ -970,4 +1003,251 @@ fn multi_grep_keeps_files_for_a_pattern_without_bigrams() {
     let (paths, searched) = grep(&["unicorn"]);
     assert_eq!(paths, vec!["a.txt", "b.txt", "c.txt"]);
     assert_eq!(searched, 3);
+}
+#[test]
+fn plain_page_full_early_stop_preserves_first_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = crate::path_utils::canonicalize(dir.path()).unwrap();
+
+    // 40 files × 3 matches each = 120 matches. With page_limit=10 the page
+    // tips on an early file and the gate must skip later files without
+    // dropping any match from the first page.
+    for i in 0..40 {
+        let content = format!("hit {} alpha\nhit {} beta\nhit {} gamma\n", i, i, i);
+        std::fs::write(base.join(format!("f{:02}.txt", i)), content).unwrap();
+    }
+    // A few non-matching files between matches to exercise the prefix tracker
+    // across zero-match completions.
+    for i in 0..10 {
+        std::fs::write(base.join(format!("empty{}.txt", i)), "nothing here\n").unwrap();
+    }
+
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: base.to_str().unwrap().into(),
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+
+    let run = |page_limit: usize| -> Vec<(String, u64, usize, String)> {
+        let parsed = crate::grep::parse_grep_query("hit");
+        let result = picker.grep(
+            &parsed,
+            &crate::GrepSearchOptions {
+                page_limit,
+                max_matches_per_file: 200,
+                ..Default::default()
+            },
+        );
+        result
+            .matches
+            .iter()
+            .map(|m| {
+                let path = result.files[m.file_index]
+                    .relative_path(&picker)
+                    .to_string();
+                (path, m.line_number, m.col, m.line_content.clone())
+            })
+            .collect()
+    };
+
+    for &limit in &[1, 5, 10, 25, 50, 100] {
+        assert_page_identity("plain", limit, &run);
+    }
+}
+
+#[test]
+fn fuzzy_page_full_early_stop_preserves_first_page() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = crate::path_utils::canonicalize(dir.path()).unwrap();
+
+    // Identifiers the fuzzy matcher will rank; each file has two hits.
+    for i in 0..30 {
+        let content = format!(
+            "fn encode_frame_{i}() {{}}\nfn decode_frame_{i}() {{}}\n",
+            i = i
+        );
+        std::fs::write(base.join(format!("mod{i:02}.rs", i = i)), content).unwrap();
+    }
+    for i in 0..10 {
+        std::fs::write(base.join(format!("noise{i}.txt", i = i)), "unrelated\n").unwrap();
+    }
+
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: base.to_str().unwrap().into(),
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+
+    let run = |page_limit: usize| -> Vec<(String, u64, usize, String)> {
+        let parsed = crate::grep::parse_grep_query("encodeframe");
+        let result = picker.grep(
+            &parsed,
+            &crate::GrepSearchOptions {
+                mode: super::GrepMode::Fuzzy,
+                page_limit,
+                max_matches_per_file: 200,
+                ..Default::default()
+            },
+        );
+        result
+            .matches
+            .iter()
+            .map(|m| {
+                let path = result.files[m.file_index]
+                    .relative_path(&picker)
+                    .to_string();
+                (path, m.line_number, m.col, m.line_content.clone())
+            })
+            .collect()
+    };
+
+    for &limit in &[1, 3, 8, 20, 60] {
+        assert_page_identity("fuzzy", limit, &run);
+    }
+}
+
+/// Walk every page and confirm coverage + no duplicates: the early-stop must
+/// not strand matches between pages.
+#[test]
+fn plain_page_pagination_covers_all_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = crate::path_utils::canonicalize(dir.path()).unwrap();
+
+    for i in 0..25 {
+        std::fs::write(
+            base.join(format!("p{:02}.txt", i)),
+            format!("token {i} one\ntoken {i} two\n"),
+        )
+        .unwrap();
+    }
+
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: base.to_str().unwrap().into(),
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+
+    let parsed = crate::grep::parse_grep_query("token");
+    let mut opts = crate::GrepSearchOptions {
+        page_limit: 7,
+        max_matches_per_file: 200,
+        ..Default::default()
+    };
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut pages = 0;
+    loop {
+        let result = picker.grep(&parsed, &opts);
+        for m in &result.matches {
+            let key = format!(
+                "{}:{}:{}",
+                result.files[m.file_index].relative_path(&picker),
+                m.line_number,
+                m.line_content
+            );
+            assert!(!seen.contains(&key), "duplicate across pages: {key}");
+            seen.push(key);
+        }
+        pages += 1;
+        assert!(pages <= 40, "pagination did not terminate");
+        if result.next_file_offset == 0 {
+            break;
+        }
+        opts.file_offset = result.next_file_offset;
+    }
+
+    assert_eq!(seen.len(), 50, "expected 25 files × 2 matches = 50");
+}
+
+/// Record content masks from real file bytes at base positions. The sync
+/// collect path leaves the mask store empty; tests that need masks set
+/// them explicitly (positions match enumeration: no deletions/overflow).
+fn record_masks_from_disk(picker: &FilePicker, root: &std::path::Path) {
+    let store = picker.content_mask_store();
+    for (index, file) in picker.get_files().iter().enumerate() {
+        let content = std::fs::read(root.join(file.relative_path(picker))).unwrap();
+        let mut mask = crate::types::ContentMask::default();
+        mask.accumulate(&content);
+        store.set(index, mask);
+    }
+}
+
+#[test]
+fn mask_prefilter_skips_counted() {
+    use std::sync::atomic::Ordering;
+    let root = tempfile::tempdir().unwrap();
+    // No 'z' anywhere: every file is rejected unopened at the mask check.
+    for index in 0..64 {
+        std::fs::write(
+            root.path().join(format!("file_{index}.txt")),
+            "ordinary content\n",
+        )
+        .unwrap();
+    }
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: root.path().to_string_lossy().into_owned(),
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+    record_masks_from_disk(&picker, root.path());
+
+    let query = parse_grep_query("zzz");
+    let options = GrepSearchOptions {
+        mode: GrepMode::PlainText,
+        page_limit: usize::MAX,
+        ..Default::default()
+    };
+    let mask_before = super::grep::CONTENT_MASK_REJECTS.load(Ordering::Relaxed);
+    let result = picker.grep(&query, &options);
+    let mask_after = super::grep::CONTENT_MASK_REJECTS.load(Ordering::Relaxed);
+    assert!(result.matches.is_empty());
+    // `>=`: parallel tests sharing the process can only add to the counter.
+    assert!(mask_after - mask_before >= 64);
+}
+
+#[test]
+fn memmem_prefilter_skips_counted_separately() {
+    use std::sync::atomic::Ordering;
+    let root = tempfile::tempdir().unwrap();
+    // 'z' present (mask allows) but no "zzz" run: memmem performs the skip.
+    for index in 0..64 {
+        std::fs::write(
+            root.path().join(format!("file_{index}.txt")),
+            "zebra zone\n",
+        )
+        .unwrap();
+    }
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: root.path().to_string_lossy().into_owned(),
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+    record_masks_from_disk(&picker, root.path());
+
+    let query = parse_grep_query("zzz");
+    let options = GrepSearchOptions {
+        mode: GrepMode::PlainText,
+        page_limit: usize::MAX,
+        ..Default::default()
+    };
+    let mask_before = super::grep::CONTENT_MASK_REJECTS.load(Ordering::Relaxed);
+    let mem_before = super::grep::MEMMEM_PREFILTER_REJECTS.load(Ordering::Relaxed);
+    let result = picker.grep(&query, &options);
+    let mask_after = super::grep::CONTENT_MASK_REJECTS.load(Ordering::Relaxed);
+    let mem_after = super::grep::MEMMEM_PREFILTER_REJECTS.load(Ordering::Relaxed);
+    assert!(result.matches.is_empty());
+    assert!(mem_after - mem_before >= 64);
+    // All masks allow here, so only memmem skips fire locally; the mask
+    // counter may also include other parallel tests.
+    assert!(mask_after >= mask_before);
 }

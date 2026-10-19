@@ -3,7 +3,7 @@ use crate::types::FileItem;
 use crate::walk::WalkOutput;
 use crate::watch::is_git_file;
 use ignore::WalkBuilder;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -35,15 +35,37 @@ pub(crate) fn walk_collect_files(
     let walker = walk_builder.build_parallel();
 
     // Single lock for both collections: every entry is either a file or a
-    // dir, so this keeps one mutex acquisition per entry.
-    let collected =
-        parking_lot::Mutex::new((Vec::<(FileItem, String)>::new(), Vec::<String>::new()));
-    walker.run(|| {
-        let collected = &collected;
-        let counter = Arc::clone(synced_files_count);
-        let base_path = base_path.to_path_buf();
+    // dir. Workers accumulate into thread-local batches and merge on drop so
+    // the walk stays parallel with minimal contention.
+    type Collected = (Vec<(FileItem, String)>, Vec<String>);
+    let collected = parking_lot::Mutex::new(Collected::default());
 
-        Box::new(move |result| {
+    struct FffVisitor<'a> {
+        collected: &'a parking_lot::Mutex<Collected>,
+        synced_files_count: &'a Arc<AtomicUsize>,
+        base_path: PathBuf,
+        local_pairs: Vec<(FileItem, String)>,
+        local_dirs: Vec<String>,
+        local_count: usize,
+    }
+
+    impl<'a> FffVisitor<'a> {
+        fn flush_local(&mut self) {
+            if self.local_pairs.is_empty() && self.local_dirs.is_empty() {
+                return;
+            }
+            let mut guard = self.collected.lock();
+            guard.0.append(&mut self.local_pairs);
+            guard.1.append(&mut self.local_dirs);
+            drop(guard);
+            self.synced_files_count
+                .fetch_add(self.local_count, Ordering::Relaxed);
+            self.local_count = 0;
+        }
+    }
+
+    impl<'a> ignore::ParallelVisitor for FffVisitor<'a> {
+        fn visit(&mut self, result: Result<ignore::DirEntry, ignore::Error>) -> ignore::WalkState {
             let Ok(entry) = result else {
                 return ignore::WalkState::Continue;
             };
@@ -51,32 +73,98 @@ pub(crate) fn walk_collect_files(
             if entry.file_type().is_some_and(|ft| ft.is_file()) {
                 let path = entry.path();
 
-                // Ignore walkers sometimes surface files inside `.git/`
-                // when the base is itself a git repo — skip them.
+                // Match July walker: filter .git files, do not touch dirs here.
                 if is_git_file(path) {
                     return ignore::WalkState::Continue;
                 }
 
-                let metadata = entry.metadata().ok();
-                let (file_item, rel_path) =
-                    FileItem::new_from_walk(path, &base_path, None, metadata.as_ref());
+                // Fast path: `strip_prefix` (no `pathdiff` component walk)
+                // + one `to_string_lossy`; basename offset from the last
+                // slash in the same pass.
+                let rel = path.strip_prefix(&self.base_path).unwrap_or(path);
+                let rel_str =
+                    crate::path_utils::to_canonical_slashes(&rel.to_string_lossy()).into_owned();
+                if rel_str.is_empty() {
+                    return ignore::WalkState::Continue;
+                }
+                let off = rel_str.rfind('/').map(|i| i + 1).unwrap_or(0) as u16;
+                let (size, modified) = match entry.metadata().ok() {
+                    Some(m) => (
+                        m.len(),
+                        m.modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                            .map_or(0, |d| d.as_secs()),
+                    ),
+                    None => (0, 0),
+                };
+                let mut item = FileItem::new_raw(
+                    off,
+                    size,
+                    modified,
+                    None,
+                    crate::file_picker::is_known_binary_extension(path),
+                );
+                item.mark_definition_language(&rel_str[off as usize..]);
 
-                collected.lock().0.push((file_item, rel_path));
-                counter.fetch_add(1, Ordering::Relaxed);
+                self.local_pairs.push((item, rel_str));
+                self.local_count += 1;
+                // Flush before the local batch grows unbounded under bursty
+                // closed-loop walkers, so the final append is not one huge
+                // critical section and peak RSS stays flatter.
+                if self.local_pairs.len() >= 512 {
+                    self.flush_local();
+                }
             } else if entry.depth() > 0 && entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 let path = entry.path();
-                if !is_git_file(path)
-                    && let Ok(rel) = path.strip_prefix(&base_path)
-                {
+                // Never descend into `.git/` — object stores are huge (multi-GB)
+                // and are not searchable paths. `hidden(!is_git_repo)` still
+                // allows other dot-dirs (.github, .config).
+                if is_git_file(path) {
+                    return ignore::WalkState::Skip;
+                }
+                if let Ok(rel) = path.strip_prefix(&self.base_path) {
                     let mut rel = crate::path_utils::to_canonical_slashes(&rel.to_string_lossy())
                         .into_owned();
                     rel.push('/');
-                    collected.lock().1.push(rel);
+                    self.local_dirs.push(rel);
                 }
             }
             ignore::WalkState::Continue
-        })
-    });
+        }
+    }
+
+    impl<'a> Drop for FffVisitor<'a> {
+        fn drop(&mut self) {
+            self.flush_local();
+        }
+    }
+
+    struct FffVisitorBuilder<'a> {
+        collected: &'a parking_lot::Mutex<Collected>,
+        synced_files_count: &'a Arc<AtomicUsize>,
+        base_path: PathBuf,
+    }
+
+    impl<'a> ignore::ParallelVisitorBuilder<'a> for FffVisitorBuilder<'a> {
+        fn build(&mut self) -> Box<dyn ignore::ParallelVisitor + 'a> {
+            Box::new(FffVisitor {
+                collected: self.collected,
+                synced_files_count: self.synced_files_count,
+                base_path: self.base_path.clone(),
+                local_pairs: Vec::with_capacity(512),
+                local_dirs: Vec::with_capacity(64),
+                local_count: 0,
+            })
+        }
+    }
+
+    let mut visitor_builder = FffVisitorBuilder {
+        collected: &collected,
+        synced_files_count,
+        base_path: base_path.to_path_buf(),
+    };
+    walker.visit(&mut visitor_builder);
 
     let (pairs, dirs) = collected.into_inner();
     Ok(WalkOutput {

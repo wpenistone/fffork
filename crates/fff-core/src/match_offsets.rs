@@ -1,5 +1,6 @@
 use smallvec::SmallVec;
 
+#[allow(dead_code)]
 pub(crate) fn char_indices_to_byte_offsets(
     line: &str,
     char_indices: &[u32],

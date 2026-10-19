@@ -1,11 +1,15 @@
-use super::prefilter::prefilter_with_filepath_retry;
+use super::prefilter::prefilter_with_filepath_retry_indexed;
+use super::prefilter::{chunk_plan, prefilter_with_filepath_retry};
 use super::regex::{RegexMatcher, RegexSink, build_regex};
-use super::sink::{SinkState, debug_assert_newline_terminator, strip_line_terminators};
-use super::types::{GrepMatch, GrepMode, GrepResult, GrepSearchOptions};
+use super::sink::{
+    SinkState, debug_assert_newline_terminator, lossy_owned, strip_line_terminators,
+};
+use super::types::{GrepMatch, GrepMode, GrepResult, GrepSearchOptions, PageFillGate};
 use crate::index::{
     BigramFilter, BigramOverlay, bigram_boundary, fuzzy_candidates, literal_candidates,
     regex_candidates,
 };
+use crate::parallelism::search_pool_threads;
 use crate::simd_string_utils::memmem;
 use crate::types::{ContentCacheBudget, FileItem, MmapSlot};
 use fff_grep::{
@@ -52,34 +56,35 @@ impl<'a> NeedleFinder<'a> {
     }
 
     /// Compare `haystack` against a slice of the needle with the same case
-    /// semantics as `find`.
+    // semantics as `find`. Short prefix loop, not a memmem dispatch.
     #[inline]
     fn eq_fold(&self, haystack: &[u8], needle_seg: &[u8]) -> bool {
         match self {
             Self::CaseSensitive(_) => haystack == needle_seg,
-            Self::CaseInsensitive(_) => {
-                haystack.len() == needle_seg.len() && memmem::find(haystack, needle_seg) == Some(0)
-            }
+            Self::CaseInsensitive(_) => haystack.eq_ignore_ascii_case(needle_seg),
         }
     }
 
     /// Collect highlight spans for every needle occurrence within a line.
-    /// The case branch is resolved once per line, not once per occurrence.
+    // Steps by needle length (non-overlapping); reslicing per hit keeps
+    // memmem's skip tables effective instead of degrading to pos+1.
     #[inline]
     fn for_each_occurrence(&self, haystack: &[u8], mut on_match: impl FnMut(usize)) {
+        let step = self.needle().len().max(1);
         match self {
             Self::CaseSensitive(finder) => {
-                let mut start_pos = 0usize;
-                while let Some(pos) = finder.find(&haystack[start_pos..]) {
-                    on_match(start_pos + pos);
-                    start_pos += pos + 1;
+                for pos in finder.find_iter(haystack) {
+                    on_match(pos);
                 }
             }
             Self::CaseInsensitive(needle_lower) => {
                 let mut start_pos = 0usize;
                 while let Some(pos) = memmem::find(&haystack[start_pos..], needle_lower) {
                     on_match(start_pos + pos);
-                    start_pos += pos + 1;
+                    start_pos += pos + step;
+                    if start_pos >= haystack.len() {
+                        break;
+                    }
                 }
             }
         }
@@ -130,7 +135,7 @@ impl Sink for PlainTextSink<'_> {
         let (display_bytes, display_len, line_number, byte_offset) =
             SinkState::prepare_line(line_bytes, sink_match);
 
-        let line_content = String::from_utf8_lossy(display_bytes);
+        let line_content = lossy_owned(display_bytes);
         let mut match_byte_offsets: SmallVec<[(u32, u32); 4]> = SmallVec::new();
         let mut col = 0usize;
         let mut first = true;
@@ -174,7 +179,7 @@ impl Sink for PlainTextSink<'_> {
             line_number,
             col,
             byte_offset,
-            line_content.into_owned(),
+            line_content,
             match_byte_offsets,
             is_definition,
             context_before,
@@ -188,7 +193,7 @@ impl Sink for PlainTextSink<'_> {
 }
 
 /// Perform a grep search across all indexed files.
-///
+//
 /// When `query` is empty, returns git-modified/untracked files sorted by
 /// frecency for the "welcome state" UI.
 #[tracing::instrument(skip_all, fields(file_count = files.len()))]
@@ -205,12 +210,13 @@ pub(crate) fn grep_search<'a>(
     base_path: &Path,
     arena: crate::simd_path::ArenaPtr,
     overflow_arena: crate::simd_path::ArenaPtr,
+    content_masks: Option<&'a crate::file_picker::ContentMaskStore>,
 ) -> GrepResult<'a> {
     let result = grep_search_parsed(
         files,
-        total_files,
         query,
         options,
+        total_files,
         budget,
         bigram_index,
         bigram_overlay,
@@ -218,6 +224,7 @@ pub(crate) fn grep_search<'a>(
         base_path,
         arena,
         overflow_arena,
+        content_masks,
     );
 
     // Constraint parsing can swallow tokens the user meant literally (e.g. `!=`
@@ -244,9 +251,9 @@ pub(crate) fn grep_search<'a>(
         };
         let unfiltered = grep_search_parsed(
             files,
-            total_files,
             query,
             &probe,
+            total_files,
             budget,
             bigram_index,
             bigram_overlay,
@@ -254,6 +261,7 @@ pub(crate) fn grep_search<'a>(
             base_path,
             arena,
             overflow_arena,
+            content_masks,
         );
         if !unfiltered.matches.is_empty() || unfiltered.next_file_offset != 0 {
             return result;
@@ -284,9 +292,9 @@ pub(crate) fn grep_search<'a>(
 
     let mut fallback = grep_search_parsed(
         files,
-        total_files,
         &literal_query,
         options,
+        total_files,
         budget,
         bigram_index,
         bigram_overlay,
@@ -294,6 +302,7 @@ pub(crate) fn grep_search<'a>(
         base_path,
         arena,
         overflow_arena,
+        content_masks,
     );
 
     if fallback.matches.is_empty() {
@@ -307,9 +316,9 @@ pub(crate) fn grep_search<'a>(
 #[allow(clippy::too_many_arguments)]
 fn grep_search_parsed<'a>(
     files: &'a [FileItem],
-    total_files: usize,
     query: &FFFQuery<'_>,
     options: &GrepSearchOptions,
+    total_files: usize,
     budget: &ContentCacheBudget,
     bigram_index: Option<&BigramFilter>,
     bigram_overlay: Option<&BigramOverlay>,
@@ -317,7 +326,11 @@ fn grep_search_parsed<'a>(
     base_path: &Path,
     arena: crate::simd_path::ArenaPtr,
     overflow_arena: crate::simd_path::ArenaPtr,
+    content_masks: Option<&'a crate::file_picker::ContentMaskStore>,
 ) -> GrepResult<'a> {
+    // Masks are sized at scan but only filled when content indexing ran.
+    // An empty store rejects nothing yet costs per-file work: drop it.
+    let content_masks = content_masks.filter(|s| s.any_recorded());
     let constraints_from_query = &query.constraints[..];
 
     let grep_text = extract_grep_text(query);
@@ -336,7 +349,7 @@ fn grep_search_parsed<'a>(
         GrepMode::Fuzzy => {
             let bigram_candidates = fuzzy_candidates(bigram_index, bigram_overlay, &grep_text);
 
-            let (files_to_search, filtered_file_count) = prefilter_with_filepath_retry(
+            let (files_to_search, filtered_file_count) = prefilter_with_filepath_retry_indexed(
                 files,
                 constraints_from_query,
                 bigram_candidates.as_deref(),
@@ -362,6 +375,7 @@ fn grep_search_parsed<'a>(
                 base_path,
                 arena,
                 overflow_arena,
+                content_masks,
             );
         }
         GrepMode::Regex => build_regex(&grep_text, casing)
@@ -431,6 +445,15 @@ fn grep_search_parsed<'a>(
     }
     .build();
 
+    // The content mask needs a literal needle. Plain text gives one; regex and
+    // fuzzy do not, and testing a decomposed pattern would be unsound.
+    let mask_needle: Option<crate::types::MaskNeedle> = match options.mode {
+        GrepMode::PlainText => Some(crate::types::MaskNeedle::new(
+            effective_pattern.as_bytes(),
+            0,
+        )),
+        _ => None,
+    };
     let should_prefilter = regex.is_none();
     let mut result = perform_grep(
         &files_to_search,
@@ -444,6 +467,9 @@ fn grep_search_parsed<'a>(
             overflow_arena,
             prefilter: should_prefilter.then_some(&finder),
             abort_signal,
+            content_masks,
+            mask_needle,
+            files,
         },
         // The single sink-selection point: every mode's matcher/sink pairing
         // is decided here based on the compiled pattern.
@@ -490,7 +516,7 @@ fn grep_search_parsed<'a>(
 }
 
 /// Replace unescaped `\n` escapes with real newlines in a single pass.
-///
+//
 /// Returns `Some((replaced, first_newline_pos))` when the pattern contained at
 /// least one real `\n` escape (the user wants multiline search), where
 /// `first_newline_pos` is the byte offset of the first inserted newline in the
@@ -498,6 +524,10 @@ fn grep_search_parsed<'a>(
 /// preserved as-is (escaped backslash + literal `n`, e.g. `\\nvim-data`).
 pub(super) fn replace_newline_escapes(text: &str) -> Option<(String, usize)> {
     let bytes = text.as_bytes();
+    // Most queries have no backslash escape — skip the Vec entirely.
+    if !bytes.contains(&b'\\') {
+        return None;
+    }
     let mut result = Vec::with_capacity(bytes.len());
     let mut first_newline_pos: Option<usize> = None;
     let mut i = 0;
@@ -564,6 +594,56 @@ pub(super) struct GrepContext<'a, 'b> {
     pub(super) overflow_arena: crate::simd_path::ArenaPtr,
     pub(super) prefilter: Option<&'a NeedleFinder<'b>>,
     pub(super) abort_signal: &'a AtomicBool,
+    // Content byte-presence masks, indexed by file position. Lets grep skip
+    // `get_content_for_search` for files that provably cannot contain the
+    // needle, which is ~95% of grep's wall time.
+    pub(super) content_masks: Option<&'a crate::file_picker::ContentMaskStore>,
+    // Literal needle bytes for the content mask pre-check. `None` disables it
+    // (regex queries have no single literal to test for).
+    // Needle with its byte classes precomputed, so the per-file check is one
+    // AND + popcount instead of a scan over the needle bytes.
+    pub(super) mask_needle: Option<crate::types::MaskNeedle>,
+    // The picker's contiguous FileItem slice, used to recover original
+    // positions from the prefilter's filtered output.
+    pub(super) files: &'a [FileItem],
+}
+
+// Files skipped by the content-mask prefilter since process start.
+pub(crate) static CONTENT_MASK_REJECTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+// Files skipped by the whole-file memmem prefilter since process start.
+// Counted separately: mask skips mean "unreadable without opening",
+// memmem skips mean "opened but needle absent".
+pub(crate) static MEMMEM_PREFILTER_REJECTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+// Recover a file's original position in the picker's contiguous `FileItem`
+// slice from its address.
+//
+// The grep prefilter returns a *filtered* `Vec<&FileItem>`, so its loop index
+// is not the file's position, and `GrepMatch::file_index` indexes
+// `result_files` rather than the index either. Using either as a mask index
+// would make grep skip files that do match.
+//
+// The slice is contiguous - `FileSync` lays out base and overflow files in one
+// allocation, partitioned by `base_count` - so the offset is exact. Returning
+// `None` for anything outside the slice keeps the caller safe if that layout
+// ever changes.
+#[inline]
+pub(super) fn original_index(files: &[FileItem], f: &FileItem) -> Option<usize> {
+    let base = files.as_ptr() as usize;
+    let addr = f as *const FileItem as usize;
+    let stride = std::mem::size_of::<FileItem>();
+    if stride == 0 || addr < base {
+        return None;
+    }
+    let off = addr - base;
+    if !off.is_multiple_of(stride) {
+        return None;
+    }
+    let idx = off / stride;
+    (idx < files.len()).then_some(idx)
 }
 
 impl GrepContext<'_, '_> {
@@ -598,14 +678,23 @@ where
     };
 
     let search_start = std::time::Instant::now();
+    // Directory FD for openat reads on Unix; None elsewhere and on
+    // open failure (callers fall back to absolute-path opens).
     #[cfg(unix)]
     let base_dir = std::fs::File::open(ctx.base_path).ok();
     #[cfg(not(unix))]
-    let base_dir = None;
+    let base_dir: Option<std::fs::File> = None;
+    let phase_timing = std::env::var_os("FFF_PHASE_TIMING").is_some();
+    // Per-phase nanos, summed across chunk iterations. Cheap: two adds per file.
+    let mut phase_read_ns = 0u64;
+    let mut phase_scan_ns = 0u64;
     let page_limit = options.page_limit;
     // Lowest index an abort skipped; everything below it was searched, so it is
     // the resume point for the next page. usize::MAX means no abort happened.
     let first_skipped = AtomicUsize::new(usize::MAX);
+    // `usize::MAX` means "collect everything" — no page can fill, so skip the
+    // per-chunk gate overhead entirely.
+    let gate_enabled = page_limit < usize::MAX;
 
     let mut result_files: Vec<&'a FileItem> = Vec::new();
     let mut all_matches: Vec<GrepMatch> = Vec::new();
@@ -613,15 +702,12 @@ where
     let mut page_filled = false;
     let mut aborted = false;
 
-    // Grow empty batches to avoid repeated barriers. A strong prefilter caps
-    // growth low (bounds over-scan past a filled page) and resets on a match.
-    let base_chunk = rayon::current_num_threads() * 4;
-    let prefilter_strong = ctx.total_files > 0 && files_to_search.len() * 2 < ctx.total_files;
-    let max_chunk = if prefilter_strong {
-        base_chunk * 8
-    } else {
-        (base_chunk * 256).max(8 * 1024)
-    };
+    // Small chunks exit early on page fill, large chunks scan sparse
+    // corpora in few barriers. Sized off the search pool, not the ambient
+    // one (which collapses under nested installs).
+    let threads = search_pool_threads();
+    let (base_chunk, max_chunk) =
+        chunk_plan(files_to_search.len(), ctx.total_files, page_limit, threads);
     let mut chunk_size = base_chunk;
     let mut chunk_start = 0;
 
@@ -634,70 +720,141 @@ where
         // Unless enforced, the budget stays dormant until something matched.
         let budget = time_budget.filter(|_| options.enforce_time_budget || all_matches.len() > 1);
 
-        let chunk_results: Vec<(usize, &'a FileItem, Vec<GrepMatch>)> = chunk
+        // Skip the gate for full scans, zero pages, and tiny chunks where
+        // the Vec<AtomicU32> + CAS traffic costs more than it saves.
+        let use_gate = gate_enabled && page_limit != 0 && chunk.len() >= threads.saturating_mul(2);
+        let gate = use_gate.then(|| PageFillGate::new(chunk.len(), all_matches.len(), page_limit));
+
+        // Carry original positions once per chunk so workers skip pointer
+        // div/mod in the hot parallel path. Skipped when masks are off.
+        let mask_on = ctx.content_masks.is_some() && ctx.mask_needle.is_some();
+        let chunk_orig: Vec<Option<usize>> = if mask_on {
+            chunk.iter().map(|f| original_index(ctx.files, f)).collect()
+        } else {
+            Vec::new()
+        };
+
+        let chunk_results: Vec<(usize, &'a FileItem, Vec<GrepMatch>, u64, u64)> = chunk
             .par_iter()
             .enumerate()
             .map_init(
-                // tested it out a few times, this is just fine for rayon worker in this specific
-                // case it doesn't reallocate this many times and it is actually faster than using
-                // scoped threads with a predefined local scratch buffers because of spawn cost
-                || (Vec::with_capacity(64 * 1024), MmapSlot::default(), false),
-                |(buf, mmap_slot, aborted), (local_idx, file)| {
-                    // check the clock on every 8th file only; `aborted` latches for the
-                    // rest of this worker's range. File 0 is never skipped so a page
-                    // always consumes at least one file (cursor 0 means "done").
+                // 8K covers most source files without realloc; the shrink
+                // below caps huge-file residue at 32K instead of 10MB.
+                || {
+                    (
+                        Vec::with_capacity(64 * 1024),
+                        MmapSlot::default(),
+                        false,
+                        0u64,
+                        0u64,
+                    )
+                },
+                |(buf, mmap_slot, aborted, read_ns, scan_ns), (local_idx, file)| {
                     let idx = chunk_offset + local_idx;
-                    if !*aborted && local_idx % 8 == 0 && idx > 0 {
-                        *aborted = ctx.abort_signal.load(Ordering::Relaxed)
-                            || budget.is_some_and(|b| search_start.elapsed() > b);
+                    let found = (|| -> Option<Vec<GrepMatch>> {
+                        // Page already full from lower-indexed files: skip. This
+                        // is not an abort, so `first_skipped` is untouched and
+                        // the resume cursor stays on the tipping file.
+                        if gate.as_ref().is_some_and(|g| g.is_full()) {
+                            return None;
+                        }
+                        // check the clock on every 8th file only; `aborted` latches for the
+                        // rest of this worker's range. File 0 is never skipped so a page
+                        // always consumes at least one file (cursor 0 means "done").
+                        if !*aborted && local_idx % 8 == 0 && idx > 0 {
+                            *aborted = ctx.abort_signal.load(Ordering::Relaxed)
+                                || budget.is_some_and(|b| search_start.elapsed() > b);
+                        }
+                        if *aborted {
+                            first_skipped.fetch_min(idx, Ordering::Relaxed);
+                            return None;
+                        }
+
+                        let t_read = phase_timing.then(std::time::Instant::now);
+                        // Content-mask pre-check: skip the open+read entirely for
+                        // files whose indexed byte classes cannot contain the
+                        // needle. Uses the carried original position, not the
+                        // filtered loop index.
+                        if let (Some(masks), Some(needle)) = (ctx.content_masks, ctx.mask_needle)
+                            && let Some(pos) = chunk_orig.get(local_idx).copied().flatten()
+                            && let Some(mask) = masks.get(pos)
+                            && needle.allows(mask) == Some(false)
+                        {
+                            // Diagnostic only, and gated: an unconditional
+                            // fetch_add here is a contended atomic on a single
+                            // cache line, once per file. On a full-corpus grep
+                            // that costs more than the check being measured.
+                            // Tests always count (deterministic counter tests).
+                            if phase_timing || cfg!(test) {
+                                CONTENT_MASK_REJECTS
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            return None;
+                        }
+                        let content = file.get_content_for_search(
+                            buf,
+                            mmap_slot,
+                            ctx.arena_for_file(file),
+                            ctx.base_path,
+                            ctx.budget,
+                            base_dir.as_ref(),
+                        )?;
+                        if let Some(t) = t_read {
+                            *read_ns += t.elapsed().as_nanos() as u64;
+                        }
+
+                        // Fast whole-file memmem check before entering the
+                        // grep-searcher machinery. Skips Vec alloc, Searcher
+                        // setup, and line-splitting for files that can't match.
+                        if let Some(pf) = ctx.prefilter
+                            && pf.find(content).is_none()
+                        {
+                            // Diagnostic only, and gated (see above).
+                            if phase_timing || cfg!(test) {
+                                MEMMEM_PREFILTER_REJECTS
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            }
+                            return None;
+                        }
+
+                        let t_scan = phase_timing.then(std::time::Instant::now);
+                        let file_matches = search_file(file, content, options.max_matches_per_file);
+                        if let Some(t) = t_scan {
+                            *scan_ns += t.elapsed().as_nanos() as u64;
+                        }
+
+                        if file_matches.is_empty() {
+                            return None;
+                        }
+
+                        Some(file_matches)
+                    })();
+
+                    // Cap huge-file residue so one 10MB file doesn't pin RSS
+                    // on this worker for the rest of the scan.
+                    if buf.capacity() > 256 * 1024 {
+                        buf.shrink_to(32 * 1024);
                     }
-                    if *aborted {
-                        first_skipped.fetch_min(idx, Ordering::Relaxed);
-                        return None;
+
+                    if let Some(g) = &gate {
+                        g.record_done(local_idx, found.as_ref().map_or(0, Vec::len));
                     }
 
-                    let content = file.get_content_for_search(
-                        buf,
-                        mmap_slot,
-                        ctx.arena_for_file(file),
-                        ctx.base_path,
-                        ctx.budget,
-                        base_dir.as_ref(),
-                    )?;
-
-                    // Fast whole-file memmem check before entering the
-                    // grep-searcher machinery. Skips Vec alloc, Searcher
-                    // setup, and line-splitting for files that can't match.
-                    if let Some(pf) = ctx.prefilter
-                        && pf.find(content).is_none()
-                    {
-                        return None;
-                    }
-
-                    let file_matches = search_file(file, content, options.max_matches_per_file);
-
-                    if file_matches.is_empty() {
-                        return None;
-                    }
-
-                    Some((idx, *file, file_matches))
+                    found.map(|m| (idx, *file, m, *read_ns, *scan_ns))
                 },
             )
             .flatten()
             .collect();
-
-        chunk_size = if prefilter_strong && !chunk_results.is_empty() {
-            base_chunk
-        } else {
-            (chunk_size * 2).min(max_chunk)
-        };
 
         // Every file in the chunk was visited unless an abort cut it short.
         let resume_at = first_skipped.load(Ordering::Relaxed);
         aborted = resume_at != usize::MAX;
         files_consumed = resume_at.min(chunk_offset + chunk.len());
 
-        for (batch_idx, file, file_matches) in chunk_results {
+        let before_matches = all_matches.len();
+        for (batch_idx, file, file_matches, read_ns, scan_ns) in chunk_results {
+            phase_read_ns += read_ns;
+            phase_scan_ns += scan_ns;
             // Matches past the abort point are dropped; the next page re-searches them.
             if batch_idx >= resume_at {
                 continue;
@@ -726,6 +883,21 @@ where
         if page_filled || aborted {
             break;
         }
+
+        // AIMD: empty chunks double (sparse scan, few barriers); near-page
+        // chunks reset to base so fill doesn't over-read; partial hits grow
+        // additively. Budget pressure clamps back to base scale.
+        let new_in_chunk = all_matches.len() - before_matches;
+        if new_in_chunk == 0 {
+            chunk_size = (chunk_size * 2).min(max_chunk);
+        } else if page_limit != usize::MAX && all_matches.len() * 2 >= page_limit {
+            chunk_size = base_chunk;
+        } else {
+            chunk_size = (chunk_size + base_chunk).min(max_chunk);
+        }
+        if time_budget.is_some_and(|b| search_start.elapsed() * 2 > b) {
+            chunk_size = chunk_size.min(base_chunk * 2);
+        }
     }
 
     // No match and no abort means the whole slice was searched.
@@ -740,6 +912,18 @@ where
     } else {
         0
     };
+
+    if phase_timing {
+        eprintln!(
+            "PHASE grep files={} read_ms={:.1} scan_ms={:.1} total_ms={:.1} mask_skips={} memmem_skips={}",
+            files_consumed,
+            phase_read_ns as f64 / 1e6,
+            phase_scan_ns as f64 / 1e6,
+            search_start.elapsed().as_secs_f64() * 1e3,
+            CONTENT_MASK_REJECTS.load(std::sync::atomic::Ordering::Relaxed),
+            MEMMEM_PREFILTER_REJECTS.load(std::sync::atomic::Ordering::Relaxed),
+        );
+    }
 
     GrepResult {
         matches: all_matches,

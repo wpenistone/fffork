@@ -8,6 +8,7 @@ use crate::simd_path::ArenaPtr;
 use crate::simd_string_utils::memmem::find_case_insensitive_short;
 
 const PAR_THRESHOLD: usize = 10_000;
+const PAR_CHUNKS_PER_THREAD: usize = 4;
 
 pub(crate) trait Constrainable {
     fn write_file_name(&self, arena: ArenaPtr, out: &mut String);
@@ -62,19 +63,14 @@ pub fn path_ends_with_suffix(path: &str, suffix: &str) -> bool {
         return false;
     }
 
-    // Exact or preceded by a separator. Scan backward past any multi-byte
-    // continuation bytes to find the preceding ASCII byte.
+    // Exact or preceded by a separator. Only the byte directly before
+    // `start` matters: separators are single-byte ASCII, so a non-ASCII
+    // byte there (lead or continuation) means no boundary. Scanning
+    // further back skips whole non-ASCII words and false-matches.
     if start == 0 {
         return true;
     }
-    let mut i = start;
-    while i > 0 {
-        i -= 1;
-        if path_bytes[i] < 128 {
-            return is_path_sep(path_bytes[i]);
-        }
-    }
-    false
+    is_path_sep(path_bytes[start - 1])
 }
 
 #[inline]
@@ -228,15 +224,29 @@ impl<'q, 'c> ConstraintPlan<'q, 'c> {
     ) -> Vec<&'a T> {
         if items.len() >= PAR_THRESHOLD {
             use rayon::prelude::*;
-            items
-                .par_iter()
-                .enumerate()
-                .map_init(ConstraintsBuffers::new, |scratch, (i, item)| {
-                    self.matches(item, i, base_arean, overflow_arena, scratch)
-                        .then_some(item)
+            // Fixed spans keep the collect indexed; the unindexed fallback
+            // pays per-task buffers plus a serial merge on the caller.
+            let threads = rayon::current_num_threads().max(1);
+            let span = items.len().div_ceil(threads * PAR_CHUNKS_PER_THREAD).max(1);
+            let n_chunks = items.len().div_ceil(span);
+            let parts: Vec<Vec<&'a T>> = (0..n_chunks)
+                .into_par_iter()
+                .map_init(ConstraintsBuffers::new, |scratch, c| {
+                    let lo = c * span;
+                    let hi = ((c + 1) * span).min(items.len());
+                    (lo..hi)
+                        .filter_map(|i| {
+                            self.matches(&items[i], i, base_arean, overflow_arena, scratch)
+                                .then_some(&items[i])
+                        })
+                        .collect()
                 })
-                .flatten()
-                .collect()
+                .collect();
+            let mut out = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+            for mut part in parts {
+                out.append(&mut part);
+            }
+            out
         } else {
             let mut scratch = ConstraintsBuffers::new();
             items
@@ -725,6 +735,18 @@ mod tests {
         // Simple path
         assert!(path_ends_with_suffix("src/main.rs", "src/main.rs"));
         assert!(path_ends_with_suffix("crates/src/main.rs", "src/main.rs"));
+
+        // Non-ASCII word directly before the suffix is not a boundary,
+        // even though scanning further back would find a separator.
+        assert!(!path_ends_with_suffix(
+            "abc/приветfoo/bar.txt",
+            "foo/bar.txt"
+        ));
+        assert!(path_ends_with_suffix(
+            "abc/привет/foo/bar.txt",
+            "foo/bar.txt"
+        ));
+        assert!(path_ends_with_suffix("привет/bar.txt", "bar.txt"));
     }
 
     #[cfg(windows)]

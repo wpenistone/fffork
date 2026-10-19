@@ -168,6 +168,11 @@ pub(crate) fn multi_grep_search<'a>(
             overflow_arena,
             prefilter: None, // no memmem prefilter for multi-pattern search
             abort_signal,
+            // Multi-pattern has no single literal needle, so the mask check
+            // cannot be sound here.
+            content_masks: None,
+            mask_needle: None,
+            files,
         },
         |file: &FileItem, file_bytes: &[u8], max_matches: usize| {
             let state = SinkState {

@@ -741,7 +741,7 @@ fn debug_dump_environment(
             let norm = normalize(raw.clone());
             s.push_str(&format!(
                 "  [{i:>2}] raw={raw:?} norm={norm:?} status={:?}\n",
-                f.git_status
+                f.git_status()
             ));
         }
         s.push_str(&format!("  (total: {} items)\n", result.items.len()));
@@ -811,7 +811,7 @@ fn read_picker_status(shared: &SharedFilePicker) -> BTreeMap<String, Option<Stat
 
     let mut out = BTreeMap::new();
     for f in &result.items {
-        out.insert(normalize(f.relative_path(picker)), f.git_status);
+        out.insert(normalize(f.relative_path(picker)), f.git_status());
     }
     out
 }
@@ -851,7 +851,7 @@ fn probe_single_file_status(shared: &SharedFilePicker, relative: &str) -> Option
         .items
         .iter()
         .find(|f| normalize(f.relative_path(picker)) == relative)
-        .map(|f| f.git_status)
+        .map(|f| f.git_status())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -933,7 +933,7 @@ fn fuzzy_search_items(shared: &SharedFilePicker, query: &str) -> Vec<(String, Op
     result
         .items
         .iter()
-        .map(|f| (normalize(f.relative_path(picker)), f.git_status))
+        .map(|f| (normalize(f.relative_path(picker)), f.git_status()))
         .collect()
 }
 

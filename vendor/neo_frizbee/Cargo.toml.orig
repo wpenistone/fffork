@@ -1,0 +1,62 @@
+[workspace]
+default-members = ["."]
+members = [
+  "bindings/frizbee-c",
+  "bindings/frizbee-py",
+  "bindings/frizbee-wasm",
+]
+
+[workspace.package]
+version = "0.13.3"
+license = "MIT"
+edition = "2024"
+repository = "https://github.com/saghen/frizbee"
+
+[package]
+name = "neo_frizbee"
+description = "Fast typo-resistant fuzzy matching via SIMD smith waterman, similar algorithm to FZF"
+include = ["src/**", "Cargo.toml", "README.md", "LICENSE"]
+license.workspace = true
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+keywords = ["fuzzy-search", "fuzzy-matching", "string-matching", "simd", "smith-waterman"]
+categories = ["algorithms", "text-processing"]
+rust-version = "1.89.0" # Changing this? Remember to update CI to test the new msrv!
+
+[profile.release]
+lto = true
+
+[dev-dependencies]
+nucleo = "0.5.0"
+proptest = { version = "1", default-features = false, features = ["std"] }
+rand = "0.10"
+rand_distr = "0.6"
+
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+criterion = "0.8"
+
+[target.'cfg(target_family = "wasm")'.dev-dependencies]
+criterion = { version = "0.8", default-features = false }
+
+[[bench]]
+name = "lib"
+harness = false
+
+[[bench]]
+name = "sort"
+harness = false
+
+[lib]
+bench = false
+
+[dependencies]
+serde = { version = "1.0", default-features = false, features = ["derive", "alloc"], optional = true }
+
+[features]
+default = ["std"]
+# required for `Matcher::match_list_parallel`
+std = ["serde?/std"]
+serde = ["dep:serde"]
+match_end_col = []
+safe_read = []

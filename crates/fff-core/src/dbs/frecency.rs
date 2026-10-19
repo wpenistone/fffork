@@ -3,9 +3,10 @@ use super::env_pool::SharedEnv;
 use crate::error::{Error, Result};
 use crate::file_picker::FFFMode;
 use crate::git::is_modified_status;
-use crate::lmdb::{DbHealth, LmdbStore, is_map_full};
+use crate::lmdb::{DbHealth, LmdbStore, WRITE_TXN_CHUNK, is_map_full};
 use heed::Database;
 use heed::types::{Bytes, SerdeBincode};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::VecDeque, path::Path};
 
@@ -23,6 +24,10 @@ pub struct FrecencyTracker {
     env: SharedEnv,
     db: Database<Bytes, SerdeBincode<VecDeque<u64>>>,
     health: DbHealth,
+    // 2 = unknown, 1 = non-empty, 0 = empty. Avoids a read txn per scan.
+    // Stale-1 after a GC purge only costs one wasted hydration pass; writes
+    // always set 1, so stale-0 (skipped hydration with data) is impossible.
+    empty_hint: AtomicU8,
 }
 
 const MODIFICATION_THRESHOLDS: [(i64, u64); 5] = [
@@ -74,9 +79,9 @@ impl LmdbStore for FrecencyTracker {
     // leaves ~18× headroom while capping runaway growth (see GH issue #437).
     const MAP_SIZE: usize = 10 * 1024 * 1024;
     const MAX_DBS: u32 = 0;
-    // Nuke the db when it exceeds 8 MiB on disk — leaves a small margin under
-    // MAP_SIZE so we don't hit MDB_MAP_FULL before the open-time erase fires.
-    const SIZE_CAP_BYTES: u64 = 12 * 1024 * 1024;
+    // Erase on disk when over 8 MiB — under MAP_SIZE so the open-time erase
+    // fires before MDB_MAP_FULL can.
+    const SIZE_CAP_BYTES: u64 = 8 * 1024 * 1024;
 
     fn shared_env(&self) -> &SharedEnv {
         &self.env
@@ -107,7 +112,12 @@ impl FrecencyTracker {
         let (env, health) = Self::open_env(db_path)?;
 
         let db = Self::open_database_safe(&env, None)?;
-        Ok(FrecencyTracker { db, env, health })
+        Ok(FrecencyTracker {
+            db,
+            env,
+            health,
+            empty_hint: AtomicU8::new(2),
+        })
     }
 
     #[deprecated(
@@ -142,6 +152,8 @@ impl FrecencyTracker {
             db: Self::LABEL,
             source,
         })?;
+        // Cursor order: single forward pass, then chunked write txns so a
+        // large purge never holds one huge txn (MDB_MAP_FULL/abort risk).
         for result in iter {
             let (key, accesses) = result.map_err(|source| Error::DbRead {
                 db: Self::LABEL,
@@ -165,31 +177,45 @@ impl FrecencyTracker {
             return Ok((0, 0));
         }
 
-        let mut wtxn = env.write_txn().map_err(|source| Error::DbStartWriteTxn {
-            db: Self::LABEL,
-            source,
-        })?;
-
-        for key in &to_delete {
-            db.delete(&mut wtxn, key).map_err(|source| Error::DbWrite {
+        // Chunked commits bound each write txn; values drain as we go.
+        const PURGE_CHUNK: usize = 1_024;
+        let n_delete = to_delete.len();
+        let n_update = to_update.len();
+        for chunk in to_delete.chunks(PURGE_CHUNK) {
+            let mut wtxn = env.write_txn().map_err(|source| Error::DbStartWriteTxn {
+                db: Self::LABEL,
+                source,
+            })?;
+            for key in chunk {
+                db.delete(&mut wtxn, key).map_err(|source| Error::DbWrite {
+                    db: Self::LABEL,
+                    source,
+                })?;
+            }
+            wtxn.commit().map_err(|source| Error::DbCommit {
+                db: Self::LABEL,
+                source,
+            })?;
+        }
+        for chunk in to_update.chunks(PURGE_CHUNK) {
+            let mut wtxn = env.write_txn().map_err(|source| Error::DbStartWriteTxn {
+                db: Self::LABEL,
+                source,
+            })?;
+            for (key, accesses) in chunk {
+                db.put(&mut wtxn, key, accesses)
+                    .map_err(|source| Error::DbWrite {
+                        db: Self::LABEL,
+                        source,
+                    })?;
+            }
+            wtxn.commit().map_err(|source| Error::DbCommit {
                 db: Self::LABEL,
                 source,
             })?;
         }
 
-        for (key, accesses) in &to_update {
-            db.put(&mut wtxn, key, accesses)
-                .map_err(|source| Error::DbWrite {
-                    db: Self::LABEL,
-                    source,
-                })?;
-        }
-        wtxn.commit().map_err(|source| Error::DbCommit {
-            db: Self::LABEL,
-            source,
-        })?;
-
-        Ok((to_delete.len(), to_update.len()))
+        Ok((n_delete, n_update))
     }
 
     fn get_accesses(&self, path: &Path) -> Result<Option<VecDeque<u64>>> {
@@ -209,12 +235,24 @@ impl FrecencyTracker {
                 db: Self::LABEL,
                 source,
             })?;
-        rtxn.commit().map_err(|source| Error::DbCommit {
-            db: Self::LABEL,
-            source,
-        })?;
+        drop(rtxn);
 
         Ok(result)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        if self.empty_hint.load(Ordering::Relaxed) == 1 {
+            return false;
+        }
+        let Ok(rtxn) = self.env.read_txn() else {
+            return true;
+        };
+        let Ok(stat) = self.db.stat(&rtxn) else {
+            return true;
+        };
+        let empty = stat.entries == 0;
+        self.empty_hint.store(u8::from(!empty), Ordering::Relaxed);
+        empty
     }
 
     fn get_now(&self) -> u64 {
@@ -227,14 +265,48 @@ impl FrecencyTracker {
     fn path_to_hash_bytes(path: &Path) -> Result<[u8; 32]> {
         // On Windows, resolve to the canonical form (short-name/case/symlink)
         // so the same file always hashes to one key regardless of how the
-        // caller spelled it. Falls back to the raw path when the file no
-        // longer exists (e.g. watcher delete events), so the op is never
-        // dropped. No-op on other platforms.
+        // caller spelled it. A missing file (renamed/deleted before the hash
+        // runs) cannot canonicalize directly, but its parent still resolves;
+        // join the leaf back on so the key matches the one recorded while
+        // the file existed. Raw path is the last resort. No-op elsewhere.
         #[cfg(windows)]
-        let canonical: Option<std::path::PathBuf> = crate::path_utils::canonicalize(path).ok();
+        let owned: Option<std::path::PathBuf>;
         #[cfg(windows)]
-        let path: &Path = canonical.as_deref().unwrap_or(path);
+        {
+            owned = crate::path_utils::canonicalize(path).ok().or_else(|| {
+                path.parent().and_then(|parent| {
+                    crate::path_utils::canonicalize(parent)
+                        .ok()
+                        .and_then(|c| path.file_name().map(|leaf| c.join(leaf)))
+                })
+            });
+        }
+        #[cfg(windows)]
+        let path: &Path = owned.as_deref().unwrap_or(path);
 
+        Self::path_hash_raw(path)
+    }
+
+    /// Hash many paths in parallel on the bg pool. Scan hydration hashes
+    /// thousands of absolute paths; serial blake3 before the single read txn
+    /// was a visible slice of that phase on 200k trees.
+    pub fn path_hashes_parallel(paths: &[&Path]) -> Vec<[u8; 32]> {
+        if paths.is_empty() {
+            return Vec::new();
+        }
+        crate::parallelism::run_on_bg_pool(|| {
+            use rayon::prelude::*;
+            paths
+                .par_iter()
+                .map(|p| Self::path_hash_raw(p).unwrap_or([0u8; 32]))
+                .collect()
+        })
+    }
+
+    /// Hash a path without canonicalize. For scan-built absolute paths that
+    /// are already spelled consistently from `base_path` this avoids one
+    /// Windows `canonicalize` syscall per file (families: io, cpu).
+    pub fn path_hash_raw(path: &Path) -> Result<[u8; 32]> {
         let Some(key) = path.to_str() else {
             return Err(Error::InvalidPath(path.to_path_buf()));
         };
@@ -328,7 +400,94 @@ impl FrecencyTracker {
             .map_err(|source| Error::DbCommit {
                 db: Self::LABEL,
                 source,
-            })
+            })?;
+        self.empty_hint.store(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Batch variant: one read txn for all lookups, then chunked write txns
+    /// of `WRITE_TXN_CHUNK` puts. Replaces N×(read+write) with 1 read + N/5k
+    /// writes for bulk imports / watcher replays.
+    pub fn track_accesses(&self, paths: &[&Path]) -> Result<usize> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        // Unhashable (non-UTF8) paths cannot round-trip through reads
+        // either; skip them rather than colliding on the zero key.
+        let hashes: Vec<[u8; 32]> = crate::parallelism::run_on_bg_pool(|| {
+            use rayon::prelude::*;
+            paths
+                .par_iter()
+                .filter_map(|p| Self::path_to_hash_bytes(p).ok())
+                .collect()
+        });
+        let now = self.get_now();
+        let cutoff_time = now.saturating_sub((MAX_HISTORY_DAYS * SECONDS_PER_DAY) as u64);
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|source| Error::DbStartReadTxn {
+                db: Self::LABEL,
+                source,
+            })?;
+        let mut pending: Vec<([u8; 32], VecDeque<u64>)> = Vec::with_capacity(hashes.len());
+        for hash in &hashes {
+            let mut accesses: VecDeque<u64> = self
+                .db
+                .get(&rtxn, hash)
+                .map_err(|source| Error::DbRead {
+                    db: Self::LABEL,
+                    source,
+                })?
+                .unwrap_or_default();
+            while let Some(&front) = accesses.front() {
+                if front < cutoff_time || accesses.len() >= MAX_TIMESTAMPS_PER_FILE {
+                    accesses.pop_front();
+                } else {
+                    break;
+                }
+            }
+            accesses.push_back(now);
+            pending.push((*hash, accesses));
+        }
+        drop(rtxn);
+        let mut done = 0usize;
+        for chunk in pending.chunks(WRITE_TXN_CHUNK) {
+            let mut wtxn = self
+                .env
+                .write_txn()
+                .map_err(|source| Error::DbStartWriteTxn {
+                    db: Self::LABEL,
+                    source,
+                })?;
+            for (hash, accesses) in chunk {
+                if let Err(e) = self.db.put(&mut wtxn, hash, accesses) {
+                    if is_map_full(&e) {
+                        self.health.mark_unhealthy("MDB_MAP_FULL on batch put");
+                        return Ok(done);
+                    }
+                    return Err(Error::DbWrite {
+                        db: Self::LABEL,
+                        source: e,
+                    });
+                }
+                done += 1;
+            }
+            if let Err(e) = wtxn.commit() {
+                if is_map_full(&e) {
+                    self.health.mark_unhealthy("MDB_MAP_FULL on batch commit");
+                    return Ok(done);
+                }
+                return Err(Error::DbCommit {
+                    db: Self::LABEL,
+                    source: e,
+                });
+            }
+        }
+        if done > 0 {
+            self.empty_hint.store(1, Ordering::Relaxed);
+        }
+        Ok(done)
     }
 
     pub fn copy_history(&self, from: &Path, to: &Path) -> Result<bool> {
@@ -388,6 +547,33 @@ impl FrecencyTracker {
 
     pub fn get_access_score(&self, file_path: &Path, mode: FFFMode) -> i64 {
         self.reader().access_score(file_path, None, mode)
+    }
+
+    /// Score a batch of precomputed path hashes with one LMDB read txn.
+    ///
+    /// Use [`Self::path_hash_raw`] for scan-built absolute paths so hydration
+    /// does not canonicalize every file on Windows.
+    pub fn get_access_scores_for_hashes(&self, hashes: &[[u8; 32]], mode: FFFMode) -> Vec<i64> {
+        let mut out = vec![0i64; hashes.len()];
+        if hashes.is_empty() {
+            return out;
+        }
+
+        let Ok(rtxn) = self.env.read_txn() else {
+            return out;
+        };
+        let now = self.get_now();
+        for (slot, hash) in out.iter_mut().zip(hashes.iter()) {
+            let Ok(accesses) = self.db.get(&rtxn, hash) else {
+                continue;
+            };
+            let Some(accesses) = accesses else {
+                continue;
+            };
+            *slot = normalize_frecency(decay_sum(&accesses, now, mode));
+        }
+        drop(rtxn);
+        out
     }
 
     // Scores many files under one read transaction: a transaction per lookup
@@ -541,6 +727,69 @@ mod tests {
     fn hashes_nonexistent_path_without_error() {
         let missing = Path::new("/this/path/definitely/does/not/exist/frecency_test_xyz");
         assert!(FrecencyTracker::path_to_hash_bytes(missing).is_ok());
+    }
+
+    #[test]
+    fn batch_scores_match_single_lookup() {
+        let dir = std::env::temp_dir().join(format!("fff-frecency-batch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracker = FrecencyTracker::open(&dir).unwrap();
+
+        // Real files under a canonicalized dir: raw and canonicalized
+        // spellings coincide, so both hash spellings must agree. (Fake
+        // nonexistent paths exercise fallback branches, not this invariant.)
+        let base = crate::path_utils::canonicalize(&dir).unwrap();
+        let a = base.join("a.rs");
+        let b = base.join("b.rs");
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let now = tracker.get_now();
+        tracker.track_access(&a).unwrap();
+
+        let hashes = [
+            FrecencyTracker::path_hash_raw(&a).unwrap(),
+            FrecencyTracker::path_hash_raw(&b).unwrap(),
+        ];
+        let batch = tracker.get_access_scores_for_hashes(&hashes, FFFMode::Neovim);
+        let single_a = tracker.get_access_score(&a, FFFMode::Neovim);
+        let single_b = tracker.get_access_score(&b, FFFMode::Neovim);
+        assert_eq!(batch.len(), 2);
+        // Single lookup canonicalizes on Windows; raw hash matches when the
+        // path spelling is already canonical (these temp paths are).
+        assert_eq!(batch[0], single_a);
+        assert_eq!(batch[1], single_b);
+        assert!(batch[0] > 0);
+        assert_eq!(batch[1], 0);
+        let _ = now;
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn batch_track_matches_single_writes() {
+        let dir = std::env::temp_dir().join(format!("fff-frecency-batchw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tracker = FrecencyTracker::open(&dir).unwrap();
+        assert!(tracker.is_empty());
+
+        let a = Path::new("/tmp/fff_batchw_a.rs");
+        let b = Path::new("/tmp/fff_batchw_b.rs");
+        let n = tracker.track_accesses(&[a, b]).unwrap();
+        assert_eq!(n, 2);
+        assert!(!tracker.is_empty());
+        // Cached hint avoids a second read txn.
+        assert!(!tracker.is_empty());
+        assert_eq!(tracker.access_count(a).unwrap(), 1);
+        assert_eq!(tracker.access_count(b).unwrap(), 1);
+        assert_eq!(
+            FrecencyTracker::path_hashes_parallel(&[a, b]),
+            vec![
+                FrecencyTracker::path_hash_raw(a).unwrap(),
+                FrecencyTracker::path_hash_raw(b).unwrap(),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn calculate_test_frecency_score(access_timestamps: &[u64], current_time: u64) -> i64 {

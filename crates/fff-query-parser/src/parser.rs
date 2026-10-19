@@ -63,10 +63,11 @@ impl<C: ParserConfig> QueryParser<C> {
         let mut constraints = ConstraintVec::new();
         let query = query.trim();
 
-        let whitespace_count = query.chars().filter(|c| c.is_whitespace()).count();
+        let has_whitespace = query.bytes().any(|b| b.is_ascii_whitespace())
+            || (!query.is_ascii() && query.chars().any(char::is_whitespace));
 
         // Single token - check if it's a constraint or plain text
-        if whitespace_count == 0 {
+        if !has_whitespace {
             // Try to parse as constraint first
             if let Some(constraint) = parse_token(query, config) {
                 // Don't treat filename tokens (FilePath) as constraints in single-token

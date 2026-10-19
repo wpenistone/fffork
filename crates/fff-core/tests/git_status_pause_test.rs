@@ -133,7 +133,7 @@ fn status_of(shared: &SharedFilePicker, base: &Path, rel: &str) -> Option<Status
     picker
         .get_file_by_path(base.join(rel))
         .unwrap_or_else(|| panic!("{rel} not indexed"))
-        .git_status
+        .git_status()
 }
 
 fn is_modified(status: Option<Status>) -> bool {

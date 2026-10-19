@@ -146,7 +146,7 @@ impl BigramIndexBuilder {
         &slab[start..start + self.words]
     }
 
-    #[doc(hidden)] // `pub` (via `#[doc(hidden)]`) only for benchmarking
+    #[doc(hidden)] // Public for external use; hidden from docs.
     pub fn add_file_content(&self, skip_builder: &Self, file_idx: usize, content: &[u8]) {
         if content.len() < 2 {
             return;
@@ -370,8 +370,10 @@ impl BigramIndexBuilder {
 
     /// Compress the dense builder into a compact `BigramFilter`.
     ///
-    /// Keeps rare columns as gap lists unless `min_density_pct` excludes them.
-    /// Ubiquitous columns (≥90%) are omitted because they barely filter.
+    /// Retains every non-ubiquitous column (<90% of indexed files).
+    /// Rare columns encode as gap lists, so keeping them costs bytes
+    /// but buys selectivity. An explicit `min_density_pct` (skip index)
+    /// still drops anything below the cutoff.
     #[inline(always)]
     pub fn compress(self, min_density_pct: Option<u32>) -> BigramFilter {
         let cols = self.columns_used() as usize;
@@ -403,15 +405,15 @@ impl BigramIndexBuilder {
                 let bitset = &col_data[col_start..col_start + words];
                 let popcount: u32 = bitset.iter().map(|w| w.count_ones()).sum();
 
-                if min_density_pct.is_some_and(|min_pct| {
-                    populated == 0 || (popcount as usize) * 100 < populated * min_pct as usize
-                }) {
-                    continue;
-                }
-
                 // Drop ubiquitous bigrams — columns ≥90% ones carry almost no
                 // filtering power and just waste memory + AND cycles.
+                // Rare columns are kept: they encode as gap lists below.
                 if populated > 0 && (popcount as usize) * 10 >= populated * 9 {
+                    continue;
+                }
+                if let Some(min_pct) = min_density_pct
+                    && (populated == 0 || (popcount as usize) * 100 < populated * min_pct as usize)
+                {
                     continue;
                 }
 
@@ -419,14 +421,6 @@ impl BigramIndexBuilder {
             }
         }
         kept.sort_unstable_by_key(|&(_, old_col, _)| old_col);
-        let mut rare_keys = vec![0u64; BIGRAM_KEY_SLOTS.div_ceil(64)];
-        if min_density_pct.is_none() {
-            for &(slot, _, count) in &kept {
-                if (count as usize) * 4 < dense_bytes {
-                    rare_keys[slot / 64] |= 1 << (slot % 64);
-                }
-            }
-        }
         let column = |old_col: u16| -> &[u64] {
             let start = old_col as usize * words;
             &col_data.as_deref().expect("kept columns imply a slab")[start..start + words]
@@ -491,7 +485,6 @@ impl BigramIndexBuilder {
         sparse_data.shrink_to_fit();
 
         BigramFilter {
-            rare_keys,
             lookup,
             dense_data,
             dense_count,
@@ -575,7 +568,6 @@ unsafe impl Send for BigramIndexBuilder {}
 #[derive(Debug)]
 pub struct BigramFilter {
     lookup: Vec<u16>,
-    rare_keys: Vec<u64>,
     /// Flat buffer of all dense column data laid out at fixed stride `words`.
     /// Column `i` starts at `i * words`.
     dense_data: ColumnSlab, // do not try to change this to u8 it has to be wordsize
@@ -612,6 +604,27 @@ impl BigramFilter {
             return None;
         }
 
+        let mut keys: [(u16, u32); 512] = [(0, 0); 512];
+        let mut nkeys = 0usize;
+        let mut prev = pattern[0];
+        for &b in &pattern[1..] {
+            if (32..=126).contains(&prev) && (32..=126).contains(&b) {
+                let key = (prev.to_ascii_lowercase() as u16) << 8 | b.to_ascii_lowercase() as u16;
+                #[allow(clippy::collapsible_if)]
+                if let Some(pop) = self.column_popcount(key) {
+                    if nkeys < keys.len() {
+                        keys[nkeys] = (key, pop);
+                        nkeys += 1;
+                    }
+                }
+            }
+            prev = b;
+        }
+        if nkeys == 0 && self.skip_index.is_none() {
+            return None;
+        }
+        keys[..nkeys].sort_unstable_by_key(|&(_, pop)| pop);
+
         let mut result = vec![u64::MAX; self.words];
         if !self.file_count.is_multiple_of(64) {
             let last = self.words - 1;
@@ -619,17 +632,13 @@ impl BigramFilter {
         }
 
         let mut has_filter = false;
-
-        let mut prev = pattern[0];
-        for &b in &pattern[1..] {
-            if (32..=126).contains(&prev) && (32..=126).contains(&b) {
-                let key = (prev.to_ascii_lowercase() as u16) << 8 | b.to_ascii_lowercase() as u16;
-                if let Some(col) = self.column_ref(key) {
-                    Self::and_column(&mut result, col);
-                    has_filter = true;
+        for &(key, _) in &keys[..nkeys] {
+            if let Some(col) = self.column_ref(key) {
+                if !Self::and_column_checked(&mut result, col) {
+                    return Some(result);
                 }
+                has_filter = true;
             }
-            prev = b;
         }
 
         // strid-1 bigrams
@@ -647,27 +656,43 @@ impl BigramFilter {
     /// Query using stride-2 bigrams from the pattern.
     /// For "ABCDE" queries with keys (A,C), (B,D), (C,E).
     fn query_skip(&self, pattern: &[u8]) -> Option<Vec<u64>> {
+        let mut keys: [(u16, u32); 512] = [(0, 0); 512];
+        let mut nkeys = 0usize;
+        for i in 0..pattern.len().saturating_sub(2) {
+            let a = pattern[i];
+            let b = pattern[i + 2];
+            if (32..=126).contains(&a) && (32..=126).contains(&b) {
+                let key = (a.to_ascii_lowercase() as u16) << 8 | b.to_ascii_lowercase() as u16;
+                #[allow(clippy::collapsible_if)]
+                if let Some(pop) = self.column_popcount(key) {
+                    if nkeys < keys.len() {
+                        keys[nkeys] = (key, pop);
+                        nkeys += 1;
+                    }
+                }
+            }
+        }
+        if nkeys == 0 {
+            return None;
+        }
+        keys[..nkeys].sort_unstable_by_key(|&(_, pop)| pop);
+
         let mut result = vec![u64::MAX; self.words];
         if !self.file_count.is_multiple_of(64) {
             let last = self.words - 1;
             result[last] = (1u64 << (self.file_count % 64)) - 1;
         }
 
-        let mut has_filter = false;
-
-        for i in 0..pattern.len().saturating_sub(2) {
-            let a = pattern[i];
-            let b = pattern[i + 2];
-            if (32..=126).contains(&a) && (32..=126).contains(&b) {
-                let key = (a.to_ascii_lowercase() as u16) << 8 | b.to_ascii_lowercase() as u16;
-                if let Some(col) = self.column_ref(key) {
-                    Self::and_column(&mut result, col);
-                    has_filter = true;
+        for &(key, _) in &keys[..nkeys] {
+            #[allow(clippy::collapsible_if)]
+            if let Some(col) = self.column_ref(key) {
+                if !Self::and_column_checked(&mut result, col) {
+                    break;
                 }
             }
         }
 
-        has_filter.then_some(result)
+        Some(result)
     }
 
     /// Resolve a bigram key to its stored column, if the index kept one.
@@ -699,16 +724,28 @@ impl BigramFilter {
         }
     }
 
-    // Regex and fuzzy filters keep their original columns; literals can use rare ones.
-    pub(crate) fn common_column_bitset(&self, key: u16) -> Option<std::borrow::Cow<'_, [u64]>> {
-        if self.column(key) == NO_COLUMN {
-            return None;
+    fn and_column_checked(result: &mut [u64], col: ColumnRef<'_>) -> bool {
+        match col {
+            ColumnRef::Dense(bits) => {
+                let mut any = 0u64;
+                for (r, b) in result.iter_mut().zip(bits.iter()) {
+                    *r &= *b;
+                    any |= *r;
+                }
+                any != 0
+            }
+            ColumnRef::Sparse(data) => {
+                and_sparse_column(result, data);
+                result.iter().any(|&w| w != 0)
+            }
         }
-        let slot = key_slot(key);
-        if self.rare_keys[slot / 64] & (1 << (slot % 64)) != 0 {
-            return None;
+    }
+
+    pub(crate) fn column_popcount(&self, key: u16) -> Option<u32> {
+        match self.column_ref(key)? {
+            ColumnRef::Dense(bits) => Some(bits.iter().map(|w| w.count_ones()).sum()),
+            ColumnRef::Sparse(data) => Some(data.iter().filter(|&&b| b & 0x80 == 0).count() as u32),
         }
-        self.column_bitset(key)
     }
 
     /// Column as a materialized bitset (borrowed for dense, decoded for sparse).
@@ -766,7 +803,7 @@ impl BigramFilter {
         let lookup_bytes = self.lookup.len() * std::mem::size_of::<u16>();
         let dense_bytes = self.dense_data.len() * std::mem::size_of::<u64>();
         let skip_bytes = self.skip_index.as_ref().map_or(0, |s| s.heap_bytes());
-        lookup_bytes + self.rare_keys.len() * 8 + dense_bytes + self.sparse_bytes() + skip_bytes
+        lookup_bytes + dense_bytes + self.sparse_bytes() + skip_bytes
     }
 
     /// Check whether a bigram key is present in this index.
@@ -832,7 +869,6 @@ impl BigramFilter {
         };
         Self {
             lookup,
-            rare_keys: vec![0; BIGRAM_KEY_SLOTS.div_ceil(64)],
             dense_data,
             dense_count,
             sparse_offsets: vec![0],
@@ -858,12 +894,34 @@ fn normalize_byte_scalar(b: u8) -> u8 {
 /// in `0..src.len()`. Inlined-scalar so LLVM auto-vectorises with the
 /// build's baseline SIMD; on x86_64 we runtime-dispatch to AVX2.
 /// Caller guarantees `dst.len() >= src.len()`.
+// Cache CPUID once. `is_x86_feature_detected!` is not free on every call.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn has_avx2_cached() -> bool {
+    #[cfg(target_feature = "avx2")]
+    {
+        true
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    {
+        static HAS_AVX2: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static INIT_AVX2: std::sync::Once = std::sync::Once::new();
+        INIT_AVX2.call_once(|| {
+            HAS_AVX2.store(
+                std::is_x86_feature_detected!("avx2"),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        });
+        HAS_AVX2.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 #[inline(always)]
 fn normalize_bytes(src: &[u8], dst: &mut [u8]) {
     debug_assert!(dst.len() >= src.len());
     #[cfg(target_arch = "x86_64")]
     {
-        if std::is_x86_feature_detected!("avx2") {
+        if has_avx2_cached() {
             unsafe { normalize_bytes_avx2(src, dst) };
             return;
         }
@@ -886,30 +944,27 @@ fn normalize_bytes_scalar(src: &[u8], dst: &mut [u8]) {
     }
 }
 
-/// AVX2 normalize: 32 bytes/iter. AVX2 only has signed cmp, so unsigned
-/// range checks use `min(max(v, lo), hi) == v`.
+/// AVX2 normalize: 32 bytes/iter. Signed wrap maps each unsigned
+/// interval to the top of i8, so one add+compare tests membership.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn normalize_bytes_avx2(src: &[u8], dst: &mut [u8]) {
     use std::arch::x86_64::*;
     let len = src.len();
     let mut i = 0;
-    let p_lo = _mm256_set1_epi8(32);
-    let p_hi = _mm256_set1_epi8(126u8 as i8);
-    let u_lo = _mm256_set1_epi8(b'A' as i8);
-    let u_hi = _mm256_set1_epi8(b'Z' as i8);
+    // [32, 126] + 1 -> [33, 127], exactly the i8 values above 32.
+    let add_p = _mm256_set1_epi8(1);
+    let thr_p = _mm256_set1_epi8(32);
+    // [65, 90] + 37 -> [102, 127], exactly the i8 values above 101.
+    let add_u = _mm256_set1_epi8(37);
+    let thr_u = _mm256_set1_epi8(101);
     let or20 = _mm256_set1_epi8(0x20);
     while i + 32 <= len {
         unsafe {
             let v = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
-            // printable_mask: v in [32, 126]
-            let clamp_p = _mm256_min_epu8(_mm256_max_epu8(v, p_lo), p_hi);
-            let printable = _mm256_cmpeq_epi8(v, clamp_p);
-            // is_upper_mask: v in [65, 90]
-            let clamp_u = _mm256_min_epu8(_mm256_max_epu8(v, u_lo), u_hi);
-            let is_upper = _mm256_cmpeq_epi8(v, clamp_u);
-            let or_bits = _mm256_and_si256(is_upper, or20);
-            let lower = _mm256_or_si256(v, or_bits);
+            let printable = _mm256_cmpgt_epi8(_mm256_add_epi8(v, add_p), thr_p);
+            let is_upper = _mm256_cmpgt_epi8(_mm256_add_epi8(v, add_u), thr_u);
+            let lower = _mm256_or_si256(v, _mm256_and_si256(is_upper, or20));
             let out = _mm256_and_si256(lower, printable);
             _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, out);
         }
@@ -988,9 +1043,7 @@ pub fn extract_bigrams(content: &[u8]) -> Vec<u16> {
 /// and cleared when the base index is rebuilt.
 #[derive(Debug)]
 pub struct BigramOverlay {
-    /// Per-file bigram sets for files modified since the base was built.
-    /// Key = file index in the base `Vec<FileItem>`.
-    modified: AHashMap<usize, Vec<u16>>,
+    modified: AHashMap<usize, ahash::AHashSet<u16>>,
 
     /// Tombstone bitset — one bit per base file. Set bits are excluded
     /// from base query results.
@@ -1011,7 +1064,8 @@ impl BigramOverlay {
     }
 
     pub(crate) fn modify_file(&mut self, file_idx: usize, content: &[u8]) {
-        self.modified.insert(file_idx, extract_bigrams(content));
+        self.modified
+            .insert(file_idx, extract_bigrams(content).into_iter().collect());
     }
 
     pub(crate) fn delete_file(&mut self, file_idx: usize) {
@@ -1022,8 +1076,6 @@ impl BigramOverlay {
         self.modified.remove(&file_idx);
     }
 
-    /// Return base file indices of modified files whose bigrams match ALL
-    /// of the given `pattern_bigrams`.
     pub(crate) fn query_modified(&self, pattern_bigrams: &[u16]) -> Vec<usize> {
         if pattern_bigrams.is_empty() {
             return self.modified.keys().copied().collect();
@@ -1097,6 +1149,7 @@ pub(crate) fn build_bigram_index(
     files: &[crate::types::FileItem],
     base_path: &std::path::Path,
     arena: crate::simd_path::ArenaPtr,
+    content_masks: Option<&std::sync::Arc<crate::file_picker::ContentMaskStore>>,
 ) -> BigramFilter {
     let builder = BigramIndexBuilder::new(files.len());
     let skip_builder = BigramIndexBuilder::new(files.len());
@@ -1116,6 +1169,10 @@ pub(crate) fn build_bigram_index(
             .par_chunks(BIGRAM_CHUNK_FILES)
             .enumerate()
             .for_each(|(chunk_idx, chunk)| {
+                // Queries win over indexing: pause while one runs.
+                while crate::parallelism::query_active() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
                 let base_idx = chunk_idx * BIGRAM_CHUNK_FILES;
                 for (offset, file) in chunk.iter().enumerate() {
                     let file_idx = base_idx + offset;
@@ -1148,6 +1205,15 @@ pub(crate) fn build_bigram_index(
                             // Need to find a better way to do this.
                             file.set_binary(crate::types::detect_binary_content(content));
 
+                            if let Some(store) = content_masks
+                                && file.size > 0
+                                && content.len() as u64 == file.size
+                            {
+                                let mut mask = crate::types::ContentMask::default();
+                                mask.accumulate(content);
+                                store.set(file_idx, mask);
+                            }
+
                             builder.add_file_content(&skip_builder, file_idx, content);
                         }
                     });
@@ -1164,9 +1230,9 @@ pub(crate) fn build_bigram_index(
     let skip_index = skip_builder.compress(Some(SKIP_INDEX_MIN_DENSITY_PCT));
     index.set_skip_index(skip_index);
 
-    // in progress bigram walk + rust's ignore crate allocates shit ton of garbage memory
-    // all custom allocators would think this is available resource while we do not allocate
-    // after the sync, so it's very important to let the unused memory go back to the OS
+    // Concurrent bigram walk and glob matching hold large transient
+    // buffers; return unused memory to the OS since little is allocated
+    // after the sync and allocators would otherwise retain the peak.
     crate::file_picker::hint_allocator_collect();
 
     index
@@ -1178,6 +1244,7 @@ pub(crate) fn sniff_binary_for_non_indexable(
     base_path: &std::path::Path,
     arena: crate::simd_path::ArenaPtr,
     cancelled: &std::sync::atomic::AtomicBool,
+    content_masks: Option<&crate::file_picker::ContentMaskStore>,
 ) {
     // Non-indexable files are few in a typical repo, so a serial pass with a
     // single reused chunk buffer beats spinning up the thread pool.
@@ -1187,17 +1254,31 @@ pub(crate) fn sniff_binary_for_non_indexable(
 
     for (i, file) in files.iter().enumerate() {
         // check every 256 files to avoid useless work
-        if (i & 0xFF) == 0 && cancelled.load(Ordering::Acquire) {
-            return;
+        if (i & 0xFF) == 0 {
+            while crate::parallelism::query_active() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if cancelled.load(Ordering::Acquire) {
+                return;
+            }
         }
 
+        // Extension-classified binaries are already settled — do not reopen them.
+        if file.is_binary() {
+            continue;
+        }
         // check only the files that we are able to grep
         if file.size == 0 || file.size > constants::MAX_FFFILE_SIZE {
             continue;
         }
 
         let abs = file.write_absolute_path(arena, base_path, &mut path_buf);
-        file.detect_binary_per_byte(abs, &mut chunk);
+        let mask = file.detect_binary_per_byte(abs, &mut chunk);
+        // Fully-read files earn a mask so grep skips reopening them;
+        // prefix-capped reads record empty (unknown) instead.
+        if let Some(store) = content_masks {
+            store.set(i, mask);
+        }
     }
 }
 
@@ -1254,31 +1335,6 @@ mod tests {
         and_sparse_column(&mut anded, &data);
         let expected: Vec<u64> = partner.iter().zip(bitset).map(|(a, b)| a & b).collect();
         assert_eq!(anded, expected);
-    }
-
-    #[test]
-    fn rare_bigrams_reject_absent_queries_without_losing_matches() {
-        let builder = BigramIndexBuilder::new(4096);
-        let skip = BigramIndexBuilder::new(4096);
-        for file_idx in 0..4096 {
-            let content: &[u8] = match file_idx {
-                31 => b"marker Qq blah",
-                500 => b"marker qz blah",
-                1000 => b"marker zy blah",
-                3000 => b"marker yx blah",
-                _ => b"ordinary content",
-            };
-            builder.add_file_content(&skip, file_idx, content);
-        }
-        let index = builder.compress(None);
-        let absent = index.query(b"Qqzyx").expect("rare bigrams retained");
-        assert_eq!(BigramFilter::count_candidates(&absent), 0);
-        let present = index.query(b"qq").unwrap();
-        assert_eq!(BigramFilter::count_candidates(&present), 1);
-        assert!(BigramFilter::is_candidate(&present, 31));
-        assert!(index.common_column_bitset(key(b'q', b'q')).is_none());
-        assert!(index.sparse_count() > 0);
-        assert!(!skip.compress(Some(12)).has_key(key(b'q', b' ')));
     }
 
     #[test]
@@ -1657,11 +1713,12 @@ mod tests {
             .collect();
         let (store, strings) =
             crate::simd_path::build_chunked_path_store_from_strings(&names, &files);
-        for (file, path) in files.iter_mut().zip(strings) {
+        for (i, (file, path)) in files.iter_mut().zip(strings).enumerate() {
             file.set_path(path);
+            file.set_presence(crate::presence::mask_of(names[i].as_bytes()));
         }
 
-        let index = build_bigram_index(&files, base, store.as_arena_ptr());
+        let index = build_bigram_index(&files, base, store.as_arena_ptr(), None);
         let candidates = index
             .query(b"unicorn")
             .expect("the text files must be in the index");

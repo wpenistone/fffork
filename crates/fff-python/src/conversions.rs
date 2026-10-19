@@ -30,7 +30,7 @@ impl From<(&fff::FileItem, &FilePicker)> for FileItem {
         Self {
             relative_path: item.relative_path(picker),
             file_name: item.file_name(picker),
-            git_status: fff::git::format_git_status(item.git_status).to_string(),
+            git_status: fff::git::format_git_status(item.git_status()).to_string(),
             size: item.size,
             modified: item.modified,
             access_frecency_score: item.access_frecency_score as i64,
@@ -56,7 +56,7 @@ impl From<(&fff::FileItem, &FilePicker)> for MixedFileItem {
         Self {
             relative_path: item.relative_path(picker),
             file_name: item.file_name(picker),
-            git_status: fff::git::format_git_status(item.git_status).to_string(),
+            git_status: fff::git::format_git_status(item.git_status()).to_string(),
             size: item.size,
             modified: item.modified,
             access_frecency_score: item.access_frecency_score as i64,
@@ -82,7 +82,7 @@ impl From<(&fff::GrepMatch, &fff::FileItem, &FilePicker)> for GrepMatch {
         Self {
             relative_path: file.relative_path(picker),
             file_name: file.file_name(picker),
-            git_status: fff::git::format_git_status(file.git_status).to_string(),
+            git_status: fff::git::format_git_status(file.git_status()).to_string(),
             line_content: m.line_content.clone(),
             match_ranges: m
                 .match_byte_offsets

@@ -40,6 +40,9 @@ pub(crate) struct ScanConfig {
     pub(crate) follow_symlinks: bool,
     pub(crate) enable_fs_root_scanning: bool,
     pub(crate) enable_home_dir_scanning: bool,
+    // Skip all git discovery/status/recency. Search-only workloads
+    // never touch .git (object stores are not search paths).
+    pub(crate) skip_git: bool,
 }
 
 /// A fully-configured scan job ready to run on a background thread.
@@ -93,6 +96,7 @@ impl ScanJob {
             follow_symlinks: picker.follows_symlinks(),
             enable_fs_root_scanning: picker.fs_root_scanning_enabled(),
             enable_home_dir_scanning: picker.home_dir_scanning_enabled(),
+            skip_git: picker.skips_git(),
         };
 
         drop(guard); // just a sanity check
@@ -163,9 +167,15 @@ impl ScanJob {
 
         let _scanning = ScanningGuard::new(&signals);
         scanned_files_counter.store(0, Ordering::Relaxed);
+        let t_scan = std::time::Instant::now();
 
         // 1. Walk the file system and collect the list of files
-        let git = FileSync::discover_git(&base_path);
+        let t_walk = std::time::Instant::now();
+        let git = if config.skip_git {
+            None
+        } else {
+            FileSync::discover_git(&base_path)
+        };
         let sync = match FileSync::walk_filesystem(
             &base_path,
             git.clone(),
@@ -180,6 +190,8 @@ impl ScanJob {
                 return;
             }
         };
+        let walk_us = t_walk.elapsed().as_micros();
+        let n_files = sync.live_count;
 
         // 2. Populate the file list
         let git_status_worker;
@@ -203,15 +215,20 @@ impl ScanJob {
             return;
         }
 
-        // Spawn the git status worker once. BUG PINNNING. If the user initiated git in the folder
-        // which is a real use case we need to have a way to start the git worker background thread dynamically
-        if git.is_some() && !signals.cancelled.load(Ordering::Acquire) {
+        // Spawn the git status worker once; huge trees skip it unless forced. When the
+        // user enables git in a folder later, the worker still has to come up dynamically.
+        let skip_git = crate::file_picker::should_skip_git(
+            config.skip_git,
+            n_files,
+            crate::file_picker::git_force(),
+        );
+        if git.is_some() && !skip_git && !signals.cancelled.load(Ordering::Acquire) {
             git_status_worker.spawn_once(shared_picker.weaken(), shared_frecency.clone());
-            git_status_worker.request_full_rescan(); // this runs anyway
+            git_status_worker.request_full_rescan();
         }
 
-        // BUG pinning: take the snapshot *before* the storing the scan=true, otherwise there is a tiny
-        // race window when there scanned is set to true, but `post_scan_indexing_active` flag is `false`
+        // Snapshot before marking scan complete; avoids a race where
+        // scan reads true while post-scan indexing is still inactive.
         let snapshot = if !signals.cancelled.load(Ordering::Acquire) {
             shared_picker.read().ok().and_then(|guard| {
                 guard
@@ -231,13 +248,31 @@ impl ScanJob {
         }
 
         // 3. Runs post scna in parallel with git status collection
+        let t_post = std::time::Instant::now();
         if !signals.cancelled.load(Ordering::Acquire)
             && let Some(snap) = snapshot.as_ref()
         {
-            Self::run_post_scan(&shared_picker, &signals, &config, snap);
+            // Read the mask handle OUTSIDE the no-picker-read region, but never
+            // make post-scan conditional on it: it builds the bigram index and
+            // overlay, and skipping it silently breaks the overlay. An earlier
+            // attempt wrapped this call in if let Some(store) and lost 6
+            // coherence tests whenever the picker lock was contended.
+            let mask_store = shared_picker
+                .read()
+                .ok()
+                .and_then(|g| g.as_ref().map(|p| p.content_mask_store()));
+            Self::run_post_scan(&shared_picker, &signals, &config, snap, mask_store.as_ref());
         }
+        let post_us = t_post.elapsed().as_micros();
 
         drop(snapshot); // SNAPSHOT SHOULD NOT BE USED AFTER THIS POINT
+        info!(
+            walk_us,
+            post_us,
+            total_us = t_scan.elapsed().as_micros(),
+            n_files,
+            "SCAN: walk+commit+post-scan done"
+        );
 
         // 5. Install filesystem watcher (initial scan only).
         if config.install_watcher && config.watch && !signals.cancelled.load(Ordering::Acquire) {
@@ -304,6 +339,7 @@ impl ScanJob {
         signals: &ScanSignals,
         config: &ScanConfig,
         unsafe_snapshot: &crate::file_picker::PostScanUnsafeSnapshot,
+        content_masks: Option<&std::sync::Arc<crate::file_picker::ContentMaskStore>>,
     ) {
         let Some(arena) = unsafe_snapshot
             .arena // we are never touching overlays so this arena is always correct
@@ -319,10 +355,21 @@ impl ScanJob {
             return;
         }
 
+        // Size the mask table before anything can read it. Runs once during
+        // the scan; grep cannot run until the picker is published.
+        if let Some(store) = content_masks {
+            store.ensure_capacity(unsafe_snapshot.files.len());
+        }
+
         if config.content_indexing {
             let indexable_count = unsafe_snapshot.indexable_count.min(files.len());
             let (indexable_files, non_indexable_files) = files.split_at(indexable_count);
-            let index = build_bigram_index(indexable_files, &unsafe_snapshot.base_path, arena);
+            let index = build_bigram_index(
+                indexable_files,
+                &unsafe_snapshot.base_path,
+                arena,
+                content_masks,
+            );
 
             if let Ok(mut guard) = shared_picker.write()
                 && let Some(picker) = guard.as_mut()
@@ -341,6 +388,7 @@ impl ScanJob {
                     &unsafe_snapshot.base_path,
                     arena,
                     &signals.cancelled,
+                    None,
                 );
             }
         } else {
@@ -350,6 +398,7 @@ impl ScanJob {
                 &unsafe_snapshot.base_path,
                 arena,
                 &signals.cancelled,
+                None,
             );
         }
 
