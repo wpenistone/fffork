@@ -350,8 +350,8 @@ fn x86_topology(t: &mut Topology) {
     // leaf 4 is only a compatibility surface there and under-reports on some
     // parts. Prefer 0x8000001D when the vendor reports it.
     let ext = __cpuid_count(0x8000_0000, 0).eax;
-    if ext >= 0x8000_000D {
-        let (l, l2, llc) = cpuid_cache_leaf(0x8000_000D);
+    if ext >= 0x8000_001D {
+        let (l, l2, llc) = cpuid_cache_leaf(0x8000_001D);
         if l != 0 {
             t.cache_line = Some(l);
         }
@@ -409,7 +409,7 @@ fn cpuid_cache_leaf(leaf: u32) -> (usize, usize, usize) {
             if level == 2 || level == 6 {
                 l2 = size;
             }
-            if level == 3 || (leaf == 0x8000_000D && level >= 8) {
+            if level == 3 {
                 llc = llc.max(size);
             }
         }
@@ -423,12 +423,11 @@ fn cpuid_cache_leaf(leaf: u32) -> (usize, usize, usize) {
 
 #[cfg(target_arch = "x86_64")]
 fn cpuid_max_freq_mhz() -> Option<f64> {
-    use core::arch::x86_64::__cpuid_count;
-    let ext = __cpuid_count(0x8000_0000, 0).eax;
-    if ext < 0x8000_0008 {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    if __cpuid(0).eax < 0x16 {
         return None;
     }
-    let mhz = __cpuid_count(0x8000_0008, 0).ecx >> 16;
+    let mhz = __cpuid_count(0x16, 0).eax & 0xffff;
     if mhz == 0 { None } else { Some(mhz as f64) }
 }
 
@@ -675,8 +674,9 @@ fn measure_latency_ns(cache_sizes: &[usize; 2]) -> f64 {
     for _ in 0..hops {
         let mut word = [0u8; 8];
         word.copy_from_slice(&buf[off..off + 8]);
-        acc = acc.wrapping_add(u64::from_le_bytes(word));
-        off = (acc as usize % want) & !63usize;
+        let next = u64::from_le_bytes(word) as usize;
+        acc = acc.wrapping_add(next as u64);
+        off = next;
         if off + 8 > buf.len() {
             break;
         }

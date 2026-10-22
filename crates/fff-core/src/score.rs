@@ -1120,25 +1120,70 @@ fn match_fuzzy_parts(
     matches
 }
 
-// Scores only `idx` for typing live-narrow; `total_matched` is the subset hit count.
+// Scores only `idx` for typing live-narrow; `total_matched` is the subset
+// hit count. Indices are full-corpus indices, so base and overflow files
+// are split and each is read through its own arena.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fuzzy_match_and_score_subset<'a>(
-    base: &'a [FileItem],
+    files: &'a [FileItem],
     idx: Vec<u32>,
     context: &ScoringContext,
-    _base_count: usize,
-    _base_arena: ArenaPtr,
-    _overflow_arena: ArenaPtr,
+    base_count: usize,
+    base_arena: ArenaPtr,
+    overflow_arena: ArenaPtr,
     max_path_len: usize,
     abort: crate::parallelism::AbortToken<'_>,
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
-    let (results, total) = match_and_score_in_arena(
-        FileItems::Filtered { base, idx },
-        context,
-        _base_arena,
-        max_path_len,
-        abort,
+    debug_assert!(
+        idx.iter().all(|&i| (i as usize) < files.len()),
+        "live-narrow candidates must be corpus-relative"
     );
+    // Partition once; keep each side's relative indices for its arena.
+    let mut base_idx: Vec<u32> = Vec::with_capacity(idx.len());
+    let mut overflow_idx: Vec<u32> = Vec::with_capacity(idx.len());
+    for i in idx {
+        let i = i as usize;
+        if i < base_count {
+            base_idx.push(i as u32);
+        } else {
+            overflow_idx.push((i - base_count) as u32);
+        }
+    }
+
+    let mut results = Vec::new();
+    let mut total = 0usize;
+    if !base_idx.is_empty() {
+        let (mut base_results, base_total) = match_and_score_in_arena(
+            FileItems::Filtered {
+                base: &files[..base_count],
+                idx: base_idx,
+            },
+            context,
+            base_arena,
+            max_path_len,
+            abort,
+            0,
+            false,
+        );
+        results.append(&mut base_results);
+        total += base_total;
+    }
+    if !overflow_idx.is_empty() {
+        let (mut overflow_results, overflow_total) = match_and_score_in_arena(
+            FileItems::Filtered {
+                base: &files[base_count..],
+                idx: overflow_idx,
+            },
+            context,
+            overflow_arena,
+            max_path_len,
+            abort,
+            base_count as u32,
+            !results.is_empty(),
+        );
+        results.append(&mut overflow_results);
+        total += overflow_total;
+    }
     let mut out = sort_and_paginate(results, context, total);
     out.2 = total;
     out
@@ -1183,6 +1228,8 @@ fn fuzzy_match_and_score_files_impl<'a>(
             overflow_arena,
             max_path_len,
             abort,
+            base_count as u32,
+            false,
         );
 
         let (base_results, base_total) = match_and_score_in_arena(
@@ -1191,6 +1238,8 @@ fn fuzzy_match_and_score_files_impl<'a>(
             base_arena,
             max_path_len,
             abort,
+            0,
+            true,
         );
         results.extend(base_results);
         total += base_total;
@@ -1202,6 +1251,8 @@ fn fuzzy_match_and_score_files_impl<'a>(
             base_arena,
             max_path_len,
             abort,
+            0,
+            false,
         )
     };
 
@@ -1700,6 +1751,8 @@ fn match_and_score_in_arena<'a>(
     arena: ArenaPtr,
     max_path_len: usize,
     abort: crate::parallelism::AbortToken<'_>,
+    capture_offset: u32,
+    capture_append: bool,
 ) -> (Vec<(&'a FileItem, Score)>, usize) {
     if files.len() == 0 {
         return (vec![], 0);
@@ -1816,6 +1869,8 @@ fn match_and_score_in_arena<'a>(
         path_matches
             .iter()
             .map(|m| working_files.file_index(m.index as usize)),
+        capture_offset,
+        capture_append,
     );
 
     let capture_us = t_capture.elapsed().as_micros();
@@ -1977,7 +2032,7 @@ fn match_and_score_in_arena<'a>(
         } else {
             0
         };
-        let git_recency_boost = file.git_recency_score as i32;
+        let git_recency_boost = file.git_recency_score() as i32;
 
         let distance_penalty = if context.current_file.is_some() {
             let dir_idx = file.parent_dir_index as usize;
@@ -2014,7 +2069,7 @@ fn match_and_score_in_arena<'a>(
             None
         };
         // Otherwise borrow the filename from the arena, copying to scratch on chunk straddle.
-        let fname: Option<&str> = if rank_collapsed {
+        let fname: Option<&str> = if rank_collapsed && !end_col_filename_match {
             None
         } else if let Some(r) = rel {
             Some(&r[fname_off..fname_off + fname_len])
@@ -2022,17 +2077,23 @@ fn match_and_score_in_arena<'a>(
             Some(file.path.filename_ref(arena, fname_buf))
         };
 
-        let is_exact_filename = !rank_collapsed
-            && (simd_filename_match.is_some_and(|(exact, _)| exact)
-                || (end_col_filename_match
-                    && main_needle_len as usize == fname_len
-                    && main_needle.eq_ignore_ascii_case(fname.as_ref().unwrap().as_bytes())));
+        let is_exact_filename = simd_filename_match.is_some_and(|(exact, _)| exact)
+            || (end_col_filename_match
+                && main_needle_len as usize == fname_len
+                && main_needle.eq_ignore_ascii_case(fname.as_ref().unwrap().as_bytes()));
 
         let mut has_special_filename_bonus = false;
-        let filename_bonus = if rank_collapsed {
-            0
-        } else if is_exact_filename {
+        let filename_bonus = if is_exact_filename {
             base_score / 5 * 2 // 40% bonus for exact filename match
+        } else if rank_collapsed {
+            // Cheap filename relevance for broad queries: no fname read,
+            // but a hit that lands in the filename still beats one that
+            // ended in a directory segment.
+            if end_col_filename_match {
+                (base_score / 6).min(30)
+            } else {
+                0
+            }
         } else if is_filename_match {
             let max_bonus = (base_score / 6).min(30);
             if let Some((_, fm_score)) = simd_filename_match {
@@ -2264,7 +2325,7 @@ fn match_and_score_in_arena<'a>(
                     let ub = ub_total_for(
                         base,
                         file.total_frecency_score().max(0),
-                        file.git_recency_score.max(0) as i32,
+                        file.git_recency_score().max(0) as i32,
                         q_intent,
                         q_collapsed,
                         path_align_on,
@@ -2302,7 +2363,7 @@ fn match_and_score_in_arena<'a>(
                                 let ub = ub_total_for(
                                     base,
                                     file.total_frecency_score().max(0),
-                                    file.git_recency_score.max(0) as i32,
+                                    file.git_recency_score().max(0) as i32,
                                     q_intent,
                                     q_collapsed,
                                     path_align_on,
@@ -2351,7 +2412,7 @@ fn match_and_score_in_arena<'a>(
         results.sort_unstable_by(|a, b| {
             b.1.total
                 .cmp(&a.1.total)
-                .then_with(|| b.0.modified.cmp(&a.0.modified))
+                .then_with(|| b.0.modified().cmp(&a.0.modified()))
                 .then_with(|| path_rank(a.0).cmp(&path_rank(b.0)))
         });
         if phase_timing {
@@ -2460,7 +2521,7 @@ impl Ord for Ranked<'_> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.total
             .cmp(&other.total)
-            .then_with(|| self.file.modified.cmp(&other.file.modified))
+            .then_with(|| self.file.modified().cmp(&other.file.modified()))
             .then_with(|| self.stamp.cmp(&other.stamp))
     }
 }
@@ -2539,7 +2600,11 @@ fn ub_total_for(
     path_on: bool,
     combo: i32,
 ) -> i32 {
-    let filename = if collapsed { 0 } else { base * 2 / 5 };
+    let filename = if collapsed {
+        (base / 6).min(30)
+    } else {
+        base * 2 / 5
+    };
     let path = if path_on && !collapsed { base } else { 0 };
     base.saturating_add(base.saturating_mul(freq) / 100)
         .saturating_add(filename)
@@ -2582,8 +2647,8 @@ fn score_filtered_by_frecency<'a>(
     // Working-set queries are constant (""); build the state once.
     let pq = crate::intent::PreparedQuery::new("");
     let score_file = |file: &'a FileItem| {
-        let total_frecency_score = file.access_frecency_score as i32
-            + (file.modification_frecency_score as i32).saturating_mul(4);
+        let total_frecency_score = file.access_frecency_score() as i32
+            + (file.modification_frecency_score() as i32).saturating_mul(4);
 
         // Give modified/dirty files a boost even in frecency-only mode
         let git_status_boost = if file.git_status().is_some_and(is_modified_status) {
@@ -2591,7 +2656,7 @@ fn score_filtered_by_frecency<'a>(
         } else {
             0
         };
-        let git_recency_boost = file.git_recency_score as i32;
+        let git_recency_boost = file.git_recency_score() as i32;
 
         let current_file_penalty =
             calculate_current_file_penalty(file, total_frecency_score, context, arena);
@@ -2644,8 +2709,8 @@ fn score_filtered_by_frecency<'a>(
     // so the bound stays above every actual total.
     let has_current = context.current_file.is_some();
     let ub_file = |file: &FileItem| {
-        let freq = file.access_frecency_score as i32
-            + (file.modification_frecency_score as i32).saturating_mul(4);
+        let freq = file.access_frecency_score() as i32
+            + (file.modification_frecency_score() as i32).saturating_mul(4);
         let status = if file.git_status().is_some_and(is_modified_status) {
             freq * 15 / 100
         } else {
@@ -2657,7 +2722,7 @@ fn score_filtered_by_frecency<'a>(
             0
         };
         freq.saturating_add(status)
-            .saturating_add(file.git_recency_score as i32)
+            .saturating_add(file.git_recency_score() as i32)
             .saturating_add(evidence)
     };
 
@@ -2898,7 +2963,7 @@ fn sort_and_paginate<'a>(
         let (fb, sb) = &results[*b as usize];
         sb.total
             .cmp(&sa.total)
-            .then_with(|| fb.modified.cmp(&fa.modified))
+            .then_with(|| fb.modified().cmp(&fa.modified()))
             // Ties fall back to file address: parallel input order is scheduling-dependent.
             .then_with(|| std::ptr::from_ref(*fa).cmp(&std::ptr::from_ref(*fb)))
     };
@@ -3129,9 +3194,9 @@ mod tests {
                     false,
                 );
                 file.parent_dir_index = (index / 100) as u32;
-                file.access_frecency_score = (index % 97) as i16;
-                file.modification_frecency_score = (index % 29) as i16;
-                file.git_recency_score = (index % 13) as i16;
+                file.set_access_frecency_score((index % 97) as i16);
+                file.set_modification_frecency_score((index % 29) as i16);
+                file.set_git_recency_score((index % 13) as i16);
                 file.set_deleted(index % 97 == 0);
                 file
             })
@@ -3170,6 +3235,8 @@ mod tests {
                     arena,
                     max_path,
                     crate::parallelism::AbortToken::disabled(),
+                    0,
+                    false,
                 );
                 context.max_threads = 1;
                 let (mut sequential, _) = match_and_score_in_arena(
@@ -3178,9 +3245,11 @@ mod tests {
                     arena,
                     max_path,
                     crate::parallelism::AbortToken::disabled(),
+                    0,
+                    false,
                 );
-                parallel.sort_unstable_by_key(|(file, _)| file.modified);
-                sequential.sort_unstable_by_key(|(file, _)| file.modified);
+                parallel.sort_unstable_by_key(|(file, _)| file.modified());
+                sequential.sort_unstable_by_key(|(file, _)| file.modified());
                 assert_eq!(parallel.len(), sequential.len(), "{text}");
                 for ((a, a_score), (b, b_score)) in parallel.iter().zip(&sequential) {
                     assert!(std::ptr::eq(*a, *b));
@@ -3194,11 +3263,11 @@ mod tests {
                 assert_eq!(
                     parallel_items
                         .iter()
-                        .map(|f| f.modified)
+                        .map(|f| f.modified())
                         .collect::<Vec<_>>(),
                     sequential_items
                         .iter()
-                        .map(|f| f.modified)
+                        .map(|f| f.modified())
                         .collect::<Vec<_>>()
                 );
                 assert_eq!(
@@ -3218,15 +3287,15 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, path)| {
-                let mut file = FileItem::new_raw(
+                let file = FileItem::new_raw(
                     path.rfind('/').unwrap() as u16 + 1,
                     0,
                     index as u64,
                     None,
                     false,
                 );
-                file.access_frecency_score = (index % 41) as i16;
-                file.modification_frecency_score = (index % 17) as i16;
+                file.set_access_frecency_score((index % 41) as i16);
+                file.set_modification_frecency_score((index % 17) as i16);
                 file
             })
             .collect();
@@ -3257,8 +3326,10 @@ mod tests {
                 arena,
                 max_path,
                 crate::parallelism::AbortToken::disabled(),
+                0,
+                false,
             );
-            base.sort_unstable_by_key(|(file, _)| file.modified);
+            base.sort_unstable_by_key(|(file, _)| file.modified());
             for width in [2usize, 3, 5, 8] {
                 context.max_threads = width;
                 let (mut got, got_total) = match_and_score_in_arena(
@@ -3267,16 +3338,18 @@ mod tests {
                     arena,
                     max_path,
                     crate::parallelism::AbortToken::disabled(),
+                    0,
+                    false,
                 );
                 assert_eq!(got_total, base_total, "{text} width={width}");
-                got.sort_unstable_by_key(|(file, _)| file.modified);
+                got.sort_unstable_by_key(|(file, _)| file.modified());
                 assert_eq!(got.len(), base.len(), "{text} width={width}");
                 for ((a, a_score), (b, b_score)) in got.iter().zip(&base) {
                     assert!(
                         std::ptr::eq(*a, *b),
                         "{text} width={width} files {} vs {}",
-                        a.modified,
-                        b.modified
+                        a.modified(),
+                        b.modified()
                     );
                     assert_eq!(
                         format!("{a_score:?}"),
@@ -3316,7 +3389,7 @@ mod tests {
             expected.sort_by(|a, b| {
                 b.1.total
                     .cmp(&a.1.total)
-                    .then_with(|| b.0.modified.cmp(&a.0.modified))
+                    .then_with(|| b.0.modified().cmp(&a.0.modified()))
             });
             for offset in [0, 1, count / 2, count, usize::MAX] {
                 for limit in [0, 1, 2, 50, count, usize::MAX] {
@@ -3555,15 +3628,15 @@ mod tests {
 
         assert_eq!(scores.len(), 5);
         assert_eq!(scores[0].total, 200);
-        assert_eq!(items[0].modified, 9000, "First 200 should be newest");
+        assert_eq!(items[0].modified(), 9000, "First 200 should be newest");
         assert_eq!(scores[1].total, 200);
-        assert_eq!(items[1].modified, 1000, "Second 200 should be older");
+        assert_eq!(items[1].modified(), 1000, "Second 200 should be older");
         assert_eq!(scores[2].total, 100);
-        assert_eq!(items[2].modified, 8000, "First 100 should be newest");
+        assert_eq!(items[2].modified(), 8000, "First 100 should be newest");
         assert_eq!(scores[3].total, 100);
-        assert_eq!(items[3].modified, 5000);
+        assert_eq!(items[3].modified(), 5000);
         assert_eq!(scores[4].total, 100);
-        assert_eq!(items[4].modified, 3000, "Last 100 should be oldest");
+        assert_eq!(items[4].modified(), 3000, "Last 100 should be oldest");
     }
 
     #[test]
@@ -3739,7 +3812,7 @@ mod tests {
             results.select_nth_unstable_by(items_needed - 1, |a, b| {
                 b.1.total
                     .cmp(&a.1.total)
-                    .then_with(|| b.0.modified.cmp(&a.0.modified))
+                    .then_with(|| b.0.modified().cmp(&a.0.modified()))
                     .then_with(|| std::ptr::from_ref(a.0).cmp(&std::ptr::from_ref(b.0)))
             });
             results.truncate(items_needed);
@@ -3747,7 +3820,7 @@ mod tests {
         sort_with_buffer(&mut results, |a, b| {
             b.1.total
                 .cmp(&a.1.total)
-                .then_with(|| b.0.modified.cmp(&a.0.modified))
+                .then_with(|| b.0.modified().cmp(&a.0.modified()))
                 .then_with(|| std::ptr::from_ref(a.0).cmp(&std::ptr::from_ref(b.0)))
         });
         if results.len() > limit {
@@ -3803,7 +3876,7 @@ mod filename_bonus_tests {
         for (i, file) in result.iter_mut().enumerate() {
             file.set_path(strings[i].clone());
             file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
-            file.access_frecency_score = specs[i].1;
+            file.set_access_frecency_score(specs[i].1);
         }
         std::mem::forget(store);
         (result, arena)
@@ -4057,7 +4130,7 @@ mod git_recency_scoring_tests {
         for (i, file) in result.iter_mut().enumerate() {
             file.set_path(strings[i].clone());
             file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
-            file.git_recency_score = specs[i].1;
+            file.set_git_recency_score(specs[i].1);
         }
         std::mem::forget(store);
         (result, arena)
@@ -4386,7 +4459,7 @@ mod ranking_policy_tests {
         for (i, file) in result.iter_mut().enumerate() {
             file.set_path(strings[i].clone());
             file.set_presence(crate::presence::mask_of(path_strings[i].as_bytes()));
-            file.access_frecency_score = specs[i].1;
+            file.set_access_frecency_score(specs[i].1);
         }
         std::mem::forget(store);
         (result, arena)
@@ -4565,7 +4638,7 @@ mod topk_prune_tests {
         let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
         let (mut files, arena) = make_paths(&refs);
         for (i, file) in files.iter_mut().enumerate() {
-            file.access_frecency_score = i as i16;
+            file.set_access_frecency_score(i as i16);
         }
         (files, arena)
     }
@@ -5006,7 +5079,7 @@ mod topk_prune_tests {
             let mut pairs: Vec<(String, i32, u64)> = items
                 .iter()
                 .zip(scores.iter())
-                .map(|(f, s)| (f.relative_path(arena), s.total, f.modified))
+                .map(|(f, s)| (f.relative_path(arena), s.total, f.modified()))
                 .collect();
             // Order by (total, modified); path breaks full ties.
             pairs.sort_by(|a, b| {
@@ -5024,7 +5097,7 @@ mod topk_prune_tests {
             let (mut files, arena) = make_paths(&refs);
             // Unique mtimes make (total, modified) a strict order.
             for (i, file) in files.iter_mut().enumerate() {
-                file.modified = 1_700_000_000 + i as u64;
+                file.set_modified(1_700_000_000 + i as u64);
             }
             for query in [
                 "handler",
@@ -5080,7 +5153,7 @@ mod topk_prune_tests {
         for (i, file) in files.iter_mut().enumerate() {
             file.set_path(strings[i].clone());
             file.set_presence(crate::presence::mask_of(paths[i].as_bytes()));
-            file.modified = 1_700_000_000 + i as u64;
+            file.set_modified(1_700_000_000 + i as u64);
         }
         std::mem::forget(store);
         let results: Vec<(&FileItem, Score)> = files

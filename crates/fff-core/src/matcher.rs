@@ -152,11 +152,19 @@ thread_local! {
 }
 
 // Collect match indices from the next `fuzzy_search` (typing live-narrow).
-pub(crate) fn capture_hit_indices(iter: impl Iterator<Item = u32>) {
+// `offset` maps a slice-relative index into the full corpus; `append`
+// merges a second arena (overflow) without discarding the base hits.
+pub(crate) fn capture_hit_indices(
+    iter: impl Iterator<Item = u32>,
+    offset: u32,
+    append: bool,
+) {
     HIT_CAPTURE.with(|c| {
         if let Some(v) = c.borrow_mut().as_mut() {
-            v.clear();
-            v.extend(iter);
+            if !append {
+                v.clear();
+            }
+            v.extend(iter.map(|i| i.wrapping_add(offset)));
         }
     });
 }

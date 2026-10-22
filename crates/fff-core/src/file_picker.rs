@@ -49,7 +49,7 @@ use crate::types::{
 use crate::walk::WalkOutput;
 use crate::watch::BackgroundWatcher;
 use ahash::{AHashMap, AHashSet};
-use fff_query_parser::FFFQuery;
+use fff_query_parser::{Constraint, FFFQuery};
 use git2::{Repository, Status};
 use rayon::prelude::*;
 use std::fmt::Debug;
@@ -638,7 +638,7 @@ impl FileItem {
     }
 
     pub(crate) fn update_frecency_scores(
-        &mut self,
+        &self,
         reader: &FrecencyReader,
         arena: ArenaPtr,
         base_path: &Path,
@@ -656,23 +656,20 @@ impl FileItem {
             None => reader.access_score(abs, None, mode),
         };
 
-        self.access_frecency_score = access_score as i16;
-        self.modification_frecency_score =
-            reader.modification_score(self.modified, self.git_status(), mode) as i16;
+        self.set_access_frecency_score(access_score as i16);
+        self.set_modification_frecency_score(
+            reader.modification_score(self.modified(), self.git_status(), mode) as i16,
+        );
     }
 
-    /// Assign precomputed access score (scan hydration batch path).
-    pub(crate) fn set_access_frecency_score(&mut self, access_score: i64) {
-        self.access_frecency_score = access_score as i16;
-    }
-
-    pub(crate) fn set_modification_frecency_score(
-        &mut self,
+    pub(crate) fn update_modification_frecency_score(
+        &self,
         tracker: &FrecencyTracker,
         mode: FFFMode,
     ) {
-        self.modification_frecency_score =
-            tracker.get_modification_score(self.modified, self.git_status(), mode) as i16;
+        self.set_modification_frecency_score(
+            tracker.get_modification_score(self.modified(), self.git_status(), mode) as i16,
+        );
     }
 }
 
@@ -809,6 +806,9 @@ struct LiveNarrow {
     generation: u64,
     query: String,
     max_typos: u16,
+    /// Parsed filter set for `query`; narrowing may only reuse a hit set
+    /// when the new query has the exact same constraints.
+    constraints_fp: u64,
     /// File indices (into sync_data.files) that matched the previous query.
     candidates: Vec<u32>,
     /// Files already scored at previous length — set only when we stored a hit set.
@@ -826,7 +826,78 @@ struct BackEntry {
     query: String,
     max_typos: u16,
     generation: u64,
+    constraints_fp: u64,
     candidates: Vec<u32>,
+}
+
+fn hash_bytes(h: &mut u64, bytes: &[u8]) {
+    for &b in bytes {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(0x100000001b3);
+    }
+    *h ^= 0xff;
+    *h = h.wrapping_mul(0x100000001b3);
+}
+
+// Canonical enough for equality: every variant and payload contributes.
+fn hash_constraint(h: &mut u64, c: &Constraint<'_>) {
+    match c {
+        Constraint::Extension(s) => {
+            hash_bytes(h, b"ext");
+            hash_bytes(h, s.as_bytes());
+        }
+        Constraint::Glob(s) => {
+            hash_bytes(h, b"glob");
+            hash_bytes(h, s.as_bytes());
+        }
+        Constraint::Parts(parts) => {
+            hash_bytes(h, b"parts");
+            hash_bytes(h, &(parts.len() as u64).to_le_bytes());
+            for p in parts.iter() {
+                hash_bytes(h, p.as_bytes());
+            }
+        }
+        Constraint::Text(s) => {
+            hash_bytes(h, b"text");
+            hash_bytes(h, s.as_bytes());
+        }
+        Constraint::Exclude(parts) => {
+            hash_bytes(h, b"exclude");
+            hash_bytes(h, &(parts.len() as u64).to_le_bytes());
+            for p in parts.iter() {
+                hash_bytes(h, p.as_bytes());
+            }
+        }
+        Constraint::PathSegment(s) => {
+            hash_bytes(h, b"segment");
+            hash_bytes(h, s.as_bytes());
+        }
+        Constraint::FilePath(s) => {
+            hash_bytes(h, b"filepath");
+            hash_bytes(h, s.as_bytes());
+        }
+        Constraint::FileType(s) => {
+            hash_bytes(h, b"filetype");
+            hash_bytes(h, s.as_bytes());
+        }
+        Constraint::GitStatus(status) => {
+            hash_bytes(h, b"gitstatus");
+            hash_bytes(h, &[*status as u8]);
+        }
+        Constraint::Not(inner) => {
+            hash_bytes(h, b"not");
+            hash_constraint(h, inner);
+        }
+    }
+}
+
+fn constraints_fingerprint(constraints: &[Constraint<'_>]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    hash_bytes(&mut h, &(constraints.len() as u64).to_le_bytes());
+    for c in constraints {
+        hash_constraint(&mut h, c);
+    }
+    h
 }
 
 // Subset scoring chases an index per file (~7ns) while the gate it
@@ -843,6 +914,7 @@ fn longest_prefix<'a>(
     q: &str,
     max_typos: u16,
     generation: u64,
+    constraints_fp: u64,
 ) -> Option<&'a [u32]> {
     if std::env::var_os("FFF_NO_TRIE").is_some() {
         return None;
@@ -852,6 +924,7 @@ fn longest_prefix<'a>(
         .filter(|e| {
             e.generation == generation
                 && e.max_typos == max_typos
+                && e.constraints_fp == constraints_fp
                 && !e.query.is_empty()
                 && q.len() > e.query.len()
                 && q.starts_with(e.query.as_str())
@@ -1377,7 +1450,7 @@ impl FilePicker {
             let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
 
             let arena = self.arena_base_ptr();
-            for file in self.sync_data.files.iter_mut() {
+            for file in self.sync_data.files.iter() {
                 file.set_git_status(git_cache.lookup_status(file.write_absolute_path(
                     arena,
                     &self.base_path,
@@ -1579,6 +1652,12 @@ impl FilePicker {
         let mut hit_buf: Vec<u32> = Vec::new();
         // Starts before the narrow plan so the presence-mask prune is included.
         let t_msa = std::time::Instant::now();
+        // Narrowing keys on the full raw query: parts[1..] and constraints
+        // change the hit set even when effective_query() does not. The
+        // fingerprint additionally stops an appended constraint (e.g.
+        // `foo` -> `foo *.rs`) from reusing an unfiltered hit set.
+        let query_key = context.query.raw_query;
+        let constraints_fp = constraints_fingerprint(&context.query.constraints);
         let (items, scores, total_matched) = {
             enum NarrowPlan {
                 Full,
@@ -1591,8 +1670,9 @@ impl FilePicker {
                 let live = self.live.lock();
                 let can_narrow = live.active
                     && live.max_typos == max_typos
-                    && context.effective_query().len() > live.query.len()
-                    && context.effective_query().starts_with(live.query.as_str())
+                    && live.constraints_fp == constraints_fp
+                    && query_key.len() > live.query.len()
+                    && query_key.starts_with(live.query.as_str())
                     && live.generation == self.index_generation();
                 if can_narrow {
                     // Presence-index prune of the previous hit set before the
@@ -1641,7 +1721,8 @@ impl FilePicker {
                     .rfind(|e| {
                         e.generation == self.index_generation()
                             && e.max_typos == max_typos
-                            && e.query == context.effective_query()
+                            && e.constraints_fp == constraints_fp
+                            && e.query == query_key
                     })
                     .map(|e| e.candidates.clone())
                 {
@@ -1654,12 +1735,15 @@ impl FilePicker {
                     } else {
                         NarrowPlan::Full
                     }
-                } else if let Some(cached) = longest_prefix(
-                    &live.prefix,
-                    context.effective_query(),
-                    max_typos,
-                    self.index_generation(),
-                ) {
+                } else if let Some(cached) =
+                    longest_prefix(
+                        &live.prefix,
+                        query_key,
+                        max_typos,
+                        self.index_generation(),
+                        constraints_fp,
+                    )
+                {
                     // Forward retype: a new query extending a visited
                     // prefix matches a subset of that prefix's hits.
                     let new_q = context.effective_query().as_bytes();
@@ -1723,15 +1807,16 @@ impl FilePicker {
         {
             let mut live = self.live.lock();
             live.generation = self.index_generation();
-            live.query = context.effective_query().to_string();
+            live.query = query_key.to_string();
             live.max_typos = max_typos;
+            live.constraints_fp = constraints_fp;
             live.active = !hit_buf.is_empty();
             // Move, don't copy — hit_buf is dead after this.
             live.candidates = hit_buf;
             // Backspace chain: remember this hit set under its query.
             // Depth-bounded (8 x <= full-corpus u32s); stale generations
             // never match and age out. Full-corpus sets narrow to nothing.
-            let q = context.effective_query();
+            let q = query_key;
             live.history
                 .retain(|e| e.query != q || e.max_typos != max_typos);
             if fuzzy_ran && narrow_pays(live.candidates.len(), files.len()) {
@@ -1741,6 +1826,7 @@ impl FilePicker {
                     query: q.to_string(),
                     max_typos,
                     generation,
+                    constraints_fp,
                     candidates: snapshot,
                 });
                 while live.history.len() > 8 {
@@ -1758,6 +1844,7 @@ impl FilePicker {
                     query: q.to_string(),
                     max_typos,
                     generation,
+                    constraints_fp,
                     candidates: snapshot,
                 });
                 while live.prefix.len() > 8 {
@@ -2189,7 +2276,11 @@ impl FilePicker {
         status_cache
             .into_iter()
             .try_for_each(|(path, status)| -> Result<(), Error> {
-                if let Some((arena, file)) = self.get_mut_file_by_path(&path) {
+                let index = self.sync_data.find_file_index(&path, &self.base_path);
+                if let Some(index) = index
+                    && let Some(file) = self.sync_data.files().get(index)
+                {
+                    let arena = self.sync_data.arena_for_file(file);
                     file.set_git_status(Some(status));
                     if let Some(reader) = reader.as_ref() {
                         file.update_frecency_scores(
@@ -2202,8 +2293,8 @@ impl FilePicker {
                     }
                     // Update parent dir frecency inline. `DirItem` has an
                     // interior-mutable atomic score, so `&self` access is
-                    // enough — no write aliasing against Arc clones.
-                    let score = file.access_frecency_score as i32;
+                    // enough - no write aliasing against Arc clones.
+                    let score = file.access_frecency_score() as i32;
                     let dir_idx = file.parent_dir_index as usize;
                     if let Some(dir) = self.sync_data.dirs.get(dir_idx) {
                         dir.update_frecency_if_larger(score);
@@ -2227,8 +2318,8 @@ impl FilePicker {
             return;
         }
 
-        for file in self.sync_data.files.iter_mut() {
-            file.git_recency_score = 0;
+        for file in self.sync_data.files.iter() {
+            file.set_git_recency_score(0);
         }
 
         let Some(scores) = scores else { return };
@@ -2236,9 +2327,9 @@ impl FilePicker {
         let mut applied = 0usize;
         for (relative_path, score) in scores {
             if let Some(index) = self.sync_data.find_by_relative_path(relative_path)
-                && let Some((_, file)) = self.sync_data.get_file_mut(index)
+                && let Some(file) = self.sync_data.files().get(index)
             {
-                file.git_recency_score = *score;
+                file.set_git_recency_score(*score);
                 applied += 1;
             }
         }
@@ -2258,7 +2349,8 @@ impl FilePicker {
         };
 
         let shared_base = self.sync_data.shared_base.clone();
-        if let Some((arena, file)) = self.sync_data.get_file_mut(index) {
+        if let Some(file) = self.sync_data.files().get(index) {
+            let arena = self.sync_data.arena_for_file(file);
             file.update_frecency_scores(
                 &frecency_tracker.reader(),
                 arena,
@@ -2268,7 +2360,7 @@ impl FilePicker {
             );
 
             // Update parent dir frecency inline (atomic, &self access).
-            let score = file.access_frecency_score as i32;
+            let score = file.access_frecency_score() as i32;
             let dir_idx = file.parent_dir_index as usize;
             if let Some(dir) = self.sync_data.dirs.get(dir_idx) {
                 dir.update_frecency_if_larger(score);
@@ -2332,7 +2424,7 @@ impl FilePicker {
             }
         };
 
-        let (_arena, file) = self.sync_data.get_file_mut(pos)?;
+        let file = self.sync_data.files().get(pos)?;
 
         let size = metadata.len();
         let modified_time = metadata
@@ -2450,7 +2542,7 @@ impl FilePicker {
     }
 
     fn tombstone_file(&mut self, index: usize) {
-        let file = &mut self.sync_data.files[index];
+        let file = &self.sync_data.files[index];
         if file.is_deleted() {
             return;
         }
@@ -2478,7 +2570,7 @@ impl FilePicker {
     }
 
     fn untombstone_file(&mut self, index: usize) {
-        let file = &mut self.sync_data.files[index];
+        let file = &self.sync_data.files[index];
         if !file.is_deleted() {
             return;
         }
@@ -2580,7 +2672,7 @@ impl FilePicker {
         let base_arena = self.sync_data.arena_base_ptr();
         let overflow_arena = self.sync_data.arena_overflow_ptr();
         let mut tombstoned = 0usize;
-        for (idx, file) in self.sync_data.files.iter_mut().enumerate() {
+        for (idx, file) in self.sync_data.files.iter().enumerate() {
             if file.is_deleted() {
                 continue;
             }
@@ -2895,7 +2987,7 @@ impl FileSync {
                                 Some(shared_base),
                                 mode,
                             );
-                            let score = file.access_frecency_score as i32;
+                            let score = file.access_frecency_score() as i32;
                             if score > 0 {
                                 let dir_idx = file.parent_dir_index as usize;
                                 if let Some(dir) = dirs_ref.get(dir_idx) {
@@ -2928,9 +3020,9 @@ impl FileSync {
                     crate::parallelism::run_on_bg_pool(|| {
                         files[offset..end].par_iter_mut().zip(scores).for_each(
                             |(file, access_score)| {
-                                file.set_access_frecency_score(access_score);
-                                file.set_modification_frecency_score(frecency, mode);
-                                let score = file.access_frecency_score as i32;
+                                file.set_access_frecency_score(access_score as i16);
+                                file.update_modification_frecency_score(frecency, mode);
+                                let score = file.access_frecency_score() as i32;
                                 if score > 0 {
                                     let dir_idx = file.parent_dir_index as usize;
                                     if let Some(dir) = dirs_ref.get(dir_idx) {
@@ -2949,8 +3041,8 @@ impl FileSync {
         // un-indexable files that are binary or not fitting the size cap has to beplaced in the end
         let is_indexable = |f: &FileItem| {
             !f.is_binary()
-                && f.size > 0
-                && f.size <= crate::constants::MAX_INDEXABLE_FILE_SIZE as u64
+                && f.size() > 0
+                && f.size() <= crate::constants::MAX_INDEXABLE_FILE_SIZE as u64
         };
 
         // Sort order is (indexable, parent_dir, filename).
@@ -3035,8 +3127,8 @@ pub(crate) fn warmup_mmaps(
     for file in files.iter() {
         if file.is_likely_hot()
             || file.is_binary()
-            || file.size == 0
-            || file.size > budget.max_file_size
+            || file.size() == 0
+            || file.size() > budget.max_file_size
         {
             continue;
         }
@@ -3659,6 +3751,73 @@ mod tests {
         }
     }
 
+    /// Overflow files live in a second arena, and an appended constraint
+    /// changes the filter even when the raw query is a prefix extension.
+    #[test]
+    fn live_narrow_overflow_and_constraint_extension_match_full_search() {
+        use crate::types::PaginationArgs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_buf = crate::path_utils::canonicalize(dir.path()).unwrap();
+        let base = base_buf.as_path();
+        for rel in ["src/alpha_1.rs", "src/alpha_2.rs", "src/beta.rs"] {
+            let path = base.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        let added = base.join("src/alpha_3.rs");
+        std::fs::write(&added, b"x").unwrap();
+        assert!(picker.add_new_file(&added).is_some());
+        assert!(!picker.get_overflow_files().is_empty());
+
+        let opts = || FuzzySearchOptions {
+            max_threads: 1,
+            current_file: None,
+            project_path: None,
+            combo_boost_score_multiplier: 0,
+            min_combo_count: 0,
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 50,
+            },
+        };
+        let parser = fff_query_parser::QueryParser::default();
+        let run = |picker: &FilePicker, text: &str| {
+            let parsed = parser.parse(text);
+            let out = picker.fuzzy_search(&parsed, None, opts());
+            let names: Vec<String> = out.items.iter().map(|f| f.relative_path(picker)).collect();
+            let totals: Vec<i32> = out.scores.iter().map(|s| s.total).collect();
+            (out.total_matched, names, totals)
+        };
+        let force_full = |picker: &FilePicker| {
+            let mut live = picker.live.lock();
+            live.active = false;
+            live.history.clear();
+            live.prefix.clear();
+        };
+
+        // Prime with an unfiltered prefix, then narrow across the overflow
+        // boundary. alpha_3.rs must survive.
+        let _ = run(&picker, "alph");
+        let narrow_alpha = run(&picker, "alpha");
+        assert!(narrow_alpha.1.iter().any(|n| n.ends_with("alpha_3.rs")));
+        force_full(&picker);
+        assert_eq!(narrow_alpha, run(&picker, "alpha"));
+
+        // Same prefix plus a new constraint must not reuse the old hit set.
+        let _ = run(&picker, "alph");
+        let narrow_filtered = run(&picker, "alph *.rs");
+        force_full(&picker);
+        assert_eq!(narrow_filtered, run(&picker, "alph *.rs"));
+    }
+
     /// Shortening the query reuses the matching history entry instead of
     /// rescanning, and must agree with a fresh full-corpus search.
     #[test]
@@ -3742,41 +3901,47 @@ mod tests {
                 query: "al".into(),
                 max_typos: 2,
                 generation: 7,
+                constraints_fp: 0,
                 candidates: vec![1],
             },
             BackEntry {
                 query: "alph".into(),
                 max_typos: 2,
                 generation: 7,
+                constraints_fp: 0,
                 candidates: vec![1, 2],
             },
             BackEntry {
                 query: "alph".into(),
                 max_typos: 3,
                 generation: 7,
+                constraints_fp: 0,
                 candidates: vec![9],
             },
             BackEntry {
                 query: "alph".into(),
                 max_typos: 2,
                 generation: 8,
+                constraints_fp: 0,
                 candidates: vec![8],
             },
         ];
         assert_eq!(
-            longest_prefix(&cache, "alphax", 2, 7),
+            longest_prefix(&cache, "alphax", 2, 7, 0),
             Some(vec![1, 2].as_slice())
         );
         assert_eq!(
-            longest_prefix(&cache, "alph", 2, 7),
+            longest_prefix(&cache, "alph", 2, 7, 0),
             Some(vec![1].as_slice())
         );
-        assert_eq!(longest_prefix(&cache, "beta", 2, 7), None);
+        assert_eq!(longest_prefix(&cache, "beta", 2, 7, 0), None);
         assert_eq!(
-            longest_prefix(&cache, "alphax", 3, 7),
+            longest_prefix(&cache, "alphax", 3, 7, 0),
             Some(vec![9].as_slice())
         );
-        assert_eq!(longest_prefix(&cache, "alphax", 2, 9), None);
+        assert_eq!(longest_prefix(&cache, "alphax", 2, 9, 0), None);
+        // A changed constraint set must never reuse an unfiltered hit set.
+        assert_eq!(longest_prefix(&cache, "alphax", 2, 7, 1), None);
     }
 
     /// Forward retype after a sideways move reuses the cached prefix

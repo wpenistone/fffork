@@ -1104,8 +1104,8 @@ fn detect_renames(
             Some((
                 path.to_path_buf(),
                 FileIdentity {
-                    size: file.size,
-                    mtime: file.modified,
+                    size: file.size(),
+                    mtime: file.modified(),
                 },
             ))
         })

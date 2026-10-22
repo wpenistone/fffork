@@ -158,8 +158,8 @@ pub(super) fn prefilter_files_indexed<'a>(
     fn basic_prefilter(file: &FileItem, max: u64, definition_only: bool) -> bool {
         !file.is_deleted()
             && !file.is_binary()
-            && file.size > 0
-            && file.size <= max
+            && file.size() > 0
+            && file.size() <= max
             && (!definition_only || file.supports_definitions())
     }
 
@@ -256,7 +256,7 @@ pub(super) fn prefilter_files_indexed<'a>(
     sort_with_buffer(&mut prefiltered, |a, b| {
         b.0.total_frecency_score()
             .cmp(&a.0.total_frecency_score())
-            .then(b.0.modified.cmp(&a.0.modified))
+            .then(b.0.modified().cmp(&a.0.modified()))
     });
 
     if options.file_offset > 0 && options.file_offset < total_count {
@@ -346,7 +346,7 @@ mod tests {
                     );
                     assert_eq!(count, expected.len());
                     assert_eq!(
-                        result.iter().map(|file| file.modified).collect::<Vec<_>>(),
+                        result.iter().map(|file| file.modified()).collect::<Vec<_>>(),
                         expected[offset.min(expected.len())..],
                     );
                 }

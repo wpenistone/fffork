@@ -2,7 +2,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "windows"))]
 use std::sync::atomic::AtomicPtr;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI16, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 
 #[cfg(not(target_os = "windows"))]
 use crate::constants::{FRESH_MMAP_THRESHOLD, MMAP_THRESHOLD};
@@ -297,8 +299,8 @@ impl Constrainable for DirItem {
 #[derive(Debug)]
 #[repr(C)]
 pub struct FileItem {
-    pub size: u64,
-    pub modified: u64,
+    size: AtomicU64,
+    modified: AtomicU64,
     // Scan-time 64-bit character-presence mask of the relative path
     // (see crate::presence). Sound necessary condition for fuzzy
     // LCS >= |q| - max_typos; never rejects a true match.
@@ -308,10 +310,10 @@ pub struct FileItem {
     // Packed `Option<git2::Status>`: `u32::MAX` means None.
     // Stored as raw bits so FileItem stays 48 B (Option<Status> is 8 B
     // and pushed the struct to 56 B × 227k ≈ +1.8 MB peak RSS).
-    git_status_bits: u32,
-    pub access_frecency_score: i16,
-    pub modification_frecency_score: i16,
-    pub git_recency_score: i16,
+    git_status_bits: AtomicU32,
+    access_frecency_score: AtomicI16,
+    modification_frecency_score: AtomicI16,
+    git_recency_score: AtomicI16,
     flags: AtomicU8,
     vendored: AtomicBool,
     /// Lazy mmap cache (boxed, set once). Only populated by the actual file
@@ -333,12 +335,14 @@ impl Clone for FileItem {
             path: self.path.clone(),
             presence: self.presence,
             parent_dir_index: self.parent_dir_index,
-            size: self.size,
-            modified: self.modified,
-            access_frecency_score: self.access_frecency_score,
-            modification_frecency_score: self.modification_frecency_score,
-            git_recency_score: self.git_recency_score,
-            git_status_bits: self.git_status_bits,
+            size: AtomicU64::new(self.size.load(Ordering::Relaxed)),
+            modified: AtomicU64::new(self.modified.load(Ordering::Relaxed)),
+            access_frecency_score: AtomicI16::new(self.access_frecency_score.load(Ordering::Relaxed)),
+            modification_frecency_score: AtomicI16::new(
+                self.modification_frecency_score.load(Ordering::Relaxed),
+            ),
+            git_recency_score: AtomicI16::new(self.git_recency_score.load(Ordering::Relaxed)),
+            git_status_bits: AtomicU32::new(self.git_status_bits.load(Ordering::Relaxed)),
             flags: AtomicU8::new(self.flags.load(Ordering::Relaxed)),
             vendored: AtomicBool::new(self.vendored.load(Ordering::Relaxed)),
             // on clone we have to reset the content cache
@@ -486,12 +490,12 @@ impl FileItem {
             path,
             presence: 0,
             parent_dir_index: u32::MAX,
-            size,
-            modified,
-            access_frecency_score: 0,
-            modification_frecency_score: 0,
-            git_recency_score: 0,
-            git_status_bits: Self::pack_git_status(git_status),
+            size: AtomicU64::new(size),
+            modified: AtomicU64::new(modified),
+            access_frecency_score: AtomicI16::new(0),
+            modification_frecency_score: AtomicI16::new(0),
+            git_recency_score: AtomicI16::new(0),
+            git_status_bits: AtomicU32::new(Self::pack_git_status(git_status)),
             flags: AtomicU8::new(flags),
             vendored: AtomicBool::new(false),
             #[cfg(not(target_os = "windows"))]
@@ -509,16 +513,69 @@ impl FileItem {
 
     #[inline]
     pub fn git_status(&self) -> Option<git2::Status> {
-        if self.git_status_bits == u32::MAX {
+        let bits = self.git_status_bits.load(Ordering::Relaxed);
+        if bits == u32::MAX {
             None
         } else {
-            Some(git2::Status::from_bits_retain(self.git_status_bits))
+            Some(git2::Status::from_bits_retain(bits))
         }
     }
 
     #[inline]
-    pub fn set_git_status(&mut self, s: Option<git2::Status>) {
-        self.git_status_bits = Self::pack_git_status(s);
+    pub fn set_git_status(&self, s: Option<git2::Status>) {
+        self.git_status_bits
+            .store(Self::pack_git_status(s), Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn size(&self) -> u64 {
+        self.size.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn modified(&self) -> u64 {
+        self.modified.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn set_size(&self, size: u64) {
+        self.size.store(size, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn set_modified(&self, modified: u64) {
+        self.modified.store(modified, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn access_frecency_score(&self) -> i16 {
+        self.access_frecency_score.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn modification_frecency_score(&self) -> i16 {
+        self.modification_frecency_score.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn git_recency_score(&self) -> i16 {
+        self.git_recency_score.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn set_access_frecency_score(&self, score: i16) {
+        self.access_frecency_score.store(score, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn set_modification_frecency_score(&self, score: i16) {
+        self.modification_frecency_score
+            .store(score, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn set_git_recency_score(&self, score: i16) {
+        self.git_recency_score.store(score, Ordering::Relaxed);
     }
 
     /// Returns an absolute path of the file
@@ -635,13 +692,13 @@ impl FileItem {
 
     #[inline]
     pub fn total_frecency_score(&self) -> i32 {
-        self.access_frecency_score as i32 + self.modification_frecency_score as i32
+        self.access_frecency_score() as i32 + self.modification_frecency_score() as i32
     }
 
     #[allow(dead_code)]
     #[inline]
     pub(crate) fn is_likely_hot(&self) -> bool {
-        self.access_frecency_score > 0 || self.git_status().is_some()
+        self.access_frecency_score() > 0 || self.git_status().is_some()
     }
 
     /// Reads a fixed bytes count from the file optimized for quick speed of opening
@@ -812,7 +869,8 @@ impl FileItem {
     // store it so grep can reject this file without opening it.
     pub(crate) fn detect_binary_per_byte(&self, path: &Path, chunk: &mut [u8]) -> ContentMask {
         let mut mask = ContentMask::default();
-        if self.size == 0 {
+        let size = self.size();
+        if size == 0 {
             return mask;
         }
 
@@ -831,7 +889,7 @@ impl FileItem {
         // as binary. Past the cap the mask would be unsound, so partial
         // reads return empty (unknown) and grep opens the file instead.
         // Index-time cost is bounded by the cap plus NUL early exit.
-        let cap = (self.size as usize).min(BINARY_CLASSIFICATION_CAP);
+        let cap = (size as usize).min(BINARY_CLASSIFICATION_CAP);
         let mut read = 0usize;
         loop {
             if read >= cap {
@@ -856,7 +914,7 @@ impl FileItem {
         }
         // Binary files are excluded from grep before the mask is consulted,
         // so only a fully-read text file earns a recorded mask.
-        if self.is_binary() || (read as u64) < self.size {
+        if self.is_binary() || (read as u64) < size {
             return ContentMask::default();
         }
         mask
@@ -905,10 +963,10 @@ impl FileItem {
     /// the stale buffer simply won't reflect the new contents. In both cases,
     /// invalidating ensures a fresh read on the next access.
     #[cfg(not(target_os = "windows"))]
-    pub fn invalidate_mmap(&mut self, budget: &ContentCacheBudget) {
+    pub fn invalidate_mmap(&self, budget: &ContentCacheBudget) {
         if self.take_content().is_some() {
             budget.cached_count.fetch_sub(1, Ordering::Relaxed);
-            budget.cached_bytes.fetch_sub(self.size, Ordering::Relaxed);
+            budget.cached_bytes.fetch_sub(self.size(), Ordering::Relaxed);
         }
     }
 
@@ -921,31 +979,31 @@ impl FileItem {
     }
 
     #[cfg(not(target_os = "windows"))]
-    fn take_content(&mut self) -> Option<Box<memmap2::Mmap>> {
+    fn take_content(&self) -> Option<Box<memmap2::Mmap>> {
         let ptr = self.content.swap(std::ptr::null_mut(), Ordering::AcqRel);
         // SAFETY: non-null pointers always come from `Box::into_raw` in `get_cached_content`.
         (!ptr.is_null()).then(|| unsafe { Box::from_raw(ptr) })
     }
 
     #[cfg(target_os = "windows")]
-    pub fn invalidate_mmap(&mut self, _: &ContentCacheBudget) {}
+    pub fn invalidate_mmap(&self, _: &ContentCacheBudget) {}
 
     pub fn update_metadata(
-        &mut self,
+        &self,
         budget: &ContentCacheBudget,
         modified_secs: Option<u64>,
         new_size: Option<u64>,
     ) {
         if let Some(modified) = modified_secs
-            && self.modified < modified
+            && self.modified() < modified
         {
-            self.modified = modified;
+            self.modified.store(modified, Ordering::Relaxed);
         }
 
         self.invalidate_mmap(budget);
 
         if let Some(size) = new_size {
-            self.size = size;
+            self.size.store(size, Ordering::Relaxed);
         }
     }
 
@@ -985,7 +1043,8 @@ impl FileItem {
             return Some(content);
         }
 
-        if self.size < MMAP_THRESHOLD || self.size > budget.max_file_size {
+        let size = self.size();
+        if size < MMAP_THRESHOLD || size > budget.max_file_size {
             return None;
         }
 
@@ -994,7 +1053,7 @@ impl FileItem {
         let bytes = budget.cached_bytes.load(Ordering::Relaxed);
         let max_files = budget.max_files;
         let max_bytes = budget.max_bytes;
-        if count >= max_files || bytes + self.size > max_bytes {
+        if count >= max_files || bytes + size > max_bytes {
             return None;
         }
 
@@ -1013,7 +1072,7 @@ impl FileItem {
         ) {
             Ok(_) => {
                 budget.cached_count.fetch_add(1, Ordering::Relaxed);
-                budget.cached_bytes.fetch_add(self.size, Ordering::Relaxed);
+                budget.cached_bytes.fetch_add(size, Ordering::Relaxed);
             }
             // Lost the race: another thread cached first, keep theirs.
             Err(_) => drop(unsafe { Box::from_raw(fresh) }),
@@ -1048,14 +1107,15 @@ impl FileItem {
         }
 
         let max_file_size = budget.max_file_size;
-        if self.is_binary() || self.size == 0 || self.size > max_file_size {
+        let size = self.size();
+        if self.is_binary() || size == 0 || size > max_file_size {
             return None;
         }
 
         let mut file = self.open_for_search(arena, base_path, base_dir)?;
 
         #[cfg(not(target_os = "windows"))]
-        if self.size >= FRESH_MMAP_THRESHOLD {
+        if size >= FRESH_MMAP_THRESHOLD {
             let mmap = unsafe { memmap2::Mmap::map(&file) }.ok()?;
             let stored = mmap_slot.insert(mmap);
             return Some(&stored[..]);
@@ -1063,7 +1123,7 @@ impl FileItem {
             let _ = (mmap_slot, arena);
         }
 
-        let len = self.size as usize;
+        let len = size as usize;
         // Avoid memset-fill of `len` before read_exact overwrites it.
         buf.clear();
         buf.reserve(len);

@@ -1133,7 +1133,7 @@ fn read_bigram_chunk<'a>(
     buf: &'a mut [u8],
     path_buf: &mut [u8; crate::simd_path::PATH_BUF_SIZE],
 ) -> Option<&'a [u8]> {
-    let want = (file.size as usize).min(MAX_INDEXABLE_FILE_SIZE);
+    let want = (file.size() as usize).min(MAX_INDEXABLE_FILE_SIZE);
     let filled = file.read_trimmed_into_buf(base_fd, base_path, arena, path_buf, &mut buf[..want]);
     if filled == 0 {
         return None;
@@ -1177,13 +1177,13 @@ pub(crate) fn build_bigram_index(
                 for (offset, file) in chunk.iter().enumerate() {
                     let file_idx = base_idx + offset;
 
-                    if file.is_binary() || file.size == 0 {
+                    if file.is_binary() || file.size() == 0 {
                         continue;
                     }
 
                     READ_BUF.with(|read_cell| {
                         let mut buf = read_cell.borrow_mut();
-                        let want = (file.size as usize).min(MAX_INDEXABLE_FILE_SIZE);
+                        let want = (file.size() as usize).min(MAX_INDEXABLE_FILE_SIZE);
                         if buf.len() < want {
                             buf.resize(want, 0);
                         }
@@ -1206,8 +1206,8 @@ pub(crate) fn build_bigram_index(
                             file.set_binary(crate::types::detect_binary_content(content));
 
                             if let Some(store) = content_masks
-                                && file.size > 0
-                                && content.len() as u64 == file.size
+                                && file.size() > 0
+                                && content.len() as u64 == file.size()
                             {
                                 let mut mask = crate::types::ContentMask::default();
                                 mask.accumulate(content);
@@ -1268,7 +1268,7 @@ pub(crate) fn sniff_binary_for_non_indexable(
             continue;
         }
         // check only the files that we are able to grep
-        if file.size == 0 || file.size > constants::MAX_FFFILE_SIZE {
+        if file.size() == 0 || file.size() > constants::MAX_FFFILE_SIZE {
             continue;
         }
 

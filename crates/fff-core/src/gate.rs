@@ -13,7 +13,11 @@ const MAX_SKIPS: usize = 7;
 
 #[inline]
 fn fold_byte(b: u8) -> u8 {
-    if b.is_ascii_uppercase() { b + 32 } else { b }
+    if b.is_ascii_uppercase() {
+        b + 32
+    } else {
+        b
+    }
 }
 
 /// Case-folded needle-byte bitmask: 256 bits as 4×u64.
@@ -900,7 +904,9 @@ impl GateNeedle {
             // extremes come from the mask bits.
             let mut st = WalkState::fresh(true);
             self.walk_range(file, arena, 0, byte_len, &mut st);
-            let hit = self.finish(&st, byte_len)?;
+            let mut hit = self.finish(&st, byte_len)?;
+            include_leading_separator(file, arena, &mut hit);
+            widen_to_filename(file, &mut hit, byte_len, st.end_cut != 0);
             return Some(self.maybe_tighten(file, arena, hit, None));
         }
         // Long needles need random access: stage the path, then skip-DP.
@@ -918,7 +924,11 @@ impl GateNeedle {
             std::mem::take(&mut *b)
         });
         file.path.read_to_buf(arena, &mut hay[..byte_len]);
-        let hit = self.hit(&hay[..byte_len]);
+        let mut hit = self.hit(&hay[..byte_len]);
+        if let Some(h) = hit.as_mut() {
+            include_leading_separator(file, arena, h);
+            widen_to_filename(file, h, byte_len, false);
+        }
         HAY.with(|c| *c.borrow_mut() = hay);
         hit
     }
@@ -979,7 +989,9 @@ impl GateNeedle {
             cache.bytes_skipped += (byte_len - split) as u64;
         }
         cache.walked += st.walked;
-        let hit = self.finish(&st, byte_len)?;
+        let mut hit = self.finish(&st, byte_len)?;
+        include_leading_separator(file, arena, &mut hit);
+        widen_to_filename(file, &mut hit, byte_len, st.end_cut != 0);
         let tight_before = hit.start;
         let out = self.maybe_tighten(file, arena, hit, Some(&mut cache.tight_trim));
         cache.tight_files += (out.start != tight_before) as u64;
@@ -1040,9 +1052,68 @@ where
     (0..n as u32).into_par_iter().filter_map(scan).collect()
 }
 
+// SW awards its delimiter bonus from the byte before the match. `st.first`
+// starts at the first needle byte, so put the preceding path separator back
+// into the window while keeping `include_prefix` false.
+fn include_leading_separator(file: &FileItem, arena: ArenaPtr, hit: &mut GateHit) {
+    let start = hit.start as usize;
+    if start == 0 || hit.include_prefix {
+        return;
+    }
+    let mut sep = [0u8; 1];
+    file.path
+        .copy_window_to(arena, (start - 1) as u32, start as u32, &mut sep);
+    if sep[0] == b'/' || sep[0] == b'\\' {
+        hit.start -= 1;
+    }
+}
+
+// An early gate acceptance can cut the window before the filename; widen it
+// so the filename is scored too. `early_cut` distinguishes a genuine stop
+// from a match that naturally ends before the path tail.
+fn widen_to_filename(file: &FileItem, hit: &mut GateHit, byte_len: usize, early_cut: bool) {
+    let split = (file.path.filename_offset as usize).min(byte_len);
+    let end = hit.end as usize;
+    if end < byte_len && (early_cut || end <= split) {
+        hit.end = byte_len.min(u32::MAX as usize) as u32;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_includes_separator_before_filename_match() {
+        use crate::simd_path::build_chunked_path_store_from_strings;
+        let rel = "lib/score.rs";
+        let mut file = FileItem::new_raw(0, 0, 0, None, false);
+        let (store, mut strings) =
+            build_chunked_path_store_from_strings(&[rel.to_string()], &[file.clone()]);
+        file.set_path(strings.remove(0));
+        file.path.filename_offset = (rel.rfind('/').unwrap() + 1) as u16;
+        let arena = store.as_arena_ptr();
+        let g = GateNeedle::new(b"score", 0);
+        let h = g.hit_file(&file, arena).expect("score should match");
+        assert_eq!(h.start, 3, "window must include the '/' delimiter");
+        assert!(!h.include_prefix);
+    }
+
+    #[test]
+    fn early_cut_inside_filename_widens_to_full_path() {
+        use crate::simd_path::build_chunked_path_store_from_strings;
+        let rel = "aa/b_long_filename.rs";
+        let mut file = FileItem::new_raw(0, 0, 0, None, false);
+        let (store, mut strings) =
+            build_chunked_path_store_from_strings(&[rel.to_string()], &[file.clone()]);
+        file.set_path(strings.remove(0));
+        file.path.filename_offset = (rel.rfind('/').unwrap() + 1) as u16;
+        let arena = store.as_arena_ptr();
+        let g = GateNeedle::new(b"aab", 0);
+        let h = g.hit_file(&file, arena).expect("aab should match");
+        assert!(h.end as usize > file.path.filename_offset as usize);
+        assert_eq!(h.end as usize, file.path.byte_len as usize);
+    }
 
     #[test]
     fn span_rejects_too_short() {
@@ -1202,7 +1273,8 @@ mod tests {
             let g = GateNeedle::new(&needle, t);
             let streamed = g.hit_file(&file, arena);
             let staged = g.hit(&hay);
-            // Cut preserves accept and only tightens the window.
+            // Cut preserves accept; separator/filename widening may cover
+            // bytes outside the staged span.
             assert_eq!(
                 streamed.is_some(),
                 staged.is_some(),
@@ -1210,8 +1282,8 @@ mod tests {
             );
             if let (Some(a), Some(b)) = (staged, streamed) {
                 assert!(
-                    b.start >= a.start && b.end <= a.end,
-                    "window escape n={needle:?} h={hay:?} t={t}"
+                    b.start <= a.start && b.end >= a.end,
+                    "window lost a staged byte n={needle:?} h={hay:?} t={t}"
                 );
             }
         }
@@ -1252,8 +1324,8 @@ mod tests {
                     );
                     if let (Some(a), Some(b)) = (staged, streamed) {
                         assert!(
-                            b.start >= a.start && b.end <= a.end,
-                            "window escape n={needle:?} h={hay:?} t={t}"
+                            b.start <= a.start && b.end >= a.end,
+                            "window lost a staged byte n={needle:?} h={hay:?} t={t}"
                         );
                     }
                 }

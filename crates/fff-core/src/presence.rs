@@ -45,6 +45,10 @@ pub(crate) struct NeedlePresence {
     min_len: usize,
     needle_mask: u64,
     dup: bool,
+    /// Masks for folded bits occurring once / twice; counts >= 3 use scalar.
+    once_mask: u64,
+    twice_mask: u64,
+    dup_two_masks: bool,
     dup_fold: [u8; 32],
     dup_n: u8,
     dup_full: bool,
@@ -58,18 +62,26 @@ impl NeedlePresence {
         let min_len = need; // LCS ≤ path_len
         let mut needle_mask = 0u64;
         let mut dup = false;
-        let mut dup_fold = [0u8; 32];
-        let mut dup_n = 0u8;
+        let mut once_mask = 0u64;
+        let mut twice_mask = 0u64;
+        let mut over_twice = false;
         for &b in needle {
             let bit = 1u64 << fold_bit(b);
             if needle_mask & bit != 0 {
                 dup = true;
-                break;
             }
             needle_mask |= bit;
+            if once_mask & bit != 0 {
+                once_mask &= !bit;
+                twice_mask |= bit;
+            } else if twice_mask & bit != 0 {
+                over_twice = true;
+            } else {
+                once_mask |= bit;
+            }
         }
-        // Dup needles re-fold every byte per candidate; cache the folds
-        // once per query (common queries like `test` are all dup).
+        let mut dup_fold = [0u8; 32];
+        let mut dup_n = 0u8;
         if dup {
             for &b in needle.iter().take(32) {
                 dup_fold[dup_n as usize] = fold_bit(b) as u8;
@@ -81,6 +93,9 @@ impl NeedlePresence {
             min_len,
             needle_mask,
             dup,
+            once_mask,
+            twice_mask,
+            dup_two_masks: dup && !over_twice,
             dup_fold,
             dup_n,
             dup_full: dup_n as usize == needle.len(),
@@ -107,6 +122,13 @@ impl NeedlePresence {
         }
         if !self.dup {
             return (path_mask & self.needle_mask).count_ones() as usize >= self.need;
+        }
+        // Exact for multiplicities 1 and 2; counts >= 3 use the scalar loop.
+        // Capping them would turn this necessary condition into a false reject.
+        if self.dup_two_masks {
+            let ones = (path_mask & self.once_mask).count_ones() as usize;
+            let twos = (path_mask & self.twice_mask).count_ones() as usize;
+            return ones + 2 * twos >= self.need;
         }
         if self.dup_full {
             let mut hits = 0usize;
@@ -203,6 +225,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn duplicate_fast_path_never_false_rejects() {
+        // Counts 1/2 use the two-mask sum; counts >= 3 use the scalar loop
+        // and must still accept every possible path.
+        for needle in [
+            &b"test"[..],
+            b"file_picke",
+            b"controller",
+            b"renderer",
+            b"aaa",
+            b"aaaa",
+            b"aaaaaaa",
+            b"aaaaaaaa",
+            b"aab",
+        ] {
+            for path in [
+                &b"test.rs"[..],
+                b"file_picker.rs",
+                b"controller.rs",
+                b"renderer.rs",
+                b"a",
+                b"aa",
+                b"aaa",
+                b"aaaaaaa",
+                b"aaaaaaaa",
+                b"b",
+            ] {
+                let mask = mask_of(path);
+                let lcs = lcs_len(needle, path);
+                let np = NeedlePresence::new(needle, 0);
+                if lcs >= needle.len() {
+                    assert!(
+                        np.allows(mask, needle),
+                        "FALSE REJECT needle={} path={} lcs={lcs}",
+                        String::from_utf8_lossy(needle),
+                        String::from_utf8_lossy(path),
+                    );
+                }
+            }
+        }
+        // The specific unsound case the global two-mask formula would reject.
+        assert!(allows(mask_of(b"a"), b"aaa", 0));
     }
 
     #[test]

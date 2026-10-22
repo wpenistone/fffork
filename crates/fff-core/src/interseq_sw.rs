@@ -1373,9 +1373,6 @@ mod tests {
         SwParams::for_query(false)
     }
 
-    // Serializes access to `FRIZBEE_SKIP_SW` across parallel tests.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     // Ground truth: frizbee Matcher under fff's scoring config.
     fn frizbee_score(needle: &str, haystack: &str) -> u16 {
         // Ensure skip_sw is OFF for the ground-truth measurement
@@ -1440,7 +1437,7 @@ mod tests {
             state = state.wrapping_mul(1664525).wrapping_add(1013904223);
             (state >> 16) as u16
         };
-        let mut byte = move |next: &mut dyn FnMut() -> u16| {
+        let byte = move |next: &mut dyn FnMut() -> u16| {
             let r = next() % 6;
             if r == 0 {
                 b'/'
