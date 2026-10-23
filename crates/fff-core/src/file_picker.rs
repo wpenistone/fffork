@@ -3618,6 +3618,65 @@ mod tests {
         assert!(picker.get_file_by_path(&kept).is_some());
     }
 
+    /// A live post-scan snapshot aliases the file buffer, so `get_file_mut`
+    /// must refuse mutable access. Watcher/frecency paths must still update
+    /// metadata through the per-entry atomics, and appended overflow files
+    /// must remain visible; otherwise the snapshot window silently loses
+    /// filesystem events (C-004).
+    #[test]
+    fn post_scan_snapshot_keeps_watcher_updates_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_buf = crate::path_utils::canonicalize(dir.path()).unwrap();
+        let base = base_buf.as_path();
+        let existing = base.join("src/existing.rs");
+        std::fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        std::fs::write(&existing, b"x").unwrap();
+
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        let idx = picker
+            .sync_data
+            .find_file_index(&existing, base)
+            .expect("scanned file must be indexed");
+        assert_eq!(picker.get_file_by_path(&existing).unwrap().size(), 1);
+
+        let snapshot = unsafe { picker.post_scan_snapshot() }.expect("snapshot");
+        assert!(picker.get_file_mut(idx).is_none());
+
+        std::fs::write(&existing, b"hello").unwrap();
+        let updated = picker
+            .handle_create_or_modify(&existing)
+            .expect("watcher update");
+        assert_eq!(updated.size(), 5);
+        assert_eq!(picker.get_file_by_path(&existing).unwrap().size(), 5);
+        assert!(
+            picker.sync_data.content_masks.get(idx).is_some(),
+            "content mask must refresh while the snapshot is held"
+        );
+        assert_eq!(snapshot.files[idx].size(), 5);
+
+        let added = base.join("src/added.rs");
+        std::fs::write(&added, b"new").unwrap();
+        assert!(picker.add_new_file(&added).is_some());
+        assert_eq!(picker.get_file_by_path(&added).unwrap().size(), 3);
+        assert!(
+            picker
+                .get_overflow_files()
+                .iter()
+                .any(|f| f.relative_path(&picker).ends_with("src/added.rs")),
+            "watcher-added overflow file must be searchable"
+        );
+
+        drop(snapshot);
+        assert!(!picker.signals.post_scan_indexing_active.load(Ordering::Acquire));
+        assert!(picker.get_file_mut(idx).is_some());
+    }
+
     /// Live-narrow caches candidate indices per index generation.
     /// Mutations must bump the generation and disarm narrow, or extended
     /// queries search a stale set.
@@ -3749,6 +3808,95 @@ mod tests {
                 "narrow diverged for {text:?}"
             );
         }
+    }
+
+    /// A raw-query extension must gate narrowing, not just `parts[0]`.
+    /// `a zzz` -> `ab yyy` grows the effective first part but is not a raw
+    /// prefix; reusing the old (zzz-filtered) set would drop `ab_yyy.rs`.
+    /// Multipart extensions that *are* raw prefixes must still match a full
+    /// scan.
+    #[test]
+    fn live_narrow_multipart_identity_matches_full_search() {
+        use crate::types::PaginationArgs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_buf = crate::path_utils::canonicalize(dir.path()).unwrap();
+        let base = base_buf.as_path();
+        for rel in [
+            "src/aa_zzz.rs",
+            "src/ab_yyy.rs",
+            "src/alpha_one.rs",
+            "src/alpha_two.rs",
+            "src/beta.rs",
+        ] {
+            let path = base.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+        let mut fresh = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        fresh.collect_files().unwrap();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+
+        let opts = || FuzzySearchOptions {
+            max_threads: 1,
+            current_file: None,
+            project_path: None,
+            combo_boost_score_multiplier: 0,
+            min_combo_count: 0,
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 50,
+            },
+        };
+        let parser = fff_query_parser::QueryParser::default();
+        let run = |picker: &FilePicker, text: &str| {
+            let parsed = parser.parse(text);
+            let out = picker.fuzzy_search(&parsed, None, opts());
+            let names: Vec<String> = out.items.iter().map(|f| f.relative_path(picker)).collect();
+            let totals: Vec<i32> = out.scores.iter().map(|s| s.total).collect();
+            (out.total_matched, names, totals)
+        };
+        let force_full = |picker: &FilePicker| {
+            let mut live = picker.live.lock();
+            live.active = false;
+            live.history.clear();
+            live.prefix.clear();
+        };
+
+        // Multipart change disguised as a first-part extension.
+        let _ = run(&picker, "a zzz");
+        assert!(picker.live.lock().active);
+        let narrowed = run(&picker, "ab yyy");
+        force_full(&fresh);
+        assert_eq!(narrowed, run(&fresh, "ab yyy"));
+        assert!(
+            narrowed.1.iter().any(|n| n.ends_with("ab_yyy.rs")),
+            "new match was dropped: {:?}",
+            narrowed.1
+        );
+
+        // A true multipart raw extension should narrow and still match full.
+        let _ = run(&picker, "src alpha");
+        assert!(picker.live.lock().active);
+        let narrowed = run(&picker, "src alpha one");
+        force_full(&fresh);
+        assert_eq!(narrowed, run(&fresh, "src alpha one"));
+        assert!(
+            narrowed.1.iter().any(|n| n.ends_with("alpha_one.rs")),
+            "{:?}",
+            narrowed.1
+        );
     }
 
     /// Overflow files live in a second arena, and an appended constraint
