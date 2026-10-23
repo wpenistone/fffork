@@ -3008,17 +3008,34 @@ impl std::hash::Hasher for FxHasher {
     }
 }
 
-struct MemoEntry {
-    key: Box<[u8]>,
-    ev: crate::intent::Evidence,
+const MEMO_SLOTS: usize = 1024;
+const MEMO_KEY_MAX: usize = 64;
+
+#[derive(Clone, Copy)]
+struct MemoSlot {
+    epoch: u64,
+    hash: u64,
+    len: u8,
+    key: [u8; MEMO_KEY_MAX],
+    ev: Option<crate::intent::Evidence>,
+}
+
+const EMPTY_MEMO_SLOT: MemoSlot = MemoSlot {
+    epoch: 0,
+    hash: 0,
+    len: 0,
+    key: [0; MEMO_KEY_MAX],
+    ev: None,
+};
+
+struct EvidenceMemo {
+    slots: Vec<MemoSlot>,
 }
 
 thread_local! {
     #[allow(clippy::missing_const_for_thread_local)]
-    static EVIDENCE_MEMO: std::cell::RefCell<(
-        u64,
-        std::collections::HashMap<u64, MemoEntry, FxBuilder>,
-    )> = std::cell::RefCell::new((0, std::collections::HashMap::with_hasher(FxBuilder)));
+    static EVIDENCE_MEMO: std::cell::RefCell<EvidenceMemo> =
+        const { std::cell::RefCell::new(EvidenceMemo { slots: Vec::new() }) };
 }
 static MEMO_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static SCORE_PROF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -3042,31 +3059,41 @@ fn memoized_evidence(
 ) -> crate::intent::Evidence {
     EVIDENCE_MEMO.with(|c| {
         let mut m = c.borrow_mut();
-        if m.0 != epoch {
-            m.1.clear();
-            if m.1.capacity() > 1 << 14 {
-                m.1.shrink_to(1 << 14);
-            }
-            m.0 = epoch;
+        if m.slots.is_empty() {
+            m.slots.resize(MEMO_SLOTS, EMPTY_MEMO_SLOT);
         }
         let fb = fname.as_bytes();
         let mut h = std::hash::BuildHasher::build_hasher(&FxBuilder);
         std::hash::Hasher::write(&mut h, fb);
         let h = std::hash::Hasher::finish(&h);
-        #[allow(clippy::collapsible_if)]
-        if let Some(e) = m.1.get(&h) {
-            if e.key.as_ref() == fb {
-                if SCORE_PROF.load(std::sync::atomic::Ordering::Relaxed) {
-                    MEMO_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
-                return e.ev;
+        let idx = h as usize & (MEMO_SLOTS - 1);
+        let slot = &m.slots[idx];
+        if let Some(ev) = slot.ev
+            && slot.epoch == epoch
+            && slot.hash == h
+            && slot.len as usize == fb.len()
+            && slot.key[..fb.len()] == *fb
+        {
+            if SCORE_PROF.load(std::sync::atomic::Ordering::Relaxed) {
+                MEMO_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+            return ev;
         }
         let ev = crate::intent::evidence_prepared(pq, "", fname, intent, None);
         if SCORE_PROF.load(std::sync::atomic::Ordering::Relaxed) {
             MEMO_MISS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        m.1.insert(h, MemoEntry { key: fb.into(), ev });
+        if fb.len() <= MEMO_KEY_MAX {
+            let mut key = [0u8; MEMO_KEY_MAX];
+            key[..fb.len()].copy_from_slice(fb);
+            m.slots[idx] = MemoSlot {
+                epoch,
+                hash: h,
+                len: fb.len() as u8,
+                key,
+                ev: Some(ev),
+            };
+        }
         ev
     })
 }
