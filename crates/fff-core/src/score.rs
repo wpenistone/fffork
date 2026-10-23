@@ -372,11 +372,8 @@ fn match_fuzzy_parts(
 
                 let t_batch = std::time::Instant::now();
                 // 64B-align batch outputs: 32 u16 fills a cache line, so par_chunks never false-share.
-                // Lengths set without zero-fill; every lane is written before any read.
-                let mut scores = SCORES.with(|c| take_tls(c, n_matches + 32));
-                set_len_uninit(&mut scores, n_matches + 32);
-                let mut end_cols = ECOLS.with(|c| take_tls(c, n_matches + 32));
-                set_len_uninit(&mut end_cols, n_matches + 32);
+                let mut scores = SCORES.with(|c| take_tls_init(c, n_matches + 32));
+                let mut end_cols = ECOLS.with(|c| take_tls_init(c, n_matches + 32));
 
                 // Scalar path: one serial pass over trims with a reused window buffer.
                 // (`max_trim` fused into the collect loop above.)
@@ -392,8 +389,7 @@ fn match_fuzzy_parts(
                         static SWIN: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
                     }
                     let t_scalar = std::time::Instant::now();
-                    let mut win = SWIN.with(|c| take_tls(c, max_trim));
-                    set_len_uninit(&mut win, max_trim);
+                    let mut win = SWIN.with(|c| take_tls_init(c, max_trim));
                     for (i, t) in trims.iter().enumerate() {
                         let wlen = (t.end - t.start) as usize;
                         if wlen == 0 {
@@ -431,8 +427,7 @@ fn match_fuzzy_parts(
                 } else {
                     // Length-ordered batches keep per-batch max_len near lane lengths.
                     let t_prep = std::time::Instant::now();
-                    let mut order = ORDER.with(|c| take_tls(c, n_matches));
-                    set_len_uninit(&mut order, n_matches);
+                    let mut order = ORDER.with(|c| take_tls_init(c, n_matches));
                     // Counting sort by trim length; grouping affects only SIMD max_len, not scores.
                     let t_sort = std::time::Instant::now();
                     if n_matches > batch_sz {
@@ -462,10 +457,8 @@ fn match_fuzzy_parts(
                             std::sync::atomic::Ordering::Relaxed,
                         );
                     }
-                    let mut perm_scores = PERM_SCORES.with(|c| take_tls(c, n_matches + 32));
-                    set_len_uninit(&mut perm_scores, n_matches + 32);
-                    let mut perm_ecols = PERM_ECOLS.with(|c| take_tls(c, n_matches + 32));
-                    set_len_uninit(&mut perm_ecols, n_matches + 32);
+                    let mut perm_scores = PERM_SCORES.with(|c| take_tls_init(c, n_matches + 32));
+                    let mut perm_ecols = PERM_ECOLS.with(|c| take_tls_init(c, n_matches + 32));
 
                     fn align64_u16(buf: &mut [u16], n: usize) -> &mut [u16] {
                         let addr = buf.as_ptr() as usize;
@@ -490,6 +483,8 @@ fn match_fuzzy_parts(
                                          max_len: usize| {
                         let n = ord.len();
                         if max_len == 0 {
+                            sc_out.fill(0);
+                            ec_out.fill(0);
                             return;
                         }
                         // u8 path only at full width; halves are u16.
@@ -745,6 +740,8 @@ fn match_fuzzy_parts(
                             max_len = max_len.max((e - s) as usize);
                         }
                         if max_len == 0 {
+                            sc_out.fill(0);
+                            ec_out.fill(0);
                             return;
                         }
                         if use_u8 && max_len > 256 {
@@ -2549,19 +2546,18 @@ fn take_tls<T: Default>(cell: &std::cell::RefCell<Vec<T>>, min_cap: usize) -> Ve
     std::mem::take(&mut *b)
 }
 
-// Length without zero-fill: caller must overwrite every lane before any read.
-// Debug builds zero-fill instead, skewing parity tests on a missed write.
-fn set_len_uninit<T: Default>(v: &mut Vec<T>, n: usize) {
-    debug_assert!(v.is_empty());
-    v.reserve(n.saturating_sub(v.capacity()));
-    debug_assert!(v.capacity() >= n);
-    #[cfg(debug_assertions)]
-    v.resize_with(n, T::default);
-    #[cfg(not(debug_assertions))]
-    // SAFETY: capacity reserved above; every lane is overwritten before read.
-    unsafe {
-        v.set_len(n);
+fn take_tls_init<T: Copy + Default>(cell: &std::cell::RefCell<Vec<T>>, len: usize) -> Vec<T> {
+    let mut b = cell.borrow_mut();
+    let cap = b.capacity();
+    if cap < len {
+        b.reserve(len - cap);
     }
+    if b.len() < len {
+        b.resize(len, T::default());
+    } else {
+        b.truncate(len);
+    }
+    std::mem::take(&mut *b)
 }
 
 // Stable tie-break for equal scores; `sort_unstable_by` alone orders runs differently.
@@ -5216,13 +5212,12 @@ mod scratch_reuse_tests {
     use super::*;
 
     #[test]
-    fn take_setlen_cycle_keeps_allocation() {
+    fn take_tls_init_reuses_allocation() {
         let cell = std::cell::RefCell::new(Vec::<u16>::new());
         // Odd sizes around lane/batch boundaries, plus empty.
         for n in [0usize, 1, 7, 8, 9, 31, 32, 33, 129, 1000] {
-            let mut v = take_tls(&cell, n);
+            let mut v = take_tls_init(&cell, n);
             assert!(v.capacity() >= n);
-            set_len_uninit(&mut v, n);
             assert_eq!(v.len(), n);
             // Mirror the production contract: overwrite every lane.
             for (i, s) in v.iter_mut().enumerate() {
@@ -5235,8 +5230,8 @@ mod scratch_reuse_tests {
             *cell.borrow_mut() = v;
             // Re-take below capacity reuses the allocation; above may grow.
             let want = n / 2 + 1;
-            let w = take_tls(&cell, want);
-            assert_eq!(w.len(), 0);
+            let w = take_tls_init(&cell, want);
+            assert_eq!(w.len(), want);
             if cap >= want {
                 assert_eq!(w.capacity(), cap);
             } else {
@@ -5248,18 +5243,15 @@ mod scratch_reuse_tests {
 
     #[test]
     fn helpers_cover_all_scratch_types() {
-        // Every T in set_len_uninit's call sites must satisfy the bound.
+        // Every T in take_tls_init's call sites must satisfy the bound.
         let trim_cell = std::cell::RefCell::new(Vec::<crate::matcher::Trim>::new());
-        let mut t = take_tls(&trim_cell, 4);
-        set_len_uninit(&mut t, 4);
+        let t = take_tls_init(&trim_cell, 4);
         assert_eq!(t.len(), 4);
         let u32_cell = std::cell::RefCell::new(Vec::<u32>::new());
-        let mut u = take_tls(&u32_cell, 4);
-        set_len_uninit(&mut u, 4);
+        let u = take_tls_init(&u32_cell, 4);
         assert_eq!(u.len(), 4);
         let u8_cell = std::cell::RefCell::new(Vec::<u8>::new());
-        let mut b = take_tls(&u8_cell, 4);
-        set_len_uninit(&mut b, 4);
+        let b = take_tls_init(&u8_cell, 4);
         assert_eq!(b.len(), 4);
     }
 }
