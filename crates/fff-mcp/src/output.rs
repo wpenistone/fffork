@@ -431,7 +431,7 @@ fn format_files_with_matches(
             "{}{}{}",
             fm.file.relative_path(picker),
             def_tag,
-            size_tag(fm.file.size)
+            size_tag(fm.file.size())
         ));
 
         // Show preview
