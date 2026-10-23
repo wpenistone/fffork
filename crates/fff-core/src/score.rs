@@ -2271,7 +2271,14 @@ fn match_and_score_in_arena<'a>(
         .max_threads
         .max(1)
         .min(crate::parallelism::search_pool_threads());
-    let score_plan = crate::dispatch::plan_matches(path_matches.len(), score_bytes, score_cap);
+    let mut score_plan = crate::dispatch::plan_matches(path_matches.len(), score_bytes, score_cap);
+    // Candidate scoring is branch/string-heavy; the byte-cost planner leaves
+    // ~1k-match top-k pages serial even though two workers win there. Keep
+    // larger plans unchanged and leave sub-1k/full-result pages serial.
+    if score_plan.threads == 1 && use_topk && path_matches.len() >= 1024 && score_cap >= 2 {
+        score_plan.threads = 2;
+        score_plan.chunk = path_matches.len().div_ceil(2);
+    }
     let t_score = std::time::Instant::now();
     let score_entrance_count = path_matches.len();
 
@@ -2414,10 +2421,11 @@ fn match_and_score_in_arena<'a>(
         });
         if phase_timing {
             eprintln!(
-                "PHASE score_us={} (topk) n={} skipped={}",
+                "PHASE score_us={} (topk) n={} skipped={} threads={}",
                 t_score.elapsed().as_micros(),
                 score_entrance_count,
                 skipped_topk,
+                score_plan.threads,
             );
             let hit = MEMO_HIT.swap(0, std::sync::atomic::Ordering::Relaxed);
             let miss = MEMO_MISS.swap(0, std::sync::atomic::Ordering::Relaxed);
