@@ -1117,6 +1117,126 @@ fn match_fuzzy_parts(
     matches
 }
 
+// Path matching is a pure function of the query and the path bytes, so an
+// exact repeat over the same candidate list can reuse the previous matches.
+// The index generation guards path mutations, and the stored candidate list
+// plus query are compared exactly (not hashed), so a stale hit is impossible.
+const MATCH_CACHE_MAX_IDX: usize = 262_144;
+const MATCH_CACHE_MAX_MATCHES: usize = 262_144;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MatchSide {
+    Base,
+    Overflow,
+}
+
+struct CachedMatchSet {
+    idx: Vec<u32>,
+    matches: Vec<neo_frizbee::Match>,
+}
+
+#[derive(Default)]
+pub(crate) struct MatchCache {
+    generation: u64,
+    query: Vec<String>,
+    max_typos: u16,
+    base: Option<CachedMatchSet>,
+    overflow: Option<CachedMatchSet>,
+    #[cfg(test)]
+    hits: std::cell::Cell<u64>,
+}
+
+impl MatchCache {
+    pub(crate) fn clear(&mut self) {
+        self.base = None;
+        self.overflow = None;
+    }
+
+    #[inline]
+    fn slot(&self, side: MatchSide) -> &Option<CachedMatchSet> {
+        match side {
+            MatchSide::Base => &self.base,
+            MatchSide::Overflow => &self.overflow,
+        }
+    }
+
+    #[inline]
+    fn slot_mut(&mut self, side: MatchSide) -> &mut Option<CachedMatchSet> {
+        match side {
+            MatchSide::Base => &mut self.base,
+            MatchSide::Overflow => &mut self.overflow,
+        }
+    }
+
+    #[inline]
+    fn key_matches(&self, generation: u64, parts: &[&str], max_typos: u16) -> bool {
+        self.generation == generation
+            && self.max_typos == max_typos
+            && self.query.len() == parts.len()
+            && self
+                .query
+                .iter()
+                .zip(parts.iter())
+                .all(|(cached, part)| cached == part)
+    }
+
+    fn get(
+        &self,
+        generation: u64,
+        parts: &[&str],
+        max_typos: u16,
+        side: MatchSide,
+        idx: &[u32],
+    ) -> Option<&[neo_frizbee::Match]> {
+        if !self.key_matches(generation, parts, max_typos) {
+            return None;
+        }
+        let entry = self.slot(side).as_ref()?;
+        if entry.idx == idx {
+            #[cfg(test)]
+            self.hits.set(self.hits.get() + 1);
+            Some(entry.matches.as_slice())
+        } else {
+            None
+        }
+    }
+
+    fn put(
+        &mut self,
+        generation: u64,
+        parts: &[&str],
+        max_typos: u16,
+        side: MatchSide,
+        idx: &[u32],
+        matches: &[neo_frizbee::Match],
+    ) {
+        if !self.key_matches(generation, parts, max_typos) {
+            self.generation = generation;
+            self.query.clear();
+            self.query.extend(parts.iter().map(|p| (*p).to_string()));
+            self.max_typos = max_typos;
+            self.base = None;
+            self.overflow = None;
+        }
+        if idx.len() > MATCH_CACHE_MAX_IDX || matches.len() > MATCH_CACHE_MAX_MATCHES {
+            // Too large to memoize; drop the slot rather than hold a big copy.
+            *self.slot_mut(side) = None;
+            return;
+        }
+        *self.slot_mut(side) = Some(CachedMatchSet {
+            idx: idx.to_vec(),
+            matches: matches.to_vec(),
+        });
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct MatchCacheRef<'a> {
+    cache: &'a parking_lot::Mutex<MatchCache>,
+    generation: u64,
+    side: MatchSide,
+}
+
 // Scores only `idx` for typing live-narrow; `total_matched` is the subset
 // hit count. Indices are full-corpus indices, so base and overflow files
 // are split and each is read through its own arena.
@@ -1130,6 +1250,8 @@ pub(crate) fn fuzzy_match_and_score_subset<'a>(
     overflow_arena: ArenaPtr,
     max_path_len: usize,
     abort: crate::parallelism::AbortToken<'_>,
+    cache: Option<&parking_lot::Mutex<MatchCache>>,
+    generation: u64,
 ) -> (Vec<&'a FileItem>, Vec<Score>, usize) {
     debug_assert!(
         idx.iter().all(|&i| (i as usize) < files.len()),
@@ -1161,6 +1283,11 @@ pub(crate) fn fuzzy_match_and_score_subset<'a>(
             abort,
             0,
             false,
+            cache.map(|cache| MatchCacheRef {
+                cache,
+                generation,
+                side: MatchSide::Base,
+            }),
         );
         results.append(&mut base_results);
         total += base_total;
@@ -1177,6 +1304,11 @@ pub(crate) fn fuzzy_match_and_score_subset<'a>(
             abort,
             base_count as u32,
             !results.is_empty(),
+            cache.map(|cache| MatchCacheRef {
+                cache,
+                generation,
+                side: MatchSide::Overflow,
+            }),
         );
         results.append(&mut overflow_results);
         total += overflow_total;
@@ -1227,6 +1359,7 @@ fn fuzzy_match_and_score_files_impl<'a>(
             abort,
             base_count as u32,
             false,
+            None,
         );
 
         let (base_results, base_total) = match_and_score_in_arena(
@@ -1237,6 +1370,7 @@ fn fuzzy_match_and_score_files_impl<'a>(
             abort,
             0,
             true,
+            None,
         );
         results.extend(base_results);
         total += base_total;
@@ -1250,6 +1384,7 @@ fn fuzzy_match_and_score_files_impl<'a>(
             abort,
             0,
             false,
+            None,
         )
     };
 
@@ -1750,6 +1885,7 @@ fn match_and_score_in_arena<'a>(
     abort: crate::parallelism::AbortToken<'_>,
     capture_offset: u32,
     capture_append: bool,
+    cache: Option<MatchCacheRef<'_>>,
 ) -> (Vec<(&'a FileItem, Score)>, usize) {
     if files.len() == 0 {
         return (vec![], 0);
@@ -1841,22 +1977,56 @@ fn match_and_score_in_arena<'a>(
         }
     };
     let t_match = std::time::Instant::now();
-    let path_matches = match_fuzzy_parts(
-        fuzzy_parts,
-        &working_files,
-        &options,
-        context.max_threads,
-        arena,
-        max_path_len,
-        abort,
-    );
+    let cache_idx = match &working_files {
+        FileItems::Filtered { idx, .. } => Some(idx.as_slice()),
+        FileItems::All(_) => None,
+    };
+    let cached_matches = match (cache, cache_idx) {
+        (Some(cr), Some(idx)) => cr
+            .cache
+            .lock()
+            .get(cr.generation, fuzzy_parts, context.max_typos, cr.side, idx)
+            .map(<[neo_frizbee::Match]>::to_vec),
+        _ => None,
+    };
+    let match_cached = cached_matches.is_some();
+    let path_matches = match cached_matches {
+        Some(matches) => matches,
+        None => {
+            let matches = match_fuzzy_parts(
+                fuzzy_parts,
+                &working_files,
+                &options,
+                context.max_threads,
+                arena,
+                max_path_len,
+                abort,
+            );
+            if let (Some(cr), Some(idx)) = (cache, cache_idx) {
+                // An aborted search can return a partial match set; never
+                // memoize it, or a later repeat would silently lose hits.
+                if !abort.aborted() {
+                    cr.cache.lock().put(
+                        cr.generation,
+                        fuzzy_parts,
+                        context.max_typos,
+                        cr.side,
+                        idx,
+                        &matches,
+                    );
+                }
+            }
+            matches
+        }
+    };
     let match_elapsed = t_match.elapsed();
     if phase_timing {
         phase_log(format!(
-            "PHASE match_us={} n_matches={} n_files={}",
+            "PHASE match_us={} n_matches={} n_files={} cached={}",
             match_elapsed.as_micros(),
             path_matches.len(),
-            working_files.len()
+            working_files.len(),
+            match_cached as u8
         ));
     }
 
@@ -3268,6 +3438,7 @@ mod tests {
                     crate::parallelism::AbortToken::disabled(),
                     0,
                     false,
+                    None,
                 );
                 context.max_threads = 1;
                 let (mut sequential, _) = match_and_score_in_arena(
@@ -3278,6 +3449,7 @@ mod tests {
                     crate::parallelism::AbortToken::disabled(),
                     0,
                     false,
+                    None,
                 );
                 parallel.sort_unstable_by_key(|(file, _)| file.modified());
                 sequential.sort_unstable_by_key(|(file, _)| file.modified());
@@ -3359,6 +3531,7 @@ mod tests {
                 crate::parallelism::AbortToken::disabled(),
                 0,
                 false,
+                None,
             );
             base.sort_unstable_by_key(|(file, _)| file.modified());
             for width in [2usize, 3, 5, 8] {
@@ -3371,6 +3544,7 @@ mod tests {
                     crate::parallelism::AbortToken::disabled(),
                     0,
                     false,
+                    None,
                 );
                 assert_eq!(got_total, base_total, "{text} width={width}");
                 got.sort_unstable_by_key(|(file, _)| file.modified());
@@ -3953,6 +4127,93 @@ mod filename_bonus_tests {
             .zip(scores.iter())
             .map(|(f, s)| (f.relative_path(arena).to_string(), s.clone()))
             .collect()
+    }
+
+    #[test]
+    fn match_cache_rejects_stale_generation_and_candidates() {
+        let idx = vec![1u32, 3, 5];
+        let matches = vec![neo_frizbee::Match {
+            score: 10,
+            index: 0,
+            exact: false,
+            end_col: 2,
+        }];
+        let mut cache = MatchCache::default();
+        cache.put(7, &["pick"], 2, MatchSide::Base, &idx, &matches);
+        assert!(cache.get(7, &["pick"], 2, MatchSide::Base, &idx).is_some());
+        assert!(cache.get(8, &["pick"], 2, MatchSide::Base, &idx).is_none());
+        assert!(cache.get(7, &["pick2"], 2, MatchSide::Base, &idx).is_none());
+        assert!(cache.get(7, &["pick"], 3, MatchSide::Base, &idx).is_none());
+        assert!(
+            cache
+                .get(7, &["pick"], 2, MatchSide::Base, &[1, 3, 6])
+                .is_none()
+        );
+        assert!(
+            cache
+                .get(7, &["pick"], 2, MatchSide::Overflow, &idx)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn match_cache_exact_repeat_matches_uncached_subset() {
+        let (files, arena) = make_files(&[
+            "src/file_picker.rs",
+            "src/other.rs",
+            "tests/file_picker_test.rs",
+            "src/picker/file.rs",
+        ]);
+        let parser = QueryParser::default();
+        let parsed = parser.parse("filepick");
+        let ctx = ScoringContext {
+            query: &parsed,
+            max_threads: 1,
+            max_typos: 2,
+            project_path: None,
+            current_file: None,
+            last_same_query_match: None,
+            combo_boost_score_multiplier: 100,
+            min_combo_count: 3,
+            pagination: PaginationArgs::default(),
+        };
+        let idx: Vec<u32> = (0..files.len() as u32).collect();
+        let max_path = crate::matcher::max_path_len_of(&files);
+        let run = |cache: Option<&parking_lot::Mutex<MatchCache>>| {
+            fuzzy_match_and_score_subset(
+                &files,
+                idx.clone(),
+                &ctx,
+                files.len(),
+                arena,
+                arena,
+                max_path,
+                crate::parallelism::AbortToken::disabled(),
+                cache,
+                11,
+            )
+        };
+
+        let (items_a, scores_a, n_a) = run(None);
+        let cache = parking_lot::Mutex::new(MatchCache::default());
+        let (items_b, scores_b, n_b) = run(Some(&cache));
+        let (items_c, scores_c, n_c) = run(Some(&cache));
+
+        assert!(n_a > 0, "query should match at least one file");
+        assert_eq!(n_a, n_b);
+        assert_eq!(n_a, n_c);
+        let summarize = |items: &[&FileItem], scores: &[Score]| {
+            items
+                .iter()
+                .zip(scores)
+                .map(|(file, score)| (file.relative_path(arena).to_string(), format!("{score:?}")))
+                .collect::<Vec<_>>()
+        };
+        let baseline = summarize(&items_a, &scores_a);
+        assert_eq!(baseline, summarize(&items_b, &scores_b));
+        assert_eq!(baseline, summarize(&items_c, &scores_c));
+        // First cached call misses and stores; the second must hit.
+        assert_eq!(cache.lock().hits.get(), 1);
     }
 
     #[test]

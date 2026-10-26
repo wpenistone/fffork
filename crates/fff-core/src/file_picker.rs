@@ -767,6 +767,9 @@ pub struct FilePicker {
     live: parking_lot::Mutex<LiveNarrow>,
     /// Bumped whenever the file set changes so live state is dropped.
     index_generation: std::sync::atomic::AtomicU64,
+    /// Exact-repeat path-match memo for live-narrow subsets. Keyed by index
+    /// generation, query, and the exact candidate list.
+    match_cache: parking_lot::Mutex<crate::score::MatchCache>,
     /// Per-keystroke search epoch: each fuzzy search bumps it at entry,
     /// workers bail their slice when it moves. Per-picker so concurrent
     /// searches on different pickers never abort each other.
@@ -783,6 +786,7 @@ impl FilePicker {
     pub(crate) fn bump_index_generation(&self) {
         self.index_generation.fetch_add(1, Ordering::Relaxed);
         self.live.lock().active = false;
+        self.match_cache.lock().clear();
     }
 
     /// Max path byte length across live files (0 when the index is empty).
@@ -1302,6 +1306,7 @@ impl FilePicker {
             trace_id,
             live: parking_lot::Mutex::new(LiveNarrow::default()),
             index_generation: std::sync::atomic::AtomicU64::new(0),
+            match_cache: parking_lot::Mutex::new(crate::score::MatchCache::default()),
             search_epoch: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -1784,6 +1789,8 @@ impl FilePicker {
                             overflow_arena,
                             self.max_path_len(),
                             abort,
+                            Some(&self.match_cache),
+                            self.index_generation(),
                         )
                     });
                     hit_buf.clear();
