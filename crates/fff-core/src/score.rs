@@ -2582,12 +2582,13 @@ fn match_and_score_in_arena<'a>(
             .into_iter()
             .map(|Reverse(r)| (r.file, r.score))
             .collect();
-        // Equal scores order arbitrarily; among equals only reproducibility matters.
+        // Canonical page order; the heap keeps the same prefix under this key.
         results.sort_unstable_by(|a, b| {
             b.1.total
                 .cmp(&a.1.total)
                 .then_with(|| b.0.modified().cmp(&a.0.modified()))
                 .then_with(|| path_rank(a.0).cmp(&path_rank(b.0)))
+                .then_with(|| std::ptr::from_ref(a.0).cmp(&std::ptr::from_ref(b.0)))
         });
         if phase_timing {
             eprintln!(
@@ -2674,7 +2675,7 @@ fn match_and_score_in_arena<'a>(
     (results, n)
 }
 
-// Top-k heap entry: full `Ord` (total, modified, stamp) keeps the set exact.
+// Heap priority is the page order inverted; equal keys must evict the worse stamp.
 struct Ranked<'a> {
     total: i32,
     stamp: u64,
@@ -2683,7 +2684,10 @@ struct Ranked<'a> {
 }
 impl PartialEq for Ranked<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.total == other.total && self.stamp == other.stamp
+        self.total == other.total
+            && self.stamp == other.stamp
+            && self.file.modified() == other.file.modified()
+            && std::ptr::eq(self.file, other.file)
     }
 }
 impl Eq for Ranked<'_> {}
@@ -2697,7 +2701,8 @@ impl Ord for Ranked<'_> {
         self.total
             .cmp(&other.total)
             .then_with(|| self.file.modified().cmp(&other.file.modified()))
-            .then_with(|| self.stamp.cmp(&other.stamp))
+            .then_with(|| other.stamp.cmp(&self.stamp))
+            .then_with(|| std::ptr::from_ref(other.file).cmp(&std::ptr::from_ref(self.file)))
     }
 }
 
@@ -3138,7 +3143,7 @@ fn sort_and_paginate<'a>(
         sb.total
             .cmp(&sa.total)
             .then_with(|| fb.modified().cmp(&fa.modified()))
-            // Ties fall back to file address: parallel input order is scheduling-dependent.
+            .then_with(|| path_rank(fa).cmp(&path_rank(fb)))
             .then_with(|| std::ptr::from_ref(*fa).cmp(&std::ptr::from_ref(*fb)))
     };
     if use_partial_sort {
@@ -5422,6 +5427,58 @@ mod topk_prune_tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn topk_pages_are_prefixes_under_score_ties() {
+        let paths: Vec<String> = (0..200)
+            .map(|i| format!("src/mod{:02}/Handler_{:02}.rs", i % 37, i / 37))
+            .collect();
+        let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        let (mut files, arena) = make_paths(&refs);
+        for file in files.iter_mut() {
+            file.set_modified(1_700_000_000);
+        }
+        let parser = QueryParser::default();
+        let parsed = parser.parse("handler");
+        let page = |limit: usize| {
+            let ctx = ScoringContext {
+                query: &parsed,
+                max_threads: 1,
+                max_typos: 2,
+                current_file: None,
+                last_same_query_match: None,
+                project_path: None,
+                combo_boost_score_multiplier: 100,
+                min_combo_count: 3,
+                pagination: PaginationArgs { offset: 0, limit },
+            };
+            let (items, scores, _) = fuzzy_match_and_score_files(
+                &files,
+                &ctx,
+                files.len(),
+                arena,
+                arena,
+                max_path_len_of(&files),
+                crate::parallelism::AbortToken::disabled(),
+            );
+            let paths = items
+                .iter()
+                .map(|f| f.relative_path(arena))
+                .collect::<Vec<_>>();
+            let totals = scores.iter().map(|s| s.total).collect::<Vec<_>>();
+            (paths, totals)
+        };
+        let (full, full_totals) = page(0);
+        assert!(full.len() >= 128);
+        assert!(
+            full_totals[..128].iter().all(|&t| t == full_totals[0]),
+            "test needs a wide score tie"
+        );
+        for limit in [1, 2, 3, 5, 8, 16, 32, 64] {
+            let (got, _) = page(limit);
+            assert_eq!(got, full[..limit], "limit={limit}");
         }
     }
 
