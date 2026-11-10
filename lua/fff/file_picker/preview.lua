@@ -39,14 +39,26 @@ local function set_preview_filetype(bufnr, filetype)
   return ok, err
 end
 
+-- Resolved buffer names stay cached while that buffer's name is unchanged.
+local resolved_names = {}
+
+local function resolved_path(path) return vim.fn.resolve(vim.fn.fnamemodify(path, ':p')) end
+
 local function find_existing_buffer(file_path)
-  local abs_path = vim.fn.resolve(vim.fn.fnamemodify(file_path, ':p'))
+  local abs_path = resolved_path(file_path)
 
   for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
     if vim.api.nvim_buf_is_loaded(bufnr) then
       local buf_name = vim.api.nvim_buf_get_name(bufnr)
       if buf_name ~= '' then
-        local buf_path = vim.fn.resolve(vim.fn.fnamemodify(buf_name, ':p'))
+        local cached = resolved_names[bufnr]
+        local buf_path
+        if cached and cached.name == buf_name then
+          buf_path = cached.path
+        else
+          buf_path = resolved_path(buf_name)
+          resolved_names[bufnr] = { name = buf_name, path = buf_path }
+        end
         if buf_path == abs_path then return bufnr end
       end
     end
@@ -336,6 +348,23 @@ function M.setup(config)
   end
 end
 
+-- Handed from the file-info stat to the preview of that same path, then dropped.
+local handed_info = nil
+
+local function release_handed_info() handed_info = nil end
+
+local function file_info_once(file_path)
+  if handed_info and handed_info.path == file_path then return handed_info.info end
+  local info = M.get_file_info(file_path)
+  if info then handed_info = { path = file_path, info = info } end
+  return info
+end
+
+local function config_for_filetype(filetype)
+  if not M.config or not M.config.filetypes then return {} end
+  return M.config.filetypes[filetype or 'text'] or {}
+end
+
 --- Check if file is too big for initial preview (inspired by snacks.nvim)
 --- @param file_path string Path to the file
 --- @return boolean True if file is too big for initial preview
@@ -377,14 +406,16 @@ end
 --- @param bufnr number Buffer number for preview
 --- @return boolean Success status
 function M.preview_file(file_path, bufnr)
-  -- Early size detection to prevent memory issues
-  if M.is_big_file(file_path) then
-    local info = M.get_file_info(file_path)
+  -- One stat: the size gate and the filetype both read this info.
+  local info = file_info_once(file_path)
+  if not info then return false end
+
+  if info.size > M.config.max_size then
     local lines = {
       'File too large for preview',
       string.format(
         'Size: %s (max: %s)',
-        info and info.size_formatted or 'Unknown',
+        info.size_formatted or 'Unknown',
         string.format('%.1fMB', M.config.max_size / 1024 / 1024)
       ),
       '',
@@ -394,8 +425,7 @@ function M.preview_file(file_path, bufnr)
     return true
   end
 
-  local info = M.get_file_info(file_path)
-  if not info then return false end
+  local file_config = config_for_filetype(info.filetype)
 
   -- if the buffer is already opened for this file we reuse the buffer directly
   local existing_bufnr = find_existing_buffer(file_path)
@@ -403,8 +433,6 @@ function M.preview_file(file_path, bufnr)
   if existing_bufnr then
     local success = link_buffer_content(existing_bufnr, bufnr)
     if success then
-      local file_config = M.get_file_config(file_path)
-
       vim.api.nvim_set_option_value('modifiable', false, { buf = bufnr })
       vim.api.nvim_set_option_value('readonly', true, { buf = bufnr })
       vim.api.nvim_set_option_value('buftype', 'nofile', { buf = bufnr })
@@ -449,7 +477,6 @@ function M.preview_file(file_path, bufnr)
       M.clear_preview_visual_state(bufnr)
       set_buffer_lines(bufnr, content)
 
-      local file_config = M.get_file_config(file_path)
       local ok = set_preview_filetype(bufnr, info.filetype)
       if not ok then
         show_preview_unavailable(bufnr)
@@ -546,7 +573,7 @@ end
 --- @param bufnr number Buffer number for preview
 --- @return boolean Success status
 function M.preview_binary_file(file_path, bufnr)
-  local info = M.get_file_info(file_path)
+  local info = file_info_once(file_path)
   local lines = {}
 
   M.state.is_binary_preview = true
@@ -595,12 +622,7 @@ end
 --- Get file-specific configuration
 --- @param file_path string Path to the file
 --- @return table Configuration for the file
-function M.get_file_config(file_path)
-  if not M.config or not M.config.filetypes then return {} end
-
-  local filetype = utils.detect_filetype(file_path) or 'text'
-  return M.config.filetypes[filetype] or {}
-end
+function M.get_file_config(file_path) return config_for_filetype(utils.detect_filetype(file_path)) end
 
 --- @param file_path string Path to the file or directory
 --- @param bufnr number Buffer number for preview
@@ -608,7 +630,10 @@ end
 --- @param is_binary boolean|nil Whether the file is binary (from Rust indexer)
 --- @return boolean if the preview was successful
 function M.preview(file_path, bufnr, location, is_binary)
-  if not file_path or file_path == '' then return false end
+  if not file_path or file_path == '' then
+    release_handed_info()
+    return false
+  end
 
   -- Bump generation to invalidate any in-flight async callbacks from previous previews
   M.state.preview_generation = M.state.preview_generation + 1
@@ -631,17 +656,22 @@ function M.preview(file_path, bufnr, location, is_binary)
   M.state.bufnr = bufnr
   M.state.location = location
 
+  local shown
   if image.is_image(file_path) then
     M.clear_buffer(bufnr)
 
-    if not M.state.winid or not vim.api.nvim_win_is_valid(M.state.winid) then return false end
-
-    return image.display_image(file_path, bufnr)
+    if not M.state.winid or not vim.api.nvim_win_is_valid(M.state.winid) then
+      shown = false
+    else
+      shown = image.display_image(file_path, bufnr)
+    end
   elseif is_binary then
-    return M.preview_binary_file(file_path, bufnr)
+    shown = M.preview_binary_file(file_path, bufnr)
   else
-    return M.preview_file(file_path, bufnr)
+    shown = M.preview_file(file_path, bufnr)
   end
+  release_handed_info()
+  return shown
 end
 
 function M.scroll(lines)
@@ -790,7 +820,7 @@ function M.update_file_info_buffer(file, bufnr, file_index, preview_win)
     return false
   end
 
-  local info = M.get_file_info(file.relative_path)
+  local info = file_info_once(file.relative_path)
   if not info then
     set_buffer_lines(bufnr, { 'File info unavailable' })
     return false

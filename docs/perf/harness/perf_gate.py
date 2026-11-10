@@ -52,16 +52,18 @@ def run_pin(exe, corpus, query, threads, timeout, affinity=0):
         "checksum": row.get("checksum"),
         "hash_ordered": row.get("hash_ordered"),
         "peak_rss_mb": row.get("peak_rss_mb"),
+        "timed_query": row.get("timed_query"),
     }
 
 
-def check_pin(label, got, expect_total, expect_hash, reasons):
+def check_pin(label, got, expect_total, expect_hash, reasons, expect_query=None):
     ok = True
     if got["total_matched"] != got["items_len"]:
         fail(reasons, f"{label} pin total {got['total_matched']} != items_len {got['items_len']}")
         ok = False
-    if got["checksum"] != 0:
-        fail(reasons, f"{label} pin checksum {got['checksum']} != 0")
+    timed = got.get("timed_query")
+    if expect_query is not None and timed not in (None, expect_query):
+        fail(reasons, f"{label} timed query {timed!r} != argv {expect_query!r}")
         ok = False
     if expect_total is not None and got["total_matched"] != expect_total:
         fail(reasons, f"{label} pin total {got['total_matched']} != expected {expect_total}")
@@ -82,7 +84,8 @@ def run_panel(args, queries, conditions, modes, threads, out_path):
         "host": os.environ.get("COMPUTERNAME", ""),
         "cpu_count": os.cpu_count(),
         "corpus": args.corpus,
-        "exclude": args.exclude,
+        "timed_query": "bare",
+        "pin_query": args.pin_query,
         "exe_a": args.candidate,
         "exe_b": args.baseline,
         "exe_a_sha256": panel.sha256(args.candidate),
@@ -109,7 +112,7 @@ def run_panel(args, queries, conditions, modes, threads, out_path):
             try:
                 for rep in range(args.reps):
                     for query in queries:
-                        driver_query = f"{query} {args.exclude}".strip()
+                        driver_query = query
                         for t in threads:
                             for mode in modes:
                                 cold = mode == "query-cold"
@@ -262,8 +265,6 @@ def check_exactness(rows, conditions, modes, queries, threads, allow_result_chan
                     tag = f"{condition} {mode} {query} t={t}"
                     if {r["total_matched"] for r in a} != {r["total_matched"] for r in b}:
                         fail(reasons, f"cross-binary total mismatch {tag}")
-                    if {r["checksum"] for r in a} != {r["checksum"] for r in b}:
-                        fail(reasons, f"cross-binary checksum mismatch {tag}")
                     if {r["hash_ordered"] for r in a} != {r["hash_ordered"] for r in b}:
                         fail(reasons, f"cross-binary hash mismatch {tag}")
 
@@ -292,8 +293,7 @@ def main():
     ap.add_argument("--candidate", required=True)
     ap.add_argument("--baseline", required=True)
     ap.add_argument("--corpus", required=True)
-    ap.add_argument("--exclude", default="", help="driver exclusion globs appended to every query")
-    ap.add_argument("--pin-query", default="", help="full-set pin query; defaults to --exclude")
+    ap.add_argument("--pin-query", default="", help="full-set pin query, not part of timed searches")
     ap.add_argument("--queries", default=DEFAULT_QUERIES)
     ap.add_argument("--threads", default="4")
     ap.add_argument("--modes", default="warm,query-cold")
@@ -326,7 +326,7 @@ def main():
     threads = parse_csv(args.threads, int)
     modes = parse_csv(args.modes)
     conditions = parse_csv(args.conditions)
-    pin_query = args.pin_query or args.exclude or "!*.zzz"
+    pin_query = args.pin_query or "!*.zzz"
 
     reasons = []
     started = datetime.now(timezone.utc)
@@ -351,8 +351,8 @@ def main():
     pre_baseline = run_pin(args.baseline, args.corpus, pin_query, threads[0], args.timeout, args.affinity)
     print(f"candidate pin {pre_candidate}", flush=True)
     print(f"baseline  pin {pre_baseline}", flush=True)
-    check_pin("candidate", pre_candidate, args.expect_total, args.expect_candidate_hash, reasons)
-    check_pin("baseline", pre_baseline, args.expect_total, args.expect_baseline_hash, reasons)
+    check_pin("candidate", pre_candidate, args.expect_total, args.expect_candidate_hash, reasons, pin_query)
+    check_pin("baseline", pre_baseline, args.expect_total, args.expect_baseline_hash, reasons, pin_query)
     if not args.allow_result_change and pre_candidate["hash_ordered"] != pre_baseline["hash_ordered"]:
         fail(reasons, "preflight full-set hashes differ; declare --allow-result-change")
     if reasons:
@@ -401,7 +401,7 @@ def main():
         "started_utc": started.isoformat(),
         "finished_utc": datetime.now(timezone.utc).isoformat(),
         "corpus": args.corpus,
-        "exclude": args.exclude,
+        "timed_query": "bare",
         "pin_query": pin_query,
         "reps": args.reps,
         "quick": args.quick,

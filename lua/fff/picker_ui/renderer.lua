@@ -21,21 +21,37 @@ local S = picker_ui_state.state
 
 local function get_prompt_position() return layout.resolve_prompt_position(S.config) end
 
+-- Same directory text, width, and strategy already returned this string.
+local shrink_cache = {}
+local shrink_cache_n = 0
+
 local function shrink_path(path, max_width)
   local config = S.config or {}
   local strategy = config.layout and config.layout.path_shorten_strategy or 'middle_number'
-  return rust.shorten_path(path, max_width, strategy)
+  local key = strategy .. '\0' .. max_width .. '\0' .. path
+  local hit = shrink_cache[key]
+  if hit then return hit end
+  local shortened = rust.shorten_path(path, max_width, strategy)
+  if shrink_cache_n >= 1024 then
+    shrink_cache = {}
+    shrink_cache_n = 0
+  end
+  shrink_cache[key] = shortened
+  shrink_cache_n = shrink_cache_n + 1
+  return shortened
 end
 
 local function format_file_display(item, max_width)
   local filename = item.name
   if type(filename) ~= 'string' then filename = filename and tostring(filename) or '' end
-  local dir_path = item.directory or ''
-  if type(dir_path) ~= 'string' then dir_path = dir_path and tostring(dir_path) or '' end
-
-  if dir_path == '' and item.relative_path then
-    local parent_dir = vim.fn.fnamemodify(item.relative_path, ':h')
-    if parent_dir ~= '.' and parent_dir ~= '' then dir_path = parent_dir end
+  -- `directory` is already the parent. Absent means derive it once here.
+  local dir_path = item.directory
+  if type(dir_path) ~= 'string' then
+    dir_path = ''
+    if item.relative_path then
+      local parent_dir = vim.fn.fnamemodify(item.relative_path, ':h')
+      if parent_dir ~= '.' and parent_dir ~= '' then dir_path = parent_dir end
+    end
   end
 
   local filename_width = vim.fn.strdisplaywidth(filename)
@@ -43,9 +59,9 @@ local function format_file_display(item, max_width)
   local path_max_width = math.max(max_width - base_width, 0)
 
   if dir_path == '' or path_max_width == 0 then return filename, '' end
-  local display_path = shrink_path(dir_path, path_max_width)
-
-  return filename, display_path
+  -- Byte length matches Rust shorten_path: a path that fits is unchanged.
+  if #dir_path <= path_max_width then return filename, dir_path end
+  return filename, shrink_path(dir_path, path_max_width)
 end
 
 --- Adjust scroll for bottom prompt to eliminate gaps.

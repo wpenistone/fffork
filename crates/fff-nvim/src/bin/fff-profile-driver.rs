@@ -1,10 +1,5 @@
-//! July-style process-run driver with cost sensors.
-//! Usage: fff-profile-driver.exe <corpus> <query> <iterations> <threads> [jsonl_out]
-//! FFF_DRV_COLD=1 evicts the query cache with the bench's 9 dummy queries
-//! before each timed call, so every timed search runs on the full corpus.
-//! FFF_DRV_GIT=1 loads git status (default is skip_git). FFF_DRV_LIMIT=N
-//! sets the page limit (0 = all items, default 100). hash_ordered is an
-//! order-sensitive FNV-1a over every returned item's relative path.
+//! fff-profile-driver <corpus> <query> <iterations> <threads> [jsonl_out]
+//! Times the argv query only; FFF_DRV_COLD evicts outside that window. hash_ordered is path-order FNV-1a.
 
 use fff::file_picker::{FFFMode, FilePicker};
 use fff::{
@@ -17,18 +12,6 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 mod sensors {
     use std::mem::size_of;
-
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct FileTime {
-        low: u32,
-        high: u32,
-    }
-    impl FileTime {
-        fn as_u64(&self) -> u64 {
-            ((self.high as u64) << 32) | self.low as u64
-        }
-    }
 
     #[repr(C)]
     struct IoCounters {
@@ -56,13 +39,6 @@ mod sensors {
 
     unsafe extern "system" {
         fn GetCurrentProcess() -> isize;
-        fn GetProcessTimes(
-            h: isize,
-            c: *mut FileTime,
-            e: *mut FileTime,
-            k: *mut FileTime,
-            u: *mut FileTime,
-        ) -> i32;
         fn QueryProcessCycleTime(h: isize, cycles: *mut u64) -> i32;
         fn GetProcessIoCounters(h: isize, io: *mut IoCounters) -> i32;
     }
@@ -71,24 +47,23 @@ mod sensors {
         fn GetProcessMemoryInfo(h: isize, c: *mut ProcessMemoryCounters, cb: u32) -> i32;
     }
 
-    pub struct Snap {
-        pub cpu_100ns: u64,
-        pub cycles: u64,
+    pub struct Usage {
         pub read_bytes: u64,
         pub faults: u32,
         pub rss_mb: f64,
     }
 
-    pub fn snap() -> Snap {
+    pub fn cycles() -> u64 {
+        unsafe {
+            let mut cycles = 0u64;
+            QueryProcessCycleTime(GetCurrentProcess(), &mut cycles);
+            cycles
+        }
+    }
+
+    pub fn usage() -> Usage {
         unsafe {
             let h = GetCurrentProcess();
-            let mut c = FileTime { low: 0, high: 0 };
-            let mut e = FileTime { low: 0, high: 0 };
-            let mut k = FileTime { low: 0, high: 0 };
-            let mut u = FileTime { low: 0, high: 0 };
-            GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u);
-            let mut cycles = 0u64;
-            QueryProcessCycleTime(h, &mut cycles);
             let mut io = IoCounters {
                 read_op: 0,
                 write_op: 0,
@@ -111,12 +86,10 @@ mod sensors {
                 peak_pagefile: 0,
             };
             GetProcessMemoryInfo(h, &mut pm, pm.cb);
-            Snap {
-                cpu_100ns: k.as_u64() + u.as_u64(),
-                cycles,
+            Usage {
                 read_bytes: io.read_bytes,
                 faults: pm.page_faults,
-                rss_mb: pm.peak_working_set as f64 / (1024.0 * 1024.0),
+                rss_mb: pm.working_set as f64 / (1024.0 * 1024.0),
             }
         }
     }
@@ -124,22 +97,36 @@ mod sensors {
 
 #[cfg(not(windows))]
 mod sensors {
-    pub struct Snap {
-        pub cpu_100ns: u64,
-        pub cycles: u64,
+    pub struct Usage {
         pub read_bytes: u64,
         pub faults: u32,
         pub rss_mb: f64,
     }
-    pub fn snap() -> Snap {
-        Snap {
-            cpu_100ns: 0,
-            cycles: 0,
+    pub fn cycles() -> u64 {
+        0
+    }
+    pub fn usage() -> Usage {
+        Usage {
             read_bytes: 0,
             faults: 0,
             rss_mb: 0.0,
         }
     }
+}
+
+fn encode_timed(query: &str) -> String {
+    let mut out = String::with_capacity(query.len());
+    for &b in query.as_bytes() {
+        if b.is_ascii_graphic() && b != b'%' {
+            out.push(b as char);
+        } else {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0xf) as usize] as char);
+        }
+    }
+    out
 }
 
 fn fnv1a(mut h: u64, bytes: &[u8]) -> u64 {
@@ -279,9 +266,13 @@ fn main() {
     let mut last_total = 0usize;
     let mut last_len = 0usize;
     let mut hash_ordered = 0u64;
-    let mut search = || {
+    let mut path_buf = String::new();
+    let mut measure = || {
         let guard = shared_picker.read().expect("picker lock");
         let picker = guard.as_ref().expect("picker");
+        let u0 = sensors::usage();
+        let c0 = sensors::cycles();
+        let t = Instant::now();
         let result = picker.fuzzy_search(
             &parsed,
             None,
@@ -298,11 +289,22 @@ fn main() {
         last_len = result.items.len();
         let mut h = 0xcbf29ce484222325u64;
         for item in &result.items {
+            item.write_relative_path(picker, &mut path_buf);
             h = fnv1a(h, &[0xFF]);
-            h = fnv1a(h, item.relative_path(picker).as_bytes());
+            h = fnv1a(h, path_buf.as_bytes());
         }
+        let us = t.elapsed().as_secs_f64() * 1_000_000.0;
+        let cyc = sensors::cycles().saturating_sub(c0);
+        let u1 = sensors::usage();
         hash_ordered = h;
-        result.total_matched ^ result.items.len()
+        (
+            us,
+            cyc,
+            u1.read_bytes.saturating_sub(u0.read_bytes),
+            u1.faults.saturating_sub(u0.faults),
+            u1.rss_mb,
+            result.total_matched ^ result.items.len(),
+        )
     };
 
     let cold = std::env::var_os("FFF_DRV_COLD").is_some();
@@ -342,49 +344,39 @@ fn main() {
     let trace = std::env::var_os("FFF_DRV_TRACE").is_some();
     let mut checksum = 0usize;
     for i in 0..warmup {
-        let s0 = sensors::snap();
-        let t = Instant::now();
-        checksum ^= search();
-        let us = t.elapsed().as_secs_f64() * 1_000_000.0;
-        let s1 = sensors::snap();
+        let (us, cyc, _, _, _, ident) = measure();
+        checksum ^= ident;
         if trace {
-            eprintln!(
-                "WARM i={i} us={us:.1} cyc={}",
-                s1.cycles.saturating_sub(s0.cycles)
-            );
+            eprintln!("WARM i={i} us={us:.1} cyc={cyc}");
         }
     }
 
     let mut per_op: Vec<f64> = Vec::with_capacity(iterations);
     let mut acc_us = 0.0f64;
-    let mut acc_cpu_100ns = 0u64;
     let mut acc_cycles = 0u64;
     let mut acc_read = 0u64;
     let mut acc_faults = 0u64;
+    let mut query_rss_mb = 0.0f64;
     for i in 0..iterations {
         if cold {
             for p in &evict_parsed {
                 evict(p);
             }
         }
-        let s0 = sensors::snap();
-        let t = Instant::now();
-        checksum = checksum.wrapping_add(search());
-        let us = t.elapsed().as_secs_f64() * 1_000_000.0;
-        let s1 = sensors::snap();
+        let (us, cyc, read, faults, rss, ident) = measure();
+        checksum = checksum.wrapping_add(ident);
         if trace {
             eprintln!(
-                "TIMED i={i} cold={} us={us:.1} cyc={}",
-                cold as u8,
-                s1.cycles.saturating_sub(s0.cycles)
+                "TIMED i={i} cold={} us={us:.1} cyc={cyc}",
+                cold as u8
             );
         }
         per_op.push(us);
         acc_us += us;
-        acc_cpu_100ns += s1.cpu_100ns.saturating_sub(s0.cpu_100ns);
-        acc_cycles += s1.cycles.saturating_sub(s0.cycles);
-        acc_read += s1.read_bytes.saturating_sub(s0.read_bytes);
-        acc_faults += s1.faults.saturating_sub(s0.faults) as u64;
+        acc_cycles += cyc;
+        acc_read += read;
+        acc_faults += faults as u64;
+        query_rss_mb = query_rss_mb.max(rss);
     }
 
     if let Some(path) = std::env::var_os("FFF_DRV_DUMP") {
@@ -412,23 +404,21 @@ fn main() {
     } else {
         (pct(0.50), pct(0.90), pct(0.99), per_op[per_op.len() - 1])
     };
-    let cpu_us_per_op = acc_cpu_100ns as f64 / 10.0 / n;
     let cycles_per_op = acc_cycles as f64 / n;
     let read_b_op = acc_read as f64 / n;
     let faults_per_100k = acc_faults as f64 / n * 100_000.0;
-    let s_end = sensors::snap();
 
+    let timed_query = encode_timed(query);
+    let query_json = json_escape(query);
     println!(
-        "query={query} threads={threads} iterations={iterations} cold={} us_per_op={us_per_op:.3} p50_us={p50:.3} p90_us={p90:.3} p99_us={p99:.3} max_us={max_us:.3} cpu_us_per_op={cpu_us_per_op:.3} cycles_per_op={cycles_per_op:.0} read_b_op={read_b_op:.2} faults_per_100k={faults_per_100k:.1} peak_rss_mb={:.2} checksum={checksum} total_matched={last_total} items_len={last_len} hash_ordered={hash_ordered:016x}",
-        cold as u8,
-        s_end.rss_mb
+        "query={query} timed={timed_query} threads={threads} iterations={iterations} cold={} us_per_op={us_per_op:.3} p50_us={p50:.3} p90_us={p90:.3} p99_us={p99:.3} max_us={max_us:.3} cycles_per_op={cycles_per_op:.0} read_b_op={read_b_op:.2} faults_per_100k={faults_per_100k:.1} peak_rss_mb={query_rss_mb:.2} checksum={checksum} total_matched={last_total} items_len={last_len} hash_ordered={hash_ordered:016x}",
+        cold as u8
     );
 
     if let Some(path) = jsonl {
         let line = format!(
-            "{{\"query\":\"{query}\",\"threads\":{threads},\"iterations\":{iterations},\"cold\":{},\"us_per_op\":{us_per_op:.3},\"p50_us\":{p50:.3},\"p90_us\":{p90:.3},\"p99_us\":{p99:.3},\"max_us\":{max_us:.3},\"cpu_us_per_op\":{cpu_us_per_op:.3},\"cycles_per_op\":{cycles_per_op:.0},\"read_bytes\":{acc_read},\"faults\":{acc_faults},\"peak_rss_mb\":{:.2},\"checksum\":{checksum},\"hash_ordered\":\"{hash_ordered:016x}\",\"items_len\":{last_len}}}",
-            cold as u8,
-            s_end.rss_mb
+            "{{\"query\":\"{query_json}\",\"timed_query\":\"{query_json}\",\"threads\":{threads},\"iterations\":{iterations},\"cold\":{},\"us_per_op\":{us_per_op:.3},\"p50_us\":{p50:.3},\"p90_us\":{p90:.3},\"p99_us\":{p99:.3},\"max_us\":{max_us:.3},\"cycles_per_op\":{cycles_per_op:.0},\"read_bytes\":{acc_read},\"faults\":{acc_faults},\"peak_rss_mb\":{query_rss_mb:.2},\"checksum\":{checksum},\"hash_ordered\":\"{hash_ordered:016x}\",\"items_len\":{last_len}}}",
+            cold as u8
         );
         use std::io::Write;
         if let Ok(mut f) = std::fs::OpenOptions::new()

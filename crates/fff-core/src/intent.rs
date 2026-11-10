@@ -148,26 +148,66 @@ pub fn filename_words(name: &str) -> Vec<&str> {
 
 /// Visit word tokens without allocating.
 pub fn for_each_word<'a>(name: &'a str, mut f: impl FnMut(&'a str)) {
+    let _ = for_each_word_until(name, |w| {
+        f(w);
+        true
+    });
+}
+
+// One load: separator, `A..=Z`, `a..=z`, or digit.
+const WORD_SEP: u8 = 1;
+const WORD_UPPER: u8 = 2;
+const WORD_LOWER: u8 = 4;
+const WORD_DIGIT: u8 = 8;
+const WORD_CLASS: [u8; 256] = {
+    let mut t = [0u8; 256];
+    let mut i = 0u16;
+    while i < 256 {
+        let b = i as u8;
+        let class = if b == b'_' || b == b'-' || b == b'.' || b == b' ' {
+            WORD_SEP
+        } else if b >= b'A' && b <= b'Z' {
+            WORD_UPPER
+        } else if b >= b'a' && b <= b'z' {
+            WORD_LOWER
+        } else if b >= b'0' && b <= b'9' {
+            WORD_DIGIT
+        } else {
+            0
+        };
+        t[i as usize] = class;
+        i += 1;
+    }
+    t
+};
+
+// `f` returns false to stop. Tokens match `for_each_word`.
+fn for_each_word_until<'a>(name: &'a str, mut f: impl FnMut(&'a str) -> bool) -> bool {
     let mut start = 0usize;
     let bytes = name.as_bytes();
     let mut prev_lower_or_digit = false;
     let mut prev_upper = false;
     for (i, &b) in bytes.iter().enumerate() {
-        let is_sep = b == b'_' || b == b'-' || b == b'.' || b == b' ';
-        let is_upper = b.is_ascii_uppercase();
-        let is_lower_or_digit = b.is_ascii_lowercase() || b.is_ascii_digit();
+        let class = WORD_CLASS[b as usize];
+        let next_class = if i + 1 < bytes.len() {
+            WORD_CLASS[bytes[i + 1] as usize]
+        } else {
+            0
+        };
+        let is_sep = class & WORD_SEP != 0;
+        let is_upper = class & WORD_UPPER != 0;
+        let is_lower_or_digit = class & (WORD_LOWER | WORD_DIGIT) != 0;
         let camel_break = prev_lower_or_digit && is_upper;
-        let acronym_break =
-            prev_upper && is_upper && i + 1 < bytes.len() && bytes[i + 1].is_ascii_lowercase();
+        let acronym_break = prev_upper && is_upper && next_class & WORD_LOWER != 0;
         if i > start && (is_sep || camel_break || acronym_break) {
             if !is_sep {
-                if i > start {
-                    f(&name[start..i]);
+                if i > start && !f(&name[start..i]) {
+                    return false;
                 }
                 start = i;
             } else {
-                if i > start {
-                    f(&name[start..i]);
+                if i > start && !f(&name[start..i]) {
+                    return false;
                 }
                 start = i + 1;
             }
@@ -180,9 +220,10 @@ pub fn for_each_word<'a>(name: &'a str, mut f: impl FnMut(&'a str)) {
             prev_upper = is_upper;
         }
     }
-    if start < name.len() {
-        f(&name[start..]);
+    if start < name.len() && !f(&name[start..]) {
+        return false;
     }
+    true
 }
 
 // Cheap typo proxy: long identifier, mixed case noise, or uncommon bigrams.
@@ -207,153 +248,363 @@ fn looks_like_typo(q: &str) -> bool {
     }
     false
 }
-// Case-insensitive substring without allocating; screens on the first
-// byte so mismatches cost one compare per offset.
+// `lower` is ASCII-lowercase query bytes. Haystack folds; the needle does not.
 #[inline]
-pub(crate) fn contains_ignore_ascii(hay: &str, needle: &str) -> bool {
+fn eq_ascii_lower(hay: &[u8], lower: &[u8]) -> bool {
+    hay.len() == lower.len()
+        && unsafe { crate::simd_string_utils::case::eq_lowered_case(hay.as_ptr(), lower) }
+}
+
+#[inline]
+fn contains_ascii_lower(hay: &str, needle_lower: &str) -> bool {
     let h = hay.as_bytes();
-    let n = needle.as_bytes();
+    let n = needle_lower.as_bytes();
     if n.is_empty() {
         return true;
     }
     if n.len() > h.len() {
         return false;
     }
-    let lo = n[0].to_ascii_lowercase();
-    let up = n[0].to_ascii_uppercase();
-    let last = h.len() - n.len();
-    for i in 0..=last {
-        let c = h[i];
-        if c != lo && c != up {
-            continue;
-        }
-        if h[i..i + n.len()].eq_ignore_ascii_case(n) {
+    let lo = n[0];
+    let up = lo.to_ascii_uppercase();
+    let mut rest = h;
+    while rest.len() >= n.len() {
+        let span = &rest[..rest.len() - n.len() + 1];
+        let rel = if lo == up {
+            memchr::memchr(lo, span)
+        } else {
+            memchr::memchr2(lo, up, span)
+        };
+        let Some(rel) = rel else {
+            return false;
+        };
+        if eq_ascii_lower(&rest[rel..rel + n.len()], n) {
             return true;
         }
+        rest = &rest[rel + 1..];
     }
     false
 }
 
+// Needle is ASCII-lowercase. Haystack folds; the needle does not.
+#[inline]
+pub(crate) fn contains_ignore_ascii(hay: &str, needle: &str) -> bool {
+    contains_ascii_lower(hay, needle)
+}
+
+// Suffix is ASCII-lowercase. Haystack folds; the suffix does not.
 #[inline]
 pub(crate) fn ends_with_ignore_ascii(hay: &str, suffix: &str) -> bool {
     let h = hay.as_bytes();
     let s = suffix.as_bytes();
-    h.len() >= s.len() && h[h.len() - s.len()..].eq_ignore_ascii_case(s)
+    h.len() >= s.len() && eq_ascii_lower(&h[h.len() - s.len()..], s)
 }
 
+// `options` are ASCII-lowercase.
 #[inline]
 fn matches_ignore_ascii(hay: &str, options: &[&str]) -> bool {
-    options.iter().any(|o| hay.eq_ignore_ascii_case(o))
+    let h = hay.as_bytes();
+    options.iter().any(|o| eq_ascii_lower(h, o.as_bytes()))
 }
 
-/// File role from a filename (not the full path). Allocation-free: this runs
-/// once per candidate, and the lowercase copy it used to build showed up as
-/// ~20ns of the per-candidate evidence cost.
+/// File role from a filename (not the full path).
 pub fn role_of_filename(fname: &str) -> FileRole {
-    if ends_with_ignore_ascii(fname, "_test.rs")
-        || ends_with_ignore_ascii(fname, ".test.ts")
-        || ends_with_ignore_ascii(fname, ".test.tsx")
-        || ends_with_ignore_ascii(fname, ".test.js")
-        || ends_with_ignore_ascii(fname, ".spec.ts")
-        || ends_with_ignore_ascii(fname, ".spec.js")
-        || ends_with_ignore_ascii(fname, ".spec.rs")
-        || contains_ignore_ascii(fname, "_test.")
-        || contains_ignore_ascii(fname, "/tests/")
-    {
-        return FileRole::Test;
+    if is_test_filename(fname) {
+        FileRole::Test
+    } else if is_entrypoint_filename(fname) {
+        FileRole::Entrypoint
+    } else if is_type_filename(fname) {
+        FileRole::Type
+    } else if is_config_filename(fname) {
+        FileRole::Config
+    } else if is_style_filename(fname) {
+        FileRole::Style
+    } else if is_doc_filename(fname) {
+        FileRole::Doc
+    } else {
+        FileRole::Other
     }
-    if matches_ignore_ascii(
-        fname,
-        &[
-            "mod.rs",
-            "index.ts",
-            "index.tsx",
-            "index.js",
-            "index.jsx",
-            "main.rs",
-            "main.go",
-            "main.py",
-            "app.rs",
-            "lib.rs",
-            "__init__.py",
-            "main.cpp",
-            "main.c",
-            "main.ts",
-            "main.js",
-        ],
-    ) {
-        return FileRole::Entrypoint;
+}
+
+fn role_is(fname: &str, want: FileRole) -> bool {
+    let hit = match want {
+        FileRole::Test => return is_test_filename(fname),
+        FileRole::Entrypoint => is_entrypoint_filename(fname),
+        FileRole::Type => is_type_filename(fname),
+        FileRole::Config => is_config_filename(fname),
+        FileRole::Style => is_style_filename(fname),
+        FileRole::Doc => is_doc_filename(fname),
+        FileRole::Other => return role_of_filename(fname) == FileRole::Other,
+    };
+    if !hit {
+        return false;
     }
-    if ends_with_ignore_ascii(fname, ".d.ts")
-        || ends_with_ignore_ascii(fname, "_pb.rs")
+    match want {
+        FileRole::Entrypoint => !is_test_filename(fname),
+        FileRole::Type => !is_test_filename(fname) && !is_entrypoint_filename(fname),
+        FileRole::Config => {
+            !is_test_filename(fname) && !is_entrypoint_filename(fname) && !is_type_filename(fname)
+        }
+        FileRole::Style => {
+            !is_test_filename(fname)
+                && !is_entrypoint_filename(fname)
+                && !is_type_filename(fname)
+                && !is_config_filename(fname)
+        }
+        FileRole::Doc => {
+            !is_test_filename(fname)
+                && !is_entrypoint_filename(fname)
+                && !is_type_filename(fname)
+                && !is_config_filename(fname)
+                && !is_style_filename(fname)
+        }
+        FileRole::Test | FileRole::Other => true,
+    }
+}
+
+fn is_test_filename(fname: &str) -> bool {
+    let n = fname.len();
+    if n < 6 {
+        return false;
+    }
+    if n >= 8 {
+        let hit = match fname.as_bytes().last() {
+            Some(b's' | b'S') => {
+                ends_with_ignore_ascii(fname, "_test.rs")
+                    || ends_with_ignore_ascii(fname, ".test.ts")
+                    || ends_with_ignore_ascii(fname, ".test.js")
+                    || ends_with_ignore_ascii(fname, ".spec.ts")
+                    || ends_with_ignore_ascii(fname, ".spec.js")
+                    || ends_with_ignore_ascii(fname, ".spec.rs")
+            }
+            Some(b'x' | b'X') => ends_with_ignore_ascii(fname, ".test.tsx"),
+            _ => false,
+        };
+        if hit {
+            return true;
+        }
+    }
+    // `_` and `/` have no case pair; one pass covers both markers.
+    contains_test_marker(fname.as_bytes())
+}
+
+fn contains_test_marker(hay: &[u8]) -> bool {
+    let mut rest = hay;
+    let mut base = 0usize;
+    while let Some(rel) = memchr::memchr2(b'_', b'/', rest) {
+        let i = base + rel;
+        if rest[rel] == b'_' && i + 6 <= hay.len() && eq_ascii_lower(&hay[i..i + 6], b"_test.") {
+            return true;
+        }
+        if rest[rel] == b'/' && i + 7 <= hay.len() && eq_ascii_lower(&hay[i..i + 7], b"/tests/") {
+            return true;
+        }
+        let next = rel + 1;
+        if next > rest.len() {
+            break;
+        }
+        rest = &rest[next..];
+        base += next;
+    }
+    false
+}
+
+fn is_entrypoint_filename(fname: &str) -> bool {
+    let b = fname.as_bytes();
+    let Some(&first) = b.first() else {
+        return false;
+    };
+    // The open set is grouped by the first byte so other names miss in one load.
+    match first {
+        b'm' | b'M' => matches_ignore_ascii(
+            fname,
+            &[
+                "mod.rs", "main.rs", "main.go", "main.py", "main.cpp", "main.c", "main.ts",
+                "main.js",
+            ],
+        ),
+        b'i' | b'I' => {
+            matches_ignore_ascii(fname, &["index.ts", "index.tsx", "index.js", "index.jsx"])
+        }
+        b'a' | b'A' => matches_ignore_ascii(fname, &["app.rs"]),
+        b'l' | b'L' => matches_ignore_ascii(fname, &["lib.rs"]),
+        b'_' => matches_ignore_ascii(fname, &["__init__.py"]),
+        _ => false,
+    }
+}
+
+fn is_type_filename(fname: &str) -> bool {
+    let suffix = fname
+        .as_bytes()
+        .last()
+        .is_some_and(|b| matches!(b, b's' | b'S'));
+    (suffix
+        && (ends_with_ignore_ascii(fname, ".d.ts")
+            || ends_with_ignore_ascii(fname, "_pb.rs")
+            || ends_with_ignore_ascii(fname, "type.ts")
+            || ends_with_ignore_ascii(fname, "type.rs")))
         || contains_ignore_ascii(fname, "types")
-        || ends_with_ignore_ascii(fname, "type.ts")
-        || ends_with_ignore_ascii(fname, "type.rs")
-    {
-        return FileRole::Type;
+}
+
+fn is_config_filename(fname: &str) -> bool {
+    match fname.as_bytes().last() {
+        Some(b'l' | b'L') => {
+            ends_with_ignore_ascii(fname, ".toml")
+                || ends_with_ignore_ascii(fname, ".yaml")
+                || ends_with_ignore_ascii(fname, ".yml")
+        }
+        Some(b'n' | b'N') => ends_with_ignore_ascii(fname, ".json"),
+        Some(b'i' | b'I') => ends_with_ignore_ascii(fname, ".ini"),
+        Some(b'e' | b'E') => matches_ignore_ascii(fname, &["makefile", "dockerfile"]),
+        _ => false,
     }
-    if ends_with_ignore_ascii(fname, ".toml")
-        || ends_with_ignore_ascii(fname, ".yaml")
-        || ends_with_ignore_ascii(fname, ".yml")
-        || ends_with_ignore_ascii(fname, ".json")
-        || ends_with_ignore_ascii(fname, ".ini")
-        || matches_ignore_ascii(fname, &["makefile", "dockerfile"])
-    {
-        return FileRole::Config;
+}
+
+fn is_style_filename(fname: &str) -> bool {
+    match fname.as_bytes().last() {
+        Some(b's' | b'S') => {
+            ends_with_ignore_ascii(fname, ".css")
+                || ends_with_ignore_ascii(fname, ".scss")
+                || ends_with_ignore_ascii(fname, ".less")
+        }
+        Some(b'l' | b'L') => ends_with_ignore_ascii(fname, ".styl"),
+        _ => false,
     }
-    if ends_with_ignore_ascii(fname, ".css")
-        || ends_with_ignore_ascii(fname, ".scss")
-        || ends_with_ignore_ascii(fname, ".less")
-        || ends_with_ignore_ascii(fname, ".styl")
-    {
-        return FileRole::Style;
+}
+
+fn is_doc_filename(fname: &str) -> bool {
+    match fname.as_bytes().last() {
+        Some(b'd' | b'D') => ends_with_ignore_ascii(fname, ".md"),
+        Some(b't' | b'T') => {
+            ends_with_ignore_ascii(fname, ".rst") || ends_with_ignore_ascii(fname, ".txt")
+        }
+        _ => false,
     }
-    if ends_with_ignore_ascii(fname, ".md")
-        || ends_with_ignore_ascii(fname, ".rst")
-        || ends_with_ignore_ascii(fname, ".txt")
-    {
-        return FileRole::Doc;
-    }
-    FileRole::Other
 }
 
 /// Implied role from a concept query (e.g. "test", "config", "types").
 pub fn implied_role_from_query(q: &str) -> Option<FileRole> {
-    let s = q.to_ascii_lowercase();
-    match s.as_str() {
-        "test" | "tests" | "spec" | "specs" => Some(FileRole::Test),
-        "config" | "conf" | "settings" => Some(FileRole::Config),
-        "types" | "type" | "defs" => Some(FileRole::Type),
-        "css" | "style" | "styles" => Some(FileRole::Style),
-        "doc" | "docs" | "readme" => Some(FileRole::Doc),
-        "main" | "index" | "mod" | "app" | "lib" => Some(FileRole::Entrypoint),
-        _ => None,
+    if matches_ignore_ascii(q, &["test", "tests", "spec", "specs"]) {
+        Some(FileRole::Test)
+    } else if matches_ignore_ascii(q, &["config", "conf", "settings"]) {
+        Some(FileRole::Config)
+    } else if matches_ignore_ascii(q, &["types", "type", "defs"]) {
+        Some(FileRole::Type)
+    } else if matches_ignore_ascii(q, &["css", "style", "styles"]) {
+        Some(FileRole::Style)
+    } else if matches_ignore_ascii(q, &["doc", "docs", "readme"]) {
+        Some(FileRole::Doc)
+    } else if matches_ignore_ascii(q, &["main", "index", "mod", "app", "lib"]) {
+        Some(FileRole::Entrypoint)
+    } else {
+        None
     }
 }
 
 /// Segment-boundary coverage: how many query segments match path components.
 pub fn segment_boundary_evidence(path: &str, q: &PathTokens<'_>) -> (bool, u8, bool) {
-    if q.segments.is_empty() {
+    segment_boundary_with(path, &q.segments, |c, s| {
+        c.len() == s.len() && crate::simd_path::eq_ignore_ascii_bytes(c.as_bytes(), s.as_bytes())
+    })
+}
+
+fn segment_boundary_with(
+    path: &str,
+    segments: &[&str],
+    mut eq_seg: impl FnMut(&str, &str) -> bool,
+) -> (bool, u8, bool) {
+    if segments.is_empty() {
         return (false, 0, false);
     }
-    let sep = if path.contains('\\') { '\\' } else { '/' };
-    let last_q = q.segments.last().copied().unwrap_or("");
-    // One pass, no component vec: track the subsequence cursor and the
-    // last component for the exact-last-segment test.
+    let bytes = path.as_bytes();
+    let last_q = segments.last().copied().unwrap_or("");
     let mut qi = 0usize;
-    let mut hits = 0usize;
     let mut last = "";
-    for c in path.split(sep).filter(|s| !s.is_empty()) {
-        last = c;
-        if qi < q.segments.len() && c.eq_ignore_ascii_case(q.segments[qi]) {
-            qi += 1;
-            hits += 1;
+    let mut start = 0usize;
+    let mut rest = bytes;
+    let mut base = 0usize;
+    loop {
+        let Some(rel) = memchr::memchr2(b'/', b'\\', rest) else {
+            if start < bytes.len() {
+                let c = &path[start..];
+                last = c;
+                if qi < segments.len() && eq_seg(c, segments[qi]) {
+                    qi += 1;
+                }
+            }
+            break;
+        };
+        let i = base + rel;
+        if bytes[i] == b'\\' {
+            return segment_boundary_sep(path, segments, b'\\', &mut eq_seg);
         }
+        if start < i {
+            let c = &path[start..i];
+            last = c;
+            if qi < segments.len() && eq_seg(c, segments[qi]) {
+                qi += 1;
+            }
+        }
+        start = i + 1;
+        let next = rel + 1;
+        rest = &rest[next..];
+        base += next;
     }
-    let last_match = !last.is_empty() && last.eq_ignore_ascii_case(last_q);
-    let sequence = qi == q.segments.len();
-    let pct = (hits * 100 / q.segments.len()).min(100) as u8;
+    let last_match = !last.is_empty() && eq_seg(last, last_q);
+    let sequence = qi == segments.len();
+    let pct = (qi * 100 / segments.len()) as u8;
     (last_match, pct, sequence)
+}
+
+// A backslash selects `\` only, including components already seen as slashes.
+fn segment_boundary_sep(
+    path: &str,
+    segments: &[&str],
+    sep: u8,
+    eq_seg: &mut impl FnMut(&str, &str) -> bool,
+) -> (bool, u8, bool) {
+    let last_q = segments.last().copied().unwrap_or("");
+    let mut qi = 0usize;
+    let mut last = "";
+    let bytes = path.as_bytes();
+    let mut start = 0usize;
+    let mut rest = bytes;
+    let mut base = 0usize;
+    loop {
+        let Some(rel) = memchr::memchr(sep, rest) else {
+            if start < bytes.len() {
+                let c = &path[start..];
+                last = c;
+                if qi < segments.len() && eq_seg(c, segments[qi]) {
+                    qi += 1;
+                }
+            }
+            break;
+        };
+        let i = base + rel;
+        if start < i {
+            let c = &path[start..i];
+            last = c;
+            if qi < segments.len() && eq_seg(c, segments[qi]) {
+                qi += 1;
+            }
+        }
+        start = i + 1;
+        let next = rel + 1;
+        rest = &rest[next..];
+        base += next;
+    }
+    let last_match = !last.is_empty() && eq_seg(last, last_q);
+    let sequence = qi == segments.len();
+    let pct = (qi * 100 / segments.len()) as u8;
+    (last_match, pct, sequence)
+}
+
+// `part` is a subslice of `query`. `lower` is that query ASCII-lowercased.
+#[inline]
+pub(crate) fn query_part_lower<'a>(query: &str, lower: &'a str, part: &str) -> &'a [u8] {
+    let start = (part.as_ptr() as usize).wrapping_sub(query.as_ptr() as usize);
+    &lower.as_bytes()[start..start + part.len()]
 }
 
 /// Word coverage: percent of query tokens found in filename words.
@@ -372,18 +623,88 @@ pub fn word_coverage(fname: &str, query: &str) -> u8 {
     word_coverage_prepared(fname, &qwords[..qn])
 }
 
+fn word_coverage_one_lower(fname: &str, q_lower: &[u8]) -> u8 {
+    let mut hit = false;
+    for_each_word_until(fname, |fw| {
+        let h = fw.as_bytes();
+        if h.len() >= q_lower.len() && eq_ascii_lower(&h[..q_lower.len()], q_lower) {
+            hit = true;
+            return false;
+        }
+        true
+    });
+    if hit { 100 } else { 0 }
+}
+
 pub(crate) fn word_coverage_prepared(fname: &str, qwords: &[&str]) -> u8 {
-    if qwords.is_empty() {
+    let n = qwords.len();
+    if n == 0 {
         return 0;
     }
+    // One filename walk for every query word. Above 128 words, rescan.
+    if n > 128 {
+        return word_coverage_each_word(fname, qwords);
+    }
+    let mut seen = 0u128;
     let mut hits = 0usize;
-    for qw in qwords.iter() {
+    for_each_word_until(fname, |fw| {
+        for (i, qw) in qwords.iter().enumerate() {
+            let bit = 1u128 << (i as u32);
+            if seen & bit != 0 {
+                continue;
+            }
+            // Exact equality is a prefix match.
+            if starts_with_ignore_ascii(fw, qw) {
+                seen |= bit;
+                hits += 1;
+                if hits == n {
+                    return false;
+                }
+            }
+        }
+        true
+    });
+    // At most one hit per query word, so this percent is already <= 100.
+    (hits * 100 / n) as u8
+}
+
+// Query words are already ASCII-lowercase. Folds filename bytes only.
+fn word_coverage_folded(fname: &str, qwords: &[&[u8]]) -> u8 {
+    let n = qwords.len();
+    if n == 0 {
+        return 0;
+    }
+    let mut seen = 0u128;
+    let mut hits = 0usize;
+    for_each_word_until(fname, |fw| {
+        let h = fw.as_bytes();
+        for (i, qw) in qwords.iter().enumerate() {
+            let bit = 1u128 << (i as u32);
+            if seen & bit != 0 {
+                continue;
+            }
+            if qw.len() <= h.len() && eq_ascii_lower(&h[..qw.len()], qw) {
+                seen |= bit;
+                hits += 1;
+                if hits == n {
+                    return false;
+                }
+            }
+        }
+        true
+    });
+    (hits * 100 / n) as u8
+}
+
+fn word_coverage_each_word(fname: &str, qwords: &[&str]) -> u8 {
+    let mut hits = 0usize;
+    for qw in qwords {
         let mut found = false;
         for_each_word(fname, |fw| {
             if found {
                 return;
             }
-            if fw.eq_ignore_ascii_case(qw) || starts_with_ignore_ascii(fw, qw) {
+            if starts_with_ignore_ascii(fw, qw) {
                 found = true;
             }
         });
@@ -391,7 +712,7 @@ pub(crate) fn word_coverage_prepared(fname: &str, qwords: &[&str]) -> u8 {
             hits += 1;
         }
     }
-    (hits * 100 / qwords.len()).min(100) as u8
+    (hits * 100 / qwords.len()) as u8
 }
 
 // Case-insensitive prefix test without allocating.
@@ -401,7 +722,7 @@ fn starts_with_ignore_ascii(hay: &str, prefix: &str) -> bool {
     if p.len() > h.len() {
         return false;
     }
-    h[..p.len()].eq_ignore_ascii_case(p)
+    crate::simd_path::eq_ignore_ascii_bytes(&h[..p.len()], p)
 }
 
 /// Mix evidence into a score delta for a given intent. `base` is the SW
@@ -469,31 +790,41 @@ pub fn evidence_bonus(intent: QueryIntent, ev: &Evidence, base: i32) -> i32 {
     x
 }
 
-/// Query-side state that is identical for every candidate. Built once per
-/// query so the per-candidate evidence pass does no heap allocation: the
-/// lowercased query and its stem used to be rebuilt for every file, which on
-/// a 100k-match query was most of the scoring cost.
+/// Query-side state built once per search. Per-file evidence borrows it
+/// and does not allocate.
 pub struct PreparedQuery<'a> {
     pub query: &'a str,
     pub lower: String,
     pub name_ext: Option<NameExt<'a>>,
-    pub stem_lower: Option<String>,
     pub wants_role: Option<FileRole>,
     pub qwords: [&'a str; 12],
+    /// Start of `qwords[i]` in both `query` and `lower`.
+    pub qword_at: [u32; 12],
     pub qword_count: usize,
     pub path_tokens: Option<PathTokens<'a>>,
+}
+
+// The folded query. The next search reuses this allocation.
+thread_local! {
+    static LOWER_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
 impl<'a> PreparedQuery<'a> {
     pub fn new(query: &'a str) -> Self {
         let query = query.trim();
         let name_ext = split_name_ext(query);
-        let stem_lower = name_ext.as_ref().map(|ne| ne.stem.to_ascii_lowercase());
+        let mut lower = LOWER_BUF.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+        lower.clear();
+        lower.push_str(query);
+        lower.make_ascii_lowercase();
         let mut qwords: [&'a str; 12] = [""; 12];
+        let mut qword_at = [0u32; 12];
         let mut qword_count = 0usize;
+        let qptr = query.as_ptr() as usize;
         for_each_word(query, |w| {
             if qword_count < qwords.len() {
                 qwords[qword_count] = w;
+                qword_at[qword_count] = (w.as_ptr() as usize).wrapping_sub(qptr) as u32;
                 qword_count += 1;
             }
         });
@@ -504,14 +835,27 @@ impl<'a> PreparedQuery<'a> {
         };
         Self {
             query,
-            lower: query.to_ascii_lowercase(),
+            lower,
             name_ext,
-            stem_lower,
             wants_role: implied_role_from_query(query),
             qwords,
+            qword_at,
             qword_count,
             path_tokens,
         }
+    }
+}
+
+impl Drop for PreparedQuery<'_> {
+    fn drop(&mut self) {
+        let mut lower = std::mem::take(&mut self.lower);
+        lower.clear();
+        LOWER_BUF.with(|slot| {
+            let slot = &mut *slot.borrow_mut();
+            if lower.capacity() > slot.capacity() {
+                *slot = lower;
+            }
+        });
     }
 }
 
@@ -557,7 +901,9 @@ pub fn evidence_prepared(
         };
         let cur_dir = cur.rsplit_once(sep).map(|(d, _)| d).unwrap_or("");
         let hit_dir = relative_path.rsplit_once(sep).map(|(d, _)| d).unwrap_or("");
-        ev.same_dir = !cur_dir.is_empty() && cur_dir.eq_ignore_ascii_case(hit_dir);
+        ev.same_dir = !cur_dir.is_empty()
+            && cur_dir.len() == hit_dir.len()
+            && crate::simd_path::eq_ignore_ascii_bytes(cur_dir.as_bytes(), hit_dir.as_bytes());
         let cur_fname = cur.rsplit(['/', '\\']).next().unwrap_or(cur);
         ev.related = is_related_filename(filename, cur_fname);
     }
@@ -569,29 +915,44 @@ pub fn evidence_prepared(
     // filename_substring are dead there, so skip those scans.
     let want_name = intent != QueryIntent::Path;
     if let Some(ne) = pq.name_ext.as_ref() {
-        ev.ext_match = filename
-            .rsplit_once('.')
-            .map(|(_, e)| e.eq_ignore_ascii_case(&ne.ext[1..]))
-            .unwrap_or(false);
-        ev.ext_mismatch = !ev.ext_match && filename.contains('.');
+        let q_stem_len = ne.stem.len();
+        let q_stem = &pq.lower.as_bytes()[..q_stem_len];
+        let q_ext = &pq.lower.as_bytes()[q_stem_len + 1..];
+        let (stem, ext, has_dot) = stem_and_ext(filename);
+        // One dot split. Stem plus extension is the whole basename.
+        ev.ext_match = has_dot && eq_ascii_lower(ext.as_bytes(), q_ext);
+        ev.ext_mismatch = !ev.ext_match && has_dot;
         if want_name {
-            let stem_matches = filename_stem(filename).eq_ignore_ascii_case(ne.stem);
-            ev.exact_filename = filename.eq_ignore_ascii_case(q) || (stem_matches && ev.ext_match);
-            ev.filename_substring =
-                contains_ignore_ascii(filename, pq.stem_lower.as_deref().unwrap_or_default());
+            let stem_matches = eq_ascii_lower(stem.as_bytes(), q_stem);
+            ev.exact_filename = stem_matches && ev.ext_match;
+            let stem_l = &pq.lower[..q_stem_len];
+            ev.filename_substring = stem_matches || contains_ascii_lower(filename, stem_l);
         }
     } else if want_name {
-        // Bare name query: stem equality signals the file, not containment.
-        let stem = filename_stem(filename);
-        ev.exact_filename = filename.eq_ignore_ascii_case(q) || stem.eq_ignore_ascii_case(q);
-        ev.filename_substring = contains_ignore_ascii(filename, &pq.lower);
+        // Bare name: exact stem or basename is a substring, so a miss skips both compares.
+        let sub = contains_ascii_lower(filename, &pq.lower);
+        ev.filename_substring = sub;
+        if sub {
+            let q_lower = pq.lower.as_bytes();
+            ev.exact_filename = if eq_ascii_lower(filename.as_bytes(), q_lower) {
+                true
+            } else {
+                let (stem, _, has_dot) = stem_and_ext(filename);
+                has_dot && eq_ascii_lower(stem.as_bytes(), q_lower)
+            };
+        }
     }
 
     // Path structure
     #[allow(clippy::collapsible_if)]
     if intent == QueryIntent::Path {
         if let Some(pt) = pq.path_tokens.as_ref() {
-            let (last_match, pct, sequence) = segment_boundary_evidence(relative_path, pt);
+            let query = pq.query;
+            let lower = pq.lower.as_str();
+            let (last_match, pct, sequence) =
+                segment_boundary_with(relative_path, &pt.segments, |c, seg| {
+                    eq_ascii_lower(c.as_bytes(), query_part_lower(query, lower, seg))
+                });
             ev.last_segment_match = last_match;
             ev.segment_boundary_pct = pct;
             ev.segment_sequence = sequence;
@@ -603,37 +964,75 @@ pub fn evidence_prepared(
         intent,
         QueryIntent::FileName | QueryIntent::Concept | QueryIntent::Typo
     ) {
-        ev.word_coverage = word_coverage_prepared(filename, &pq.qwords[..pq.qword_count]);
+        let n = pq.qword_count;
+        let words = &pq.qwords[..n];
+        // That token is the whole query, so a substring miss has no word prefix.
+        let whole = n == 1 && words[0].len() == pq.lower.len();
+        ev.word_coverage = if whole && !ev.filename_substring {
+            0
+        } else if whole {
+            word_coverage_one_lower(filename, pq.lower.as_bytes())
+        } else {
+            let mut lows: [&[u8]; 12] = [&[]; 12];
+            let lb = pq.lower.as_bytes();
+            for i in 0..n {
+                let s = pq.qword_at[i] as usize;
+                let len = words[i].len();
+                lows[i] = &lb[s..s + len];
+            }
+            word_coverage_folded(filename, &lows[..n])
+        };
     }
 
-    // Role is ~15 substring scans; only pay when the query wants one.
-    #[allow(clippy::if_same_then_else, clippy::needless_bool_assign)]
     if let Some(want) = pq.wants_role {
-        ev.role_match = role_of_filename(filename) == want;
-    } else if intent == QueryIntent::FileName || intent == QueryIntent::Typo {
-        ev.role_match = false;
-    } else {
-        ev.role_match = false;
+        // Asked pattern first. Higher roles override it; lower roles do not.
+        ev.role_match = role_is(filename, want);
     }
 
     ev
 }
 
+fn stem_and_ext(filename: &str) -> (&str, &str, bool) {
+    match filename.rsplit_once('.') {
+        Some((stem, ext)) => (stem, ext, true),
+        None => (filename, "", false),
+    }
+}
+
 fn filename_stem(filename: &str) -> &str {
-    filename
-        .rsplit_once('.')
-        .map(|(s, _)| s)
-        .unwrap_or(filename)
+    stem_and_ext(filename).0
 }
 
 /// True when `cand` is a conventional sibling of `cur` (same stem, different role).
 pub fn is_related_filename(cand: &str, cur_fname: &str) -> bool {
-    let a = filename_stem(cur_fname);
-    let b = filename_stem(cand);
-    if a.is_empty() || a.eq_ignore_ascii_case(b) {
+    is_related_key(cand, &related_key(cur_fname))
+}
+
+// Lowercased stem of the open file, before and after role suffixes.
+pub(crate) struct RelatedKey {
+    full: Vec<u8>,
+    stripped: Vec<u8>,
+}
+
+pub(crate) fn related_key(cur_fname: &str) -> RelatedKey {
+    let stem = filename_stem(cur_fname);
+    let mut full = vec![0u8; stem.len()];
+    crate::simd_path::fold_ascii_needle(stem.as_bytes(), &mut full);
+    let stripped_src = strip_sibling_suffix(stem);
+    let mut stripped = vec![0u8; stripped_src.len()];
+    crate::simd_path::fold_ascii_needle(stripped_src.as_bytes(), &mut stripped);
+    RelatedKey { full, stripped }
+}
+
+pub(crate) fn is_related_key(cand: &str, key: &RelatedKey) -> bool {
+    if key.full.is_empty() {
         return false;
     }
-    strip_sibling_suffix(a).eq_ignore_ascii_case(strip_sibling_suffix(b))
+    let stem = filename_stem(cand);
+    if eq_ascii_lower(stem.as_bytes(), &key.full) {
+        return false;
+    }
+    eq_ascii_lower(strip_sibling_suffix(stem).as_bytes(), &key.stripped)
 }
 
 fn strip_sibling_suffix(mut s: &str) -> &str {
@@ -642,7 +1041,7 @@ fn strip_sibling_suffix(mut s: &str) -> &str {
             let n = s.len() - pat.len();
             // Byte cuts can land inside a multibyte char (CJK stems);
             // the ASCII suffix cannot match there, so keep looking.
-            if !s.is_char_boundary(n) || !s[n..].eq_ignore_ascii_case(pat) {
+            if !s.is_char_boundary(n) || !eq_ascii_lower(s[n..].as_bytes(), pat.as_bytes()) {
                 break;
             }
             s = &s[..n];

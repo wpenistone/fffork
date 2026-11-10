@@ -1,5 +1,5 @@
 use super::grep::{GrepContext, perform_grep};
-use super::prefilter::prefilter_files;
+use super::prefilter::prefilter_files_indexed;
 use super::sink::{SinkState, debug_assert_newline_terminator, strip_line_terminators};
 use super::types::{GrepResult, GrepSearchOptions};
 use crate::index::{BigramFilter, BigramOverlay, bigram_boundary, literal_candidates};
@@ -126,7 +126,7 @@ pub(crate) fn multi_grep_search<'a>(
     let base_file_count = bigram_boundary(bigram_overlay, files.len());
 
     // Constraints are separate from patterns, so a miss must not broaden the search.
-    let (files_to_search, filtered_file_count) = prefilter_files(
+    let (files_to_search, filtered_file_count) = prefilter_files_indexed(
         files,
         constraints,
         bigram_candidates.as_deref(),
@@ -172,7 +172,7 @@ pub(crate) fn multi_grep_search<'a>(
             // cannot be sound here.
             content_masks: None,
             mask_needle: None,
-            files,
+            direct_plain: false,
         },
         |file: &FileItem, file_bytes: &[u8], max_matches: usize| {
             let state = SinkState {

@@ -2,16 +2,16 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "windows"))]
 use std::sync::atomic::AtomicPtr;
-use std::sync::atomic::{
-    AtomicBool, AtomicI16, AtomicI32, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering,
-};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
+use crate::constants::FRESH_MMAP_THRESHOLD;
 #[cfg(not(target_os = "windows"))]
-use crate::constants::{FRESH_MMAP_THRESHOLD, MMAP_THRESHOLD};
+use crate::constants::MMAP_THRESHOLD;
 use crate::constants::{MAX_CACHED_CONTENT_BYTES, MAX_FFFILE_SIZE, PATH_BUF_SIZE};
 use crate::index::constraints::Constrainable;
 use crate::query_tracker::QueryMatchEntry;
 use crate::simd_path::ArenaPtr;
+use crate::simd_string_utils::memmem::PairPlan;
 use fff_query_parser::{FFFQuery, FuzzyQuery, Location};
 
 /// Different sources of the string storage used by FFF
@@ -75,9 +75,7 @@ fn segment_is_vendored(name: &str) -> bool {
     let b = name.as_bytes();
     VENDORED_DIRS.iter().any(|v| {
         b.len() == v.len()
-            && b.iter()
-                .zip(v.as_bytes())
-                .all(|(a, c)| a.to_ascii_lowercase() == *c)
+            && unsafe { crate::simd_string_utils::case::eq_lowered_case(b.as_ptr(), v.as_bytes()) }
     })
 }
 
@@ -223,6 +221,20 @@ impl DirItem {
         self.path.read_to_buf(arena, buf)
     }
 
+    // Full relative path in `buf`. Shorter than the path truncates.
+    pub fn read_relative_path_into<'a>(
+        &self,
+        storage: impl FFFStringStorage,
+        buf: &'a mut [u8],
+    ) -> &'a str {
+        let ptr = if self.is_overflow() {
+            storage.overflow_arena()
+        } else {
+            storage.base_arena()
+        };
+        self.path.read_to_buf(ptr, buf)
+    }
+
     /// Relative dir path as owned String (cold path).
     pub fn relative_path(&self, arena: impl FFFStringStorage) -> String {
         let mut out = String::new();
@@ -244,10 +256,23 @@ impl DirItem {
         if offset >= total {
             return;
         }
-        // Read the full path, then slice from last_segment_offset
-        let mut buf = [0u8; PATH_BUF_SIZE];
-        let full = self.path.read_to_buf(arena, &mut buf);
-        out.push_str(&full[offset..]);
+        // Same tail a PATH_BUF_SIZE read would expose; do not copy the prefix.
+        let visible = total.min(PATH_BUF_SIZE);
+        if offset > visible {
+            let mut buf = [0u8; PATH_BUF_SIZE];
+            let full = self.path.read_to_buf(arena, &mut buf);
+            out.push_str(&full[offset..]);
+            return;
+        }
+        let len = visible - offset;
+        if len == 0 {
+            return;
+        }
+        out.reserve(len);
+        let vec = unsafe { out.as_mut_vec() };
+        vec.resize(len, 0);
+        self.path
+            .copy_window_to(arena, offset as u32, visible as u32, vec);
     }
 
     /// The dirname (last segment) as an owned String. Cold path.
@@ -286,6 +311,37 @@ impl Constrainable for DirItem {
     }
 
     #[inline]
+    #[cfg(feature = "zlob")]
+    fn append_relative_path(&self, arena: ArenaPtr, out: &mut Vec<u8>, _scratch: &mut String) {
+        self.path.append_bytes(arena, out);
+    }
+
+    #[inline]
+    fn path_contains(&self, arena: ArenaPtr, finder: &memchr::memmem::Finder<'_>) -> bool {
+        self.path.contains_needle(arena, finder)
+    }
+
+    #[inline]
+    fn path_contains_folded(
+        &self,
+        arena: ArenaPtr,
+        needle_lower: &[u8],
+        plan: PairPlan,
+    ) -> bool {
+        self.path.contains_folded(arena, needle_lower, plan)
+    }
+
+    #[inline]
+    fn path_has_segment(&self, arena: ArenaPtr, segment_lower: &[u8]) -> bool {
+        self.path.contains_segment(arena, segment_lower)
+    }
+
+    #[inline]
+    fn ends_with_path_suffix(&self, arena: ArenaPtr, suffix: &str) -> bool {
+        crate::index::constraints::chunked_ends_with_path_suffix(&self.path, arena, suffix)
+    }
+
+    #[inline]
     fn git_status(&self) -> Option<git2::Status> {
         None
     }
@@ -297,29 +353,78 @@ impl Constrainable for DirItem {
 }
 
 #[derive(Debug)]
-#[repr(C)]
+#[cfg_attr(target_os = "windows", repr(C, align(16)))]
+#[cfg_attr(not(target_os = "windows"), repr(C))]
 pub struct FileItem {
-    size: AtomicU64,
-    modified: AtomicU64,
-    // Scan-time 64-bit character-presence mask of the relative path
-    // (see crate::presence). Sound necessary condition for fuzzy
-    // LCS >= |q| - max_typos; never rejects a true match.
+    // Sound necessary condition for fuzzy LCS >= |q| - max_typos; never rejects a true match.
+    // Beside the path header. On Windows that 16-byte prefix cannot cross a cache line.
     pub(crate) presence: u64,
     pub(crate) path: crate::simd_path::ChunkedString,
+    size: AtomicU64,
+    modified: AtomicU64,
     pub(crate) parent_dir_index: u32,
     // Packed `Option<git2::Status>`: `u32::MAX` means None.
     // Stored as raw bits so FileItem stays 48 B (Option<Status> is 8 B
     // and pushed the struct to 56 B × 227k ≈ +1.8 MB peak RSS).
     git_status_bits: AtomicU32,
-    access_frecency_score: AtomicI16,
-    modification_frecency_score: AtomicI16,
-    git_recency_score: AtomicI16,
-    flags: AtomicU8,
-    vendored: AtomicBool,
+    // One relaxed word: access i16, modification i16, git recency i16, flags u8, vendored u8.
+    // Writers CAS a field so a sibling store cannot tear the others.
+    score_bits: AtomicU64,
     /// Lazy mmap cache (boxed, set once). Only populated by the actual file
     /// read, controlled by the budget. Null while empty.
     #[cfg(not(target_os = "windows"))]
     content: AtomicPtr<memmap2::Mmap>,
+}
+
+#[cfg(target_os = "windows")]
+const _: () = {
+    assert!(std::mem::align_of::<FileItem>() >= 16);
+    assert!(std::mem::size_of::<FileItem>() == 48);
+    let presence = std::mem::offset_of!(FileItem, presence);
+    let path = std::mem::offset_of!(FileItem, path);
+    assert!(presence % 16 == 0 && path == presence + 8);
+    assert!(std::mem::offset_of!(FileItem, score_bits) == 40);
+};
+
+// Same bits as `FileItem::presence`, one `u64` per file index.
+// Full scans read this slice and do not load the 48-byte record.
+#[derive(Clone, Default)]
+pub(crate) struct PresenceTable {
+    masks: Vec<u64>,
+}
+
+impl std::fmt::Debug for PresenceTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PresenceTable")
+            .field("len", &self.masks.len())
+            .finish()
+    }
+}
+
+impl PresenceTable {
+    pub(crate) fn from_files(files: &[FileItem]) -> Self {
+        let mut masks = Vec::with_capacity(files.len());
+        masks.extend(files.iter().map(|f| f.presence));
+        Self { masks }
+    }
+
+    pub(crate) fn reserve_additional(&mut self, extra: usize) {
+        self.masks.reserve(extra);
+    }
+
+    pub(crate) fn push(&mut self, mask: u64) {
+        self.masks.push(mask);
+    }
+
+    #[inline]
+    pub(crate) fn as_slice(&self) -> &[u64] {
+        &self.masks
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, index: usize) -> Option<u64> {
+        self.masks.get(index).copied()
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -337,14 +442,8 @@ impl Clone for FileItem {
             parent_dir_index: self.parent_dir_index,
             size: AtomicU64::new(self.size.load(Ordering::Relaxed)),
             modified: AtomicU64::new(self.modified.load(Ordering::Relaxed)),
-            access_frecency_score: AtomicI16::new(self.access_frecency_score.load(Ordering::Relaxed)),
-            modification_frecency_score: AtomicI16::new(
-                self.modification_frecency_score.load(Ordering::Relaxed),
-            ),
-            git_recency_score: AtomicI16::new(self.git_recency_score.load(Ordering::Relaxed)),
             git_status_bits: AtomicU32::new(self.git_status_bits.load(Ordering::Relaxed)),
-            flags: AtomicU8::new(self.flags.load(Ordering::Relaxed)),
-            vendored: AtomicBool::new(self.vendored.load(Ordering::Relaxed)),
+            score_bits: AtomicU64::new(self.score_bits.load(Ordering::Relaxed)),
             // on clone we have to reset the content cache
             #[cfg(not(target_os = "windows"))]
             content: AtomicPtr::new(std::ptr::null_mut()),
@@ -398,12 +497,10 @@ impl ContentMask {
 
     /// Fold bytes into the mask. Call once per content chunk.
     #[inline]
-    pub fn accumulate(&mut self, content: &[u8]) {
-        let mut m = self.0;
-        for &b in content {
-            m |= 1u64 << crate::presence::fold_bit(b);
-        }
+    pub fn accumulate(&mut self, content: &[u8]) -> bool {
+        let (m, nul) = crate::presence::fold_mask(self.0, content);
         self.0 = m;
+        nul
     }
 
     // Sound necessary condition for `content` to contain `needle`.
@@ -434,28 +531,35 @@ impl ContentMask {
     }
 }
 
-// Sound necessary condition for `content` to contain `needle`, with the
-// needle's byte classes resolved once so each file costs one AND + popcount.
+// Needle-byte hits against a content mask. Repeats share a class bit.
+// Mask 0 is unknown; a miss cannot match. No-repeat needles are one popcount.
 #[derive(Clone, Copy)]
 pub(crate) struct MaskNeedle {
-    // Folded byte classes the needle uses, deduplicated.
     classes: u64,
-    // Distinct classes that must be present. Clamped to the class count,
-    // since repeats in the needle cannot require more than they provide.
     need: usize,
+    multi: bool,
+    counts: [u16; 64],
 }
 
 impl MaskNeedle {
     pub(crate) fn new(needle: &[u8], max_typos: u16) -> Self {
         let mut classes = 0u64;
+        let mut counts = [0u16; 64];
+        let mut multi = false;
         for &b in needle {
-            classes |= 1u64 << crate::presence::fold_bit(b);
+            let bit = crate::presence::fold_bit(b) as usize;
+            classes |= 1u64 << bit;
+            if counts[bit] != 0 {
+                multi = true;
+            }
+            counts[bit] = counts[bit].saturating_add(1);
         }
-        let need = needle
-            .len()
-            .saturating_sub(max_typos as usize)
-            .min(classes.count_ones() as usize);
-        Self { classes, need }
+        Self {
+            classes,
+            need: needle.len().saturating_sub(max_typos as usize),
+            multi,
+            counts,
+        }
     }
 
     #[inline(always)]
@@ -466,8 +570,74 @@ impl MaskNeedle {
         if self.need == 0 {
             return Some(true);
         }
-        Some((mask.0 & self.classes).count_ones() as usize >= self.need)
+        let present = mask.0 & self.classes;
+        if !self.multi {
+            return Some(present.count_ones() as usize >= self.need);
+        }
+        let mut hits = 0usize;
+        let mut bits = present;
+        while bits != 0 {
+            let class = bits.trailing_zeros() as usize;
+            hits += self.counts[class] as usize;
+            if hits >= self.need {
+                return Some(true);
+            }
+            bits &= bits - 1;
+        }
+        Some(false)
     }
+}
+
+const SCORE_ACCESS_SHIFT: u32 = 0;
+const SCORE_MOD_SHIFT: u32 = 16;
+const SCORE_GIT_SHIFT: u32 = 32;
+const SCORE_FLAGS_SHIFT: u32 = 48;
+const SCORE_VEND_SHIFT: u32 = 56;
+const SCORE_GIT_DIRTY_SHIFT: u32 = 57;
+
+pub(crate) struct ScoreHot {
+    pub(crate) access: i16,
+    pub(crate) modification: i16,
+    pub(crate) git_recency: i16,
+    #[allow(dead_code)]
+    pub(crate) vendored: bool,
+    pub(crate) git_dirty: bool,
+    pub(crate) binary: bool,
+}
+
+#[inline]
+fn score_i16(bits: u64, shift: u32) -> i16 {
+    (bits >> shift) as i16
+}
+
+#[inline]
+fn put_i16(bits: u64, shift: u32, value: i16) -> u64 {
+    let mask = 0xffffu64 << shift;
+    (bits & !mask) | ((value as u16 as u64) << shift)
+}
+
+#[inline]
+fn flags_byte(bits: u64) -> u8 {
+    (bits >> SCORE_FLAGS_SHIFT) as u8
+}
+
+#[inline]
+fn with_flags_byte(bits: u64, flags: u8) -> u64 {
+    let mask = 0xffu64 << SCORE_FLAGS_SHIFT;
+    (bits & !mask) | ((flags as u64) << SCORE_FLAGS_SHIFT)
+}
+
+// Mtime, frecency, git recency, and git-status stores that change score or D-040 order.
+static SCORE_INPUT_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn score_input_epoch() -> u64 {
+    SCORE_INPUT_EPOCH.load(Ordering::Relaxed)
+}
+
+#[inline]
+pub(crate) fn bump_score_input_epoch() {
+    SCORE_INPUT_EPOCH.fetch_add(1, Ordering::Relaxed);
 }
 
 impl FileItem {
@@ -478,13 +648,15 @@ impl FileItem {
         git_status: Option<git2::Status>,
         is_binary: bool,
     ) -> Self {
-        let mut flags = 0u8;
-        if is_binary {
-            flags |= FileItemFlags::BINARY;
-        }
-
         let mut path = crate::simd_path::ChunkedString::empty();
         path.filename_offset = filename_start;
+        let mut score_bits = 0u64;
+        if is_binary {
+            score_bits |= (FileItemFlags::BINARY as u64) << SCORE_FLAGS_SHIFT;
+        }
+        if git_status.is_some_and(crate::git::is_modified_status) {
+            score_bits |= 1u64 << SCORE_GIT_DIRTY_SHIFT;
+        }
 
         Self {
             path,
@@ -492,12 +664,8 @@ impl FileItem {
             parent_dir_index: u32::MAX,
             size: AtomicU64::new(size),
             modified: AtomicU64::new(modified),
-            access_frecency_score: AtomicI16::new(0),
-            modification_frecency_score: AtomicI16::new(0),
-            git_recency_score: AtomicI16::new(0),
             git_status_bits: AtomicU32::new(Self::pack_git_status(git_status)),
-            flags: AtomicU8::new(flags),
-            vendored: AtomicBool::new(false),
+            score_bits: AtomicU64::new(score_bits),
             #[cfg(not(target_os = "windows"))]
             content: AtomicPtr::new(std::ptr::null_mut()),
         }
@@ -513,7 +681,7 @@ impl FileItem {
 
     #[inline]
     pub fn git_status(&self) -> Option<git2::Status> {
-        let bits = self.git_status_bits.load(Ordering::Relaxed);
+        let bits = self.git_status_raw();
         if bits == u32::MAX {
             None
         } else {
@@ -522,9 +690,23 @@ impl FileItem {
     }
 
     #[inline]
+    pub(crate) fn git_status_raw(&self) -> u32 {
+        self.git_status_bits.load(Ordering::Relaxed)
+    }
+
+    #[inline]
     pub fn set_git_status(&self, s: Option<git2::Status>) {
         self.git_status_bits
             .store(Self::pack_git_status(s), Ordering::Relaxed);
+        // Same predicate as `is_modified_status`, kept beside the frecency word.
+        let dirty = s.is_some_and(crate::git::is_modified_status);
+        self.map_score_bits(|bits| {
+            if dirty {
+                bits | (1u64 << SCORE_GIT_DIRTY_SHIFT)
+            } else {
+                bits & !(1u64 << SCORE_GIT_DIRTY_SHIFT)
+            }
+        });
     }
 
     #[inline]
@@ -544,38 +726,119 @@ impl FileItem {
 
     #[inline]
     pub fn set_modified(&self, modified: u64) {
-        self.modified.store(modified, Ordering::Relaxed);
+        if self.modified.swap(modified, Ordering::Relaxed) != modified {
+            bump_score_input_epoch();
+        }
+    }
+
+    #[inline]
+    fn map_score_bits(&self, f: impl Fn(u64) -> u64) {
+        let _ = self
+            .score_bits
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| Some(f(bits)));
+    }
+
+    #[inline]
+    fn hot_from_bits(bits: u64) -> ScoreHot {
+        ScoreHot {
+            access: score_i16(bits, SCORE_ACCESS_SHIFT),
+            modification: score_i16(bits, SCORE_MOD_SHIFT),
+            git_recency: score_i16(bits, SCORE_GIT_SHIFT),
+            vendored: (bits >> SCORE_VEND_SHIFT) & 1 != 0,
+            git_dirty: (bits >> SCORE_GIT_DIRTY_SHIFT) & 1 != 0,
+            binary: flags_byte(bits) & FileItemFlags::BINARY != 0,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn score_hot(&self) -> ScoreHot {
+        Self::hot_from_bits(self.score_bits.load(Ordering::Relaxed))
+    }
+
+    // Frecency for the cheap bound. The word still holds vendored and dirty.
+    #[inline]
+    pub(crate) fn rank_freq_git(&self) -> (u64, i32, i32) {
+        let bits = self.score_bits.load(Ordering::Relaxed);
+        let freq = score_i16(bits, SCORE_ACCESS_SHIFT) as i32
+            + score_i16(bits, SCORE_MOD_SHIFT) as i32;
+        let git = score_i16(bits, SCORE_GIT_SHIFT) as i32;
+        (bits, freq, git)
+    }
+
+    #[inline]
+    pub(crate) fn rank_flags(bits: u64) -> (bool, bool) {
+        (
+            (bits >> SCORE_VEND_SHIFT) & 1 != 0,
+            (bits >> SCORE_GIT_DIRTY_SHIFT) & 1 != 0,
+        )
+    }
+
+    // The frecency word can sit on the cache line after the record start.
+    #[inline]
+    pub(crate) fn prefetch_score_hot(&self) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(
+                &self.score_bits as *const _ as *const i8,
+                std::arch::x86_64::_MM_HINT_T0,
+            );
+        }
+    }
+
+    // One load: deleted files return `None` instead of a second flags read.
+    #[inline]
+    pub(crate) fn score_hot_if_live(&self) -> Option<ScoreHot> {
+        let bits = self.score_bits.load(Ordering::Relaxed);
+        if flags_byte(bits) & FileItemFlags::DELETED != 0 {
+            None
+        } else {
+            Some(Self::hot_from_bits(bits))
+        }
     }
 
     #[inline]
     pub fn access_frecency_score(&self) -> i16 {
-        self.access_frecency_score.load(Ordering::Relaxed)
+        score_i16(self.score_bits.load(Ordering::Relaxed), SCORE_ACCESS_SHIFT)
     }
 
     #[inline]
     pub fn modification_frecency_score(&self) -> i16 {
-        self.modification_frecency_score.load(Ordering::Relaxed)
+        score_i16(self.score_bits.load(Ordering::Relaxed), SCORE_MOD_SHIFT)
     }
 
     #[inline]
     pub fn git_recency_score(&self) -> i16 {
-        self.git_recency_score.load(Ordering::Relaxed)
+        score_i16(self.score_bits.load(Ordering::Relaxed), SCORE_GIT_SHIFT)
     }
 
     #[inline]
     pub fn set_access_frecency_score(&self, score: i16) {
-        self.access_frecency_score.store(score, Ordering::Relaxed);
+        self.store_score_i16(SCORE_ACCESS_SHIFT, score);
     }
 
     #[inline]
     pub fn set_modification_frecency_score(&self, score: i16) {
-        self.modification_frecency_score
-            .store(score, Ordering::Relaxed);
+        self.store_score_i16(SCORE_MOD_SHIFT, score);
     }
 
     #[inline]
     pub fn set_git_recency_score(&self, score: i16) {
-        self.git_recency_score.store(score, Ordering::Relaxed);
+        self.store_score_i16(SCORE_GIT_SHIFT, score);
+    }
+
+    #[inline]
+    fn store_score_i16(&self, shift: u32, score: i16) {
+        let mut changed = false;
+        let _ = self
+            .score_bits
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
+                let next = put_i16(bits, shift, score);
+                changed = next != bits;
+                changed.then_some(next)
+            });
+        if changed {
+            bump_score_input_epoch();
+        }
     }
 
     /// Returns an absolute path of the file
@@ -605,10 +868,6 @@ impl FileItem {
         s
     }
 
-    pub(crate) fn write_dir_str(&self, arena: ArenaPtr, out: &mut String) {
-        self.path.write_dir_to(arena, out);
-    }
-
     pub fn file_name(&self, arena: impl FFFStringStorage) -> String {
         let mut s = String::with_capacity(32);
         self.path.write_filename_to(arena.arena_for(self), &mut s);
@@ -621,22 +880,38 @@ impl FileItem {
         s
     }
 
+    pub fn write_relative_path(&self, arena: impl FFFStringStorage, out: &mut String) {
+        out.clear();
+        self.path.write_to_string(arena.arena_for(self), out);
+    }
+
+    #[inline(always)]
     pub fn relative_path_len(&self) -> usize {
         self.path.byte_len as usize
     }
 
+    // Full relative path in `buf`. Shorter than the path truncates.
+    pub fn read_relative_path<'a>(
+        &self,
+        storage: impl FFFStringStorage,
+        buf: &'a mut [u8],
+    ) -> &'a str {
+        self.path
+            .read_to_buf(storage.arena_for(self), buf)
+    }
+
+    #[inline(always)]
     pub fn filename_offset_in_relative_path(&self) -> usize {
         self.path.filename_offset as usize
     }
 
+    #[inline]
     pub(crate) fn relative_path_eq(&self, arena: ArenaPtr, other: &str) -> bool {
         self.path.equals(arena, other)
     }
 
     pub(crate) fn relative_path_starts_with(&self, arena: ArenaPtr, prefix: &str) -> bool {
-        let mut buf = [0u8; PATH_BUF_SIZE];
-        let path = self.path.read_to_buf(arena, &mut buf);
-        path.starts_with(prefix)
+        self.path.starts_with_bytes(arena, prefix.as_bytes())
     }
 
     /// Write `base_path + '/' + relative_path` into `buf` and return it
@@ -692,7 +967,8 @@ impl FileItem {
 
     #[inline]
     pub fn total_frecency_score(&self) -> i32 {
-        self.access_frecency_score() as i32 + self.modification_frecency_score() as i32
+        let hot = self.score_hot();
+        hot.access as i32 + hot.modification as i32
     }
 
     #[allow(dead_code)]
@@ -798,14 +1074,15 @@ impl FileItem {
 
     pub(crate) fn mark_definition_language(&mut self, filename: &str) {
         let language = crate::definition::Language::from_filename(filename) as u8;
-        let flags = self.flags.get_mut();
-        *flags = (*flags & !FileItemFlags::DEFINITION_LANGUAGE_MASK) | (language << 3);
+        let bits = self.score_bits.get_mut();
+        let flags = (flags_byte(*bits) & !FileItemFlags::DEFINITION_LANGUAGE_MASK) | (language << 3);
+        *bits = with_flags_byte(*bits, flags);
     }
 
     /// Classify a returned match using the language recorded during indexing.
     /// Lines longer than 256 bytes are not classified as definitions.
     pub fn is_definition_match(&self, line: &str, ranges: &[(u32, u32)]) -> bool {
-        let flags = self.flags.load(Ordering::Relaxed);
+        let flags = flags_byte(self.score_bits.load(Ordering::Relaxed));
         flags & (FileItemFlags::BINARY | FileItemFlags::DELETED) == 0
             && crate::definition::is_definition_match(
                 (flags & FileItemFlags::DEFINITION_LANGUAGE_MASK) >> 3,
@@ -821,7 +1098,7 @@ impl FileItem {
         ranges: &[(u32, u32)],
         fuzzy: bool,
     ) -> bool {
-        let flags = self.flags.load(Ordering::Relaxed);
+        let flags = flags_byte(self.score_bits.load(Ordering::Relaxed));
         flags & (FileItemFlags::BINARY | FileItemFlags::DELETED) == 0
             && crate::definition::is_definition_match(
                 (flags & FileItemFlags::DEFINITION_LANGUAGE_MASK) >> 3,
@@ -833,33 +1110,36 @@ impl FileItem {
 
     #[inline]
     pub(crate) fn supports_definitions(&self) -> bool {
-        self.flags.load(Ordering::Relaxed) & FileItemFlags::DEFINITION_LANGUAGE_MASK != 0
+        flags_byte(self.score_bits.load(Ordering::Relaxed)) & FileItemFlags::DEFINITION_LANGUAGE_MASK
+            != 0
     }
 
     #[inline]
     pub fn is_binary(&self) -> bool {
-        self.flags.load(Ordering::Relaxed) & FileItemFlags::BINARY != 0
+        flags_byte(self.score_bits.load(Ordering::Relaxed)) & FileItemFlags::BINARY != 0
     }
 
     #[inline]
     pub fn is_vendored(&self) -> bool {
-        self.vendored.load(Ordering::Relaxed)
+        (self.score_bits.load(Ordering::Relaxed) >> SCORE_VEND_SHIFT) & 1 != 0
     }
 
     #[inline]
     pub fn set_vendored(&self) {
-        self.vendored.store(true, Ordering::Relaxed);
+        self.map_score_bits(|bits| bits | (1u64 << SCORE_VEND_SHIFT));
     }
 
     #[inline]
     pub fn set_binary(&self, val: bool) {
-        if val {
-            self.flags
-                .fetch_or(FileItemFlags::BINARY, Ordering::Relaxed);
-        } else {
-            self.flags
-                .fetch_and(!FileItemFlags::BINARY, Ordering::Relaxed);
-        }
+        self.map_score_bits(|bits| {
+            let flags = flags_byte(bits);
+            let flags = if val {
+                flags | FileItemFlags::BINARY
+            } else {
+                flags & !FileItemFlags::BINARY
+            };
+            with_flags_byte(bits, flags)
+        });
     }
 
     /// Chunked classifier of the binary content of the file chunk by chunk
@@ -904,8 +1184,7 @@ impl FileItem {
                 Ok(n) => {
                     read += n;
                     let view = &chunk[..n];
-                    mask.accumulate(view);
-                    if detect_binary_content(view) {
+                    if mask.accumulate(view) {
                         self.set_binary(true);
                         break;
                     }
@@ -922,36 +1201,33 @@ impl FileItem {
 
     #[inline]
     pub fn is_deleted(&self) -> bool {
-        self.flags.load(Ordering::Relaxed) & FileItemFlags::DELETED != 0
+        flags_byte(self.score_bits.load(Ordering::Relaxed)) & FileItemFlags::DELETED != 0
     }
 
     #[inline]
     #[doc(hidden)]
     /// Don't use it, use FilePicker::delete_file
     pub fn set_deleted(&self, val: bool) {
-        if val {
-            self.flags
-                .fetch_or(FileItemFlags::DELETED, Ordering::Relaxed);
-        } else {
-            self.flags
-                .fetch_and(!FileItemFlags::DELETED, Ordering::Relaxed);
-        }
+        self.map_flag(FileItemFlags::DELETED, val);
     }
 
     #[inline]
     pub fn is_overflow(&self) -> bool {
-        self.flags.load(Ordering::Relaxed) & FileItemFlags::OVERFLOW != 0
+        flags_byte(self.score_bits.load(Ordering::Relaxed)) & FileItemFlags::OVERFLOW != 0
     }
 
     #[inline]
     pub fn set_overflow(&self, val: bool) {
-        if val {
-            self.flags
-                .fetch_or(FileItemFlags::OVERFLOW, Ordering::Relaxed);
-        } else {
-            self.flags
-                .fetch_and(!FileItemFlags::OVERFLOW, Ordering::Relaxed);
-        }
+        self.map_flag(FileItemFlags::OVERFLOW, val);
+    }
+
+    #[inline]
+    fn map_flag(&self, mask: u8, on: bool) {
+        self.map_score_bits(|bits| {
+            let flags = flags_byte(bits);
+            let flags = if on { flags | mask } else { flags & !mask };
+            with_flags_byte(bits, flags)
+        });
     }
 }
 
@@ -997,7 +1273,8 @@ impl FileItem {
         if let Some(modified) = modified_secs
             && self.modified() < modified
         {
-            self.modified.store(modified, Ordering::Relaxed);
+            // Mtime changes D-040 order; the setter bumps the score-input epoch.
+            self.set_modified(modified);
         }
 
         self.invalidate_mmap(budget);
@@ -1090,7 +1367,7 @@ impl FileItem {
     pub(crate) fn get_content_for_search<'a>(
         &'a self,
         buf: &'a mut Vec<u8>,
-        #[cfg_attr(target_os = "windows", allow(unused_variables))] mmap_slot: &'a mut MmapSlot,
+        mmap_slot: &'a mut MmapSlot,
         arena: ArenaPtr,
         base_path: &Path,
         budget: &ContentCacheBudget,
@@ -1121,6 +1398,25 @@ impl FileItem {
             return Some(&stored[..]);
         } else {
             let _ = (mmap_slot, arena);
+        }
+
+        // Indexed bytes, mapped. Warm scans read cache pages in place;
+        // a short or failed map falls through to the copy.
+        #[cfg(target_os = "windows")]
+        if size >= FRESH_MMAP_THRESHOLD {
+            if let Ok(mmap) = unsafe { memmap2::Mmap::map(&file) } {
+                if mmap.len() as u64 >= size {
+                    let stored = mmap_slot.insert(mmap);
+                    return Some(&stored[..size as usize]);
+                }
+            }
+        }
+
+        // Drop a previous map before the copy path so one large file cannot
+        // stay mapped for the rest of the worker.
+        #[cfg(target_os = "windows")]
+        {
+            mmap_slot.take();
         }
 
         let len = size as usize;
@@ -1178,13 +1474,9 @@ impl FileItem {
     }
 }
 
-/// Per-thread scratch slot owning a transient mmap returned from
-/// [`FileItem::get_content_for_search`]. `Option<Mmap>` on Unix,
-/// unit on Windows where mmap is unused.
-#[cfg(not(target_os = "windows"))]
+/// One transient search map, dropped with the slot after the file.
+/// Not the persistent content cache; that stays off on Windows.
 pub type MmapSlot = Option<memmap2::Mmap>;
-#[cfg(target_os = "windows")]
-pub type MmapSlot = ();
 
 impl Constrainable for FileItem {
     #[inline]
@@ -1200,6 +1492,37 @@ impl Constrainable for FileItem {
     #[inline]
     fn write_relative_path(&self, arena: ArenaPtr, out: &mut String) {
         self.path.write_to_string(arena, out);
+    }
+
+    #[inline]
+    #[cfg(feature = "zlob")]
+    fn append_relative_path(&self, arena: ArenaPtr, out: &mut Vec<u8>, _scratch: &mut String) {
+        self.path.append_bytes(arena, out);
+    }
+
+    #[inline]
+    fn path_contains(&self, arena: ArenaPtr, finder: &memchr::memmem::Finder<'_>) -> bool {
+        self.path.contains_needle(arena, finder)
+    }
+
+    #[inline]
+    fn path_contains_folded(
+        &self,
+        arena: ArenaPtr,
+        needle_lower: &[u8],
+        plan: PairPlan,
+    ) -> bool {
+        self.path.contains_folded(arena, needle_lower, plan)
+    }
+
+    #[inline]
+    fn path_has_segment(&self, arena: ArenaPtr, segment_lower: &[u8]) -> bool {
+        self.path.contains_segment(arena, segment_lower)
+    }
+
+    #[inline]
+    fn ends_with_path_suffix(&self, arena: ArenaPtr, suffix: &str) -> bool {
+        crate::index::constraints::chunked_ends_with_path_suffix(&self.path, arena, suffix)
     }
 
     #[inline]
@@ -1258,6 +1581,8 @@ pub struct ScoringContext<'a> {
     pub combo_boost_score_multiplier: i32,
     pub min_combo_count: u32,
     pub pagination: PaginationArgs,
+    // When false, the gate skips the per-file deleted load. True if any tombstone exists.
+    pub check_deleted: bool,
 }
 
 impl ScoringContext<'_> {
@@ -1270,11 +1595,36 @@ impl ScoringContext<'_> {
     }
 }
 
+pub type SharedScores = std::sync::Arc<Vec<Score>>;
+pub type SharedOffsets = std::sync::Arc<Vec<smallvec::SmallVec<[(u32, u32); 4]>>>;
+
+#[derive(Debug, Clone, Copy)]
+pub struct CachedFileRow {
+    pub start: u32,
+    pub len: u32,
+    pub name_off: u32,
+    pub size: u64,
+    pub modified: u64,
+    pub access_frecency_score: i16,
+    pub modification_frecency_score: i16,
+    pub total_frecency_score: i32,
+    pub git_status: &'static str,
+    pub git_recency_score: i16,
+    pub is_binary: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PathSnapshot {
+    pub bytes: std::sync::Arc<Vec<u8>>,
+    pub rows: std::sync::Arc<Vec<CachedFileRow>>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SearchResult<'a> {
     pub items: Vec<&'a FileItem>,
-    pub scores: Vec<Score>,
-    pub match_byte_offsets: Vec<smallvec::SmallVec<[(u32, u32); 4]>>,
+    pub scores: SharedScores,
+    pub match_byte_offsets: SharedOffsets,
+    pub paths: Option<PathSnapshot>,
     pub total_matched: usize,
     pub total_files: usize,
     pub location: Option<Location>,

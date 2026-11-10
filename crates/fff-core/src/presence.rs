@@ -3,38 +3,116 @@
 //! Sound pretest for `LCS >= |needle| - max_typos`; lossy fold may pass
 //! non-matches, but never rejects a true match.
 
-// Map a byte to a bit in `0..64`; uppercase folds to lowercase so the
-// pretest stays sound. Overflow bits only cost selectivity.
+// Bit in `0..64` for every byte. ASCII uppercase folds to lowercase
+// first; collisions only cost selectivity.
+const FOLD_BIT: [u8; 256] = {
+    let mut table = [0u8; 256];
+    let mut i = 0;
+    while i < 256 {
+        let b = i as u8;
+        let b = if b.is_ascii_uppercase() { b + 32 } else { b };
+        table[i] = match b {
+            b'a'..=b'z' => b - b'a',
+            b'0'..=b'9' => 26 + (b - b'0'),
+            b'.' => 36,
+            b'_' => 37,
+            b'-' => 38,
+            b'/' => 39,
+            b'\\' => 40,
+            b' ' => 41,
+            b',' => 42,
+            b'@' => 43,
+            b'#' => 44,
+            b'(' => 45,
+            b')' => 46,
+            b'[' => 47,
+            _ => 48 + (b & 15),
+        };
+        i += 1;
+    }
+    table
+};
+
 #[inline(always)]
 pub(crate) fn fold_bit(b: u8) -> u32 {
-    let b = if b.is_ascii_uppercase() { b + 32 } else { b };
-    match b {
-        b'a'..=b'z' => (b - b'a') as u32,
-        b'0'..=b'9' => 26 + (b - b'0') as u32,
-        b'.' => 36,
-        b'_' => 37,
-        b'-' => 38,
-        b'/' => 39,
-        b'\\' => 40,
-        b' ' => 41,
-        b',' => 42,
-        b'@' => 43,
-        b'#' => 44,
-        b'(' => 45,
-        b')' => 46,
-        b'[' => 47,
-        _ => 48 + (b & 15) as u32,
-    }
+    u32::from(FOLD_BIT[b as usize])
 }
 
 // Build the presence mask for a path (relative path bytes, any case).
 #[inline]
 pub(crate) fn mask_of(path: &[u8]) -> u64 {
-    let mut m = 0u64;
-    for &b in path {
+    fold_mask(0, path).0
+}
+
+#[inline(always)]
+fn contains_zero_byte(v: u64) -> bool {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    (v.wrapping_sub(LO) & !v & HI) != 0
+}
+
+// OR `path` into an existing mask. The bool is true when any byte is 0.
+#[inline]
+pub(crate) fn fold_mask(mut m: u64, path: &[u8]) -> (u64, bool) {
+    let mut i = 0usize;
+    let mut nul = false;
+    while i + 16 <= path.len() {
+        let v0 = u64::from_le(unsafe {
+            core::ptr::read_unaligned(path.as_ptr().add(i) as *const u64)
+        });
+        let v1 = u64::from_le(unsafe {
+            core::ptr::read_unaligned(path.as_ptr().add(i + 8) as *const u64)
+        });
+        // Four independent folds. The mask is their OR.
+        let mut a = 0u64;
+        let mut b = 0u64;
+        let mut c = 0u64;
+        let mut d = 0u64;
+        a |= 1u64 << fold_bit(v0 as u8);
+        a |= 1u64 << fold_bit((v0 >> 8) as u8);
+        a |= 1u64 << fold_bit((v0 >> 16) as u8);
+        a |= 1u64 << fold_bit((v0 >> 24) as u8);
+        b |= 1u64 << fold_bit((v0 >> 32) as u8);
+        b |= 1u64 << fold_bit((v0 >> 40) as u8);
+        b |= 1u64 << fold_bit((v0 >> 48) as u8);
+        b |= 1u64 << fold_bit((v0 >> 56) as u8);
+        c |= 1u64 << fold_bit(v1 as u8);
+        c |= 1u64 << fold_bit((v1 >> 8) as u8);
+        c |= 1u64 << fold_bit((v1 >> 16) as u8);
+        c |= 1u64 << fold_bit((v1 >> 24) as u8);
+        d |= 1u64 << fold_bit((v1 >> 32) as u8);
+        d |= 1u64 << fold_bit((v1 >> 40) as u8);
+        d |= 1u64 << fold_bit((v1 >> 48) as u8);
+        d |= 1u64 << fold_bit((v1 >> 56) as u8);
+        m |= a | b | c | d;
+        nul |= contains_zero_byte(v0) | contains_zero_byte(v1);
+        i += 16;
+    }
+    while i + 8 <= path.len() {
+        let v = u64::from_le(unsafe {
+            core::ptr::read_unaligned(path.as_ptr().add(i) as *const u64)
+        });
+        let mut a = 0u64;
+        let mut b = 0u64;
+        a |= 1u64 << fold_bit(v as u8);
+        a |= 1u64 << fold_bit((v >> 8) as u8);
+        a |= 1u64 << fold_bit((v >> 16) as u8);
+        a |= 1u64 << fold_bit((v >> 24) as u8);
+        b |= 1u64 << fold_bit((v >> 32) as u8);
+        b |= 1u64 << fold_bit((v >> 40) as u8);
+        b |= 1u64 << fold_bit((v >> 48) as u8);
+        b |= 1u64 << fold_bit((v >> 56) as u8);
+        m |= a | b;
+        nul |= contains_zero_byte(v);
+        i += 8;
+    }
+    for &b in &path[i..] {
+        if b == 0 {
+            nul = true;
+        }
         m |= 1u64 << fold_bit(b);
     }
-    m
+    (m, nul)
 }
 
 // Precomputed per-query presence check. The needle fold is built once
@@ -49,9 +127,12 @@ pub(crate) struct NeedlePresence {
     once_mask: u64,
     twice_mask: u64,
     dup_two_masks: bool,
+    twice_n: u8,
     dup_fold: [u8; 32],
     dup_n: u8,
     dup_full: bool,
+    /// `need` equals the mask's bit count, so a hit is the mask itself.
+    cover: bool,
 }
 
 impl NeedlePresence {
@@ -96,9 +177,11 @@ impl NeedlePresence {
             once_mask,
             twice_mask,
             dup_two_masks: dup && !over_twice,
+            twice_n: twice_mask.count_ones() as u8,
             dup_fold,
             dup_n,
             dup_full: dup_n as usize == needle.len(),
+            cover: !dup && needle_mask.count_ones() as usize == need,
         }
     }
 
@@ -115,20 +198,89 @@ impl NeedlePresence {
         self.need >= 3
     }
 
+    // No folded byte repeats, so one popcount is the whole test.
+    #[inline(always)]
+    pub(crate) fn distinct(&self) -> bool {
+        !self.dup
+    }
+
+    #[inline(always)]
+    pub(crate) fn distinct_mask(&self) -> u64 {
+        self.needle_mask
+    }
+
+    // The required letters are exactly the mask bits. A compare replaces the popcount.
+    #[inline(always)]
+    pub(crate) fn cover_eq(&self) -> bool {
+        self.cover
+    }
+
+    #[inline(always)]
+    pub(crate) fn min_hits(&self) -> usize {
+        self.need
+    }
+
     #[inline(always)]
     pub(crate) fn allows(&self, path_mask: u64, needle: &[u8]) -> bool {
         if self.need == 0 {
             return true;
         }
         if !self.dup {
-            return (path_mask & self.needle_mask).count_ones() as usize >= self.need;
+            let hit = path_mask & self.needle_mask;
+            if self.cover {
+                return hit == self.needle_mask;
+            }
+            return hit.count_ones() as usize >= self.need;
         }
-        // Exact for multiplicities 1 and 2; counts >= 3 use the scalar loop.
-        // Capping them would turn this necessary condition into a false reject.
+        self.allows_repeated(path_mask, needle)
+    }
+
+    // Multiplicity at most 2. The scan can skip the heavier repeated test.
+    #[inline(always)]
+    pub(crate) fn twice_bounded(&self) -> bool {
+        self.dup_two_masks
+    }
+
+    // One class popcount accepts or rejects when the twice-bit bound decides.
+    #[inline(always)]
+    pub(crate) fn allows_twice(&self, path_mask: u64) -> bool {
+        let covered = (path_mask & self.needle_mask).count_ones() as usize;
+        let cap = covered + self.twice_n as usize;
+        if covered >= self.need || cap < self.need {
+            return covered >= self.need;
+        }
+        let twos = (path_mask & self.twice_mask).count_ones() as usize;
+        covered + twos >= self.need
+    }
+
+    // Repeated letters and `need > 0`. Unknown masks are the caller's job.
+    #[inline(always)]
+    pub(crate) fn allows_repeated(&self, path_mask: u64, needle: &[u8]) -> bool {
         if self.dup_two_masks {
-            let ones = (path_mask & self.once_mask).count_ones() as usize;
-            let twos = (path_mask & self.twice_mask).count_ones() as usize;
-            return ones + 2 * twos >= self.need;
+            return self.allows_twice(path_mask);
+        }
+        self.allows_gt2(path_mask, needle)
+    }
+
+    // `needle` matches `new`. A class miss rejects only when its minimum
+    // weight exceeds the typo budget; mask 0 is not treated as unknown here.
+    #[inline(never)]
+    fn allows_gt2(&self, path_mask: u64, needle: &[u8]) -> bool {
+        let missing = self.needle_mask & !path_mask;
+        if missing == 0 {
+            return true;
+        }
+        let budget = needle.len().saturating_sub(self.need);
+        let nmiss = missing.count_ones() as usize;
+        if nmiss > budget {
+            return false;
+        }
+        if (missing & !self.once_mask) == 0 {
+            return true;
+        }
+        let ge2 = (missing & self.twice_mask).count_ones() as usize;
+        if nmiss + ge2 > budget {
+            return false;
         }
         if self.dup_full {
             let mut hits = 0usize;
@@ -305,10 +457,49 @@ mod tests {
         assert!(!allows(mask, b"xyz", 0));
     }
 
+    fn formula(b: u8) -> u32 {
+        let b = if b.is_ascii_uppercase() { b + 32 } else { b };
+        match b {
+            b'a'..=b'z' => (b - b'a') as u32,
+            b'0'..=b'9' => 26 + (b - b'0') as u32,
+            b'.' => 36,
+            b'_' => 37,
+            b'-' => 38,
+            b'/' => 39,
+            b'\\' => 40,
+            b' ' => 41,
+            b',' => 42,
+            b'@' => 43,
+            b'#' => 44,
+            b'(' => 45,
+            b')' => 46,
+            b'[' => 47,
+            _ => 48 + (b & 15) as u32,
+        }
+    }
+
     #[test]
     fn fold_bit_is_stable_for_case() {
+        assert!((0..=u8::MAX).all(|b| fold_bit(b) == formula(b)));
         assert_eq!(fold_bit(b'A'), fold_bit(b'a'));
         assert_eq!(fold_bit(b'Z'), fold_bit(b'z'));
         assert_ne!(fold_bit(b'a'), fold_bit(b'b'));
+    }
+
+    #[test]
+    fn zero_byte_matches_memchr() {
+        let mut bytes = [0x41u8; 40];
+        for n in 0..=bytes.len() {
+            let (mask, nul) = fold_mask(0, &bytes[..n]);
+            assert_eq!(mask, mask_of(&bytes[..n]));
+            assert_eq!(nul, memchr::memchr(0, &bytes[..n]).is_some());
+        }
+        for at in 0..bytes.len() {
+            bytes[at] = 0;
+            let (_, nul) = fold_mask(0, &bytes);
+            assert!(nul);
+            assert_eq!(nul, memchr::memchr(0, &bytes).is_some());
+            bytes[at] = 0x41;
+        }
     }
 }

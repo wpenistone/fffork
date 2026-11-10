@@ -5,31 +5,8 @@ use crate::sort_buffer::sort_with_buffer;
 use crate::types::FileItem;
 use fff_query_parser::Constraint;
 
-/// Prefilter with a FilePath-constraint fallback: when constraints yield 0
-/// files and the query had FilePath constraints, retry without them (the path
-/// token was likely part of the search text).
-#[allow(clippy::too_many_arguments)]
-pub(super) fn prefilter_with_filepath_retry<'a>(
-    files: &'a [FileItem],
-    constraints: &[Constraint<'_>],
-    bigram_candidates: Option<&[u64]>,
-    base_count: usize,
-    options: &GrepSearchOptions,
-    arena: crate::simd_path::ArenaPtr,
-    overflow_arena: crate::simd_path::ArenaPtr,
-) -> (Vec<&'a FileItem>, usize) {
-    let (indexed, total) = prefilter_with_filepath_retry_indexed(
-        files,
-        constraints,
-        bigram_candidates,
-        base_count,
-        options,
-        arena,
-        overflow_arena,
-    );
-    (indexed.into_iter().map(|(f, _)| f).collect(), total)
-}
-
+/// On an empty FilePath-constrained result, retry without those path tokens.
+/// Each item is `(file, picker index)` for the content mask.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prefilter_with_filepath_retry_indexed<'a>(
     files: &'a [FileItem],
@@ -252,12 +229,7 @@ pub(super) fn prefilter_files_indexed<'a>(
     };
 
     let total_count = prefiltered.len();
-
-    sort_with_buffer(&mut prefiltered, |a, b| {
-        b.0.total_frecency_score()
-            .cmp(&a.0.total_frecency_score())
-            .then(b.0.modified().cmp(&a.0.modified()))
-    });
+    sort_candidates_once(&mut prefiltered);
 
     if options.file_offset > 0 && options.file_offset < total_count {
         let paginated = prefiltered.split_off(options.file_offset);
@@ -286,6 +258,40 @@ fn strip_file_path_constraint_if_present<'a>(
         .collect();
 
     Some(filtered)
+}
+
+// One sequential load of frecency/mtime. The stable sort compares those keys
+// and does not reload FileItem atomics on each comparison.
+fn sort_candidates_once(items: &mut Vec<(&FileItem, usize)>) {
+    let n = items.len();
+    if n < 2 {
+        return;
+    }
+    let mut keys: Vec<(i32, u64)> = Vec::with_capacity(n);
+    for (file, _) in items.iter() {
+        keys.push((file.total_frecency_score(), file.modified()));
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    sort_with_buffer(&mut order, |&a, &b| {
+        keys[b].0.cmp(&keys[a].0).then(keys[b].1.cmp(&keys[a].1))
+    });
+    // `order[i]` is the source index for position `i`.
+    for i in 0..n {
+        if order[i] == i {
+            continue;
+        }
+        let mut current = i;
+        loop {
+            let next = order[current];
+            if next == i {
+                order[current] = current;
+                break;
+            }
+            items.swap(current, next);
+            order[current] = current;
+            current = next;
+        }
+    }
 }
 
 #[cfg(test)]

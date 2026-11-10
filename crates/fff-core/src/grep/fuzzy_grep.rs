@@ -10,6 +10,90 @@ use super::prefilter::chunk_plan;
 use super::sink::{char_indices_to_byte_offsets, strip_line_terminators, truncate_display_bytes};
 use super::types::{GrepMatch, GrepResult, GrepSearchOptions, PageFillGate};
 
+// Cleared, then filled on each search.
+// Parked empty so the next search keeps the allocation.
+thread_local! {
+    static UNIQUE_NEEDLE_CHARS: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static PER_FILE_RESULTS: std::cell::RefCell<Vec<(usize, Vec<GrepMatch>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static MATCH_SPARE: std::cell::RefCell<Option<Vec<GrepMatch>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn take_unique_needle_chars() -> Vec<u8> {
+    let mut buf = UNIQUE_NEEDLE_CHARS.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+    buf.clear();
+    buf
+}
+
+fn park_unique_needle_chars(mut buf: Vec<u8>) {
+    buf.clear();
+    UNIQUE_NEEDLE_CHARS.with(|slot| {
+        let slot = &mut *slot.borrow_mut();
+        if buf.capacity() > slot.capacity() {
+            *slot = buf;
+        }
+    });
+}
+
+fn take_per_file_results() -> Vec<(usize, Vec<GrepMatch>)> {
+    let mut buf = PER_FILE_RESULTS.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+    buf.clear();
+    buf
+}
+
+fn park_per_file_results(mut buf: Vec<(usize, Vec<GrepMatch>)>) {
+    buf.clear();
+    PER_FILE_RESULTS.with(|slot| {
+        let slot = &mut *slot.borrow_mut();
+        if buf.capacity() > slot.capacity() {
+            *slot = buf;
+        }
+    });
+}
+
+// Spare list on this thread, reserved for `n` rows; otherwise a new buffer of `n`.
+fn alloc_match_buf(n: usize) -> Vec<GrepMatch> {
+    MATCH_SPARE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if let Some(mut buf) = slot.take() {
+            buf.clear();
+            buf.reserve(n);
+            buf
+        } else {
+            Vec::with_capacity(n)
+        }
+    })
+}
+
+fn recycle_match_buf(mut buf: Vec<GrepMatch>) {
+    buf.clear();
+    MATCH_SPARE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let keep = match slot.as_ref() {
+            Some(cur) => buf.capacity() > cur.capacity(),
+            None => buf.capacity() > 0,
+        };
+        if keep {
+            *slot = Some(buf);
+        }
+    });
+}
+
+fn match_buf_len(slot: &Option<Vec<GrepMatch>>) -> usize {
+    slot.as_ref().map_or(0, Vec::len)
+}
+
+fn ensure_match_buf(slot: &mut Option<Vec<GrepMatch>>, n: usize) -> &mut Vec<GrepMatch> {
+    if slot.is_none() {
+        *slot = Some(alloc_match_buf(n));
+    } else if let Some(buf) = slot.as_mut() {
+        buf.reserve(n);
+    }
+    slot.as_mut().unwrap()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fuzzy_grep_search<'a>(
     grep_text: &str,
@@ -83,7 +167,8 @@ pub(super) fn fuzzy_grep_search<'a>(
     // case-sensitive too (a wrong-case file passes, never a match rejected).
     let needle_bytes = grep_text.as_bytes();
     let mut seen = [false; 256];
-    let mut unique_needle_chars: Vec<u8> = Vec::new();
+    let mut unique_needle_chars = take_unique_needle_chars();
+    unique_needle_chars.clear();
     for &b in needle_bytes {
         let l = b.to_ascii_lowercase();
         if !seen[l as usize] {
@@ -95,9 +180,19 @@ pub(super) fn fuzzy_grep_search<'a>(
     // How many distinct needle chars must appear in the file.
     // With max_typos allowed, we need at least (unique_count - max_typos)
     let min_chars_required = unique_needle_chars.len().saturating_sub(max_typos);
-    // Indexed byte-class check before any open+read. Sound for fuzzy: a
-    // match keeps at least len-typos needle bytes, so a failing AND+popcount
-    // provably cannot match.
+    // A class owned by one needle byte proves that byte. A shared class does not.
+    let mut seen_class = 0u64;
+    let mut private_classes = 0u64;
+    for &ch in &unique_needle_chars {
+        let bit = 1u64 << crate::presence::fold_bit(ch);
+        if seen_class & bit != 0 {
+            private_classes &= !bit;
+        } else {
+            seen_class |= bit;
+            private_classes |= bit;
+        }
+    }
+    let classes_distinct = private_classes == seen_class && min_chars_required > 0;
     let mask_needle = MaskNeedle::new(needle_bytes, max_typos as u16);
 
     let time_budget = if options.time_budget_ms > 0 {
@@ -124,7 +219,8 @@ pub(super) fn fuzzy_grep_search<'a>(
     let mut chunk_size = base_chunk;
     let mut chunk_start = 0;
     let mut running_matches = 0usize;
-    let mut per_file_results: Vec<(usize, &'a FileItem, Vec<GrepMatch>)> = Vec::new();
+    let mut per_file_results = take_per_file_results();
+    per_file_results.clear();
 
     while chunk_start < files_to_search.len() {
         let chunk_end = (chunk_start + chunk_size).min(files_to_search.len());
@@ -168,12 +264,33 @@ pub(super) fn fuzzy_grep_search<'a>(
                             return None;
                         }
 
-                        // Indexed mask first: skips open+read, one AND+popcount.
+                        // Miss skips the read. A private class skips memchr.
+                        // Mask 0 is unknown and falls through to a scan.
+                        let mut skip_char_scan = false;
+                        let mut mask_bits = 0u64;
                         if let Some(masks) = content_masks
                             && let Some(mask) = masks.get(*orig_idx)
-                            && mask_needle.allows(mask) == Some(false)
                         {
-                            return None;
+                            match mask_needle.allows(mask) {
+                                Some(false) => return None,
+                                Some(true) => {
+                                    let bits = mask.get();
+                                    let private_present =
+                                        (bits & private_classes).count_ones() as usize;
+                                    let shared = unique_needle_chars.len().saturating_sub(
+                                        private_classes.count_ones() as usize,
+                                    );
+                                    if private_present + shared < min_chars_required {
+                                        return None;
+                                    }
+                                    if classes_distinct {
+                                        skip_char_scan = true;
+                                    } else {
+                                        mask_bits = bits;
+                                    }
+                                }
+                                None => {}
+                            }
                         }
 
                         let file_arena = if file.is_overflow() {
@@ -191,10 +308,13 @@ pub(super) fn fuzzy_grep_search<'a>(
                             base_dir.as_ref(),
                         )?;
 
-                        if min_chars_required > 0 {
+                        if min_chars_required > 0 && !skip_char_scan {
                             let mut chars_found = 0usize;
                             for &ch in &unique_needle_chars {
-                                let hit = if ch.is_ascii_lowercase() {
+                                let bit = 1u64 << crate::presence::fold_bit(ch);
+                                let hit = if mask_bits != 0 && private_classes & bit != 0 {
+                                    mask_bits & bit != 0
+                                } else if ch.is_ascii_lowercase() {
                                     memchr::memchr2(ch, ch.to_ascii_uppercase(), file_bytes)
                                         .is_some()
                                 } else {
@@ -217,7 +337,7 @@ pub(super) fn fuzzy_grep_search<'a>(
                         let mut stepper = LineStep::new(b'\n', 0, file_bytes.len());
                         let mut batch_lines: Vec<&str> = Vec::with_capacity(128);
                         let mut batch_meta: Vec<(u64, u64)> = Vec::with_capacity(128);
-                        let mut file_matches: Vec<GrepMatch> = Vec::new();
+                        let mut file_matches: Option<Vec<GrepMatch>> = None;
                         let mut line_number: u64 = 1;
                         while let Some(line_match) = stepper.next_match(file_bytes) {
                             let byte_offset = line_match.start() as u64;
@@ -250,7 +370,7 @@ pub(super) fn fuzzy_grep_search<'a>(
                                 batch_lines.clear();
                                 batch_meta.clear();
                                 if max_matches_per_file != 0
-                                    && file_matches.len() >= max_matches_per_file
+                                    && match_buf_len(&file_matches) >= max_matches_per_file
                                 {
                                     break;
                                 }
@@ -258,7 +378,7 @@ pub(super) fn fuzzy_grep_search<'a>(
                         }
                         if !batch_lines.is_empty()
                             && (max_matches_per_file == 0
-                                || file_matches.len() < max_matches_per_file)
+                                || match_buf_len(&file_matches) < max_matches_per_file)
                         {
                             push_fuzzy_batch(
                                 &mut *matcher,
@@ -276,9 +396,14 @@ pub(super) fn fuzzy_grep_search<'a>(
                             );
                         }
 
-                        if file_matches.is_empty() {
-                            return None;
-                        }
+                        let file_matches = match file_matches {
+                            Some(buf) if !buf.is_empty() => buf,
+                            Some(buf) => {
+                                recycle_match_buf(buf);
+                                return None;
+                            }
+                            None => return None,
+                        };
 
                         Some(file_matches)
                     })();
@@ -298,9 +423,9 @@ pub(super) fn fuzzy_grep_search<'a>(
             .collect();
 
         let before_matches = running_matches;
-        for result in chunk_results {
-            running_matches += result.2.len();
-            per_file_results.push(result);
+        for (idx, _file, matches) in chunk_results {
+            running_matches += matches.len();
+            per_file_results.push((idx, matches));
         }
 
         if running_matches >= page_limit || first_skipped.load(Ordering::Relaxed) != usize::MAX {
@@ -322,15 +447,99 @@ pub(super) fn fuzzy_grep_search<'a>(
         }
     }
 
+    park_unique_needle_chars(unique_needle_chars);
     let abort_resume = Some(first_skipped.load(Ordering::Relaxed)).filter(|&i| i != usize::MAX);
-    GrepResult::collect(
-        per_file_results,
-        files_to_search.len(),
+    let result = assemble_grep_result(
+        &mut per_file_results,
+        files_to_search,
         options,
         total_files,
         filtered_file_count,
         abort_resume,
-    )
+    );
+    park_per_file_results(per_file_results);
+    result
+}
+
+// Same page cursor as `GrepResult::collect`.
+fn assemble_grep_result<'a>(
+    per_file_results: &mut Vec<(usize, Vec<GrepMatch>)>,
+    files_to_search: &[(&'a FileItem, usize)],
+    options: &GrepSearchOptions,
+    total_files: usize,
+    filtered_file_count: usize,
+    abort_resume: Option<usize>,
+) -> GrepResult<'a> {
+    let files_to_search_len = files_to_search.len();
+    let page_limit = options.page_limit;
+    let mut result_files: Vec<&'a FileItem> = Vec::new();
+    let mut all_matches: Vec<GrepMatch> = Vec::new();
+    let mut files_consumed: usize = 0;
+    let mut page_filled = false;
+
+    let mut iter = per_file_results.drain(..);
+    while let Some((batch_idx, mut file_matches)) = iter.next() {
+        if abort_resume.is_some_and(|at| batch_idx >= at) {
+            recycle_match_buf(file_matches);
+            continue;
+        }
+
+        files_consumed = batch_idx + 1;
+        let file_result_idx = result_files.len();
+        result_files.push(files_to_search[batch_idx].0);
+
+        for mut m in file_matches.drain(..) {
+            m.file_index = file_result_idx;
+            if options.trim_whitespace {
+                m.trim_leading_whitespace();
+            }
+            all_matches.push(m);
+        }
+        recycle_match_buf(file_matches);
+
+        if all_matches.len() >= page_limit {
+            page_filled = true;
+            break;
+        }
+    }
+    for (_, file_matches) in iter {
+        recycle_match_buf(file_matches);
+    }
+
+    match abort_resume {
+        Some(resume_at) if !page_filled => files_consumed = resume_at.min(files_to_search_len),
+        None if result_files.is_empty() => files_consumed = files_to_search_len,
+        _ => {}
+    }
+
+    let has_more = files_consumed < files_to_search_len
+        && (abort_resume.is_some() || all_matches.len() >= page_limit);
+    let next_file_offset = if has_more {
+        options.file_offset + files_consumed
+    } else {
+        0
+    };
+
+    GrepResult {
+        matches: all_matches,
+        files_with_matches: result_files.len(),
+        files: result_files,
+        total_files_searched: files_consumed,
+        total_files,
+        filtered_file_count,
+        next_file_offset,
+        regex_fallback_error: None,
+        literal_fallback: false,
+    }
+}
+
+fn fuzzy_display_line(raw_line: &str) -> &str {
+    let truncated = truncate_display_bytes(raw_line.as_bytes());
+    if truncated.len() < raw_line.len() {
+        &raw_line[..truncated.len()]
+    } else {
+        raw_line
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -346,26 +555,35 @@ fn push_fuzzy_batch(
     max_gaps: usize,
     max_matches_per_file: usize,
     definition_mode: super::DefinitionMode,
-    file_matches: &mut Vec<GrepMatch>,
+    file_matches: &mut Option<Vec<GrepMatch>>,
 ) {
-    let scored = matcher.match_list_indices(batch_lines);
-    for mut m in scored {
-        if m.score < min_score {
+    // Rows this batch will push. Sized before the owned list is reserved.
+    struct Kept {
+        scored_idx: u32,
+        line_idx: u32,
+        line_number: u64,
+        byte_offset: u64,
+        is_definition: bool,
+    }
+
+    let already = match_buf_len(file_matches);
+    let mut kept: smallvec::SmallVec<[Kept; 8]> = smallvec::SmallVec::new();
+    let mut scored = matcher.match_list_indices(batch_lines);
+    for i in 0..scored.len() {
+        if max_matches_per_file != 0 && already + kept.len() >= max_matches_per_file {
+            break;
+        }
+        if scored[i].score < min_score {
             continue;
         }
-        let line_idx = m.index as usize;
+        let line_idx = scored[i].index as usize;
         let Some(&(ln, bo)) = batch_meta.get(line_idx) else {
             continue;
         };
         let Some(&raw_line) = batch_lines.get(line_idx) else {
             continue;
         };
-        let truncated = truncate_display_bytes(raw_line.as_bytes());
-        let display_line = if truncated.len() < raw_line.len() {
-            &raw_line[..truncated.len()]
-        } else {
-            raw_line
-        };
+        let display_line = fuzzy_display_line(raw_line);
         if display_line.len() < raw_line.len() {
             let Some(re_m) = matcher
                 .match_list_indices(std::slice::from_ref(&display_line))
@@ -374,20 +592,20 @@ fn push_fuzzy_batch(
             else {
                 continue;
             };
-            m = re_m;
+            scored[i] = re_m;
         }
-        m.indices.sort_unstable();
+        scored[i].indices.sort_unstable();
         let min_matched = needle_len.saturating_sub(max_typos).max(1);
-        if m.indices.len() < min_matched {
+        if scored[i].indices.len() < min_matched {
             continue;
         }
-        if let (Some(&first), Some(&last)) = (m.indices.first(), m.indices.last()) {
+        if let (Some(&first), Some(&last)) = (scored[i].indices.first(), scored[i].indices.last()) {
             let span = (last - first + 1) as usize;
             if span > max_match_span {
                 continue;
             }
-            let density = (m.indices.len() * 100) / span;
-            let min_density = if m.indices.len() >= needle_len {
+            let density = (scored[i].indices.len() * 100) / span;
+            let min_density = if scored[i].indices.len() >= needle_len {
                 45
             } else {
                 65
@@ -395,32 +613,51 @@ fn push_fuzzy_batch(
             if density < min_density {
                 continue;
             }
-            let gaps = m.indices.windows(2).filter(|w| w[1] != w[0] + 1).count();
+            let gaps = scored[i]
+                .indices
+                .windows(2)
+                .filter(|w| w[1] != w[0] + 1)
+                .count();
             if gaps > max_gaps {
                 continue;
             }
         }
-        let offsets = char_indices_to_byte_offsets(display_line, &m.indices);
+        let offsets = char_indices_to_byte_offsets(display_line, &scored[i].indices);
         let Some(is_definition) =
             definition_mode.classify_match(file, raw_line.as_bytes(), &offsets, true)
         else {
             continue;
         };
-        let col = offsets.first().map(|r| r.0 as usize).unwrap_or(0);
-        file_matches.push(GrepMatch {
-            file_index: 0,
+        kept.push(Kept {
+            scored_idx: i as u32,
+            line_idx: line_idx as u32,
             line_number: ln,
-            col,
             byte_offset: bo,
             is_definition,
+        });
+    }
+
+    if kept.is_empty() {
+        return;
+    }
+    let out = ensure_match_buf(file_matches, kept.len());
+    for row in kept {
+        let m = &scored[row.scored_idx as usize];
+        let raw_line = batch_lines[row.line_idx as usize];
+        let display_line = fuzzy_display_line(raw_line);
+        let offsets = char_indices_to_byte_offsets(display_line, &m.indices);
+        let col = offsets.first().map(|r| r.0 as usize).unwrap_or(0);
+        out.push(GrepMatch {
+            file_index: 0,
+            line_number: row.line_number,
+            col,
+            byte_offset: row.byte_offset,
+            is_definition: row.is_definition,
             line_content: display_line.to_string(),
             match_byte_offsets: offsets,
             fuzzy_score: Some(m.score),
             context_before: Vec::new(),
             context_after: Vec::new(),
         });
-        if max_matches_per_file != 0 && file_matches.len() >= max_matches_per_file {
-            break;
-        }
     }
 }

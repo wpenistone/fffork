@@ -1,13 +1,5 @@
-//! Location parsing for file:line:col patterns
-//!
-//! Parses various location formats like:
-//! - `file:12` - Line number
-//! - `file:12:4` - Line and column
-//! - `file:12-114` - Line range
-//! - `file:12:4-20` - Column range on same line
-//! - `file:12:4-14:20` - Position range
-//! - `file(12)` - Visual Studio style line
-//! - `file(12,4)` - Visual Studio style line and column
+//! `file:12`, `file:12:4`, `file:12-114`, `file:12:4-20`, `file:12:4-14:20`.
+//! Also `file(12)` and `file(12,4)`. A Windows drive colon is not a location.
 
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
 pub enum Location {
@@ -162,24 +154,9 @@ fn parse_vstudio_location(query: &str) -> Option<(&str, Location)> {
     None
 }
 
-/// Parse location from the end of a query string.
-///
-/// Returns the query without the location suffix, and the parsed location if found.
-///
-/// # Examples
-/// ```
-/// use fff_query_parser::location::{parse_location, Location};
-///
-/// let (query, loc) = parse_location("file:12");
-/// assert_eq!(query, "file");
-/// assert_eq!(loc, Some(Location::Line(12)));
-///
-/// let (query, loc) = parse_location("search term");
-/// assert_eq!(query, "search term");
-/// assert_eq!(loc, None);
-/// ```
+/// Query text with a trailing location removed, plus that location.
+/// A leftover trailing `:`, `-`, or `(` is stripped and is not a location.
 pub fn parse_location(query: &str) -> (&str, Option<Location>) {
-    // simply ignore the last semicolon even if there are no additional location info
     let query = query.trim_end_matches([':', '-', '(']);
     if let Some((path, location)) = parse_column_location(query) {
         return (path, Some(location));

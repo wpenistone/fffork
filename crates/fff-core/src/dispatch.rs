@@ -130,11 +130,33 @@ pub(crate) fn probe_len(n: usize, avg_bytes: usize) -> usize {
     p.min(n)
 }
 
-// Mean path bytes over a strided sample; avoids walking the corpus.
+#[derive(Clone, Copy)]
+struct PathAvg {
+    ptr: usize,
+    len: usize,
+    avg: usize,
+}
+
+// Mean path bytes over a strided sample. The same file list reuses it.
 pub(crate) fn sampled_path_avg(files: &crate::matcher::FileItems<'_>) -> usize {
     let n = files.len();
     if n == 0 {
         return 1;
+    }
+    let (ptr, len) = match files {
+        crate::matcher::FileItems::All(s) => (s.as_ptr() as usize, s.len()),
+        crate::matcher::FileItems::Filtered { idx, .. } => (idx.as_ptr() as usize, idx.len()),
+    };
+    std::thread_local! {
+        static LAST: std::cell::Cell<PathAvg> = const {
+            std::cell::Cell::new(PathAvg { ptr: 0, len: 0, avg: 0 })
+        };
+    }
+    if let Some(avg) = LAST.with(|slot| {
+        let prev = slot.get();
+        (prev.ptr == ptr && prev.len == len && prev.avg != 0).then_some(prev.avg)
+    }) {
+        return avg;
     }
     let m = n.min(32);
     let stride = (n / m).max(1);
@@ -146,7 +168,26 @@ pub(crate) fn sampled_path_avg(files: &crate::matcher::FileItems<'_>) -> usize {
             break;
         }
     }
-    sum.div_ceil(count.max(1)).max(1)
+    let avg = sum.div_ceil(count.max(1)).max(1);
+    LAST.with(|slot| slot.set(PathAvg { ptr, len, avg }));
+    avg
+}
+
+// One env read. `FFF_NO_BATCH_PAR` keeps Smith-Waterman batches on the caller.
+pub(crate) fn batch_par_disabled() -> bool {
+    static OFF: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FFF_NO_BATCH_PAR").is_some());
+    *OFF
+}
+
+// One env read. `FFF_SW_CHUNK` replaces the planned group size; unset keeps the plan.
+pub(crate) fn sw_chunk_override() -> Option<usize> {
+    static C: LazyLock<Option<usize>> = LazyLock::new(|| {
+        std::env::var("FFF_SW_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n| *n >= 1)
+    });
+    *C
 }
 
 // Fixed-size SIMD batch fan-out: parallel wins iff saved time exceeds dispatch.
@@ -156,6 +197,18 @@ pub(crate) fn parallel_batches(n_batches: usize, ns_per_batch: f64, threads: usi
     }
     let t = threads as f64;
     (n_batches as f64) * ns_per_batch * (1.0 - 1.0 / t) > fork_join_ns() as f64
+}
+
+// Inner batches may use the pool only when the outer join left workers idle
+// and the caller did not bind width below that pool. Scores do not move.
+pub(crate) fn allow_inner_sw_fanout(n_groups: usize, group_cap: usize, requested: usize) -> bool {
+    if n_groups > 1 && n_groups >= group_cap.max(1) {
+        return false;
+    }
+    if batch_par_disabled() {
+        return false;
+    }
+    requested.max(1) >= crate::machine::search_threads()
 }
 
 // Seed batch cost per lane class; slices refine it, so error only shifts the boundary.
@@ -189,8 +242,9 @@ pub(crate) fn observe_batch_ns(u8_class: bool, slice_ns: f64, n_batches: usize) 
         std::sync::atomic::Ordering::Relaxed,
         std::sync::atomic::Ordering::Relaxed,
         |ema| {
-            let ema = ema.max(1) as i64;
-            Some((ema + (sample as i64 - ema) / 8).max(1) as u64)
+            let base = ema.max(1) as i64;
+            let next = (base + (sample as i64 - base) / 8).max(1) as u64;
+            (next != ema).then_some(next)
         },
     );
 }

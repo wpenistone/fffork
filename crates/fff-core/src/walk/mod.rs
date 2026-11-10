@@ -18,11 +18,64 @@ mod ripgrep;
 #[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
 pub(crate) use ripgrep::walk_collect_files;
 
+/// Byte range in `WalkOutput` buffer `buf`. Text is UTF-8.
+#[derive(Clone, Copy)]
+pub(crate) struct WalkSpan {
+    pub(crate) buf: u16,
+    pub(crate) off: u32,
+    pub(crate) len: u32,
+}
+
 pub(crate) struct WalkOutput {
-    pub(crate) pairs: Vec<(FileItem, String)>,
+    buffers: Vec<Vec<u8>>,
+    pub(crate) pairs: Vec<(FileItem, WalkSpan)>,
     /// Every non-ignored directory the walk visited, relative, ending with /
-    pub(crate) dirs: Vec<String>,
+    pub(crate) dirs: Vec<WalkSpan>,
     pub(crate) ignore_rules: Option<WalkIgnoreRules>,
+}
+
+impl WalkOutput {
+    pub(crate) fn from_parts(
+        buffers: Vec<Vec<u8>>,
+        pairs: Vec<(FileItem, WalkSpan)>,
+        dirs: Vec<WalkSpan>,
+        ignore_rules: Option<WalkIgnoreRules>,
+    ) -> Self {
+        Self {
+            buffers,
+            pairs,
+            dirs,
+            ignore_rules,
+        }
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<Vec<u8>>,
+        Vec<(FileItem, WalkSpan)>,
+        Vec<WalkSpan>,
+        Option<WalkIgnoreRules>,
+    ) {
+        (self.buffers, self.pairs, self.dirs, self.ignore_rules)
+    }
+
+    #[inline]
+    pub(crate) fn path(&self, span: WalkSpan) -> &str {
+        span_path(&self.buffers, span)
+    }
+}
+
+#[inline]
+pub(crate) fn span_bytes(buffers: &[Vec<u8>], span: WalkSpan) -> &[u8] {
+    let start = span.off as usize;
+    &buffers[span.buf as usize][start..start + span.len as usize]
+}
+
+#[inline]
+pub(crate) fn span_path<'a>(buffers: &'a [Vec<u8>], span: WalkSpan) -> &'a str {
+    // Insert stored UTF-8; invalid OS names were lossy-replaced before the copy.
+    unsafe { std::str::from_utf8_unchecked(span_bytes(buffers, span)) }
 }
 
 pub(crate) struct WalkIgnoreRules {
@@ -95,7 +148,11 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let out = walk_collect_files(root, true, false, 1, &counter).unwrap();
 
-        let mut names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
+        let mut names: Vec<String> = out
+            .pairs
+            .iter()
+            .map(|(_, span)| out.path(*span).to_string())
+            .collect();
         names.sort();
 
         assert!(names.contains(&"Cargo.toml".to_string()));
@@ -118,7 +175,11 @@ mod tests {
 
         let counter = Arc::new(AtomicUsize::new(0));
         let out = walk_collect_files(root, false, false, 1, &counter).unwrap();
-        let names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
+        let names: Vec<String> = out
+            .pairs
+            .iter()
+            .map(|(_, span)| out.path(*span).to_string())
+            .collect();
 
         assert!(names.iter().any(|n| n.ends_with("index.js")));
         assert!(!names.iter().any(|n| n.contains("node_modules")));
@@ -143,18 +204,31 @@ mod tests {
 
         let counter = Arc::new(AtomicUsize::new(0));
         let out = walk_collect_files(&root, false, true, 1, &counter).unwrap();
-        let mut names: Vec<String> = out.pairs.iter().map(|(_, rel)| rel.clone()).collect();
+        let mut names: Vec<String> = out
+            .pairs
+            .iter()
+            .map(|(_, span)| out.path(*span).to_string())
+            .collect();
         names.sort();
 
         assert_eq!(names, ["linked/inner.toml", "projects.toml", "sesh.toml"]);
         assert_eq!(counter.load(Ordering::Relaxed), names.len());
 
-        let (item, rel) = out.pairs.iter().find(|(_, r)| r == "sesh.toml").unwrap();
+        let (item, span) = out
+            .pairs
+            .iter()
+            .find(|(_, span)| out.path(*span) == "sesh.toml")
+            .unwrap();
+        let rel = out.path(*span);
         assert_eq!(item.size, 10);
         assert_eq!(&rel[item.filename_offset_in_relative_path()..], "sesh.toml");
 
         let out = walk_collect_files(&root, false, false, 1, &counter).unwrap();
-        let names: Vec<String> = out.pairs.into_iter().map(|(_, rel)| rel).collect();
+        let names: Vec<String> = out
+            .pairs
+            .iter()
+            .map(|(_, span)| out.path(*span).to_string())
+            .collect();
         assert_eq!(names, ["projects.toml"]);
     }
 

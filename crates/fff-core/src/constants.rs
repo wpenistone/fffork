@@ -31,13 +31,11 @@ pub const RESCAN_MIN_INTERVAL_LARGE_INDEX: std::time::Duration =
 /// Live-file count at which [`RESCAN_MIN_INTERVAL_LARGE_INDEX`] takes over.
 pub const LARGE_INDEX_FILE_COUNT: usize = 1_000_000;
 
-/// Fresh-mmap threshold: files at or above this size get mmapped directly on
-/// cache miss instead of chunked reads into Vec. Empirically tuned per-platform.
-/// Only referenced on Unix; Windows uses the `std::fs::read` fallback so this
-/// constant is gated to non-Windows targets to keep `-D unused-imports` happy.
+/// Files at or above this size are mapped for search instead of copied into a Vec.
+/// Smaller files stay on ReadFile: map/unmap costs more than the copy.
 #[cfg(target_os = "macos")]
 pub const FRESH_MMAP_THRESHOLD: u64 = 1024 * 1024;
-#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+#[cfg(not(target_os = "macos"))]
 pub const FRESH_MMAP_THRESHOLD: u64 = 256 * 1024;
 
 // we do not support 32kb path limit on windows

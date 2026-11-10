@@ -4,9 +4,11 @@ use crate::error::{Error, Result};
 use crate::file_picker::FFFMode;
 use crate::git::is_modified_status;
 use crate::lmdb::{DbHealth, LmdbStore, WRITE_TXN_CHUNK, is_map_full};
+use ahash::AHashMap;
 use heed::Database;
 use heed::types::{Bytes, SerdeBincode};
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::VecDeque, path::Path};
 
@@ -14,6 +16,8 @@ const DECAY_CONSTANT: f64 = 0.0693; // ln(2)/10 for 10-day half-life
 const SECONDS_PER_DAY: f64 = 86400.0;
 const MAX_HISTORY_DAYS: f64 = 30.0; // Only consider accesses within 30 days
 const MAX_TIMESTAMPS_PER_FILE: usize = 128;
+// Below this, point gets. At/above, one sequential pass reused for the same snapshot and second.
+const DECAY_SCAN_MIN: usize = 1024;
 
 // AI mode: faster decay since AI sessions are shorter and more intense
 const AI_DECAY_CONSTANT: f64 = 0.231; // ln(2)/3 for 3-day half-life
@@ -24,10 +28,19 @@ pub struct FrecencyTracker {
     env: SharedEnv,
     db: Database<Bytes, SerdeBincode<VecDeque<u64>>>,
     health: DbHealth,
-    // 2 = unknown, 1 = non-empty, 0 = empty. Avoids a read txn per scan.
-    // Stale-1 after a GC purge only costs one wasted hydration pass; writes
-    // always set 1, so stale-0 (skipped hydration with data) is impossible.
+    // 2 unknown, 1 nonempty, 0 empty. Reads skip LMDB while 0.
+    // Local writes store 1 before commit so a probe cannot publish 0 over data.
     empty_hint: AtomicU8,
+    // Decay sums for one snapshot id, `now` second, and mode. A new id or second rebuilds.
+    decay_cache: Mutex<Option<DecayCache>>,
+}
+
+#[derive(Debug)]
+struct DecayCache {
+    snapshot: usize,
+    now: u64,
+    mode: u8,
+    sums: AHashMap<[u8; 32], f64>,
 }
 
 const MODIFICATION_THRESHOLDS: [(i64, u64); 5] = [
@@ -112,12 +125,15 @@ impl FrecencyTracker {
         let (env, health) = Self::open_env(db_path)?;
 
         let db = Self::open_database_safe(&env, None)?;
-        Ok(FrecencyTracker {
+        let tracker = FrecencyTracker {
             db,
             env,
             health,
             empty_hint: AtomicU8::new(2),
-        })
+            decay_cache: Mutex::new(None),
+        };
+        let _ = tracker.probe_access_empty();
+        Ok(tracker)
     }
 
     #[deprecated(
@@ -219,6 +235,9 @@ impl FrecencyTracker {
     }
 
     fn get_accesses(&self, path: &Path) -> Result<Option<VecDeque<u64>>> {
+        if self.reads_skip_lmdb() {
+            return Ok(None);
+        }
         let key_hash = Self::path_to_hash_bytes(path)?;
 
         let rtxn = self
@@ -241,18 +260,11 @@ impl FrecencyTracker {
     }
 
     pub fn is_empty(&self) -> bool {
-        if self.empty_hint.load(Ordering::Relaxed) == 1 {
-            return false;
+        match self.empty_hint.load(Ordering::Acquire) {
+            0 => true,
+            1 => false,
+            _ => self.probe_access_empty().unwrap_or(true),
         }
-        let Ok(rtxn) = self.env.read_txn() else {
-            return true;
-        };
-        let Ok(stat) = self.db.stat(&rtxn) else {
-            return true;
-        };
-        let empty = stat.entries == 0;
-        self.empty_hint.store(u8::from(!empty), Ordering::Relaxed);
-        empty
     }
 
     fn get_now(&self) -> u64 {
@@ -387,6 +399,7 @@ impl FrecencyTracker {
             }
         }
 
+        self.empty_hint.store(1, Ordering::Release);
         wtxn.commit()
             .inspect_err(|e| {
                 if is_map_full(e) {
@@ -401,7 +414,6 @@ impl FrecencyTracker {
                 db: Self::LABEL,
                 source,
             })?;
-        self.empty_hint.store(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -473,6 +485,7 @@ impl FrecencyTracker {
                 }
                 done += 1;
             }
+            self.empty_hint.store(1, Ordering::Release);
             if let Err(e) = wtxn.commit() {
                 if is_map_full(&e) {
                     self.health.mark_unhealthy("MDB_MAP_FULL on batch commit");
@@ -483,9 +496,6 @@ impl FrecencyTracker {
                     source: e,
                 });
             }
-        }
-        if done > 0 {
-            self.empty_hint.store(1, Ordering::Relaxed);
         }
         Ok(done)
     }
@@ -530,6 +540,7 @@ impl FrecencyTracker {
             });
         }
 
+        self.empty_hint.store(1, Ordering::Release);
         if let Err(e) = wtxn.commit() {
             if is_map_full(&e) {
                 self.health.mark_unhealthy("MDB_MAP_FULL on commit");
@@ -549,13 +560,11 @@ impl FrecencyTracker {
         self.reader().access_score(file_path, None, mode)
     }
 
-    /// Score a batch of precomputed path hashes with one LMDB read txn.
-    ///
-    /// Use [`Self::path_hash_raw`] for scan-built absolute paths so hydration
-    /// does not canonicalize every file on Windows.
+    /// Scores precomputed path hashes at one `now` and one LMDB snapshot.
+    /// Use [`Self::path_hash_raw`] for scan-built paths (no canonicalize).
     pub fn get_access_scores_for_hashes(&self, hashes: &[[u8; 32]], mode: FFFMode) -> Vec<i64> {
         let mut out = vec![0i64; hashes.len()];
-        if hashes.is_empty() {
+        if hashes.is_empty() || self.reads_skip_lmdb() {
             return out;
         }
 
@@ -563,41 +572,170 @@ impl FrecencyTracker {
             return out;
         };
         let now = self.get_now();
-        for (slot, hash) in out.iter_mut().zip(hashes.iter()) {
-            let Ok(accesses) = self.db.get(&rtxn, hash) else {
-                continue;
-            };
-            let Some(accesses) = accesses else {
-                continue;
-            };
-            *slot = normalize_frecency(decay_sum(&accesses, now, mode));
+        let snapshot = rtxn.id();
+        let mode_key = u8::from(mode.is_ai());
+
+        if self.write_cached(snapshot, now, mode_key, hashes, &mut out) {
+            return out;
         }
-        drop(rtxn);
+
+        if hashes.len() >= DECAY_SCAN_MIN
+            && let Some(sums) = self.scan_decay_sums(&rtxn, now, mode)
+        {
+            write_normalized(&sums, hashes, &mut out);
+            let mut guard = self.decay_cache_lock();
+            let replace = guard
+                .as_ref()
+                .map(|c| c.snapshot <= snapshot)
+                .unwrap_or(true);
+            if replace {
+                *guard = Some(DecayCache {
+                    snapshot,
+                    now,
+                    mode: mode_key,
+                    sums,
+                });
+            }
+            return out;
+        }
+
+        for (slot, hash) in out.iter_mut().zip(hashes.iter()) {
+            let sum = self.decay_of_hash(&rtxn, hash, now, mode);
+            if sum != 0.0 {
+                *slot = normalize_frecency(sum);
+            }
+        }
         out
     }
 
     // Scores many files under one read transaction: a transaction per lookup
     // serializes parallel scans on the LMDB reader table mutex
     pub(crate) fn reader(&self) -> FrecencyReader<'_> {
-        FrecencyReader {
-            tracker: self,
-            rtxn: self
-                .env
+        let rtxn = if self.reads_skip_lmdb() {
+            None
+        } else {
+            self.env
                 .read_txn()
                 .inspect_err(|e| tracing::debug!(?e, "Frecency read txn failed"))
-                .ok(),
+                .ok()
+        };
+        FrecencyReader {
+            tracker: self,
+            rtxn,
             now: self.get_now(),
         }
     }
 
-    /// Calculating modification score but only if the file is modified in the current git dir
+    fn reads_skip_lmdb(&self) -> bool {
+        match self.empty_hint.load(Ordering::Acquire) {
+            0 => true,
+            1 => false,
+            _ => self.probe_access_empty().unwrap_or(false),
+        }
+    }
+
+    fn probe_access_empty(&self) -> Option<bool> {
+        let rtxn = self.env.read_txn().ok()?;
+        let stat = self.db.stat(&rtxn).ok()?;
+        Some(self.publish_access_empty(stat.entries == 0))
+    }
+
+    fn write_cached(
+        &self,
+        snapshot: usize,
+        now: u64,
+        mode_key: u8,
+        hashes: &[[u8; 32]],
+        out: &mut [i64],
+    ) -> bool {
+        let guard = self.decay_cache_lock();
+        let Some(cache) = guard.as_ref() else {
+            return false;
+        };
+        if cache.snapshot != snapshot || cache.now != now || cache.mode != mode_key {
+            return false;
+        }
+        write_normalized(&cache.sums, hashes, out);
+        true
+    }
+
+    fn decay_cache_lock(&self) -> std::sync::MutexGuard<'_, Option<DecayCache>> {
+        self.decay_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn scan_decay_sums(
+        &self,
+        rtxn: &heed::RoTxn<'_, heed::WithoutTls>,
+        now: u64,
+        mode: FFFMode,
+    ) -> Option<AHashMap<[u8; 32], f64>> {
+        let db = self
+            .db
+            .remap_types::<Bytes, Bytes>();
+        let stat = self.db.stat(rtxn).ok()?;
+        let mut sums = AHashMap::with_capacity(stat.entries as usize);
+        let iter = db.iter(rtxn).ok()?;
+        for item in iter {
+            let (key, val) = item.ok()?;
+            if key.len() != 32 {
+                continue;
+            }
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(key);
+            let sum = decay_from_bincode(val, now, mode);
+            if sum != 0.0 {
+                sums.insert(hash, sum);
+            }
+        }
+        Some(sums)
+    }
+
+    fn decay_of_hash(
+        &self,
+        rtxn: &heed::RoTxn<'_, heed::WithoutTls>,
+        hash: &[u8; 32],
+        now: u64,
+        mode: FFFMode,
+    ) -> f64 {
+        let db = self.db.remap_types::<Bytes, Bytes>();
+        match db.get(rtxn, hash) {
+            Ok(Some(bytes)) => decay_from_bincode(bytes, now, mode),
+            _ => 0.0,
+        }
+    }
+
+    fn publish_access_empty(&self, empty: bool) -> bool {
+        if !empty {
+            self.empty_hint.store(1, Ordering::Release);
+            return false;
+        }
+        match self
+            .empty_hint
+            .compare_exchange(2, 0, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) | Err(0) => true,
+            Err(_) => false,
+        }
+    }
+
+    /// Modification points for a git-modified file. Unmodified is 0.
     pub fn get_modification_score(
         &self,
         modified_time: u64,
         git_status: Option<git2::Status>,
         mode: FFFMode,
     ) -> i64 {
-        modification_score(modified_time, git_status, mode, self.get_now())
+        // The clock does not affect a non-modified file, so it stays unread.
+        if !git_status.is_some_and(is_modified_status) {
+            return 0;
+        }
+        score_modified_at(
+            modified_time,
+            modification_thresholds(mode.is_ai()),
+            self.get_now(),
+        )
     }
 }
 
@@ -625,23 +763,33 @@ impl FrecencyReader<'_> {
             return 0.0;
         };
 
-        match self.tracker.db.get(rtxn, &key) {
-            Ok(Some(accesses)) => decay_sum(&accesses, self.now, mode),
-            _ => 0.0,
-        }
+        self.tracker.decay_of_hash(rtxn, &key, self.now, mode)
     }
 
-    pub(crate) fn modification_score(
-        &self,
-        modified_time: u64,
-        git_status: Option<git2::Status>,
-        mode: FFFMode,
-    ) -> i64 {
-        modification_score(modified_time, git_status, mode, self.now)
+    // One `now` and one mode table for every file scored from this reader.
+    #[inline]
+    pub(crate) fn modification_basis(&self, mode: FFFMode) -> ModificationBasis {
+        ModificationBasis {
+            now: self.now,
+            thresholds: modification_thresholds(mode.is_ai()),
+        }
     }
 }
 
-fn decay_sum(accesses: &VecDeque<u64>, now: u64, mode: FFFMode) -> f64 {
+// Shared by a batch so per-file scoring does not re-read the clock or re-branch on mode.
+pub(crate) struct ModificationBasis {
+    now: u64,
+    thresholds: &'static [(i64, u64); 5],
+}
+
+impl ModificationBasis {
+    #[inline]
+    pub(crate) fn score_modified(&self, modified_time: u64) -> i64 {
+        score_modified_at(modified_time, self.thresholds, self.now)
+    }
+}
+
+fn decay_oldest_first(oldest_first: &[u64], now: u64, mode: FFFMode) -> f64 {
     let (decay_constant, max_history_days) = if mode.is_ai() {
         (AI_DECAY_CONSTANT, AI_MAX_HISTORY_DAYS)
     } else {
@@ -650,9 +798,10 @@ fn decay_sum(accesses: &VecDeque<u64>, now: u64, mode: FFFMode) -> f64 {
     let cutoff_time = now.saturating_sub((max_history_days * SECONDS_PER_DAY) as u64);
 
     let mut total_frecency = 0.0;
-    for &access_time in accesses.iter().rev() {
+    for &access_time in oldest_first.iter().rev() {
         if access_time < cutoff_time {
-            break; // All remaining entries are older, stop processing
+            // Oldest-first: every remaining timestamp is older.
+            break;
         }
 
         let days_ago = (now.saturating_sub(access_time) as f64) / SECONDS_PER_DAY;
@@ -662,23 +811,76 @@ fn decay_sum(accesses: &VecDeque<u64>, now: u64, mode: FFFMode) -> f64 {
     total_frecency
 }
 
-fn modification_score(
-    modified_time: u64,
-    git_status: Option<git2::Status>,
-    mode: FFFMode,
-    now: u64,
-) -> i64 {
-    let is_modified_git_status = git_status.is_some_and(is_modified_status);
-    if !is_modified_git_status {
-        return 0;
+fn decay_from_bincode(bytes: &[u8], now: u64, mode: FFFMode) -> f64 {
+    let mut buf = [0u64; MAX_TIMESTAMPS_PER_FILE];
+    if let Some(n) = copy_bincode_u64s(bytes, &mut buf) {
+        return decay_oldest_first(&buf[..n], now, mode);
     }
+    // Same length-prefixed layout as the stack path, for histories past the cap.
+    let Some(all) = decode_bincode_u64s(bytes) else {
+        return 0.0;
+    };
+    decay_oldest_first(&all, now, mode)
+}
 
-    let thresholds = if mode.is_ai() {
+fn decode_bincode_u64s(bytes: &[u8]) -> Option<Vec<u64>> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let len = u64::from_le_bytes(bytes[..8].try_into().ok()?) as usize;
+    if bytes.len() < 8 + len * 8 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let start = 8 + i * 8;
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&bytes[start..start + 8]);
+        out.push(u64::from_le_bytes(raw));
+    }
+    Some(out)
+}
+
+fn copy_bincode_u64s(bytes: &[u8], buf: &mut [u64; MAX_TIMESTAMPS_PER_FILE]) -> Option<usize> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let len = u64::from_le_bytes(bytes[..8].try_into().ok()?) as usize;
+    if len > MAX_TIMESTAMPS_PER_FILE || bytes.len() < 8 + len * 8 {
+        return None;
+    }
+    for i in 0..len {
+        let start = 8 + i * 8;
+        let mut raw = [0u8; 8];
+        raw.copy_from_slice(&bytes[start..start + 8]);
+        buf[i] = u64::from_le_bytes(raw);
+    }
+    Some(len)
+}
+
+fn write_normalized(sums: &AHashMap<[u8; 32], f64>, hashes: &[[u8; 32]], out: &mut [i64]) {
+    for (slot, hash) in out.iter_mut().zip(hashes.iter()) {
+        if let Some(sum) = sums.get(hash) {
+            *slot = normalize_frecency(*sum);
+        }
+    }
+}
+
+#[inline]
+fn modification_thresholds(ai: bool) -> &'static [(i64, u64); 5] {
+    if ai {
         &AI_MODIFICATION_THRESHOLDS
     } else {
         &MODIFICATION_THRESHOLDS
-    };
+    }
+}
 
+#[inline]
+fn score_modified_at(
+    modified_time: u64,
+    thresholds: &'static [(i64, u64); 5],
+    now: u64,
+) -> i64 {
     let duration_since = now.saturating_sub(modified_time);
 
     for i in 0..thresholds.len() {

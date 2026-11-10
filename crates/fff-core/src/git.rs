@@ -263,8 +263,7 @@ impl GitStatusCache {
             let mut map = AHashMap::with_capacity(1);
             // Store relative when the flag is on so the shape matches bulk.
             if relative_keys_enabled() {
-                let rel = full_path.strip_prefix(&workdir)?.to_path_buf();
-                map.insert(rel, status);
+                map.insert(relative_path.to_path_buf(), status);
                 return Ok(Self {
                     map,
                     prefix: workdir,
@@ -277,24 +276,43 @@ impl GitStatusCache {
             });
         }
 
-        // Dirty-only options (`include_unmodified` would walk every tracked
-        // path) and literal paths (no wildmatching every entry against every
-        // pathspec), chunked so one watcher burst cannot build an unbounded
-        // pathspec.
+        // Literal pathspecs. Clean paths stay in the map; a missing entry
+        // is what leaves a stale dirty bit for status:modified.
         let cap = pathspec_batch_cap();
         let mut merged = AHashMap::with_capacity(paths.len());
         let mut merged_prefix = PathBuf::new();
+        let mut listed = 0usize;
         for chunk in paths.chunks(cap) {
             let mut status_options = initial_scan_status_options();
-            status_options.disable_pathspec_match(true);
+            status_options
+                .include_unmodified(true)
+                .disable_pathspec_match(true);
+            let mut chunk_listed = 0usize;
             for path in chunk {
-                status_options.pathspec(path.as_ref().strip_prefix(&workdir)?);
+                match path.as_ref().strip_prefix(&workdir) {
+                    Ok(rel) => {
+                        status_options.pathspec(rel);
+                        chunk_listed += 1;
+                    }
+                    Err(_) => continue,
+                }
             }
+            if chunk_listed == 0 {
+                continue;
+            }
+            listed += chunk_listed;
             let part = Self::read_status(repo, &mut status_options)?;
             if !part.prefix.as_os_str().is_empty() {
                 merged_prefix = part.prefix.clone();
             }
             merged.extend(part.map);
+        }
+        if listed == 0 {
+            return Err(paths[0]
+                .as_ref()
+                .strip_prefix(&workdir)
+                .unwrap_err()
+                .into());
         }
         Ok(Self {
             map: merged,

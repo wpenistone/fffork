@@ -392,13 +392,14 @@ impl ScanJob {
                 );
             }
         } else {
-            // this potentially a long running as we are not parallelizing it but it's okay
+            // Keep the mask this sniff already built. Content indexing stays off.
+            // Mask 0 (partial or binary) stays unknown, so grep still reads.
             sniff_binary_for_non_indexable(
                 files,
                 &unsafe_snapshot.base_path,
                 arena,
                 &signals.cancelled,
-                None,
+                content_masks.map(|store| store.as_ref()),
             );
         }
 

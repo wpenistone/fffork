@@ -153,14 +153,18 @@ function M.display_image(file_path, bufnr)
 
   local reserved_metadata_lines = reserve_image_buffer_space(bufnr, 2)
   local image_content_starts_at_line = reserved_metadata_lines + 1
-  identify_image_lines_async(
-    file_path,
-    bufnr,
-    function(final_info_lines) update_metadata_lines(bufnr, final_info_lines, reserved_metadata_lines) end
-  )
+  -- Identify once. clear_buffer_images would kill a job started earlier.
+  local function show_meta()
+    identify_image_lines_async(
+      file_path,
+      bufnr,
+      function(final_info_lines) update_metadata_lines(bufnr, final_info_lines, reserved_metadata_lines) end
+    )
+  end
 
   local ok, snacks = pcall(require, 'snacks')
   if not ok then
+    show_meta()
     local error_lines = {
       '⚠ Image Preview Unavailable',
       '',
@@ -173,6 +177,7 @@ function M.display_image(file_path, bufnr)
   end
 
   if not snacks.image.supports_terminal() then
+    show_meta()
     local error_lines = {
       '⚠ Image Preview Unavailable',
       '',
@@ -186,6 +191,7 @@ function M.display_image(file_path, bufnr)
   end
 
   if not snacks.image.supports_file(file_path) then
+    show_meta()
     local error_lines = {
       '⚠ Unsupported Image Format',
       '',
@@ -212,15 +218,11 @@ function M.display_image(file_path, bufnr)
       if success and placement then active_placements[bufnr] = placement end
     end)
 
-    identify_image_lines_async(
-      file_path,
-      bufnr,
-      function(final_info_lines) update_metadata_lines(bufnr, final_info_lines, reserved_metadata_lines) end
-    )
-
+    show_meta()
     return true
   end
 
+  show_meta()
   return false
 end
 

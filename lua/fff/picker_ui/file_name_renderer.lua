@@ -2,6 +2,9 @@ local M = {}
 
 local path_separator = package.config:sub(1, 1)
 
+-- One layout per item while width, icon, and strategy stay the same.
+local layouts = setmetatable({}, { __mode = 'k' })
+
 --- @class FffFileNameLayout
 --- @field text string Icon + name section of the rendered line
 --- @field filename string File name as returned by `ctx.format_file_display`
@@ -23,6 +26,18 @@ function M.is_path_first(config) return (config and config.layout and config.lay
 --- @return FffFileNameLayout
 function M.build(item, ctx, icon)
   local path_first = M.is_path_first(ctx.config)
+  local strategy = (ctx.config and ctx.config.layout and ctx.config.layout.path_shorten_strategy) or 'middle_number'
+  local hit = layouts[item]
+  if
+    hit
+    and hit.path_first == path_first
+    and hit.icon == icon
+    and hit.strategy == strategy
+    and hit.max_path_width == ctx.max_path_width
+  then
+    return hit.layout
+  end
+
   local icon_width = icon and (vim.fn.strdisplaywidth(icon) + 1) or 0
   -- name-first needs a floor so the directory column does not jump around,
   -- path-first has nothing to align and takes whatever the window gives
@@ -31,10 +46,11 @@ function M.build(item, ctx, icon)
 
   local prefix = icon and (icon .. ' ') or ''
   local prefix_len = #prefix
+  local layout
   if path_first then
     local separator = dir_path ~= '' and path_separator or ''
     local dir_end_col = prefix_len + #dir_path + #separator
-    return {
+    layout = {
       text = prefix .. dir_path .. separator .. filename,
       filename = filename,
       dir_path = dir_path,
@@ -43,18 +59,26 @@ function M.build(item, ctx, icon)
       dir_end_col = dir_end_col,
       path_first = true,
     }
+  else
+    local dir_col = prefix_len + #filename + 1
+    layout = {
+      text = prefix .. filename .. ' ' .. dir_path,
+      filename = filename,
+      dir_path = dir_path,
+      filename_col = prefix_len,
+      dir_col = dir_col,
+      dir_end_col = dir_col + #dir_path,
+      path_first = false,
+    }
   end
-
-  local dir_col = prefix_len + #filename + 1
-  return {
-    text = prefix .. filename .. ' ' .. dir_path,
-    filename = filename,
-    dir_path = dir_path,
-    filename_col = prefix_len,
-    dir_col = dir_col,
-    dir_end_col = dir_col + #dir_path,
-    path_first = false,
+  layouts[item] = {
+    path_first = path_first,
+    icon = icon,
+    strategy = strategy,
+    max_path_width = ctx.max_path_width,
+    layout = layout,
   }
+  return layout
 end
 
 --- Map fuzzy match ranges over `item.relative_path` onto line byte columns.
@@ -63,14 +87,21 @@ end
 --- @param layout FffFileNameLayout Layout returned by `M.build`
 --- @return number[][]
 function M.fuzzy_segments(item, layout)
+  -- Columns are fixed for this layout; later highlights reuse them.
+  if layout.fuzzy_segments then return layout.fuzzy_segments end
+
   local rel_path = item.relative_path or ''
   if type(rel_path) ~= 'string' then rel_path = tostring(rel_path) end
 
   local filename_rel_start = math.max(0, #rel_path - #layout.filename)
   local segments = { { filename_rel_start, filename_rel_start + #layout.filename, layout.filename_col } }
 
-  local parent_dir = vim.fn.fnamemodify(rel_path, ':h')
-  if parent_dir == '.' then parent_dir = '' end
+  -- Same parent text as format_file_display. Absent directory still uses :h.
+  local parent_dir = item.directory
+  if type(parent_dir) ~= 'string' then
+    parent_dir = vim.fn.fnamemodify(rel_path, ':h')
+    if parent_dir == '.' then parent_dir = '' end
+  end
 
   -- a shortened directory breaks the byte mapping, only map an intact one
   if parent_dir ~= '' and layout.dir_path == parent_dir then
@@ -78,6 +109,7 @@ function M.fuzzy_segments(item, layout)
     segments[#segments + 1] = { 0, dir_source_end, layout.dir_col }
   end
 
+  layout.fuzzy_segments = segments
   return segments
 end
 

@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import unquote
 
 
 def set_affinity(pid, mask):
@@ -82,6 +83,16 @@ def field(text, name):
     return m.group(1) if m else None
 
 
+def require_timed(text, argv_query):
+    raw = field(text, "timed")
+    if raw is None:
+        return None
+    got = unquote(raw)
+    if got != argv_query:
+        raise RuntimeError(f"timed query {got!r} != argv {argv_query!r}")
+    return got
+
+
 def timed_samples(stderr):
     out = []
     for line in stderr.splitlines():
@@ -126,8 +137,9 @@ def cmd_search(args):
         for rep in range(args.reps):
             for leg, exe in panel_legs(args.candidate, args.baseline):
                 env = env_base(args.warmup, args.limit, cold=False, trace=True)
-                _, err, _ = run_driver(exe, args.corpus, f"{query} {args.exclude}".strip(),
-                                       args.p95_iters, args.threads, env, args.affinity)
+                stdout, err, _ = run_driver(exe, args.corpus, query,
+                                            args.p95_iters, args.threads, env, args.affinity)
+                require_timed(stdout, query)
                 samples = timed_samples(err)
                 if not samples:
                     raise RuntimeError(f"no TIMED samples for {query} leg {leg}")
@@ -187,9 +199,10 @@ def cmd_search(args):
         for rep in range(args.reps):
             for leg, exe in panel_legs(args.candidate, args.baseline):
                 env = env_base(0, args.limit)
-                stdout, _, _ = run_driver(exe, args.corpus, f"{query} {args.exclude}".strip(),
+                stdout, _, _ = run_driver(exe, args.corpus, query,
                                           1, args.threads, env, args.affinity)
-                rows.append({"query": query, "rep": rep, "leg": leg,
+                rows.append({"query": query, "timed_query": require_timed(stdout, query),
+                             "rep": rep, "leg": leg,
                              "us": float(field(stdout, "us_per_op")),
                              "total": int(field(stdout, "total_matched")),
                              "checksum": int(field(stdout, "checksum"))})
@@ -215,7 +228,7 @@ def panel_legs(a, b):
 
 def typing_session(exe, args, prefixes):
     env = env_base(0, args.limit)
-    env["FFF_DRV_TYPING_SUFFIX"] = args.exclude
+    env["FFF_DRV_TYPING_SUFFIX"] = ""
     stdout, _, _ = run_driver(exe, args.corpus, prefixes, 0, args.threads, env,
                               args.affinity)
     keys = {}
@@ -223,7 +236,8 @@ def typing_session(exe, args, prefixes):
         if line.startswith("KEY "):
             prefix = field(line, "prefix")
             keys[prefix] = {"us": float(field(line, "us")),
-                            "total": int(field(line, "total"))}
+                            "total": int(field(line, "total")),
+                            "timed": require_timed(line, prefix)}
         elif line.startswith("STREAM "):
             keys["_stream"] = {
                 "scan_ms": float(field(line, "scan_ms")),
@@ -390,7 +404,6 @@ def main():
     def common(p):
         p.add_argument("--corpus", required=True)
         p.add_argument("--queries", default="score,controller,file_picke,index,netconvert")
-        p.add_argument("--exclude", default="!*frontier_research*")
         p.add_argument("--pin-query", default="!*frontier_research*")
         p.add_argument("--threads", type=int, default=4)
         p.add_argument("--limit", type=int, default=100)

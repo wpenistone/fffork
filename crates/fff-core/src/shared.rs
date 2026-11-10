@@ -125,6 +125,17 @@ impl SharedFilePicker {
         Ok(self.0.picker.read())
     }
 
+    /// Read lock is held only while `body` runs.
+    /// Return owned data; a `SearchResult` borrows the picker and would dangle.
+    pub fn with_picker<T>(
+        &self,
+        body: impl FnOnce(&FilePicker) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let guard = self.read()?;
+        let picker = guard.as_ref().ok_or(Error::FilePickerMissing)?;
+        body(picker)
+    }
+
     pub fn write(&self) -> Result<parking_lot::RwLockWriteGuard<'_, Option<FilePicker>>, Error> {
         Ok(self.0.picker.write())
     }

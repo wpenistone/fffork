@@ -1,8 +1,5 @@
-//! Machine calibration: topology first, latency probed once.
-//!
-//! Core, cache, NUMA and cgroup facts derive dispatch constants; only latency
-//! is measured. Overrides: `FFF_MATCH_WORK_PER_THREAD`, `FFF_SCAN_THREAD_CAP`,
-//! `FFF_FORK_JOIN_NS`, `FFF_NO_PROBE`.
+//! Topology plus one latency probe. `FFF_NO_PROBE` skips the measurement.
+//! Overrides: `FFF_MATCH_WORK_PER_THREAD`, `FFF_SCAN_THREAD_CAP`, `FFF_FORK_JOIN_NS`.
 
 use std::sync::LazyLock;
 
@@ -91,7 +88,7 @@ impl Machine {
             if let Some(cap) = crate::parallelism::cgroup_cpu_count() {
                 by_cores = by_cores.min(cap).max(1);
             }
-            if by_cores < 4 || std::env::var_os("FFF_NO_PROBE").is_some() {
+            if by_cores < 4 || probe_disabled() {
                 return by_cores;
             }
             let mut want = if self.llc_bytes > 0 {
@@ -196,9 +193,7 @@ fn pin_thread_to_core(t: usize, allowed: Option<&[usize]>) {
     let cpu = match allowed {
         Some(list) if !list.is_empty() => list[t % list.len()],
         _ => {
-            let ncpu = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1);
+            let ncpu = crate::parallelism::effective_core_count().max(1);
             if ncpu <= 1 {
                 return;
             }
@@ -276,15 +271,24 @@ pub(crate) fn scan_thread_cap() -> usize {
     *C
 }
 
+// Search-pool width. `current_num_threads` walks the registry; one load after open.
+pub(crate) fn search_threads() -> usize {
+    static N: LazyLock<usize> =
+        LazyLock::new(|| crate::parallelism::search_pool_threads().max(1));
+    *N
+}
+
 // Run probe + derived caps now (open path). Lazy statics would otherwise
 // fire inside the first query (~30ms of buffers and bandwidth samples).
 pub(crate) fn warm_calibration() {
-    let _ = (match_work_per_thread(), scan_thread_cap());
+    let _ = (match_work_per_thread(), scan_thread_cap(), search_threads());
     // Dispatch probes (empty fan-out median) join the open path so no
     // measurement fires inside the first query.
     let _ = (
         crate::dispatch::fork_join_ns(),
         crate::dispatch::bytes_to_amortize(),
+        crate::dispatch::sw_chunk_override(),
+        crate::dispatch::batch_par_disabled(),
     );
 }
 impl Machine {
@@ -620,15 +624,19 @@ fn parse_cache_size(s: &str) -> Option<usize> {
     num.trim().parse::<usize>().ok().map(|n| n * mult)
 }
 
-// Latency probe: pointer-chase a buffer sized past the last-level cache
-// with a dependent load chain. Returns 0 when probing is disabled
-// (`FFF_NO_PROBE`) or allocation fails; the caller uses the default.
+// One env read. Set before calibration; both probes honor it.
+fn probe_disabled() -> bool {
+    static OFF: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FFF_NO_PROBE").is_some());
+    *OFF
+}
+
+// Pointer-chase past the LLC. Returns 0 when probing is disabled,
+// allocation fails, or the sample falls outside 40..2000 ns.
 fn measure_latency_ns(cache_sizes: &[usize; 2]) -> f64 {
-    if std::env::var_os("FFF_NO_PROBE").is_some() {
+    if probe_disabled() {
         return 0.0;
     }
-    // Past LLC, but never a huge allocation in a plugin host: capped at
-    // 32 MB and additionally clamped by any cgroup limit.
+    // Past the LLC, capped at 32 MB and by any cgroup limit.
     let llc = cache_sizes[1];
     let mut want = if llc > 0 {
         llc.saturating_mul(2)
@@ -639,10 +647,7 @@ fn measure_latency_ns(cache_sizes: &[usize; 2]) -> f64 {
     if let Some(limit) = cgroup_memory_limit() {
         want = want.min(limit / 8).max(1 << 20);
     }
-    // Slots are spread across the whole buffer and each stores the *byte offset*
-    // of the next, so the chase walks the entire allocation. A previous version
-    // indexed the first 128KB directly and therefore measured L2 latency
-    // (24.9ns here) while claiming to measure memory.
+    // Each slot stores the next byte offset so the chase spans the buffer.
     const SLOTS: usize = 8192;
     if want < (SLOTS + 1) * 64 {
         return 0.0;
@@ -651,6 +656,9 @@ fn measure_latency_ns(cache_sizes: &[usize; 2]) -> f64 {
         return 0.0;
     };
     let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+    if raw.is_null() {
+        return 0.0;
+    }
     let buf = unsafe { std::slice::from_raw_parts_mut(raw, want) };
     let stride = want / SLOTS;
     // Random permutation over the slots so consecutive hops are not sequential.
@@ -689,12 +697,7 @@ fn measure_latency_ns(cache_sizes: &[usize; 2]) -> f64 {
     if std::env::var_os("FFF_LATENCY_DEBUG").is_some() {
         eprintln!("LATENCY raw_ns={ns:.2} want={want} slots={SLOTS}");
     }
-    // Plausible range guards against a descheduled thread inflating the mean.
-
-    // We are after *DRAM* latency, so both tails are rejected: too slow means the
-    // thread was descheduled mid-probe, too fast means the chase stayed in cache
-    // (measured 9.7ns on a box whose real DRAM latency is ~80ns, which inflated
-    // work_per_thread 8x). The documented default is safer than either tail.
+    // Reject both tails: a deschedule inflates, an in-cache chase under-reports.
     if (40.0..2000.0).contains(&ns) {
         ns
     } else {

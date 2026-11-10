@@ -6,6 +6,24 @@ local M = {}
 --- @type table<string, number>
 local scratch_bufs = {}
 
+-- Same filename keeps one language. false means no parser.
+local lang_cache = {}
+local lang_cache_n = 0
+
+-- Same line text and language keep one highlight list.
+local line_hl_cache = {}
+local line_hl_n = 0
+
+local function store_line_hl(key, highlights)
+  if line_hl_n >= 128 then
+    line_hl_cache = {}
+    line_hl_n = 0
+  end
+  line_hl_cache[key] = highlights
+  line_hl_n = line_hl_n + 1
+  return highlights
+end
+
 --- Get or create a scratch buffer for a given treesitter language.
 --- The buffer is reused across calls — content is overwritten each time.
 --- @param lang string Treesitter language name
@@ -31,14 +49,27 @@ end
 function M.lang_from_filename(filename)
   if not filename or filename == '' then return nil end
 
+  local cached = lang_cache[filename]
+  if cached ~= nil then return cached or nil end
+
   local ft = utils.detect_filetype(filename) or 'text'
   local lang_ok, lang = pcall(vim.treesitter.language.get_lang, ft)
   if not lang_ok or not lang then lang = ft end
 
   -- Check if the parser is actually installed
   local has_parser = pcall(vim.treesitter.language.add, lang)
-  if not has_parser then return nil end
+  if lang_cache_n >= 2048 then
+    lang_cache = {}
+    lang_cache_n = 0
+  end
+  if not has_parser then
+    lang_cache[filename] = false
+    lang_cache_n = lang_cache_n + 1
+    return nil
+  end
 
+  lang_cache[filename] = lang
+  lang_cache_n = lang_cache_n + 1
   return lang
 end
 
@@ -51,6 +82,10 @@ end
 --- @return table[] highlights Array of { col: number, end_col: number, hl_group: string }
 function M.get_line_highlights(text, lang)
   if not text or text == '' or not lang then return {} end
+
+  local key = lang .. '\0' .. text
+  local cached = line_hl_cache[key]
+  if cached then return cached end
 
   local buf = get_scratch_buf(lang)
 
@@ -96,7 +131,7 @@ function M.get_line_highlights(text, lang)
     end
   end)
 
-  return highlights
+  return store_line_hl(key, highlights)
 end
 
 --- Clean up all scratch buffers.

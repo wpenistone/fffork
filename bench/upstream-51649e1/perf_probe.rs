@@ -277,9 +277,12 @@ fn main() {
     let mut last_total = 0usize;
     let mut last_len = 0usize;
     let mut hash_ordered = 0u64;
+    // Wall and cycles stop at fuzzy_search. The path hash is identity, not search.
     let mut search = || {
         let guard = shared_picker.read().expect("picker lock");
         let picker = guard.as_ref().expect("picker");
+        let c0 = sensors::snap();
+        let t = Instant::now();
         let result = picker.fuzzy_search(
             &parsed,
             None,
@@ -292,6 +295,8 @@ fn main() {
                 pagination: PaginationArgs { offset: 0, limit },
             },
         );
+        let us = t.elapsed().as_secs_f64() * 1_000_000.0;
+        let cyc = sensors::snap().cycles.saturating_sub(c0.cycles);
         last_total = result.total_matched;
         last_len = result.items.len();
         let mut h = 0xcbf29ce484222325u64;
@@ -300,7 +305,7 @@ fn main() {
             h = fnv1a(h, item.relative_path(picker).as_bytes());
         }
         hash_ordered = h;
-        result.total_matched ^ result.items.len()
+        (us, cyc, result.total_matched ^ result.items.len())
     };
 
     let cold = std::env::var_os("FFF_DRV_COLD").is_some();
@@ -340,16 +345,10 @@ fn main() {
     let trace = std::env::var_os("FFF_DRV_TRACE").is_some();
     let mut checksum = 0usize;
     for i in 0..warmup {
-        let s0 = sensors::snap();
-        let t = Instant::now();
-        checksum ^= search();
-        let us = t.elapsed().as_secs_f64() * 1_000_000.0;
-        let s1 = sensors::snap();
+        let (us, cyc, id) = search();
+        checksum ^= id;
         if trace {
-            eprintln!(
-                "WARM i={i} us={us:.1} cyc={}",
-                s1.cycles.saturating_sub(s0.cycles)
-            );
+            eprintln!("WARM i={i} us={us:.1} cyc={cyc}");
         }
     }
 
@@ -367,21 +366,16 @@ fn main() {
             }
         }
         let s0 = sensors::snap();
-        let t = Instant::now();
-        checksum = checksum.wrapping_add(search());
-        let us = t.elapsed().as_secs_f64() * 1_000_000.0;
+        let (us, cyc, id) = search();
         let s1 = sensors::snap();
+        checksum = checksum.wrapping_add(id);
         if trace {
-            eprintln!(
-                "TIMED i={i} cold={} us={us:.1} cyc={}",
-                cold as u8,
-                s1.cycles.saturating_sub(s0.cycles)
-            );
+            eprintln!("TIMED i={i} cold={} us={us:.1} cyc={cyc}", cold as u8);
         }
         per_op.push(us);
         acc_us += us;
         acc_cpu_100ns += s1.cpu_100ns.saturating_sub(s0.cpu_100ns);
-        acc_cycles += s1.cycles.saturating_sub(s0.cycles);
+        acc_cycles += cyc;
         acc_read += s1.read_bytes.saturating_sub(s0.read_bytes);
         acc_faults += s1.faults.saturating_sub(s0.faults) as u64;
     }

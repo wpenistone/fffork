@@ -1,7 +1,7 @@
 use crate::cursor::{CursorStore, GrepCursor};
 use crate::output::{GrepFormatter, OutputMode, file_suffix};
 use fff::grep::{GrepMode, GrepSearchOptions, has_regex_metacharacters};
-use fff::types::{FileItem, PaginationArgs};
+use fff::types::PaginationArgs;
 use fff::{FuzzySearchOptions, QueryParser, SharedFilePicker};
 use fff_query_parser::AiGrepConfig;
 use rmcp::handler::server::wrapper::Parameters;
@@ -299,7 +299,7 @@ impl FffServer {
         }
         let ctx_lines = options.before_context;
 
-        // Acquire picker lock once for the entire operation.
+        // Read lock covers the grep. Formatting runs after the guard drops.
         let guard = self.picker.read().map_err(|e| {
             ErrorData::internal_error(format!("Failed to acquire picker lock: {e}"), None)
         })?;
@@ -347,20 +347,27 @@ impl FffServer {
                     let retry_result = picker.grep(&rest_parsed, &retry_options);
 
                     if !retry_result.matches.is_empty() && retry_result.matches.len() <= 10 {
+                        let (paths, sizes) = path_and_size(&retry_result.files, picker);
+                        let matches = retry_result.matches;
+                        let total_matched = matches.len();
+                        let broaden_cursor = GrepCursor {
+                            file_offset: retry_result.next_file_offset,
+                            ..cursor
+                        };
+                        drop(retry_result);
+                        drop(picker);
+                        drop(guard);
                         let mut cs = self.lock_cursors()?;
-                        let text = &GrepFormatter {
-                            matches: &retry_result.matches,
-                            files: &retry_result.files,
-                            total_matched: retry_result.matches.len(),
-                            cursor: GrepCursor {
-                                file_offset: retry_result.next_file_offset,
-                                ..cursor
-                            },
+                        let text = GrepFormatter {
+                            matches: &matches,
+                            paths: &paths,
+                            sizes: &sizes,
+                            total_matched,
+                            cursor: broaden_cursor,
                             output_mode,
                             max_results,
                             show_context: ctx_lines > 0,
                             auto_expand_defs: auto_expand,
-                            picker,
                         }
                         .format(&mut cs);
                         return Ok(grep_response(
@@ -451,22 +458,38 @@ impl FffServer {
         cursor.file_offset = result.next_file_offset;
         cursor.found_definitions |= cursor.definitions_only && !result.matches.is_empty();
 
+        let (paths, sizes) = path_and_size(&result.files, picker);
+        let matches = result.matches;
+        let total_matched = matches.len();
+        drop(result);
+        drop(picker);
+        drop(guard);
         let mut cs = self.lock_cursors()?;
         let text = GrepFormatter {
-            matches: &result.matches,
-            files: &result.files,
-            total_matched: result.matches.len(),
+            matches: &matches,
+            paths: &paths,
+            sizes: &sizes,
+            total_matched,
             cursor,
             output_mode,
             max_results,
             show_context: ctx_lines > 0,
             auto_expand_defs: auto_expand,
-            picker,
         }
         .format(&mut cs);
 
         Ok(grep_response(text, definitions_fallback))
     }
+}
+
+fn path_and_size(files: &[&fff::types::FileItem], picker: &fff::file_picker::FilePicker) -> (Vec<String>, Vec<u64>) {
+    let mut paths = Vec::with_capacity(files.len());
+    let mut sizes = Vec::with_capacity(files.len());
+    for file in files {
+        paths.push(file.relative_path(picker));
+        sizes.push(file.size());
+    }
+    (paths, sizes)
 }
 
 #[tool_router]
@@ -501,85 +524,112 @@ impl FffServer {
             .and_then(|id| self.cursor_store.lock().ok()?.get(id))
             .unwrap_or(0);
 
-        let guard = self.picker.read().map_err(|e| {
-            ErrorData::internal_error(format!("Failed to acquire picker lock: {e}"), None)
-        })?;
-        let picker = guard
-            .as_ref()
-            .ok_or_else(|| ErrorData::internal_error("File picker not initialized", None))?;
-        let base_path = picker.base_path();
-        let make_opts = |offset: usize| FuzzySearchOptions {
-            max_threads: 0,
-            current_file: None,
-            project_path: Some(base_path),
-            combo_boost_score_multiplier: 100,
-            min_combo_count: 3,
-            pagination: PaginationArgs {
-                offset,
-                limit: max_results,
-            },
-        };
-
         let parser = QueryParser::default();
         let fff_query = parser.parse(query);
-        let result = picker.fuzzy_search(&fff_query, None, make_opts(page_offset));
-        let total_files = result.total_files;
-
-        // Auto-retry with fewer terms if 3+ words return 0 results
         let words: Vec<&str> = query.split_whitespace().collect();
         let shorter = words.get(..2).map(|w| w.join(" "));
 
-        let (items, scores, total_matched) =
-            if result.items.is_empty() && words.len() >= 3 && page_offset == 0 {
-                if let Some(shorter) = &shorter {
-                    let shorter_query = parser.parse(shorter);
-                    let retry = picker.fuzzy_search(&shorter_query, None, make_opts(0));
+        struct Hit {
+            path: String,
+            git: Option<git2::Status>,
+            frecency: i32,
+        }
+        struct Page {
+            hits: Vec<Hit>,
+            exact: bool,
+            dominant: bool,
+            total_files: usize,
+            total_matched: usize,
+        }
 
-                    (retry.items, retry.scores, retry.total_matched)
-                } else {
-                    (result.items, result.scores, result.total_matched)
-                }
-            } else {
-                (result.items, result.scores, result.total_matched)
-            };
+        let page = self
+            .picker
+            .with_picker(|picker| {
+                let base_path = picker.base_path();
+                let make_opts = |offset: usize| FuzzySearchOptions {
+                    max_threads: 0,
+                    current_file: None,
+                    project_path: Some(base_path),
+                    combo_boost_score_multiplier: 100,
+                    min_combo_count: 3,
+                    pagination: PaginationArgs {
+                        offset,
+                        limit: max_results,
+                    },
+                };
+                let result = picker.fuzzy_search(&fff_query, None, make_opts(page_offset));
+                let total_files = result.total_files;
+                let (items, scores, total_matched) =
+                    if result.items.is_empty() && words.len() >= 3 && page_offset == 0 {
+                        if let Some(shorter) = &shorter {
+                            let shorter_query = parser.parse(shorter);
+                            let retry = picker.fuzzy_search(&shorter_query, None, make_opts(0));
+                            (retry.items, retry.scores, retry.total_matched)
+                        } else {
+                            (result.items, result.scores, result.total_matched)
+                        }
+                    } else {
+                        (result.items, result.scores, result.total_matched)
+                    };
+                let hits = items
+                    .iter()
+                    .map(|item| Hit {
+                        path: item.relative_path(picker),
+                        git: item.git_status(),
+                        frecency: item.total_frecency_score(),
+                    })
+                    .collect();
+                let exact = scores.first().is_some_and(|score| score.exact_match);
+                let dominant = scores.len() < 2
+                    || scores[0].total > scores[1].total.saturating_mul(2);
+                Ok(Page {
+                    hits,
+                    exact,
+                    dominant,
+                    total_files,
+                    total_matched,
+                })
+            })
+            .map_err(|e| {
+                ErrorData::internal_error(format!("Failed to acquire picker lock: {e}"), None)
+            })?;
 
-        if items.is_empty() {
+        if page.hits.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(format!(
                 "0 results ({} indexed)",
-                total_files
+                page.total_files
             ))]));
         }
 
         let mut lines: Vec<String> = Vec::new();
-        let top_item = items[0];
-        let is_exact_match = scores[0].exact_match;
+        let top_path = &page.hits[0].path;
 
         if page_offset == 0 {
-            if is_exact_match {
+            if page.exact {
+                lines.push(format!("→ Read {top_path} (exact match!)"));
+            } else if page.dominant {
                 lines.push(format!(
-                    "→ Read {} (exact match!)",
-                    top_item.relative_path(picker)
-                ));
-            } else if scores.len() < 2 || scores[0].total > scores[1].total.saturating_mul(2) {
-                lines.push(format!(
-                    "→ Read {} (best match — Read this file directly)",
-                    top_item.relative_path(picker)
+                    "→ Read {top_path} (best match — Read this file directly)"
                 ));
             }
         }
 
-        let next_offset = page_offset + items.len();
-        let has_more = next_offset < total_matched;
+        let next_offset = page_offset + page.hits.len();
+        let has_more = next_offset < page.total_matched;
 
         if has_more {
-            lines.push(format!("{}/{} matches", items.len(), total_matched));
+            lines.push(format!(
+                "{}/{} matches",
+                page.hits.len(),
+                page.total_matched
+            ));
         }
 
-        for item in &items {
+        for hit in &page.hits {
             lines.push(format!(
                 "{}{}",
-                item.relative_path(picker),
-                file_suffix(item.git_status(), item.total_frecency_score())
+                hit.path,
+                file_suffix(hit.git, hit.frecency)
             ));
         }
 
@@ -699,25 +749,29 @@ impl FffServer {
             options.classify_definitions = fff::DefinitionMode::Classify;
             result = picker.multi_grep(&patterns_refs, &constraints, &options);
         }
-        let file_refs: Vec<&FileItem> = result.files.to_vec();
-
         if result.matches.is_empty() && result.next_file_offset == 0 {
             return Ok(grep_response("0 matches.".into(), definitions_fallback));
         }
 
         cursor.file_offset = result.next_file_offset;
         cursor.found_definitions |= cursor.definitions_only && !result.matches.is_empty();
+        let (paths, sizes) = path_and_size(&result.files, picker);
+        let matches = result.matches;
+        let total_matched = matches.len();
+        drop(result);
+        drop(picker);
+        drop(guard);
         let mut cs = self.lock_cursors()?;
         let text = GrepFormatter {
-            matches: &result.matches,
-            files: &file_refs,
-            total_matched: result.matches.len(),
+            matches: &matches,
+            paths: &paths,
+            sizes: &sizes,
+            total_matched,
             cursor,
             output_mode,
             max_results,
             show_context: ctx_lines > 0,
             auto_expand_defs: auto_expand,
-            picker,
         }
         .format(&mut cs);
 

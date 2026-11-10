@@ -14,6 +14,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import unquote
 
 CREATE_NO_WINDOW = 0x08000000
 PROCESS_SET_INFORMATION = 0x0200
@@ -45,7 +46,7 @@ def parse_line(line):
         if "=" not in tok:
             continue
         key, value = tok.split("=", 1)
-        if key in ("query", "hash_ordered"):
+        if key in ("query", "hash_ordered", "timed"):
             out[key] = value
             continue
         try:
@@ -156,6 +157,13 @@ def run_one(exe, corpus, query, iters, threads, warmup, cold, limit, timeout, af
     if not lines:
         raise RuntimeError(f"no query line\nstdout={stdout[-2000:]}\nstderr={stderr[-2000:]}")
     row = parse_line(lines[-1])
+    if "timed" in row:
+        timed_query = unquote(str(row["timed"]))
+        if timed_query != query:
+            raise RuntimeError(f"timed query {timed_query!r} != argv {query!r}")
+        row["timed_query"] = timed_query
+    else:
+        row["timed_query"] = None
     row["external_wall_s"] = round(wall, 6)
     if affinity:
         row["affinity"] = f"0x{affinity:x}"
@@ -174,7 +182,6 @@ def main():
     ap.add_argument("--exe-b")
     ap.add_argument("--corpus", required=True)
     ap.add_argument("--queries", default="score,controller,file_picke,index,netconvert")
-    ap.add_argument("--exclude", default="", help="driver exclusion globs appended to every query")
     ap.add_argument("--threads", default="4")
     ap.add_argument("--modes", default="warm,query-cold")
     ap.add_argument("--conditions", default="quiet")
@@ -213,7 +220,7 @@ def main():
         "limit": args.limit,
         "reps": args.reps,
         "queries": queries,
-        "exclude": args.exclude,
+        "timed_query": "bare",
         "threads": thread_counts,
         "modes": modes,
         "conditions": conditions,
@@ -234,7 +241,7 @@ def main():
             try:
                 for rep in range(args.reps):
                     for query in queries:
-                        driver_query = f"{query} {args.exclude}".strip()
+                        driver_query = query
                         for threads in thread_counts:
                             for mode in modes:
                                 cold = mode == "query-cold"

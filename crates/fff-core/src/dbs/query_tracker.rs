@@ -7,6 +7,8 @@ use heed::{Database, Env};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_HISTORY_ENTRIES: usize = 128;
@@ -36,6 +38,19 @@ pub struct QueryTracker {
     // Database for project_path -> VecDeque<HistoryEntry> mappings (grep)
     grep_query_history_db: Database<Bytes, SerdeBincode<VecDeque<HistoryEntry>>>,
     health: DbHealth,
+    // 2 unknown, 1 nonempty, 0 empty. Search lookup skips LMDB while 0.
+    // Local writes store 1 before commit so a probe cannot publish 0 over data.
+    file_db_hint: AtomicU8,
+    // Last combo read. A repeat of the same query key skips the read transaction.
+    last_combo: Mutex<Option<CachedCombo>>,
+}
+
+#[derive(Debug)]
+struct CachedCombo {
+    key: [u8; 32],
+    project: PathBuf,
+    query: String,
+    entry: Option<QueryMatchEntry>,
 }
 
 impl DbHealthChecker for QueryTracker {
@@ -116,13 +131,17 @@ impl QueryTracker {
         let query_history_db = Self::open_database_safe(&env, Some("query_history"))?;
         let grep_query_history_db = Self::open_database_safe(&env, Some("grep_query_history"))?;
 
-        Ok(QueryTracker {
+        let tracker = QueryTracker {
             env,
             query_file_db,
             query_history_db,
             grep_query_history_db,
             health,
-        })
+            file_db_hint: AtomicU8::new(2),
+            last_combo: Mutex::new(None),
+        };
+        let _ = tracker.probe_file_assoc_empty();
+        Ok(tracker)
     }
 
     #[deprecated(
@@ -294,6 +313,7 @@ impl QueryTracker {
                 source: e,
             });
         }
+        self.file_db_hint.store(1, Ordering::Release);
 
         // Update query history database
         let project_key = Self::create_project_key(project_path)?;
@@ -324,6 +344,7 @@ impl QueryTracker {
             });
         }
 
+        self.store_combo(query_key, project_path, query, Some(entry));
         tracing::debug!(?query, ?file_path, "Tracked query completion");
         Ok(())
     }
@@ -334,6 +355,12 @@ impl QueryTracker {
         project_path: &Path,
         min_combo_count: u32,
     ) -> Result<Option<QueryMatchEntry>, Error> {
+        if self.file_assoc_empty() {
+            return Ok(None);
+        }
+        if let Some(hit) = self.cached_combo_text(project_path, query) {
+            return Ok(hit.filter(|entry| entry.open_count >= min_combo_count));
+        }
         let query_key = Self::create_query_key(project_path, query)?;
         let rtxn = self
             .env
@@ -351,6 +378,7 @@ impl QueryTracker {
                 source,
             })?;
 
+        self.store_read(query_key, project_path, query, last_match.clone());
         Ok(last_match.filter(|entry| entry.open_count >= min_combo_count))
     }
 
@@ -361,6 +389,9 @@ impl QueryTracker {
         file_path: &Path,
         combo_boost: i32,
     ) -> Result<i32, Error> {
+        if self.file_assoc_empty() {
+            return Ok(0);
+        }
         let query_key = Self::create_query_key(project_path, query)?;
         tracing::debug!(?query_key, "HASH");
         let rtxn = self
@@ -510,6 +541,7 @@ impl QueryTracker {
                         source: e,
                     });
                 }
+                self.file_db_hint.store(1, Ordering::Release);
                 if let Err(e) = Self::append_to_history(
                     &self.query_history_db,
                     &mut wtxn,
@@ -539,6 +571,7 @@ impl QueryTracker {
                     source: e,
                 });
             }
+            self.clear_combo();
         }
         Ok(done)
     }
@@ -612,6 +645,95 @@ impl QueryTracker {
     ) -> Result<Option<String>, Error> {
         let project_key = Self::create_project_key(project_path)?;
         Self::read_history_at_offset(&self.grep_query_history_db, &self.env, &project_key, offset)
+    }
+
+    fn cached_combo_text(&self, project: &Path, query: &str) -> Option<Option<QueryMatchEntry>> {
+        let guard = self.last_combo.lock().unwrap_or_else(|e| e.into_inner());
+        let hit = guard.as_ref()?;
+        if hit.query != query || hit.project.as_path() != project {
+            return None;
+        }
+        Some(hit.entry.clone())
+    }
+
+    fn store_combo(&self, key: [u8; 32], project: &Path, query: &str, entry: Option<QueryMatchEntry>) {
+        let mut guard = self.last_combo.lock().unwrap_or_else(|e| e.into_inner());
+        Self::write_combo(&mut guard, key, project, query, entry);
+    }
+
+    // A read must not cover a combo write that landed while the snapshot was open.
+    fn store_read(
+        &self,
+        key: [u8; 32],
+        project: &Path,
+        query: &str,
+        entry: Option<QueryMatchEntry>,
+    ) {
+        let mut guard = self.last_combo.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_ref().is_some_and(|hit| hit.key == key) {
+            return;
+        }
+        Self::write_combo(&mut guard, key, project, query, entry);
+    }
+
+    // Same project bytes keep the path buffer; the query buffer is always rewritten in place.
+    fn write_combo(
+        slot: &mut Option<CachedCombo>,
+        key: [u8; 32],
+        project: &Path,
+        query: &str,
+        entry: Option<QueryMatchEntry>,
+    ) {
+        if let Some(hit) = slot.as_mut() {
+            hit.key = key;
+            if hit.project.as_os_str().as_encoded_bytes() != project.as_os_str().as_encoded_bytes() {
+                hit.project.clear();
+                hit.project.push(project);
+            }
+            hit.query.clear();
+            hit.query.push_str(query);
+            hit.entry = entry;
+            return;
+        }
+        *slot = Some(CachedCombo {
+            key,
+            project: project.to_path_buf(),
+            query: query.to_string(),
+            entry,
+        });
+    }
+
+    fn clear_combo(&self) {
+        let mut guard = self.last_combo.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
+    }
+
+    fn file_assoc_empty(&self) -> bool {
+        match self.file_db_hint.load(Ordering::Acquire) {
+            0 => true,
+            1 => false,
+            _ => self.probe_file_assoc_empty().unwrap_or(false),
+        }
+    }
+
+    fn probe_file_assoc_empty(&self) -> Option<bool> {
+        let rtxn = self.env.read_txn().ok()?;
+        let stat = self.query_file_db.stat(&rtxn).ok()?;
+        Some(self.publish_file_assoc_empty(stat.entries == 0))
+    }
+
+    fn publish_file_assoc_empty(&self, empty: bool) -> bool {
+        if !empty {
+            self.file_db_hint.store(1, Ordering::Release);
+            return false;
+        }
+        match self
+            .file_db_hint
+            .compare_exchange(2, 0, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) | Err(0) => true,
+            Err(_) => false,
+        }
     }
 }
 
