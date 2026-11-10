@@ -635,6 +635,47 @@ pub(crate) static CONTENT_MASK_REJECTS: std::sync::atomic::AtomicU64 =
 pub(crate) static MEMMEM_PREFILTER_REJECTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+// Warm the next chunk's file while this worker reads its own. Hint only.
+#[cfg(unix)]
+#[inline]
+fn prefetch_ahead(
+    files: &[(&FileItem, usize)],
+    idx: usize,
+    stride: usize,
+    ctx: &GrepContext<'_, '_>,
+) {
+    let Some(&(next, orig_idx)) = files.get(idx.saturating_add(stride)) else {
+        return;
+    };
+    if next.is_binary() || next.size() == 0 || next.size() > ctx.budget.max_file_size {
+        return;
+    }
+    if let (Some(masks), Some(needle)) = (ctx.content_masks, ctx.mask_needle)
+        && let Some(mask) = masks.get(orig_idx)
+        && needle.allows(mask) == Some(false)
+    {
+        return;
+    }
+    let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+    let abs = next.write_absolute_path(ctx.arena_for_file(next), ctx.base_path, &mut path_buf);
+    if let Ok(file) = std::fs::File::open(abs) {
+        use std::os::fd::AsRawFd;
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_WILLNEED);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+#[inline]
+fn prefetch_ahead(
+    _files: &[(&FileItem, usize)],
+    _idx: usize,
+    _stride: usize,
+    _ctx: &GrepContext<'_, '_>,
+) {
+}
+
 impl GrepContext<'_, '_> {
     #[inline]
     fn arena_for_file(&self, file: &FileItem) -> crate::simd_path::ArenaPtr {
@@ -749,6 +790,8 @@ where
                             first_skipped.fetch_min(idx, Ordering::Relaxed);
                             return None;
                         }
+
+                        prefetch_ahead(files_to_search, idx, chunk.len(), ctx);
 
                         let t_read = phase_timing.then(std::time::Instant::now);
                         // Content masks are keyed by picker position from the prefilter.
