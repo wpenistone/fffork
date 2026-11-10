@@ -101,7 +101,15 @@ fn bench_typing_stream(c: &mut Criterion) {
     // extends the previous one, so all but the first reuse prior hits.
     let (_root, picker) = make_picker(10_000);
     let steps = [
-        "c", "co", "con", "cont", "contr", "contro", "control", "controll", "controlle",
+        "c",
+        "co",
+        "con",
+        "cont",
+        "contr",
+        "contro",
+        "control",
+        "controll",
+        "controlle",
         "controller",
     ];
     let mut group = c.benchmark_group("typing_stream_10k");

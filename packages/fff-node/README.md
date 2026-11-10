@@ -29,6 +29,20 @@ The correct native binary for your platform is installed automatically via platf
 
 If the platform package isn't available, the postinstall script will attempt to download from GitHub releases as a fallback.
 
+### Platforms without a prebuilt package
+
+On a platform that has no `@ff-labs/fff-bin-*` package (e.g. FreeBSD), build the C
+library from source and point `@ff-labs/fff-node` at it with `FFF_C_LIB`:
+
+```bash
+cargo build --release -p fff-c
+FFF_C_LIB=target/release/libfff_c.so node ./app.mjs
+```
+
+`FFF_C_LIB` is checked before the platform package and the local dev build. If the
+path does not exist, resolution fails with an explicit error rather than silently
+falling back. `ffi-rs` has no FreeBSD prebuilt either and must be built from source.
+
 ## Quick Start
 
 Each `FileFinder` instance owns an independent native index. Create one, wait

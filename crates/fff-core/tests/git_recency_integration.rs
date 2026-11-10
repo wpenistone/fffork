@@ -122,7 +122,7 @@ fn wait_for_score(shared: &SharedFilePicker, base: &Path, rel: &str, expected: i
             if let Some(picker) = guard.as_ref()
                 && picker
                     .get_file_by_path(base.join(rel))
-                    .is_some_and(|f| f.git_recency_score == expected)
+                    .is_some_and(|f| f.git_recency_score() == expected)
             {
                 return;
             }
@@ -170,6 +170,6 @@ fn init_repo() -> (TempDir, PathBuf) {
 fn recency_score(picker: &FilePicker, base: &Path, rel: &str) -> i16 {
     picker
         .get_file_by_path(base.join(rel))
-        .map(|f| f.git_recency_score)
+        .map(|f| f.git_recency_score())
         .unwrap_or_else(|| panic!("{rel} not indexed"))
 }

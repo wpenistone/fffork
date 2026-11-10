@@ -122,6 +122,8 @@ pub mod git;
 pub mod git_recency;
 pub use git_recency::GitRecencyConfig;
 
+mod definition;
+
 /// Live grep search with regex, plain-text, and fuzzy matching modes.
 pub mod grep;
 pub use grep::*;

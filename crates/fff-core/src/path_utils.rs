@@ -1,3 +1,4 @@
+use smallvec::SmallVec;
 use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
@@ -10,9 +11,9 @@ pub fn canonicalize(path: impl AsRef<Path>) -> std::io::Result<PathBuf> {
     std::fs::canonicalize(path)
 }
 
-/// The index stores relative paths with `/` on every platform. These helpers
-/// convert between that canonical form and the OS-native separator, and are
-/// no-ops on non-Windows where `/` is already native.
+// The index stores relative paths with `/` on every platform. These helpers
+// convert between that canonical form and the OS-native separator, and are
+// no-ops on non-Windows where `/` is already native.
 
 /// Fold a relative path to the canonical `/` form (no-op off Windows).
 #[cfg(windows)]
@@ -62,7 +63,7 @@ pub fn normalize(path: PathBuf) -> PathBuf {
 
 #[cfg(windows)]
 pub fn expand_tilde(path: &str) -> PathBuf {
-    return PathBuf::from(path);
+    PathBuf::from(path)
 }
 
 #[cfg(not(windows))]
@@ -83,6 +84,22 @@ pub fn expand_tilde(path: &str) -> PathBuf {
 /// It may have a trailing `/` which is stripped internally.
 ///
 /// Zero-allocation: byte walks both directory part iterators in lockstep.
+// High bit set in each byte that is neither `/` nor `\`.
+#[inline(always)]
+fn non_sep_mask(v: u64) -> u64 {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let slash = {
+        let x = v ^ 0x2f2f_2f2f_2f2f_2f2f;
+        x.wrapping_sub(LO) & !x & HI
+    };
+    let back = {
+        let x = v ^ 0x5c5c_5c5c_5c5c_5c5c;
+        x.wrapping_sub(LO) & !x & HI
+    };
+    !(slash | back) & HI
+}
+
 pub fn calculate_distance_penalty(current_file: Option<&str>, candidate_dir: &str) -> i32 {
     CurrentDir::new(current_file).penalty_for(candidate_dir)
 }
@@ -90,13 +107,15 @@ pub fn calculate_distance_penalty(current_file: Option<&str>, candidate_dir: &st
 /// Pre-split current file directory, built once per query and reused
 /// across all candidates. Same scoring as `calculate_distance_penalty`.
 pub struct CurrentDir<'a> {
-    parts: Vec<&'a [u8]>,
+    parts: SmallVec<[&'a [u8]; 8]>,
 }
 
 impl<'a> CurrentDir<'a> {
     pub fn new(current_file: Option<&'a str>) -> Self {
         let Some(path) = current_file else {
-            return Self { parts: Vec::new() };
+            return Self {
+                parts: SmallVec::new(),
+            };
         };
         let bytes = path.as_bytes();
         let dir = match bytes.iter().rposition(|&b| b == b'/' || b == b'\\') {
@@ -157,6 +176,223 @@ impl<'a> CurrentDir<'a> {
         }
         (-(depth as i32)).max(-20)
     }
+
+    // Same depth as `penalty_for`. The directory is the bytes before the filename.
+    // Trailing separators trim in the last slot, stepping back one slot if the run crosses.
+    pub(crate) fn penalty_for_path(
+        &self,
+        path: &crate::simd_path::ChunkedString,
+        arena: crate::simd_path::ArenaPtr,
+    ) -> i32 {
+        if self.parts.is_empty() {
+            return 0;
+        }
+        let (byte_len_u, name_off) = path.span_lens();
+        let total = byte_len_u as usize;
+        let mut end = (name_off as usize).min(total);
+        if end == 0 {
+            return 0;
+        }
+        let simd = crate::simd_path::SIMD_CHUNK_BYTES;
+        let mut slot = (end - 1) / simd;
+        let mut index = path.slot_index(arena, slot);
+        loop {
+            let chunk = crate::simd_path::ChunkedString::chunk_at(arena, unsafe { *index });
+            let base = slot * simd;
+            let mut i = end - base;
+            let mut cross = false;
+            while i >= 16 {
+                let later = u64::from_le(unsafe {
+                    core::ptr::read_unaligned(chunk.as_ptr().add(i - 8) as *const u64)
+                });
+                let earlier = u64::from_le(unsafe {
+                    core::ptr::read_unaligned(chunk.as_ptr().add(i - 16) as *const u64)
+                });
+                let non_later = non_sep_mask(later);
+                let non_earlier = non_sep_mask(earlier);
+                if non_later != 0 {
+                    let byte = ((63 - non_later.leading_zeros()) / 8) as usize;
+                    end = base + (i - 8) + byte + 1;
+                    break;
+                }
+                if non_earlier != 0 {
+                    let byte = ((63 - non_earlier.leading_zeros()) / 8) as usize;
+                    end = base + (i - 16) + byte + 1;
+                    break;
+                }
+                i -= 16;
+            }
+            if i < 16 {
+            while i >= 8 {
+                let v = u64::from_le(unsafe {
+                    core::ptr::read_unaligned(chunk.as_ptr().add(i - 8) as *const u64)
+                });
+                // High bit set in each byte that is neither separator.
+                let non = non_sep_mask(v);
+                if non != 0 {
+                    let byte = ((63 - non.leading_zeros()) / 8) as usize;
+                    end = base + (i - 8) + byte + 1;
+                    break;
+                }
+                i -= 8;
+            }
+            if i < 8 {
+                if i == 0 {
+                    end = base;
+                    cross = slot > 0;
+                } else {
+                    while i > 0 {
+                        i -= 1;
+                        let b = chunk[i];
+                        if b != b'/' && b != b'\\' {
+                            end = base + i + 1;
+                            break;
+                        }
+                        if i == 0 {
+                            end = base;
+                            cross = slot > 0;
+                        }
+                    }
+                }
+            }
+            }
+            if !cross {
+                break;
+            }
+            slot -= 1;
+            index = unsafe { index.sub(1) };
+        }
+        if end == 0 {
+            return 0;
+        }
+        let mut ci = 0usize;
+        let mut common_len = 0usize;
+        let mut current_total = 0usize;
+        let mut seg_start = 0usize;
+        let mut off = 0usize;
+        let mut stopped = false;
+        index = path.slot_index(arena, 0);
+        while off < end && !stopped {
+            let chunk = crate::simd_path::ChunkedString::chunk_at(arena, unsafe { *index });
+            let n = simd.min(end - off);
+            #[cfg(target_arch = "x86_64")]
+            if off + n < end {
+                let next = unsafe { *index.add(1) };
+                unsafe {
+                    std::arch::x86_64::_mm_prefetch(
+                        crate::simd_path::ChunkedString::chunk_at(arena, next).as_ptr() as *const i8,
+                        std::arch::x86_64::_MM_HINT_T0,
+                    );
+                }
+            }
+            for i in memchr::memchr2_iter(b'/', b'\\', &chunk[..n]) {
+                let abs = off + i;
+                if abs > seg_start {
+                    let kept = if seg_start >= off {
+                        self.absorb_bytes(
+                            &chunk[seg_start - off..i],
+                            &mut ci,
+                            &mut common_len,
+                            &mut current_total,
+                        )
+                    } else {
+                        self.absorb_segment(
+                            path,
+                            arena,
+                            seg_start,
+                            abs,
+                            &mut ci,
+                            &mut common_len,
+                            &mut current_total,
+                        )
+                    };
+                    if !kept {
+                        stopped = true;
+                        break;
+                    }
+                }
+                seg_start = abs + 1;
+            }
+            off += n;
+            if off < end {
+                index = unsafe { index.add(1) };
+            }
+        }
+        if !stopped
+            && end > seg_start
+            && !self.absorb_segment(
+                path,
+                arena,
+                seg_start,
+                end,
+                &mut ci,
+                &mut common_len,
+                &mut current_total,
+            )
+        {
+            stopped = true;
+        }
+        if !stopped && self.parts.get(ci).is_some() {
+            ci += 1;
+            current_total += 1 + self.parts.len() - ci;
+        }
+        let depth = current_total.saturating_sub(common_len);
+        if depth == 0 {
+            return 0;
+        }
+        (-(depth as i32)).max(-20)
+    }
+
+    fn absorb_segment(
+        &self,
+        path: &crate::simd_path::ChunkedString,
+        arena: crate::simd_path::ArenaPtr,
+        start: usize,
+        end: usize,
+        ci: &mut usize,
+        common_len: &mut usize,
+        current_total: &mut usize,
+    ) -> bool {
+        let cur = self.parts.get(*ci).copied();
+        *ci += cur.is_some() as usize;
+        match cur {
+            Some(part) => {
+                *current_total += 1;
+                if path.eq_range(arena, start, end, part) {
+                    *common_len += 1;
+                    true
+                } else {
+                    *current_total += self.parts.len() - *ci;
+                    false
+                }
+            }
+            None => false,
+        }
+    }
+
+    fn absorb_bytes(
+        &self,
+        bytes: &[u8],
+        ci: &mut usize,
+        common_len: &mut usize,
+        current_total: &mut usize,
+    ) -> bool {
+        let cur = self.parts.get(*ci).copied();
+        *ci += cur.is_some() as usize;
+        match cur {
+            Some(part) => {
+                *current_total += 1;
+                if bytes == part {
+                    *common_len += 1;
+                    true
+                } else {
+                    *current_total += self.parts.len() - *ci;
+                    false
+                }
+            }
+            None => false,
+        }
+    }
 }
 
 /// Memoized distance penalties keyed by `parent_dir_index`. Scoring loops
@@ -166,11 +402,19 @@ pub struct DirPenaltyMemo {
     penalties: Vec<i32>,
 }
 
+thread_local! {
+    static PENALTY_BUF: std::cell::RefCell<Vec<i32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl DirPenaltyMemo {
     pub fn new(dir_count: usize) -> Self {
-        Self {
-            penalties: vec![i32::MAX; dir_count],
+        let mut penalties = PENALTY_BUF.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+        // `clear` keeps the allocation. A new search must not see old dirs.
+        penalties.clear();
+        if dir_count > 0 {
+            penalties.resize(dir_count, i32::MAX);
         }
+        Self { penalties }
     }
 
     pub fn penalty_for(&mut self, cur: &CurrentDir, dir_idx: usize, candidate_dir: &str) -> i32 {
@@ -193,7 +437,12 @@ impl DirPenaltyMemo {
         }
     }
 
-    pub fn penalty_for_grow(&mut self, cur: &CurrentDir, dir_idx: usize, candidate_dir: &str) -> i32 {
+    pub fn penalty_for_grow(
+        &mut self,
+        cur: &CurrentDir,
+        dir_idx: usize,
+        candidate_dir: &str,
+    ) -> i32 {
         if let Some(&p) = self.penalties.get(dir_idx)
             && p != i32::MAX
         {
@@ -205,6 +454,38 @@ impl DirPenaltyMemo {
         }
         self.penalties[dir_idx] = p;
         p
+    }
+
+    pub(crate) fn penalty_for_grow_path(
+        &mut self,
+        cur: &CurrentDir,
+        dir_idx: usize,
+        path: &crate::simd_path::ChunkedString,
+        arena: crate::simd_path::ArenaPtr,
+    ) -> i32 {
+        if let Some(&p) = self.penalties.get(dir_idx)
+            && p != i32::MAX
+        {
+            return p;
+        }
+        let p = cur.penalty_for_path(path, arena);
+        if dir_idx >= self.penalties.len() {
+            self.penalties.resize(dir_idx + 1, i32::MAX);
+        }
+        self.penalties[dir_idx] = p;
+        p
+    }
+}
+
+impl Drop for DirPenaltyMemo {
+    fn drop(&mut self) {
+        let buf = std::mem::take(&mut self.penalties);
+        PENALTY_BUF.with(|slot| {
+            let slot = &mut *slot.borrow_mut();
+            if buf.capacity() > slot.capacity() {
+                *slot = buf;
+            }
+        });
     }
 }
 
@@ -368,5 +649,49 @@ mod tests {
             ),
             -1
         );
+    }
+
+    #[test]
+    fn penalty_for_path_matches_copied_dir() {
+        let current = "examples/user/test/main.rs";
+        let cur = CurrentDir::new(Some(current));
+        let paths = [
+            "examples/user/test/main.rs",
+            "examples/user/other.rs",
+            "examples/audio-announce/src/lib/audio-announce.rs",
+            "lib/mod.rs",
+            "main.rs",
+            "src/foo\\bar/baz.txt",
+            "very/deeply/nested/directory/structure/with/many/levels/file.txt",
+            "a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q.rs",
+        ];
+        let files: Vec<crate::types::FileItem> = paths
+            .iter()
+            .map(|path| {
+                let start = path
+                    .rfind(std::path::is_separator)
+                    .map(|i| i + 1)
+                    .unwrap_or(0) as u16;
+                crate::types::FileItem::new_raw(start, 0, 0, None, false)
+            })
+            .collect();
+        let owned: Vec<String> = paths.iter().map(|p| (*p).to_string()).collect();
+        let (store, strings) =
+            crate::simd_path::build_chunked_path_store_from_strings(&owned, &files);
+        let arena = store.as_arena_ptr();
+        for (path, chunked) in paths.iter().zip(&strings) {
+            let dir = match path.rfind(std::path::is_separator) {
+                Some(i) => &path[..=i],
+                None => "",
+            };
+            assert_eq!(
+                cur.penalty_for_path(chunked, arena),
+                calculate_distance_penalty(Some(current), dir),
+                "{path}"
+            );
+        }
+        let mut memo = DirPenaltyMemo::new(0);
+        let first = memo.penalty_for_grow_path(&cur, 3, &strings[0], arena);
+        assert_eq!(memo.penalty_for_grow_path(&cur, 3, &strings[1], arena), first);
     }
 }

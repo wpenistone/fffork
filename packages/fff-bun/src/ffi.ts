@@ -20,6 +20,7 @@ import {
 import { findBinary } from "./download";
 import { embeddedLibPath } from "./embedded";
 import type {
+  DefinitionMode,
   DirItem,
   DirSearchResult,
   FileItem,
@@ -35,7 +36,7 @@ import type {
   WatchEvent,
   WatchEventKind,
 } from "./fff-api";
-import { createGrepCursor, err } from "./fff-api";
+import { createGrepCursor, definitionModeToInt, err } from "./fff-api";
 
 /** Grep mode constants matching the C API (u8). */
 const GREP_MODE_PLAIN = 0;
@@ -153,7 +154,7 @@ const ffiDefinition = {
       FFIType.bool, // enforce_time_budget
       FFIType.u32, // before_context
       FFIType.u32, // after_context
-      FFIType.bool, // classify_definitions
+      FFIType.u8, // classify_definitions
     ],
     returns: FFIType.ptr,
   },
@@ -173,7 +174,7 @@ const ffiDefinition = {
       FFIType.bool, // enforce_time_budget
       FFIType.u32, // before_context
       FFIType.u32, // after_context
-      FFIType.bool, // classify_definitions
+      FFIType.u8, // classify_definitions
     ],
     returns: FFIType.ptr,
   },
@@ -1255,8 +1256,11 @@ export function ffiLiveGrep(
   enforceTimeBudget: boolean,
   beforeContext: number,
   afterContext: number,
-  classifyDefinitions: boolean,
+  classifyDefinitions: DefinitionMode | boolean,
 ): Result<GrepResult> {
+  const definitionMode = definitionModeToInt(classifyDefinitions);
+  if (definitionMode === undefined) return err("Invalid classifyDefinitions mode");
+
   const library = loadLibrary();
   const resultPtr = library.symbols.fff_live_grep_ex(
     handle,
@@ -1271,7 +1275,7 @@ export function ffiLiveGrep(
     enforceTimeBudget,
     beforeContext,
     afterContext,
-    classifyDefinitions,
+    definitionMode,
   );
   return parseGrepResult(resultPtr);
 }
@@ -1292,8 +1296,11 @@ export function ffiMultiGrep(
   enforceTimeBudget: boolean,
   beforeContext: number,
   afterContext: number,
-  classifyDefinitions: boolean,
+  classifyDefinitions: DefinitionMode | boolean,
 ): Result<GrepResult> {
+  const definitionMode = definitionModeToInt(classifyDefinitions);
+  if (definitionMode === undefined) return err("Invalid classifyDefinitions mode");
+
   const library = loadLibrary();
   const resultPtr = library.symbols.fff_multi_grep_ex(
     handle,
@@ -1308,7 +1315,7 @@ export function ffiMultiGrep(
     enforceTimeBudget,
     beforeContext,
     afterContext,
-    classifyDefinitions,
+    definitionMode,
   );
   return parseGrepResult(resultPtr);
 }

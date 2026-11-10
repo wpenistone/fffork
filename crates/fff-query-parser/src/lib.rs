@@ -1,43 +1,5 @@
-//! Fast query parser for file search
-//!
-//! This parser takes a search query and extracts structured constraints
-//! while preserving text for fuzzy matching. Designed for maximum performance:
-//! - Single-pass parsing with minimal branching
-//! - Stack-allocated string buffers
-//!
-//! # Examples
-//!
-//! ```
-//! use fff_query_parser::{QueryParser, Constraint, FuzzyQuery};
-//!
-//! let parser = QueryParser::default();
-//!
-//! // Single-token queries return FFFQuery with Text fuzzy query and no constraints
-//! let result = parser.parse("hello");
-//! assert!(result.constraints.is_empty());
-//! assert_eq!(result.fuzzy_query, FuzzyQuery::Text("hello"));
-//!
-//! // Multi-token queries are parsed
-//! let result = parser.parse("name *.rs");
-//! match &result.fuzzy_query {
-//!     FuzzyQuery::Text(text) => assert_eq!(*text, "name"),
-//!     _ => panic!("Expected text"),
-//! }
-//! assert!(matches!(result.constraints[0], Constraint::Extension("rs")));
-//!
-//! // Parse glob pattern with text
-//! let result = parser.parse("**/*.rs foo");
-//! assert!(matches!(result.constraints[0], Constraint::Glob("**/*.rs")));
-//!
-//! // Parse negation
-//! let result = parser.parse("!*.rs foo");
-//! match &result.constraints[0] {
-//!     Constraint::Not(inner) => {
-//!         assert!(matches!(inner.as_ref(), Constraint::Extension("rs")));
-//!     }
-//!     _ => panic!("Expected Not constraint"),
-//! }
-//! ```
+//! Splits a query into constraints and fuzzy text.
+//! `!*.ext` is `Not(Extension)`; other `!` wildcards are `Not(Glob)`.
 
 mod config;
 mod constraints;
@@ -50,11 +12,9 @@ pub use config::is_filename_constraint_token;
 pub use config::{
     AiGrepConfig, DirSearchConfig, FileSearchConfig, GrepConfig, MixedSearchConfig, ParserConfig,
 };
-pub use constraints::{Constraint, GitStatusFilter};
+pub use constraints::{Constraint, ConstraintVec, GitStatusFilter};
 pub use location::Location;
 pub use parser::{FFFQuery, FuzzyQuery, QueryParser};
-
-pub type ConstraintVec<'a> = Vec<Constraint<'a>>;
 
 #[cfg(test)]
 mod tests {

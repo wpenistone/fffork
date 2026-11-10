@@ -394,6 +394,8 @@ export interface HealthCheck {
  */
 export type GrepMode = "plain" | "regex" | "fuzzy";
 
+export type DefinitionMode = "off" | "classify" | "definition_only" | "usage_only";
+
 /**
  * Opaque pagination cursor for grep results.
  * Pass this to `GrepOptions.cursor` to fetch the next page.
@@ -449,12 +451,9 @@ export interface GrepOptions {
   afterContext?: number;
   /** Maximum matches to return in this page across all files (default: 50) */
   pageSize?: number;
-  /**
-   * When true, classify each match line as a code definition (struct/fn/class/...)
-   * and expose it via `GrepMatch.isDefinition`. Let callers re-rank defs first
-   * without a TS-side regex port. (default: false)
-   */
-  classifyDefinitions?: boolean;
+  /** Select matching definitions/usages, or classify all matches. Defaults to "off".
+   * Legacy booleans map false to "off" and true to "classify". Keep the same mode with a cursor. */
+  classifyDefinitions?: DefinitionMode | boolean;
 }
 
 /**
@@ -495,7 +494,7 @@ export interface GrepMatch {
   contextBefore?: string[];
   /** Lines after the match (context). Empty array when context is 0. */
   contextAfter?: string[];
-  /** Whether this line is a code definition (only populated when `classifyDefinitions: true`). */
+  /** Whether the query matches a declared name. Available when classification is enabled. */
   isDefinition?: boolean;
 }
 
@@ -560,11 +559,9 @@ export interface MultiGrepOptions {
   afterContext?: number;
   /** Maximum matches to return in this page across all files (default: 50) */
   pageSize?: number;
-  /**
-   * When true, classify each match line as a code definition (struct/fn/class/...)
-   * and expose it via `GrepMatch.isDefinition`. (default: false)
-   */
-  classifyDefinitions?: boolean;
+  /** Select matching definitions/usages, or classify all matches. Defaults to "off".
+   * Legacy booleans map false to "off" and true to "classify". Keep the same mode with a cursor. */
+  classifyDefinitions?: DefinitionMode | boolean;
 }
 
 /**
@@ -666,4 +663,25 @@ export interface FileFinderApi {
 
   /** Health/diagnostics information for this instance. */
   healthCheck(testPath?: string): Result<HealthCheck>;
+}
+
+/** @internal Convert the public mode to the C integer argument. */
+export function definitionModeToInt(
+  mode: DefinitionMode | boolean | undefined,
+): number | undefined {
+  switch (mode) {
+    case undefined:
+    case false:
+    case "off":
+      return 0;
+    case true:
+    case "classify":
+      return 1;
+    case "definition_only":
+      return 2;
+    case "usage_only":
+      return 3;
+    default:
+      return undefined;
+  }
 }

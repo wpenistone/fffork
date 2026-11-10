@@ -3,7 +3,7 @@
 #ifndef FFF_C_H
 #define FFF_C_H
 
-/* Generated with cbindgen:0.29.2 */
+/* Generated with cbindgen:0.29.4 */
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -629,7 +629,8 @@ struct FffResult *fff_search_mixed(void *fff_handle,
  * 0 = plain text (SIMD), 1 = regex, 2 = fuzzy. Zero picks the default:
  * `max_file_size` 10 MB, `page_limit` 50, `max_matches_per_file` and
  * `time_budget_ms` unlimited. `smart_case` is case-insensitive for
- * all-lowercase queries; `classify_definitions` tags code definitions.
+ * all-lowercase queries. `classify_definitions`: 0 = off, 1 = classify,
+ * 2 = definition_only, 3 = usage_only.
  *
  * ## Safety
  * * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
@@ -646,7 +647,7 @@ struct FffResult *fff_live_grep(void *fff_handle,
                                 uint64_t time_budget_ms,
                                 uint32_t before_context,
                                 uint32_t after_context,
-                                bool classify_definitions);
+                                uint8_t classify_definitions);
 
 /**
  * [`fff_live_grep`] plus `enforce_time_budget`: when true the budget also bounds
@@ -667,7 +668,7 @@ struct FffResult *fff_live_grep_ex(void *fff_handle,
                                    bool enforce_time_budget,
                                    uint32_t before_context,
                                    uint32_t after_context,
-                                   bool classify_definitions);
+                                   uint8_t classify_definitions);
 
 /**
  * Multi-pattern OR search (SIMD Aho-Corasick): lines matching ANY pattern.
@@ -691,7 +692,7 @@ struct FffResult *fff_multi_grep(void *fff_handle,
                                  uint64_t time_budget_ms,
                                  uint32_t before_context,
                                  uint32_t after_context,
-                                 bool classify_definitions);
+                                 uint8_t classify_definitions);
 
 /**
  * [`fff_multi_grep`] plus `enforce_time_budget`, as in [`fff_live_grep_ex`].
@@ -711,7 +712,7 @@ struct FffResult *fff_multi_grep_ex(void *fff_handle,
                                     bool enforce_time_budget,
                                     uint32_t before_context,
                                     uint32_t after_context,
-                                    bool classify_definitions);
+                                    uint8_t classify_definitions);
 
 /**
  * Trigger a rescan of the file index.

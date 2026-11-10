@@ -1,8 +1,8 @@
 use crate::file_picker::is_known_binary_extension_basename;
 use crate::ignore::IGNORED_DIRS;
 use crate::types::FileItem;
-use crate::walk::{WalkIgnoreRules, WalkOutput};
-use parking_lot::Mutex;
+use crate::walk::{WalkIgnoreRules, WalkOutput, WalkSpan};
+use std::cell::UnsafeCell;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -10,6 +10,17 @@ use std::time::SystemTime;
 use zlob::walk::{WalkBuilder, WalkFlags, WalkMetadata, WalkState};
 
 const PROGRESS_FLUSH: usize = 512;
+
+// Real `.git` directories never arrive: GITIGNORE skips them before the
+// callback. Nested `.git/` is yielded only if that name was a followed symlink dir.
+#[inline]
+fn skip_git_rel(rel: &[u8], follow_symlinks: bool) -> bool {
+    let base = rel.rsplit(|b| *b == b'/').next().unwrap_or(rel);
+    if base == b".git" {
+        return true;
+    }
+    follow_symlinks && is_git_rel(rel)
+}
 
 #[inline]
 fn is_git_rel(rel: &[u8]) -> bool {
@@ -28,6 +39,70 @@ fn is_git_rel(rel: &[u8]) -> bool {
         }
     }
     false
+}
+
+// Exclusive to one zlob `worker_id` until `WalkBuilder::run` returns.
+struct Shard {
+    bytes: UnsafeCell<Vec<u8>>,
+    files: UnsafeCell<Vec<(FileItem, u32, u32)>>,
+    dirs: UnsafeCell<Vec<(u32, u32)>>,
+    pending: UnsafeCell<usize>,
+}
+
+// SAFETY: zlob invokes each worker_id on one thread until run() returns.
+unsafe impl Sync for Shard {}
+
+struct ShardParts<'a> {
+    bytes: &'a mut Vec<u8>,
+    files: &'a mut Vec<(FileItem, u32, u32)>,
+    dirs: &'a mut Vec<(u32, u32)>,
+    pending: &'a mut usize,
+}
+
+impl Shard {
+    fn new() -> Self {
+        Self {
+            bytes: UnsafeCell::new(Vec::with_capacity(64 * 1024)),
+            files: UnsafeCell::new(Vec::with_capacity(1024)),
+            dirs: UnsafeCell::new(Vec::with_capacity(64)),
+            pending: UnsafeCell::new(0),
+        }
+    }
+
+    #[inline]
+    fn parts(&self) -> ShardParts<'_> {
+        // Same worker_id never runs this on two threads at once.
+        unsafe {
+            ShardParts {
+                bytes: &mut *self.bytes.get(),
+                files: &mut *self.files.get(),
+                dirs: &mut *self.dirs.get(),
+                pending: &mut *self.pending.get(),
+            }
+        }
+    }
+}
+
+// Copies `rel` as UTF-8 (lossy when the OS bytes are not) and returns
+// `(off, len, basename_off)` in that stored text.
+#[inline]
+fn store_rel(buf: &mut Vec<u8>, rel: &[u8], slash: bool) -> (u32, u32, usize) {
+    let start = buf.len();
+    if std::str::from_utf8(rel).is_ok() {
+        buf.extend_from_slice(rel);
+    } else {
+        buf.extend_from_slice(String::from_utf8_lossy(rel).as_bytes());
+    }
+    let path_end = buf.len();
+    if slash {
+        buf.push(b'/');
+    }
+    let stored_base = buf[start..path_end]
+        .iter()
+        .rposition(|b| *b == b'/')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    (start as u32, (buf.len() - start) as u32, stored_base)
 }
 
 #[tracing::instrument(skip_all, name = "zlob walker", level = "info")]
@@ -66,15 +141,14 @@ pub(crate) fn walk_collect_files(
         tracing::warn!(?e, "zlob extra_ignore rejected; walking without it");
     }
 
-    // Per-worker shards indexed by `worker_id`: the lock is never
-    // contended across workers, and progress flushes every 512 files.
-    let workers = builder.max_workers().max(1).min(256);
-    let shards: Vec<Mutex<(Vec<(FileItem, String)>, Vec<String>, usize)>> = (0..workers)
-        .map(|_| Mutex::new((Vec::with_capacity(1024), Vec::with_capacity(64), 0)))
-        .collect();
+    // One shard per worker_id. zlob never shares an id across threads, so
+    // pushes do not take a lock.
+    let workers = builder.max_workers().max(1);
+    let shards: Vec<Shard> = (0..workers).map(|_| Shard::new()).collect();
 
     let outcome = match builder.run(|entry| {
-        let wid = (entry.worker_id() % workers) as usize;
+        // `worker_id` is < `max_workers` and exclusive to this thread.
+        let mut parts = shards[entry.worker_id()].parts();
         // Followed links keep the Symlink kind and lstat metadata, so stat
         // the target to index the ones resolving to files (#912).
         let target = if entry.is_file() {
@@ -85,42 +159,28 @@ pub(crate) fn walk_collect_files(
                 _ => return WalkState::Continue,
             }
         } else {
-            // unlike ripgrep walker zlob doesnt show .git files
             if entry.is_dir() {
                 let rel = entry.relative_path_bytes();
                 if rel.is_empty() {
                     return WalkState::Continue;
                 }
-                if is_git_rel(rel) {
+                if skip_git_rel(rel, follow_symlinks) {
                     return WalkState::SkipDir;
                 }
-                let mut rel = entry.relative_path_lossy().into_owned();
-                rel.push('/');
-                shards[wid].lock().1.push(rel);
+                let (off, len, _) = store_rel(parts.bytes, rel, true);
+                parts.dirs.push((off, len));
             }
 
             return WalkState::Continue;
         };
 
-        if is_git_rel(entry.relative_path_bytes()) {
+        let rel = entry.relative_path_bytes();
+        if skip_git_rel(rel, follow_symlinks) {
             return WalkState::Continue;
         }
 
-        // Lossy pair: the offset must index the decoded string, not the raw
-        // bytes, or it lands inside a U+FFFD on invalid-UTF-8 names (#799).
-        let basename_offset = entry.basename_offset_in_relative_lossy();
-        // zlob emits '/'-separated relative paths, which is fff's canonical
-        // internal form on every platform — store them verbatim.
-        let relative_path = entry.relative_path_lossy().into_owned();
-
-        // `basename()` returns `&str` for files only.
-        let basename = match target {
-            None => entry.basename().unwrap_or(""),
-            Some(_) => &relative_path[basename_offset..],
-        };
-        let is_binary = is_known_binary_extension_basename(basename);
-
-        let (size, modified) = match target {
+        let (off, len, base_off) = store_rel(parts.bytes, rel, false);
+        let (size, modified) = match &target {
             Some(meta) => (
                 meta.len(),
                 meta.modified()
@@ -138,15 +198,40 @@ pub(crate) fn walk_collect_files(
             ),
         };
 
-        let item = FileItem::new_raw(basename_offset as u16, size, modified, None, is_binary);
+        let mut item = if target.is_none() {
+            let name = entry.basename().unwrap_or("");
+            let mut item = FileItem::new_raw(
+                base_off as u16,
+                size,
+                modified,
+                None,
+                is_known_binary_extension_basename(name),
+            );
+            item.mark_definition_language(name);
+            item
+        } else {
+            let start = off as usize;
+            // Stored bytes are UTF-8; `base_off` is the basename in that text.
+            let name = unsafe {
+                std::str::from_utf8_unchecked(&parts.bytes[start + base_off..start + len as usize])
+            };
+            let mut item = FileItem::new_raw(
+                base_off as u16,
+                size,
+                modified,
+                None,
+                is_known_binary_extension_basename(name),
+            );
+            item.mark_definition_language(name);
+            item
+        };
 
-        let mut guard = shards[wid].lock();
-        guard.0.push((item, relative_path));
-        guard.2 += 1;
-        if guard.2 >= PROGRESS_FLUSH {
-            let n = guard.2;
-            guard.2 = 0;
-            drop(guard);
+        parts.files.push((item, off, len));
+        *parts.pending += 1;
+        if *parts.pending >= PROGRESS_FLUSH {
+            let n = *parts.pending;
+            *parts.pending = 0;
+            drop(parts);
             synced_files_count.fetch_add(n, Ordering::Relaxed);
         }
 
@@ -161,12 +246,26 @@ pub(crate) fn walk_collect_files(
         }
     };
 
+    let mut buffers = Vec::with_capacity(shards.len());
     let mut pairs = Vec::new();
     let mut dirs = Vec::new();
     for shard in &shards {
-        let mut guard = shard.lock();
-        pairs.append(&mut guard.0);
-        dirs.append(&mut guard.1);
+        let parts = shard.parts();
+        if parts.files.is_empty() && parts.dirs.is_empty() && parts.bytes.is_empty() {
+            continue;
+        }
+        let buf_i = buffers.len() as u16;
+        if *parts.pending > 0 {
+            synced_files_count.fetch_add(*parts.pending, Ordering::Relaxed);
+            *parts.pending = 0;
+        }
+        for (item, off, len) in parts.files.drain(..) {
+            pairs.push((item, WalkSpan { buf: buf_i, off, len }));
+        }
+        for (off, len) in parts.dirs.drain(..) {
+            dirs.push(WalkSpan { buf: buf_i, off, len });
+        }
+        buffers.push(std::mem::take(parts.bytes));
     }
     // Always report the exact final total regardless of the last step.
     synced_files_count.store(pairs.len(), Ordering::Relaxed);
@@ -178,11 +277,7 @@ pub(crate) fn walk_collect_files(
         .is_some()
         .then(|| WalkIgnoreRules { inner: outcome });
 
-    Ok(WalkOutput {
-        pairs,
-        dirs,
-        ignore_rules,
-    })
+    Ok(WalkOutput::from_parts(buffers, pairs, dirs, ignore_rules))
 }
 
 #[cfg(test)]

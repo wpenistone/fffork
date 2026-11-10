@@ -197,6 +197,7 @@ impl BigramQuery {
                     }
                 });
             } else {
+                #[allow(clippy::question_mark)]
                 let Some(bits) = child.evaluate(index) else {
                     return None;
                 };
@@ -235,7 +236,8 @@ impl HirInfo {
 /// we allow max_typos = min(len/3,2) every typo destroys at most 2 consecutive bigrams
 /// So out of N bigrams at least N - 2 * max_typos have to present in the matching fil
 pub(crate) fn fuzzy_to_bigram_query(query: &str, num_probes: usize) -> BigramQuery {
-    let lower: Vec<u8> = query.bytes().map(|b| b.to_ascii_lowercase()).collect();
+    let mut lower = vec![0u8; query.len()];
+    crate::simd_path::fold_ascii_needle(query.as_bytes(), &mut lower);
 
     if lower.len() < 2 {
         return BigramQuery::Any;
@@ -412,7 +414,8 @@ fn decompose_literal(bytes: &[u8]) -> HirInfo {
         return HirInfo::empty();
     }
 
-    let lower: SmallVec<[u8; 64]> = bytes.iter().map(|b| b.to_ascii_lowercase()).collect();
+    let mut lower = SmallVec::<[u8; 64]>::from_elem(0, bytes.len());
+    crate::simd_path::fold_ascii_needle(bytes, &mut lower);
 
     if lower.len() == 1 {
         let b = lower[0];

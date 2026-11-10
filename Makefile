@@ -16,7 +16,7 @@ SHELL := bash
 # string rather than the literal `-o` / `pipefail` tokens.
 .SHELLFLAGS := -o pipefail -euc
 
-.PHONY: build build-c-lib install uninstall test test-rust test-rescan test-rescan-known-defects rescan-probe test-c-smoke test-c-api test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-bun-packaged prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-regressions test-stress-repos test-node-stress sync-js-api sync-js-api-check bump-homebrew-formula bump-install-mcp-sh test-bun-compile bench-search bench-grep
+.PHONY: build build-c-lib install uninstall test test-rust test-rescan test-rescan-known-defects rescan-probe test-c-smoke test-c-api test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-bun-packaged prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-regressions test-stress-repos test-node-stress sync-js-api sync-js-api-check bump-homebrew-formula bump-install-mcp-sh test-bun-compile bench-search bench-grep bench-definition
 
 all: format test lint
 
@@ -91,6 +91,9 @@ bench-search:
 
 bench-grep:
 	cargo bench -p fff-search --no-default-features --features zlob --bench grep_bench -- $(BENCH_ARGS)
+
+bench-definition:
+	cargo bench -p fff-search --no-default-features --features zlob --bench definition_bench -- $(BENCH_ARGS)
 
 # Watcher rescan harness: asserts that editing, build output, git activity and
 # preview reads all stay on the incremental path instead of re-walking the tree.

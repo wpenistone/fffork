@@ -70,36 +70,54 @@ pub(crate) fn compute_git_recency(
         let _ = revwalk.hide(merge_base);
     }
 
+    let mut diff_opts = DiffOptions::new();
+    if let Some(subdir) = subdir.as_deref() {
+        // Literal directory prefix, children included. Glob characters stay literal.
+        diff_opts.disable_pathspec_match(true);
+        diff_opts.pathspec(subdir);
+    }
+
     let mut scores: AHashMap<String, i16> = AHashMap::new();
     let mut qualifying = 0usize;
-    // Adaptive walk budget: bulk/merge-heavy histories skip more commits, so
-    // scale the window with the skip density instead of a fixed `* 5`. Stays
-    // off the searchable path (callers index first, apply recency after).
+    // Walk budget scales with how many commits the file cap skips.
     let density_mult = (config.max_files_per_commit / 25).clamp(0, 8);
     let mult = walk_mult_override().unwrap_or(5 + density_mult);
     let walk_budget = (max_commits.saturating_mul(mult)).clamp(64, 1024);
+    // Newest-first: this commit's parent is usually the next oid. Reuse it.
+    let mut next_commit: Option<git2::Commit<'_>> = None;
 
     for oid in revwalk.take(walk_budget) {
         if qualifying >= max_commits {
             break;
         }
 
-        let Ok(commit) = oid.and_then(|oid| repo.find_commit(oid)) else {
+        let Ok(oid) = oid else {
             continue;
+        };
+        let reuse = next_commit.as_ref().is_some_and(|commit| commit.id() == oid);
+        let commit = if reuse {
+            next_commit.take().unwrap()
+        } else {
+            match repo.find_commit(oid) {
+                Ok(commit) => commit,
+                Err(_) => continue,
+            }
         };
 
         // if merge commit
         if commit.parent_count() > 1 {
+            next_commit = None;
             continue;
         }
 
-        let Ok(tree) = commit.tree() else { continue };
-        let parent_tree = commit.parent(0).ok().and_then(|p| p.tree().ok());
+        let Ok(tree) = commit.tree() else {
+            next_commit = None;
+            continue;
+        };
+        let parent = commit.parent(0).ok();
+        let parent_tree = parent.as_ref().and_then(|parent| parent.tree().ok());
+        next_commit = parent;
 
-        let mut diff_opts = DiffOptions::new();
-        if let Some(subdir) = subdir.as_deref() {
-            diff_opts.pathspec(subdir);
-        }
         let Ok(diff) =
             repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut diff_opts))
         else {

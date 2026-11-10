@@ -603,13 +603,24 @@ impl BigramFilter {
         if pattern.len() < 2 {
             return None;
         }
+        let mut stack = [0u8; 256];
+        let mut heap = Vec::new();
+        let pattern: &[u8] = if pattern.len() <= stack.len() {
+            crate::simd_path::fold_ascii_needle(pattern, &mut stack[..pattern.len()]);
+            &stack[..pattern.len()]
+        } else {
+            heap.resize(pattern.len(), 0);
+            crate::simd_path::fold_ascii_needle(pattern, &mut heap);
+            &heap
+        };
 
         let mut keys: [(u16, u32); 512] = [(0, 0); 512];
         let mut nkeys = 0usize;
         let mut prev = pattern[0];
         for &b in &pattern[1..] {
             if (32..=126).contains(&prev) && (32..=126).contains(&b) {
-                let key = (prev.to_ascii_lowercase() as u16) << 8 | b.to_ascii_lowercase() as u16;
+                let key = (prev as u16) << 8 | b as u16;
+                #[allow(clippy::collapsible_if)]
                 if let Some(pop) = self.column_popcount(key) {
                     if nkeys < keys.len() {
                         keys[nkeys] = (key, pop);
@@ -640,56 +651,48 @@ impl BigramFilter {
             }
         }
 
-        // strid-1 bigrams
+        // Skip-1 columns AND into `result`. A second bitset would be the same
+        // intersection plus another full pass and allocation.
         if let Some(skip) = &self.skip_index
             && pattern.len() >= 3
-            && let Some(skip_candidates) = skip.query_skip(pattern)
+            && skip.and_skip_into(&mut result, pattern)
         {
-            bitset_and(&mut result, &skip_candidates);
             has_filter = true;
         }
 
         has_filter.then_some(result)
     }
 
-    /// Query using stride-2 bigrams from the pattern.
-    /// For "ABCDE" queries with keys (A,C), (B,D), (C,E).
-    fn query_skip(&self, pattern: &[u8]) -> Option<Vec<u64>> {
+    /// AND stride-2 keys `(A,C),(B,D),...` into `result`. `pattern` is already ASCII-lowercase.
+    fn and_skip_into(&self, result: &mut [u64], pattern: &[u8]) -> bool {
         let mut keys: [(u16, u32); 512] = [(0, 0); 512];
         let mut nkeys = 0usize;
         for i in 0..pattern.len().saturating_sub(2) {
             let a = pattern[i];
             let b = pattern[i + 2];
             if (32..=126).contains(&a) && (32..=126).contains(&b) {
-                let key = (a.to_ascii_lowercase() as u16) << 8 | b.to_ascii_lowercase() as u16;
-                if let Some(pop) = self.column_popcount(key) {
-                    if nkeys < keys.len() {
-                        keys[nkeys] = (key, pop);
-                        nkeys += 1;
-                    }
+                let key = (a as u16) << 8 | b as u16;
+                if let Some(pop) = self.column_popcount(key)
+                    && nkeys < keys.len()
+                {
+                    keys[nkeys] = (key, pop);
+                    nkeys += 1;
                 }
             }
         }
         if nkeys == 0 {
-            return None;
+            return false;
         }
         keys[..nkeys].sort_unstable_by_key(|&(_, pop)| pop);
 
-        let mut result = vec![u64::MAX; self.words];
-        if !self.file_count.is_multiple_of(64) {
-            let last = self.words - 1;
-            result[last] = (1u64 << (self.file_count % 64)) - 1;
-        }
-
         for &(key, _) in &keys[..nkeys] {
             if let Some(col) = self.column_ref(key) {
-                if !Self::and_column_checked(&mut result, col) {
+                if !Self::and_column_checked(result, col) {
                     break;
                 }
             }
         }
-
-        Some(result)
+        true
     }
 
     /// Resolve a bigram key to its stored column, if the index kept one.
@@ -936,8 +939,28 @@ fn normalize_bytes(src: &[u8], dst: &mut [u8]) {
 
 #[inline(always)]
 fn normalize_bytes_scalar(src: &[u8], dst: &mut [u8]) {
-    for (i, &b) in src.iter().enumerate() {
-        dst[i] = normalize_byte_scalar(b);
+    let mut i = 0usize;
+    let n = src.len();
+    while i + 8 <= n {
+        let v = u64::from_le(unsafe {
+            core::ptr::read_unaligned(src.as_ptr().add(i) as *const u64)
+        });
+        let out = u64::to_le(
+            normalize_byte_scalar(v as u8) as u64
+                | (normalize_byte_scalar((v >> 8) as u8) as u64) << 8
+                | (normalize_byte_scalar((v >> 16) as u8) as u64) << 16
+                | (normalize_byte_scalar((v >> 24) as u8) as u64) << 24
+                | (normalize_byte_scalar((v >> 32) as u8) as u64) << 32
+                | (normalize_byte_scalar((v >> 40) as u8) as u64) << 40
+                | (normalize_byte_scalar((v >> 48) as u8) as u64) << 48
+                | (normalize_byte_scalar((v >> 56) as u8) as u64) << 56,
+        );
+        unsafe { core::ptr::write_unaligned(dst.as_mut_ptr().add(i) as *mut u64, out) };
+        i += 8;
+    }
+    while i < n {
+        dst[i] = normalize_byte_scalar(src[i]);
+        i += 1;
     }
 }
 
@@ -956,6 +979,23 @@ unsafe fn normalize_bytes_avx2(src: &[u8], dst: &mut [u8]) {
     let add_u = _mm256_set1_epi8(37);
     let thr_u = _mm256_set1_epi8(101);
     let or20 = _mm256_set1_epi8(0x20);
+    while i + 64 <= len {
+        unsafe {
+            let v0 = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
+            let v1 = _mm256_loadu_si256(src.as_ptr().add(i + 32) as *const __m256i);
+            let printable0 = _mm256_cmpgt_epi8(_mm256_add_epi8(v0, add_p), thr_p);
+            let printable1 = _mm256_cmpgt_epi8(_mm256_add_epi8(v1, add_p), thr_p);
+            let is_upper0 = _mm256_cmpgt_epi8(_mm256_add_epi8(v0, add_u), thr_u);
+            let is_upper1 = _mm256_cmpgt_epi8(_mm256_add_epi8(v1, add_u), thr_u);
+            let lower0 = _mm256_or_si256(v0, _mm256_and_si256(is_upper0, or20));
+            let lower1 = _mm256_or_si256(v1, _mm256_and_si256(is_upper1, or20));
+            let out0 = _mm256_and_si256(lower0, printable0);
+            let out1 = _mm256_and_si256(lower1, printable1);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, out0);
+            _mm256_storeu_si256(dst.as_mut_ptr().add(i + 32) as *mut __m256i, out1);
+        }
+        i += 64;
+    }
     while i + 32 <= len {
         unsafe {
             let v = _mm256_loadu_si256(src.as_ptr().add(i) as *const __m256i);
@@ -966,6 +1006,48 @@ unsafe fn normalize_bytes_avx2(src: &[u8], dst: &mut [u8]) {
             _mm256_storeu_si256(dst.as_mut_ptr().add(i) as *mut __m256i, out);
         }
         i += 32;
+    }
+    let add_p16 = _mm_set1_epi8(1);
+    let thr_p16 = _mm_set1_epi8(32);
+    let add_u16 = _mm_set1_epi8(37);
+    let thr_u16 = _mm_set1_epi8(101);
+    let or20_16 = _mm_set1_epi8(0x20);
+    while i + 16 <= len {
+        unsafe {
+            let v = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
+            let printable = _mm_cmpgt_epi8(_mm_add_epi8(v, add_p16), thr_p16);
+            let is_upper = _mm_cmpgt_epi8(_mm_add_epi8(v, add_u16), thr_u16);
+            let lower = _mm_or_si128(v, _mm_and_si128(is_upper, or20_16));
+            let out = _mm_and_si128(lower, printable);
+            _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, out);
+        }
+        i += 16;
+    }
+    while i + 8 <= len {
+        unsafe {
+            let v = _mm_loadl_epi64(src.as_ptr().add(i) as *const __m128i);
+            let printable = _mm_cmpgt_epi8(_mm_add_epi8(v, add_p16), thr_p16);
+            let is_upper = _mm_cmpgt_epi8(_mm_add_epi8(v, add_u16), thr_u16);
+            let lower = _mm_or_si128(v, _mm_and_si128(is_upper, or20_16));
+            let out = _mm_and_si128(lower, printable);
+            _mm_storel_epi64(dst.as_mut_ptr().add(i) as *mut __m128i, out);
+        }
+        i += 8;
+    }
+    while i + 4 <= len {
+        unsafe {
+            let raw = core::ptr::read_unaligned(src.as_ptr().add(i) as *const u32);
+            let v = _mm_cvtsi32_si128(raw as i32);
+            let printable = _mm_cmpgt_epi8(_mm_add_epi8(v, add_p16), thr_p16);
+            let is_upper = _mm_cmpgt_epi8(_mm_add_epi8(v, add_u16), thr_u16);
+            let lower = _mm_or_si128(v, _mm_and_si128(is_upper, or20_16));
+            let out = _mm_and_si128(lower, printable);
+            core::ptr::write_unaligned(
+                dst.as_mut_ptr().add(i) as *mut u32,
+                _mm_cvtsi128_si32(out) as u32,
+            );
+        }
+        i += 4;
     }
     while i < len {
         dst[i] = normalize_byte_scalar(src[i]);
@@ -1017,19 +1099,33 @@ pub fn extract_bigrams(content: &[u8]) -> Vec<u16> {
     // Use a flat bitset (65536 bits = 8 KB) for dedup — faster than HashSet.
     let mut seen = vec![0u64; 1024]; // 1024 * 64 = 65536 bits
     let mut bigrams = Vec::new();
-
-    let mut prev = content[0];
-    for &b in &content[1..] {
-        if (32..=126).contains(&prev) && (32..=126).contains(&b) {
-            let key = (prev.to_ascii_lowercase() as u16) << 8 | b.to_ascii_lowercase() as u16;
-            let word = key as usize / 64;
-            let bit = 1u64 << (key as usize % 64);
-            if seen[word] & bit == 0 {
-                seen[word] |= bit;
-                bigrams.push(key);
-            }
+    let mut buf = [0u8; 32];
+    let mut off = 0usize;
+    let mut prev = 0u8;
+    let mut started = false;
+    while off < content.len() {
+        let n = (content.len() - off).min(buf.len());
+        crate::simd_path::fold_ascii_needle(&content[off..off + n], &mut buf[..n]);
+        let mut j = if started { 0 } else { 1 };
+        if !started {
+            prev = buf[0];
+            started = true;
         }
-        prev = b;
+        while j < n {
+            let b = buf[j];
+            if (32..=126).contains(&prev) && (32..=126).contains(&b) {
+                let key = (prev as u16) << 8 | b as u16;
+                let word = key as usize / 64;
+                let bit = 1u64 << (key as usize % 64);
+                if seen[word] & bit == 0 {
+                    seen[word] |= bit;
+                    bigrams.push(key);
+                }
+            }
+            prev = b;
+            j += 1;
+        }
+        off += n;
     }
     bigrams
 }
@@ -1130,7 +1226,7 @@ fn read_bigram_chunk<'a>(
     buf: &'a mut [u8],
     path_buf: &mut [u8; crate::simd_path::PATH_BUF_SIZE],
 ) -> Option<&'a [u8]> {
-    let want = (file.size as usize).min(MAX_INDEXABLE_FILE_SIZE);
+    let want = (file.size() as usize).min(MAX_INDEXABLE_FILE_SIZE);
     let filled = file.read_trimmed_into_buf(base_fd, base_path, arena, path_buf, &mut buf[..want]);
     if filled == 0 {
         return None;
@@ -1174,13 +1270,13 @@ pub(crate) fn build_bigram_index(
                 for (offset, file) in chunk.iter().enumerate() {
                     let file_idx = base_idx + offset;
 
-                    if file.is_binary() || file.size == 0 {
+                    if file.is_binary() || file.size() == 0 {
                         continue;
                     }
 
                     READ_BUF.with(|read_cell| {
                         let mut buf = read_cell.borrow_mut();
-                        let want = (file.size as usize).min(MAX_INDEXABLE_FILE_SIZE);
+                        let want = (file.size() as usize).min(MAX_INDEXABLE_FILE_SIZE);
                         if buf.len() < want {
                             buf.resize(want, 0);
                         }
@@ -1203,8 +1299,8 @@ pub(crate) fn build_bigram_index(
                             file.set_binary(crate::types::detect_binary_content(content));
 
                             if let Some(store) = content_masks
-                                && file.size > 0
-                                && content.len() as u64 == file.size
+                                && file.size() > 0
+                                && content.len() as u64 == file.size()
                             {
                                 let mut mask = crate::types::ContentMask::default();
                                 mask.accumulate(content);
@@ -1265,7 +1361,7 @@ pub(crate) fn sniff_binary_for_non_indexable(
             continue;
         }
         // check only the files that we are able to grep
-        if file.size == 0 || file.size > constants::MAX_FFFILE_SIZE {
+        if file.size() == 0 || file.size() > constants::MAX_FFFILE_SIZE {
             continue;
         }
 

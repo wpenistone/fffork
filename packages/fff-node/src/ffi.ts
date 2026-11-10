@@ -52,6 +52,7 @@ import {
 } from "ffi-rs";
 import { findBinary } from "./binary.js";
 import type {
+  DefinitionMode,
   DirItem,
   DirSearchResult,
   FileItem,
@@ -66,7 +67,7 @@ import type {
   WatchEvent,
   WatchEventKind,
 } from "./fff-api.js";
-import { createGrepCursor, err } from "./fff-api.js";
+import { createGrepCursor, definitionModeToInt, err } from "./fff-api.js";
 
 const LIBRARY_KEY = "fff_c";
 
@@ -1371,8 +1372,11 @@ export function ffiLiveGrep(
   enforceTimeBudget: boolean,
   beforeContext: number,
   afterContext: number,
-  classifyDefinitions: boolean,
+  classifyDefinitions: DefinitionMode | boolean,
 ): Result<GrepResult> {
+  const definitionMode = definitionModeToInt(classifyDefinitions);
+  if (definitionMode === undefined) return err("Invalid classifyDefinitions mode");
+
   loadLibrary();
 
   const rawPtr = load({
@@ -1392,7 +1396,7 @@ export function ffiLiveGrep(
       DataType.Boolean, // enforce_time_budget
       DataType.U32, // before_context
       DataType.U32, // after_context
-      DataType.Boolean, // classify_definitions
+      DataType.U8, // classify_definitions
     ],
     paramsValue: [
       handle,
@@ -1407,7 +1411,7 @@ export function ffiLiveGrep(
       enforceTimeBudget,
       beforeContext,
       afterContext,
-      classifyDefinitions,
+      definitionMode,
     ],
     freeResultMemory: false,
   }) as JsExternal;
@@ -1431,8 +1435,11 @@ export function ffiMultiGrep(
   enforceTimeBudget: boolean,
   beforeContext: number,
   afterContext: number,
-  classifyDefinitions: boolean,
+  classifyDefinitions: DefinitionMode | boolean,
 ): Result<GrepResult> {
+  const definitionMode = definitionModeToInt(classifyDefinitions);
+  if (definitionMode === undefined) return err("Invalid classifyDefinitions mode");
+
   loadLibrary();
 
   const rawPtr = load({
@@ -1452,7 +1459,7 @@ export function ffiMultiGrep(
       DataType.Boolean, // enforce_time_budget
       DataType.U32, // before_context
       DataType.U32, // after_context
-      DataType.Boolean, // classify_definitions
+      DataType.U8, // classify_definitions
     ],
     paramsValue: [
       handle,
@@ -1467,7 +1474,7 @@ export function ffiMultiGrep(
       enforceTimeBudget,
       beforeContext,
       afterContext,
-      classifyDefinitions,
+      definitionMode,
     ],
     freeResultMemory: false,
   }) as JsExternal;

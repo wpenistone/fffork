@@ -22,7 +22,6 @@ mod iter;
 #[cfg(all(feature = "std", not(target_family = "wasm")))]
 mod parallel;
 mod resolved;
-pub use algo::with_skip_sw;
 use algo::{MANY_TYPOS, NO_PREFILTER, Specialized};
 use backend::*;
 pub use iter::{FuzzyMatch, FuzzyMatchExt, FuzzyMatchIndices};

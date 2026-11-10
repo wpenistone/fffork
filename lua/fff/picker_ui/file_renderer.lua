@@ -4,6 +4,18 @@ local M = {}
 
 local file_name_renderer = require('fff.picker_ui.file_name_renderer')
 
+-- Icon lookup is per item. Highlight passes reuse the first result.
+local icon_cache = setmetatable({}, { __mode = 'k' })
+
+local function item_icon(item)
+  local hit = icon_cache[item]
+  if hit then return hit[1], hit[2] end
+  local icons = require('fff.file_picker.icons')
+  local icon, hl = icons.get_icon(item.name, item.extension, false)
+  icon_cache[item] = { icon, hl }
+  return icon, hl
+end
+
 --- File Item structure from Rust
 --- @class FileItem
 --- @field path string Absolute file path
@@ -24,10 +36,9 @@ local file_name_renderer = require('fff.picker_ui.file_name_renderer')
 --- @param item_idx number|nil 1-based item index in ctx.items
 --- @return string[] Array of line strings (always exactly 1)
 function M.render_line(item, ctx, item_idx) -- luacheck: ignore item_idx
-  local icons = require('fff.file_picker.icons')
   local lines = {}
 
-  local icon, _ = icons.get_icon(item.name, item.extension, false)
+  local icon = item_icon(item)
 
   -- Build frecency indicator (debug mode only)
   local frecency = ''
@@ -68,7 +79,6 @@ end
 --- @param line_idx number 1-based line index in buffer
 --- @param line_content string The actual line content
 function M.apply_highlights(item, ctx, item_idx, buf, ns_id, line_idx, line_content)
-  local icons = require('fff.file_picker.icons')
   local highlights = require('fff.highlights')
   local file_picker = require('fff.file_picker')
 
@@ -77,7 +87,7 @@ function M.apply_highlights(item, ctx, item_idx, buf, ns_id, line_idx, line_cont
   local is_current_file = score and score.current_file_penalty and score.current_file_penalty < 0
 
   -- Get icon and paths
-  local icon, icon_hl_group = icons.get_icon(item.name, item.extension, false)
+  local icon, icon_hl_group = item_icon(item)
   local name_layout = file_name_renderer.build(item, ctx, icon)
   local filename, dir_path = name_layout.filename, name_layout.dir_path
 

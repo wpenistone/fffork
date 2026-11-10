@@ -1,9 +1,4 @@
-//! Glob wildcard detection — delegates to zlob when available, pure-Rust fallback otherwise.
-//!
-//! All call sites use a single function: `has_wildcards(text) -> bool`.
-//! When the `zlob` feature is enabled this calls `zlob::has_wildcards` with
-//! `ZlobFlags::RECOMMENDED`; without it we check for the same set of wildcard
-//! characters (`*`, `?`, `[`, `{`) in pure Rust.
+//! `*`, `?`, `[`, or `{`. The `zlob` feature uses `ZlobFlags::RECOMMENDED`.
 
 #[cfg(feature = "zlob")]
 #[inline]

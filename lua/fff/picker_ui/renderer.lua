@@ -21,21 +21,37 @@ local S = picker_ui_state.state
 
 local function get_prompt_position() return layout.resolve_prompt_position(S.config) end
 
+-- Same directory text, width, and strategy already returned this string.
+local shrink_cache = {}
+local shrink_cache_n = 0
+
 local function shrink_path(path, max_width)
   local config = S.config or {}
   local strategy = config.layout and config.layout.path_shorten_strategy or 'middle_number'
-  return rust.shorten_path(path, max_width, strategy)
+  local key = strategy .. '\0' .. max_width .. '\0' .. path
+  local hit = shrink_cache[key]
+  if hit then return hit end
+  local shortened = rust.shorten_path(path, max_width, strategy)
+  if shrink_cache_n >= 1024 then
+    shrink_cache = {}
+    shrink_cache_n = 0
+  end
+  shrink_cache[key] = shortened
+  shrink_cache_n = shrink_cache_n + 1
+  return shortened
 end
 
 local function format_file_display(item, max_width)
   local filename = item.name
   if type(filename) ~= 'string' then filename = filename and tostring(filename) or '' end
-  local dir_path = item.directory or ''
-  if type(dir_path) ~= 'string' then dir_path = dir_path and tostring(dir_path) or '' end
-
-  if dir_path == '' and item.relative_path then
-    local parent_dir = vim.fn.fnamemodify(item.relative_path, ':h')
-    if parent_dir ~= '.' and parent_dir ~= '' then dir_path = parent_dir end
+  -- `directory` is already the parent. Absent means derive it once here.
+  local dir_path = item.directory
+  if type(dir_path) ~= 'string' then
+    dir_path = ''
+    if item.relative_path then
+      local parent_dir = vim.fn.fnamemodify(item.relative_path, ':h')
+      if parent_dir ~= '.' and parent_dir ~= '' then dir_path = parent_dir end
+    end
   end
 
   local filename_width = vim.fn.strdisplaywidth(filename)
@@ -43,9 +59,9 @@ local function format_file_display(item, max_width)
   local path_max_width = math.max(max_width - base_width, 0)
 
   if dir_path == '' or path_max_width == 0 then return filename, '' end
-  local display_path = shrink_path(dir_path, path_max_width)
-
-  return filename, display_path
+  -- Byte length matches Rust shorten_path: a path that fits is unchanged.
+  if #dir_path <= path_max_width then return filename, dir_path end
+  return filename, shrink_path(dir_path, path_max_width)
 end
 
 --- Adjust scroll for bottom prompt to eliminate gaps.
@@ -84,7 +100,14 @@ local function render_grep_empty_state(ctx)
   local hl_cmds = {}
 
   table.insert(content, '')
-  table.insert(content, '  Start typing to search file contents...')
+  if S.pagination.grep_next_file_offset ~= 0 then
+    local direction = prompt_position == 'bottom' and 'up' or 'down'
+    table.insert(content, '  More files remain. Move ' .. direction .. ' to keep searching.')
+  elseif S.query and S.query ~= '' then
+    table.insert(content, '  No matches found.')
+  else
+    table.insert(content, '  Start typing to search file contents...')
+  end
   table.insert(content, '')
   table.insert(content, '  Tips:')
   table.insert(content, '    "pattern *.rs"    search only in Rust files')
@@ -123,7 +146,15 @@ local function render_grep_empty_state(ctx)
   for i = 0, #content - 1 do
     local line = content[i + 1]
     if
-      line and (line:match('^%s+Start typing') or line:match('^%s+Tips') or line:match('^%s+"') or line:match('^%s+!'))
+      line
+      and (
+        line:match('^%s+Start typing')
+        or line:match('^%s+More files remain')
+        or line:match('^%s+No matches found')
+        or line:match('^%s+Tips')
+        or line:match('^%s+"')
+        or line:match('^%s+!')
+      )
     then
       pcall(
         vim.api.nvim_buf_set_extmark,
@@ -181,11 +212,26 @@ local function build_render_context()
     }
     S.combo_initial_cursor = combo_info.idx
   end
+  if S.mode == 'grep' and not S.suggestion_source then
+    local definition_count = 0
+    for _, item in ipairs(items) do
+      if not item.is_definition then break end
+      definition_count = definition_count + 1
+    end
+    if definition_count > 0 and definition_count < #items then
+      separator = {
+        idx = definition_count,
+        text = 'Definitions',
+        text_hl = config.hl.combo_header,
+        border_hl = config.hl.border,
+      }
+    end
+  end
 
   local display_start = 1
   local display_end = #items
 
-  if separator and (display_end - display_start + 1) >= win_height then
+  if combo_info and separator and (display_end - display_start + 1) >= win_height then
     if separator.idx == display_start then
       display_end = display_end - 1
     else
@@ -227,11 +273,12 @@ local function build_render_context()
 end
 
 local function finalize_render(separator_line, ctx)
-  if ctx.separator and separator_line then
+  local topline = vim.fn.getwininfo(S.list_win)[1].topline
+  if ctx.separator and separator_line and separator_line >= topline and separator_line < topline + ctx.win_height then
     local arrow = ctx.prompt_position == 'bottom' and '↓' or '↑'
 
     local list_cfg = vim.api.nvim_win_get_config(S.list_win)
-    local screen_row = list_cfg.row + separator_line
+    local screen_row = list_cfg.row + separator_line - topline + 1
 
     list_separator.update({
       list_win = S.list_win,
@@ -262,6 +309,7 @@ function M.render_list()
   end
 
   local item_to_lines, separator_line = list_renderer.render(ctx, S.list_buf, S.list_win, S.ns_id)
+  ctx.separator_line = separator_line
   S.item_to_lines = item_to_lines
   S.last_render_ctx = ctx
 
@@ -311,6 +359,7 @@ local function rerender_cursor_rows(old_cursor, new_cursor)
   end
 
   vim.api.nvim_win_set_cursor(S.list_win, { new_lines.last, 0 })
+  finalize_render(ctx.separator_line, ctx)
   return true
 end
 

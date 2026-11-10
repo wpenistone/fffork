@@ -20,6 +20,7 @@ pub(crate) const WRITE_TXN_CHUNK: usize = 5_000;
 fn map_size_override() -> Option<usize> {
     let mb: usize = std::env::var("FFF_LMDB_MAP_SIZE_MB").ok()?.parse().ok()?;
     let bytes = mb.checked_mul(1024 * 1024)?;
+    #[allow(clippy::manual_range_contains)]
     if bytes < 4 * 1024 * 1024 || bytes > 1024 * 1024 * 1024 {
         return None;
     }

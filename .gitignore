@@ -1,7 +1,6 @@
 doc/tags
 big-repo
 target/
-target-prof/
 .archive.lua
 _*.lua
 .lazy.lua
@@ -33,12 +32,6 @@ scripts/benchmark-results/
 
 # Test logs
 fff-test.log
-
-# Scratch work (notes, harnesses, one-way experiments; never merged)
-scratch/
-
-# Bench corpora and run logs are machine-local state, not reviewable.
-.fff-bench/
 
 # Python
 __pycache__/

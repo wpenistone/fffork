@@ -379,7 +379,7 @@ pub unsafe extern "C" fn fff_search(
         FuzzySearchOptions {
             max_threads: max_threads as usize,
             current_file: current_file_str,
-            project_path: Some(picker.base_path()),
+            project_path: Some(picker.shared_base_path()),
             combo_boost_score_multiplier: combo_boost_multiplier,
             min_combo_count,
             pagination: PaginationArgs {
@@ -441,7 +441,7 @@ pub unsafe extern "C" fn fff_glob(
         FuzzySearchOptions {
             max_threads: max_threads as usize,
             current_file: current_file_str,
-            project_path: Some(picker.base_path()),
+            project_path: Some(picker.shared_base_path()),
             combo_boost_score_multiplier: 0,
             min_combo_count: 0,
             pagination: PaginationArgs {
@@ -505,7 +505,7 @@ pub unsafe extern "C" fn fff_search_directories(
         FuzzySearchOptions {
             max_threads: max_threads as usize,
             current_file: current_file_str,
-            project_path: Some(picker.base_path()),
+            project_path: Some(picker.shared_base_path()),
             combo_boost_score_multiplier: 0,
             min_combo_count: 0,
             pagination: PaginationArgs {
@@ -580,7 +580,7 @@ pub unsafe extern "C" fn fff_search_mixed(
         FuzzySearchOptions {
             max_threads: max_threads as usize,
             current_file: current_file_str,
-            project_path: Some(picker.base_path()),
+            project_path: Some(picker.shared_base_path()),
             combo_boost_score_multiplier: combo_boost_multiplier,
             min_combo_count,
             pagination: PaginationArgs {
@@ -600,7 +600,8 @@ pub unsafe extern "C" fn fff_search_mixed(
 /// 0 = plain text (SIMD), 1 = regex, 2 = fuzzy. Zero picks the default:
 /// `max_file_size` 10 MB, `page_limit` 50, `max_matches_per_file` and
 /// `time_budget_ms` unlimited. `smart_case` is case-insensitive for
-/// all-lowercase queries; `classify_definitions` tags code definitions.
+/// all-lowercase queries. `classify_definitions`: 0 = off, 1 = classify,
+/// 2 = definition_only, 3 = usage_only.
 ///
 /// ## Safety
 /// * `fff_handle` must be a valid instance pointer from `fff_create_instance`.
@@ -618,7 +619,7 @@ pub unsafe extern "C" fn fff_live_grep(
     time_budget_ms: u64,
     before_context: u32,
     after_context: u32,
-    classify_definitions: bool,
+    classify_definitions: u8,
 ) -> *mut FffResult {
     unsafe {
         fff_live_grep_ex(
@@ -658,8 +659,13 @@ pub unsafe extern "C" fn fff_live_grep_ex(
     enforce_time_budget: bool,
     before_context: u32,
     after_context: u32,
-    classify_definitions: bool,
+    classify_definitions: u8,
 ) -> *mut FffResult {
+    let Some(classify_definitions) = fff::DefinitionMode::from_u8(classify_definitions) else {
+        return FffResult::err(
+            "classify_definitions must be 0 (off), 1 (classify), 2 (definition_only), or 3 (usage_only)",
+        );
+    };
     let inst = match unsafe { instance_ref(fff_handle) } {
         Ok(i) => i,
         Err(e) => return e,
@@ -733,7 +739,7 @@ pub unsafe extern "C" fn fff_multi_grep(
     time_budget_ms: u64,
     before_context: u32,
     after_context: u32,
-    classify_definitions: bool,
+    classify_definitions: u8,
 ) -> *mut FffResult {
     unsafe {
         fff_multi_grep_ex(
@@ -772,8 +778,13 @@ pub unsafe extern "C" fn fff_multi_grep_ex(
     enforce_time_budget: bool,
     before_context: u32,
     after_context: u32,
-    classify_definitions: bool,
+    classify_definitions: u8,
 ) -> *mut FffResult {
+    let Some(classify_definitions) = fff::DefinitionMode::from_u8(classify_definitions) else {
+        return FffResult::err(
+            "classify_definitions must be 0 (off), 1 (classify), 2 (definition_only), or 3 (usage_only)",
+        );
+    };
     let inst = match unsafe { instance_ref(fff_handle) } {
         Ok(i) => i,
         Err(e) => return e,
@@ -1085,13 +1096,16 @@ pub unsafe extern "C" fn fff_track_query(
         Err(e) => return FffResult::err(&format!("Failed to canonicalize path: {}", e)),
     };
 
-    let project_path = {
+    let (project_path, file_path) = {
         let guard = match inst.picker.read() {
             Ok(g) => g,
             Err(_) => return FffResult::ok_int(0),
         };
         match guard.as_ref() {
-            Some(p) => p.base_path().to_path_buf(),
+            Some(p) => (
+                p.shared_base_path().to_path_buf(),
+                p.shared_path_for(&file_path).unwrap_or(file_path),
+            ),
             None => return FffResult::ok_int(0),
         }
     };
@@ -1130,7 +1144,7 @@ pub unsafe extern "C" fn fff_get_historical_query(
             Err(_) => return FffResult::ok_empty(),
         };
         match guard.as_ref() {
-            Some(p) => p.base_path().to_path_buf(),
+            Some(p) => p.shared_base_path().to_path_buf(),
             None => return FffResult::ok_empty(),
         }
     };

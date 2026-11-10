@@ -171,14 +171,14 @@ impl ScanJob {
 
         // 1. Walk the file system and collect the list of files
         let t_walk = std::time::Instant::now();
-        let git_workdir = if config.skip_git {
+        let git = if config.skip_git {
             None
         } else {
-            FileSync::discover_git_workdir(&base_path)
+            FileSync::discover_git(&base_path)
         };
         let sync = match FileSync::walk_filesystem(
             &base_path,
-            git_workdir.clone(),
+            git.clone(),
             &scanned_files_counter,
             &shared_frecency,
             mode,
@@ -215,13 +215,14 @@ impl ScanJob {
             return;
         }
 
-        // Start the git worker once; huge trees skip it unless forced.
+        // Spawn the git status worker once; huge trees skip it unless forced. When the
+        // user enables git in a folder later, the worker still has to come up dynamically.
         let skip_git = crate::file_picker::should_skip_git(
             config.skip_git,
             n_files,
             crate::file_picker::git_force(),
         );
-        if git_workdir.is_some() && !skip_git && !signals.cancelled.load(Ordering::Acquire) {
+        if git.is_some() && !skip_git && !signals.cancelled.load(Ordering::Acquire) {
             git_status_worker.spawn_once(shared_picker.weaken(), shared_frecency.clone());
             git_status_worker.request_full_rescan();
         }
@@ -281,7 +282,7 @@ impl ScanJob {
 
             match BackgroundWatcher::new(
                 base_path.to_path_buf(),
-                git_workdir,
+                git,
                 shared_picker.clone(),
                 shared_frecency.clone(),
                 mode,
@@ -372,6 +373,7 @@ impl ScanJob {
 
             if let Ok(mut guard) = shared_picker.write()
                 && let Some(picker) = guard.as_mut()
+                && !signals.cancelled.load(Ordering::Acquire)
             {
                 picker.set_bigram_index(index);
             }
@@ -390,13 +392,14 @@ impl ScanJob {
                 );
             }
         } else {
-            // this potentially a long running as we are not parallelizing it but it's okay
+            // Keep the mask this sniff already built. Content indexing stays off.
+            // Mask 0 (partial or binary) stays unknown, so grep still reads.
             sniff_binary_for_non_indexable(
                 files,
                 &unsafe_snapshot.base_path,
                 arena,
                 &signals.cancelled,
-                None,
+                content_masks.map(|store| store.as_ref()),
             );
         }
 

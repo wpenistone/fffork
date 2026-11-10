@@ -14,23 +14,17 @@ pub enum FuzzyQuery<'a> {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FFFQuery<'a> {
-    /// The original raw query string before parsing
+    /// Query text before parsing.
     pub raw_query: &'a str,
-    /// Parsed constraints (stack-allocated for ≤8 constraints)
+    /// Constraints in source order.
     pub constraints: ConstraintVec<'a>,
     pub fuzzy_query: FuzzyQuery<'a>,
-    /// Parsed location (e.g., file:12:4 -> line 12, col 4)
+    /// `file:12` or `file:12:4` when location parsing is enabled.
     pub location: Option<Location>,
 }
 
 impl<'a> FFFQuery<'a> {
-    /// Parse query and execute, perfectly paired with configuration presets
-    ///
-    /// ```
-    /// use fff_query_parser::{FFFQuery, FileSearchConfig};
-    ///
-    /// let query = FFFQuery::parse("file *.rs", FileSearchConfig);
-    /// ```
+    /// Parse `query` under `config`.
     pub fn parse(query: &'a str, config: impl ParserConfig) -> Self {
         let query_parser = QueryParser::new(config);
 
@@ -38,7 +32,7 @@ impl<'a> FFFQuery<'a> {
     }
 }
 
-/// Main query parser - zero-cost wrapper around configuration
+/// Parses with the `ParserConfig` it was built from.
 #[derive(Debug)]
 pub struct QueryParser<C: ParserConfig> {
     config: C,
@@ -59,77 +53,152 @@ impl<C: ParserConfig> QueryParser<C> {
 
     pub fn parse<'a>(&self, query: &'a str) -> FFFQuery<'a> {
         let raw_query = query;
-        let config: &C = &self.config;
-        let mut constraints = ConstraintVec::new();
-        let query = query.trim();
-
-        let has_whitespace = query.bytes().any(|b| b.is_ascii_whitespace())
-            || (!query.is_ascii() && query.chars().any(char::is_whitespace));
-
-        // Single token - check if it's a constraint or plain text
-        if !has_whitespace {
-            // Try to parse as constraint first
-            if let Some(constraint) = parse_token(query, config) {
-                // Don't treat filename tokens (FilePath) as constraints in single-token
-                // queries — the user is fuzzy-searching, not filtering. FilePath constraints
-                // are only useful as filters in multi-token queries like "score.rs search".
-                //
-                // Also skip PathSegment constraints when the token looks like an absolute
-                // file path with a location suffix (e.g. /Users/.../file.rs:12). Without
-                // this, the leading `/` causes the entire path to be consumed as a
-                // PathSegment, preventing location parsing from running.
-                let has_location_suffix = matches!(constraint, Constraint::PathSegment(_))
-                    && query.bytes().any(|b| b == b':')
-                    && query
-                        .bytes()
-                        .rev()
-                        .take_while(|&b| b != b':')
-                        .all(|b| b.is_ascii_digit());
-
-                // for grep we don't want to treat a part of path like pathname
-                let treat_as_text = matches!(constraint, Constraint::PathSegment(_))
-                    && config.treat_lone_path_as_text();
-
-                if !matches!(constraint, Constraint::FilePath(_))
-                    && !has_location_suffix
-                    && !treat_as_text
-                {
-                    constraints.push(constraint);
-                    return FFFQuery {
-                        raw_query,
-                        constraints,
-                        fuzzy_query: FuzzyQuery::Empty,
-                        location: None,
-                    };
-                }
-            }
-
-            // Try to extract location from single token (e.g., "file:12")
-            if config.enable_location() {
-                let (query_without_loc, location) = parse_location(query);
-                if location.is_some() {
-                    return FFFQuery {
-                        raw_query,
-                        constraints,
-                        fuzzy_query: FuzzyQuery::Text(query_without_loc),
-                        location,
-                    };
-                }
-            }
-
-            // Plain text single token
-            return FFFQuery {
-                raw_query,
-                constraints,
-                fuzzy_query: if query.is_empty() {
-                    FuzzyQuery::Empty
-                } else {
-                    FuzzyQuery::Text(query)
-                },
-                location: None,
-            };
+        // One pass over the raw bytes. A plain ASCII token returns before trim or split.
+        let mut scan = scan_token(query);
+        if !scan.has_whitespace && scan.non_ascii && query.chars().any(char::is_whitespace) {
+            scan.has_whitespace = true;
         }
 
+        if !scan.has_whitespace {
+            if let Some(hit) = self.try_fast(raw_query, query, scan) {
+                return hit;
+            }
+            return self.parse_one(raw_query, query, scan);
+        }
+
+        let bytes = query.as_bytes();
+        let edge = has_ascii_edge_ws(bytes) || scan.non_ascii;
+        if !edge {
+            return self.parse_split(raw_query, query);
+        }
+
+        let query = query.trim();
+        let mut scan = scan_token(query);
+        if !scan.has_whitespace && scan.non_ascii && query.chars().any(char::is_whitespace) {
+            scan.has_whitespace = true;
+        }
+        if scan.has_whitespace {
+            return self.parse_split(raw_query, query);
+        }
+        if let Some(hit) = self.try_fast(raw_query, query, scan) {
+            return hit;
+        }
+        self.parse_one(raw_query, query, scan)
+    }
+
+    #[inline(always)]
+    fn try_fast<'a>(
+        &self,
+        raw_query: &'a str,
+        query: &'a str,
+        scan: TokenScan,
+    ) -> Option<FFFQuery<'a>> {
+        if scan.non_ascii {
+            return None;
+        }
+        if query.is_empty() {
+            return Some(FFFQuery {
+                raw_query,
+                constraints: ConstraintVec::empty(),
+                fuzzy_query: FuzzyQuery::Empty,
+                location: None,
+            });
+        }
+
+        let bytes = query.as_bytes();
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if !scan.saw_colon
+            && !scan.saw_paren
+            && !scan.saw_meta
+            && first != b'!'
+            && first != b'/'
+            && last != b'/'
+        {
+            #[cfg(feature = "zlob")]
+            if crate::glob_detect::has_wildcards(query) {
+                return None;
+            }
+            if self.config.parse_custom(query).is_none() {
+                return Some(FFFQuery {
+                    raw_query,
+                    constraints: ConstraintVec::empty(),
+                    fuzzy_query: FuzzyQuery::Text(query),
+                    location: None,
+                });
+            }
+            return None;
+        }
+
+        if scan.colons == 1 && !scan.saw_paren && !scan.saw_meta && first != b'!' {
+            return try_plain_line(raw_query, query, scan.colon_at, &self.config);
+        }
+        None
+    }
+
+    fn parse_one<'a>(&self, raw_query: &'a str, query: &'a str, scan: TokenScan) -> FFFQuery<'a> {
+        let config: &C = &self.config;
+        let mut constraints = ConstraintVec::empty();
+
+        // A lone FilePath is fuzzy text. A PathSegment with a trailing `:digits`
+        // suffix, or lone-path-as-text, stays text so location parsing can run.
+        if let Some(constraint) = parse_token(query, config) {
+            let has_location_suffix = matches!(constraint, Constraint::PathSegment(_))
+                && scan.saw_colon
+                && query
+                    .bytes()
+                    .rev()
+                    .take_while(|&b| b != b':')
+                    .all(|b| b.is_ascii_digit());
+
+            let treat_as_text = matches!(constraint, Constraint::PathSegment(_))
+                && config.treat_lone_path_as_text();
+
+            if !matches!(constraint, Constraint::FilePath(_))
+                && !has_location_suffix
+                && !treat_as_text
+            {
+                constraints.push(constraint);
+                return FFFQuery {
+                    raw_query,
+                    constraints,
+                    fuzzy_query: FuzzyQuery::Empty,
+                    location: None,
+                };
+            }
+        }
+
+        let loc_possible = config.enable_location()
+            && (scan.saw_colon
+                || scan.saw_paren
+                || matches!(query.as_bytes().last(), Some(b'-' | b':' | b'(')));
+        if loc_possible {
+            let (query_without_loc, location) = parse_location(query);
+            if location.is_some() {
+                return FFFQuery {
+                    raw_query,
+                    constraints,
+                    fuzzy_query: FuzzyQuery::Text(query_without_loc),
+                    location,
+                };
+            }
+        }
+
+        FFFQuery {
+            raw_query,
+            constraints,
+            fuzzy_query: if query.is_empty() {
+                FuzzyQuery::Empty
+            } else {
+                FuzzyQuery::Text(query)
+            },
+            location: None,
+        }
+    }
+
+    fn parse_split<'a>(&self, raw_query: &'a str, query: &'a str) -> FFFQuery<'a> {
+        let config: &C = &self.config;
+        let mut constraints = ConstraintVec::empty();
         let mut text_parts = TextPartsBuffer::new();
         let tokens = query.split_whitespace();
 
@@ -142,9 +211,7 @@ impl<C: ParserConfig> QueryParser<C> {
             match parse_token(token, config) {
                 Some(Constraint::FilePath(_)) => {
                     if has_file_path {
-                        // Only one FilePath constraint allowed; treat extra path
-                        // tokens as literal text (e.g. an import path the user is
-                        // searching for).
+                        // A second FilePath token is search text.
                         text_parts.push(token);
                     } else {
                         file_path_constraint_idx = Some(constraints.len());
@@ -162,13 +229,8 @@ impl<C: ParserConfig> QueryParser<C> {
             }
         }
 
-        // If the query produced a single FilePath and no fuzzy text parts, the
-        // user isn't filtering by filename suffix — they're fuzzy-searching
-        // for that name (the only other constraints are path-scoping like
-        // PathSegment/Extension/Glob). Mirror the single-token rule at
-        // parser.rs:48-64: promote FilePath → fuzzy text so e.g. `profile.h`
-        // alongside `chrome/browser/profiles/` fuzzy-matches all `profile*.h`
-        // files instead of only one file literally ending in `/profile.h`.
+        // A lone FilePath beside PathSegment, Extension, or Glob is fuzzy text.
+        // `profiles/ profile.h` searches for that name; it does not suffix-filter.
         if text_parts.is_empty()
             && let Some(idx) = file_path_constraint_idx
             && let Some(tok) = file_path_token
@@ -183,7 +245,6 @@ impl<C: ParserConfig> QueryParser<C> {
             let last_idx = text_parts.len() - 1;
             let (without_loc, loc) = parse_location(text_parts[last_idx]);
             if loc.is_some() {
-                // Update the last part to be without the location suffix
                 text_parts[last_idx] = without_loc;
                 loc
             } else {
@@ -196,19 +257,15 @@ impl<C: ParserConfig> QueryParser<C> {
         let fuzzy_query = if text_parts.is_empty() {
             FuzzyQuery::Empty
         } else if text_parts.len() == 1 {
-            // If the only remaining text is empty after location extraction, treat as Empty
             if text_parts[0].is_empty() {
                 FuzzyQuery::Empty
             } else {
                 FuzzyQuery::Text(text_parts[0])
             }
+        } else if text_parts.iter().all(|p| p.is_empty()) {
+            FuzzyQuery::Empty
         } else {
-            // Filter out empty parts that might result from location extraction
-            if text_parts.iter().all(|p| p.is_empty()) {
-                FuzzyQuery::Empty
-            } else {
-                FuzzyQuery::Parts(text_parts)
-            }
+            FuzzyQuery::Parts(text_parts)
         };
 
         FFFQuery {
@@ -221,39 +278,31 @@ impl<C: ParserConfig> QueryParser<C> {
 }
 
 impl<'a> FFFQuery<'a> {
-    /// Returns the grep search text by joining all non-constraint text tokens.
-    ///
-    /// Backslash-escaped tokens (e.g. `\*.rs`) are included as literal text
-    /// with the leading `\` stripped, since the backslash is only an escape
-    /// signal to the parser and should not appear in the final pattern.
-    ///
-    /// `FuzzyQuery::Empty` → empty string
-    /// `FuzzyQuery::Text("foo")` → `"foo"`
-    /// `FuzzyQuery::Parts(["a", "\\*.rs", "b"])` → `"a *.rs b"`
+    /// Constraints removed, tokens joined by one space. `\` is stripped only
+    /// before `*`, `/`, or `!`.
     pub fn grep_text(&self) -> String {
         match &self.fuzzy_query {
             FuzzyQuery::Empty => String::new(),
             FuzzyQuery::Text(t) => strip_leading_backslash(t).to_string(),
-            FuzzyQuery::Parts(parts) => parts
-                .iter()
-                .map(|t| strip_leading_backslash(t))
-                .collect::<Vec<_>>()
-                .join(" "),
+            FuzzyQuery::Parts(parts) => {
+                let mut out = String::new();
+                for (i, t) in parts.iter().enumerate() {
+                    if i > 0 {
+                        out.push(' ');
+                    }
+                    out.push_str(strip_leading_backslash(t));
+                }
+                out
+            }
         }
     }
 }
 
-/// Strip the leading `\` from a backslash-escaped constraint token only.
-///
-/// We strip the backslash when the next character is a constraint trigger
-/// (`*`, `/`, `!`) — the user typed `\*.rs` to mean literal `*.rs`, not an
-/// extension constraint. For regex escape sequences like `\w`, `\b`, `\d`,
-/// `\s`, `\n` etc., the backslash is preserved so regex mode works correctly.
+// Drop a leading `\` only before `*`, `/`, or `!`. Keep `\w` and `\b`.
 #[inline]
 fn strip_leading_backslash(token: &str) -> &str {
     if token.len() > 1 && token.starts_with('\\') {
         let next = token.as_bytes()[1];
-        // Only strip if the backslash is escaping a constraint trigger character
         if next == b'*' || next == b'/' || next == b'!' {
             return &token[1..];
         }
@@ -267,10 +316,126 @@ impl Default for QueryParser<crate::FileSearchConfig> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct TokenScan {
+    has_whitespace: bool,
+    non_ascii: bool,
+    saw_colon: bool,
+    saw_paren: bool,
+    saw_meta: bool,
+    colon_at: usize,
+    colons: u8,
+}
+
+// Stops at the first ASCII whitespace. A rescan happens only after trim.
+fn scan_token(query: &str) -> TokenScan {
+    let mut scan = TokenScan {
+        has_whitespace: false,
+        non_ascii: false,
+        saw_colon: false,
+        saw_paren: false,
+        saw_meta: false,
+        colon_at: 0,
+        colons: 0,
+    };
+    for (i, &b) in query.as_bytes().iter().enumerate() {
+        if b.is_ascii_whitespace() {
+            scan.has_whitespace = true;
+            break;
+        }
+        if b > 127 {
+            scan.non_ascii = true;
+        } else if b == b':' {
+            scan.saw_colon = true;
+            if scan.colons == 0 {
+                scan.colon_at = i;
+            }
+            scan.colons = scan.colons.saturating_add(1);
+        } else if b == b'(' {
+            scan.saw_paren = true;
+        } else if matches!(b, b'*' | b'?' | b'[' | b'{') {
+            scan.saw_meta = true;
+        }
+    }
+    scan
+}
+
+fn has_ascii_edge_ws(bytes: &[u8]) -> bool {
+    match (bytes.first(), bytes.last()) {
+        (Some(first), Some(last)) => first.is_ascii_whitespace() || last.is_ascii_whitespace(),
+        _ => false,
+    }
+}
+
+// One colon and a digit suffix. `type:` and `file:12:4` stay on the general path.
+fn try_plain_line<'a, C: ParserConfig>(
+    raw_query: &'a str,
+    query: &'a str,
+    colon_at: usize,
+    config: &C,
+) -> Option<FFFQuery<'a>> {
+    #[cfg(feature = "zlob")]
+    if crate::glob_detect::has_wildcards(query) {
+        return None;
+    }
+    let suffix = &query[colon_at + 1..];
+    let line = ascii_digits_i32(suffix)?;
+    let prefix = &query[..colon_at];
+    if prefix.is_empty() || is_keyed_constraint(prefix, config) {
+        return None;
+    }
+    if config.parse_custom(query).is_some() {
+        return None;
+    }
+    if config.enable_location() {
+        Some(FFFQuery {
+            raw_query,
+            constraints: ConstraintVec::empty(),
+            fuzzy_query: FuzzyQuery::Text(prefix),
+            location: Some(Location::Line(line)),
+        })
+    } else {
+        Some(FFFQuery {
+            raw_query,
+            constraints: ConstraintVec::empty(),
+            fuzzy_query: FuzzyQuery::Text(query),
+            location: None,
+        })
+    }
+}
+
+fn ascii_digits_i32(text: &str) -> Option<i32> {
+    if text.is_empty() {
+        return None;
+    }
+    let mut value: i32 = 0;
+    for byte in text.bytes() {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add((byte - b'0') as i32)?;
+    }
+    Some(value)
+}
+
+#[inline]
+fn is_keyed_constraint<C: ParserConfig>(key: &str, config: &C) -> bool {
+    (config.enable_type_filter() && key == "type")
+        || (config.enable_git_status() && matches!(key, "status" | "st" | "g" | "git"))
+}
+
 #[inline]
 fn parse_token<'a, C: ParserConfig>(token: &'a str, config: &C) -> Option<Constraint<'a>> {
-    // Backslash escape: \token → treat as literal text, skip all constraint parsing.
-    // The leading \ is stripped by the caller when building the search text.
+    parse_token_inner::<C, true>(token, config)
+}
+
+// `OUTER` is the top-level token. After `!`, globs and `key:value` beat FilePath.
+#[inline]
+fn parse_token_inner<'a, C: ParserConfig, const OUTER: bool>(
+    token: &'a str,
+    config: &C,
+) -> Option<Constraint<'a>> {
+    // `\*.rs` is text here. `grep_text` drops the `\` only for `*`, `/`, and `!`.
     if token.starts_with('\\') && token.len() > 1 {
         return None;
     }
@@ -279,49 +444,44 @@ fn parse_token<'a, C: ParserConfig>(token: &'a str, config: &C) -> Option<Constr
 
     match first_byte {
         b'*' if config.enable_extension() => {
-            // Ignore incomplete patterns like "*" or "*."
-            if token == "*" || token == "*." {
+            // Incomplete `*` / `*.` are text only at the top level, not after `!`.
+            if OUTER && (token == "*" || token == "*.") {
                 return None;
             }
 
-            // Try extension first (*.rs) - simple patterns without additional wildcards
+            // Plain `*.ext` is Extension. Extra wildcards (`*.test.*`) stay Glob.
             if let Some(constraint) = parse_extension(token) {
-                // Only return Extension if the rest doesn't have wildcards
-                // e.g., *.rs is Extension, but *.test.* should be Glob
                 let ext_part = &token[2..];
                 if !has_wildcards(ext_part) {
                     return Some(constraint);
                 }
             }
-            // Has wildcards -> use config-specific glob detection
             if config.enable_glob() && config.is_glob_pattern(token) {
                 return Some(Constraint::Glob(token));
             }
             None
         }
-        b'!' if config.enable_exclude() => parse_negation(token, config),
+        b'!' if OUTER && config.enable_exclude() => parse_negation(token, config),
         b'/' if config.enable_path_segments() => parse_path_segment(token),
-        // Handle trailing slash syntax: www/ -> PathSegment("www")
         _ if config.enable_path_segments() && token.ends_with('/') => {
             parse_path_segment_trailing(token)
         }
-        // tokens like `file.rs` *if enabled*
-        _ if config.enable_filename_constraint()
+        // Top-level `file.rs` wins over `key:value`. `!type:rust.rs` does not.
+        _ if OUTER
+            && config.enable_filename_constraint()
             && !token.ends_with('/')
             && Constraint::is_filename_constraint_token(token) =>
         {
             Some(Constraint::FilePath(token))
         }
         _ => {
-            // Check for glob patterns using config-specific detection
             if config.enable_glob() && config.is_glob_pattern(token) {
                 return Some(Constraint::Glob(token));
             }
 
-            // Check for key:value patterns
             if let Some(colon_idx) = memchr(b':', token.as_bytes()) {
                 let (key, value_with_colon) = token.split_at(colon_idx);
-                let value = &value_with_colon[1..]; // Skip the colon
+                let value = &value_with_colon[1..];
 
                 match key {
                     "type" if config.enable_type_filter() => {
@@ -334,7 +494,13 @@ fn parse_token<'a, C: ParserConfig>(token: &'a str, config: &C) -> Option<Constr
                 }
             }
 
-            // Try custom parsers
+            if !OUTER
+                && config.enable_filename_constraint()
+                && Constraint::is_filename_constraint_token(token)
+            {
+                return Some(Constraint::FilePath(token));
+            }
+
             config.parse_custom(token)
         }
     }
@@ -357,8 +523,8 @@ fn parse_extension(token: &str) -> Option<Constraint<'_>> {
     }
 }
 
-/// Parse negation pattern: !*.rs -> Not(Extension("rs")), !test -> Not(Text("test"))
-/// This allows negating any constraint type
+// `!*.ext` wraps Extension. Other `!` wildcards wrap Glob. `!` is not parsed again.
+// Text negation needs ≥3 inner chars and one alphanumeric (`!=`, `!!` stay text).
 #[inline]
 fn parse_negation<'a, C: ParserConfig>(token: &'a str, config: &C) -> Option<Constraint<'a>> {
     if token.len() <= 1 {
@@ -366,85 +532,14 @@ fn parse_negation<'a, C: ParserConfig>(token: &'a str, config: &C) -> Option<Con
     }
 
     let inner_token = &token[1..];
-
-    // Try to parse the inner token as any constraint
-    if let Some(inner_constraint) = parse_token_without_negation(inner_token, config) {
-        // Wrap it in a Not constraint
+    if let Some(inner_constraint) = parse_token_inner::<C, false>(inner_token, config) {
         return Some(Constraint::Not(Box::new(inner_constraint)));
     }
 
-    // Negated text (!test) requires ≥3 inner chars with at least one alphanumeric,
-    // so operators like `!=`, `!==`, `!!` stay literal search text.
     if inner_token.len() < 3 || !inner_token.chars().any(|c| c.is_alphanumeric()) {
         return None;
     }
     Some(Constraint::Not(Box::new(Constraint::Text(inner_token))))
-}
-
-/// Parse a token without checking for negation (to avoid infinite recursion)
-#[inline]
-fn parse_token_without_negation<'a, C: ParserConfig>(
-    token: &'a str,
-    config: &C,
-) -> Option<Constraint<'a>> {
-    // Backslash escape applies here too
-    if token.starts_with('\\') && token.len() > 1 {
-        return None;
-    }
-
-    let first_byte = token.as_bytes().first()?;
-
-    match first_byte {
-        b'*' if config.enable_extension() => {
-            // Try extension first (*.rs) - simple patterns without additional wildcards
-            if let Some(constraint) = parse_extension(token) {
-                let ext_part = &token[2..];
-                if !has_wildcards(ext_part) {
-                    return Some(constraint);
-                }
-            }
-            // Has wildcards -> use config-specific glob detection
-            if config.enable_glob() && config.is_glob_pattern(token) {
-                return Some(Constraint::Glob(token));
-            }
-            None
-        }
-        b'/' if config.enable_path_segments() => parse_path_segment(token),
-        _ if config.enable_path_segments() && token.ends_with('/') => {
-            // Handle trailing slash syntax: www/ -> PathSegment("www")
-            parse_path_segment_trailing(token)
-        }
-        _ => {
-            // Check for glob patterns using config-specific detection
-            if config.enable_glob() && config.is_glob_pattern(token) {
-                return Some(Constraint::Glob(token));
-            }
-
-            // Check for key:value patterns
-            if let Some(colon_idx) = memchr(b':', token.as_bytes()) {
-                let (key, value_with_colon) = token.split_at(colon_idx);
-                let value = &value_with_colon[1..]; // Skip the colon
-
-                match key {
-                    "type" if config.enable_type_filter() => {
-                        return Some(Constraint::FileType(value));
-                    }
-                    "status" | "st" | "g" | "git" if config.enable_git_status() => {
-                        return parse_git_status(value);
-                    }
-                    _ => {}
-                }
-            }
-
-            if config.enable_filename_constraint()
-                && Constraint::is_filename_constraint_token(token)
-            {
-                return Some(Constraint::FilePath(token));
-            }
-
-            config.parse_custom(token)
-        }
-    }
 }
 
 /// Parse path segment: /src/ -> PathSegment("src")

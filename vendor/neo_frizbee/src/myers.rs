@@ -299,8 +299,8 @@ fn lcs_ge_batch8_scalar(needle: &[u8], hays: [&[u8]; 8], need: usize) -> u8 {
     }
 
     let mut out = 0u8;
-    for k in 0..8 {
-        if hits[k] as usize >= need {
+    for (k, &hit) in hits.iter().enumerate() {
+        if hit as usize >= need {
             out |= 1 << k;
         }
     }
@@ -362,7 +362,9 @@ unsafe fn lcs_ge_batch8_avx2(needle: &[u8], hays: [&[u8]; 8], need: usize) -> u8
         s_v = ns;
 
         let mut s_arr = [0i32; 8];
-        _mm256_storeu_si256(s_arr.as_mut_ptr() as *mut __m256i, s_v);
+        unsafe {
+            _mm256_storeu_si256(s_arr.as_mut_ptr() as *mut __m256i, s_v);
+        }
 
         for k in 0..8 {
             if !lane_alive[k] {
@@ -388,8 +390,8 @@ unsafe fn lcs_ge_batch8_avx2(needle: &[u8], hays: [&[u8]; 8], need: usize) -> u8
     }
 
     let mut out = 0u8;
-    for k in 0..8 {
-        if hits[k] as usize >= need {
+    for (k, &hit) in hits.iter().enumerate() {
+        if hit as usize >= need {
             out |= 1 << k;
         }
     }

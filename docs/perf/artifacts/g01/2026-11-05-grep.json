@@ -1,0 +1,57 @@
+{
+  "query": "netconvert",
+  "A_us": 7975000.0,
+  "B_us": 7810000.0,
+  "ratio": 1.0211267605633803,
+  "rep_ratios": [
+    1.0211
+  ],
+  "A_scan_s": 3.73,
+  "B_scan_s": 4.369999999999999,
+  "rows": [
+    {
+      "rep": 0,
+      "leg": "A",
+      "scan_files": 590593,
+      "scan_s": 3.71,
+      "us": 8199999.999999999,
+      "matches": 17505,
+      "files": 7724,
+      "searched": 488381,
+      "total_files": 590593
+    },
+    {
+      "rep": 0,
+      "leg": "B",
+      "scan_files": 590593,
+      "scan_s": 4.27,
+      "us": 7940000.0,
+      "matches": 17505,
+      "files": 7724,
+      "searched": 488381,
+      "total_files": 590593
+    },
+    {
+      "rep": 0,
+      "leg": "B",
+      "scan_files": 590593,
+      "scan_s": 4.47,
+      "us": 7680000.0,
+      "matches": 17505,
+      "files": 7724,
+      "searched": 488381,
+      "total_files": 590593
+    },
+    {
+      "rep": 0,
+      "leg": "A",
+      "scan_files": 590593,
+      "scan_s": 3.75,
+      "us": 7750000.0,
+      "matches": 17505,
+      "files": 7724,
+      "searched": 488381,
+      "total_files": 590593
+    }
+  ]
+}

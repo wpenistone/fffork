@@ -746,7 +746,7 @@ impl Fixture {
         guard
             .as_ref()
             .and_then(|p| p.get_file_by_path(self.path(rel)))
-            .map(|file| file.access_frecency_score)
+            .map(|file| file.access_frecency_score())
             .unwrap_or(0)
     }
 
@@ -780,11 +780,14 @@ impl Fixture {
 
     fn feed(&self, events: impl IntoIterator<Item = DebouncedEvent>) -> RescanStats {
         let before = self.picker.rescan_stats();
+        let mut cached_repo = None;
         handle_debounced_events(
             FFFMode::Neovim,
             events.into_iter().collect(),
             &self.base,
             &self.git_workdir,
+            None,
+            &mut cached_repo,
             &self.picker,
             &self.frecency,
             &self.git_worker,

@@ -111,6 +111,7 @@ pub(crate) fn fuzzy_candidates(
 /// which contains neither `ab` nor `bc` — so AND-ing consecutive needle
 /// bigrams false-rejects ~15% of brute-force hits on sampled queries.
 /// Keep the hook (and the lazily built index) for a future sound filter.
+#[allow(dead_code)]
 pub(crate) fn path_fuzzy_candidates(
     index: Option<&BigramFilter>,
     overlay: Option<&BigramOverlay>,

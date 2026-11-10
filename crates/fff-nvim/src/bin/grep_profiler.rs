@@ -97,7 +97,7 @@ impl<'a> GrepBench<'a> {
                 enforce_time_budget: false,
                 before_context: 0,
                 after_context: 0,
-                classify_definitions: false,
+                classify_definitions: Default::default(),
                 trim_whitespace: false,
                 abort_signal: None,
             },
@@ -197,7 +197,7 @@ fn main() {
     let load_time = load_start.elapsed();
     let files = picker.get_files();
     let non_binary = files.iter().filter(|f| !f.is_binary()).count();
-    let large_files = files.iter().filter(|f| f.size > 10 * 1024 * 1024).count();
+    let large_files = files.iter().filter(|f| f.size() > 10 * 1024 * 1024).count();
     eprintln!(
         "  Loaded {} files in {:.2}s ({} non-binary, {} >10MB skipped)\n",
         files.len(),
@@ -420,7 +420,7 @@ fn main() {
             enforce_time_budget: false,
             before_context: 0,
             after_context: 0,
-            classify_definitions: false,
+            classify_definitions: Default::default(),
             trim_whitespace: false,
             abort_signal: None,
         };

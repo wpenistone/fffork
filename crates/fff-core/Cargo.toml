@@ -35,6 +35,10 @@ name = "grep_bench"
 harness = false
 
 [[bench]]
+name = "definition_bench"
+harness = false
+
+[[bench]]
 name = "fuzzy_search_bench"
 harness = false
 
@@ -48,7 +52,7 @@ ffi = []
 # Count full rescans and their causes. Always on in debug builds; enable this
 # to keep the accounting in a release build (used by the rescan_probe binary).
 rescan-stats = []
-# Enables POC definition classification for grep result matched lines
+# Compatibility feature. Classification is controlled per grep call.
 definitions = []
 # Pure-Rust filesystem walker + glob matcher (ignore + globset crates).
 ripgrep = ["dep:ignore", "dep:globset", "fff-query-parser/ripgrep"]

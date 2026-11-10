@@ -5,15 +5,55 @@ use smallvec::SmallVec;
 
 use crate::git::is_modified_status;
 use crate::simd_path::ArenaPtr;
-use crate::simd_string_utils::memmem::find_case_insensitive_short;
+use crate::simd_string_utils::memmem::{find_planned, plan_for, PairPlan};
 
 const PAR_THRESHOLD: usize = 10_000;
+const PAR_CHUNKS_PER_THREAD: usize = 4;
 
 pub(crate) trait Constrainable {
     fn write_file_name(&self, arena: ArenaPtr, out: &mut String);
     fn git_status(&self) -> Option<git2::Status>;
     fn write_relative_path(&self, arena: ArenaPtr, out: &mut String);
+    // Same bytes as `write_relative_path`. Overrides skip the scratch `String`.
+    #[cfg(feature = "zlob")]
+    fn append_relative_path(&self, arena: ArenaPtr, out: &mut Vec<u8>, scratch: &mut String) {
+        self.write_relative_path(arena, scratch);
+        out.extend_from_slice(scratch.as_bytes());
+    }
+    // Case-sensitive substring of the relative path. Default copies; overrides do not.
+    fn path_contains(&self, arena: ArenaPtr, finder: &memchr::memmem::Finder<'_>) -> bool {
+        let mut owned = String::new();
+        self.write_relative_path(arena, &mut owned);
+        finder.find(owned.as_bytes()).is_some()
+    }
+    // ASCII case-insensitive substring. Default copies; overrides read chunks.
+    fn path_contains_folded(
+        &self,
+        arena: ArenaPtr,
+        needle_lower: &[u8],
+        plan: PairPlan,
+    ) -> bool {
+        let mut owned = String::new();
+        self.write_relative_path(arena, &mut owned);
+        find_planned(owned.as_bytes(), needle_lower, plan).is_some()
+    }
+    // Directory segment. `segment_lower` is ASCII-folded. Default copies.
+    fn path_has_segment(&self, arena: ArenaPtr, segment_lower: &[u8]) -> bool {
+        let mut owned = String::new();
+        self.write_relative_path(arena, &mut owned);
+        match std::str::from_utf8(segment_lower) {
+            Ok(seg) => path_contains_segment(&owned, seg),
+            Err(_) => false,
+        }
+    }
     fn is_overflow(&self) -> bool;
+
+    // Suffix at a separator boundary. Default copies; overrides read the arena.
+    fn ends_with_path_suffix(&self, arena: ArenaPtr, suffix: &str) -> bool {
+        let mut owned = String::new();
+        self.write_relative_path(arena, &mut owned);
+        path_ends_with_suffix(&owned, suffix)
+    }
 
     fn has_extension(&self, arena: ArenaPtr, extension: &str, scratch: &mut String) -> bool {
         self.write_file_name(arena, scratch);
@@ -28,18 +68,54 @@ fn is_path_sep(b: u8) -> bool {
     b == b'/' || b == b'\\'
 }
 
+fn bytes_match(a: u8, b: u8) -> bool {
+    if is_path_sep(a) && is_path_sep(b) {
+        true
+    } else {
+        a.eq_ignore_ascii_case(&b)
+    }
+}
+
+// First index at or after `i` where either side is `/` or `\`. Lengths match.
+#[inline(always)]
+fn next_sep_either(hay: &[u8], needle: &[u8], i: usize) -> usize {
+    let h = memchr::memchr2(b'/', b'\\', &hay[i..]).map(|p| i + p);
+    let n = memchr::memchr2(b'/', b'\\', &needle[i..]).map(|p| i + p);
+    match (h, n) {
+        (Some(a), Some(b)) => a.min(b),
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => hay.len(),
+    }
+}
+
+// A non-separator run of 4 or more uses the wide compare. Separators stay one byte.
+fn span_eq(hay: &[u8], needle: &[u8]) -> bool {
+    let mut i = 0usize;
+    while i < hay.len() {
+        let run = next_sep_either(hay, needle, i);
+        let len = run - i;
+        if len >= 4 {
+            if !crate::simd_path::eq_ignore_ascii_bytes(&hay[i..run], &needle[i..run]) {
+                return false;
+            }
+        } else if (i..run).any(|j| !hay[j].eq_ignore_ascii_case(&needle[j])) {
+            return false;
+        }
+        if run == hay.len() {
+            return true;
+        }
+        if !bytes_match(hay[run], needle[run]) {
+            return false;
+        }
+        i = run + 1;
+    }
+    true
+}
+
 #[inline]
 fn path_slice_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).all(|(x, y)| {
-        if is_path_sep(*x) && is_path_sep(*y) {
-            true
-        } else {
-            x.eq_ignore_ascii_case(y)
-        }
-    })
+    a.len() == b.len() && span_eq(a, b)
 }
 
 /// Path ends with suffix at a path-separator boundary (case-insensitive).
@@ -72,6 +148,65 @@ pub fn path_ends_with_suffix(path: &str, suffix: &str) -> bool {
     is_path_sep(path_bytes[start - 1])
 }
 
+// Same rule as `path_ends_with_suffix`. One index base; each later slot is the next entry.
+pub(crate) fn chunked_ends_with_path_suffix(
+    path: &crate::simd_path::ChunkedString,
+    arena: ArenaPtr,
+    suffix: &str,
+) -> bool {
+    let suffix = suffix.as_bytes();
+    let total = path.byte_len as usize;
+    if total < suffix.len() {
+        return false;
+    }
+    let start = total - suffix.len();
+    let simd = crate::simd_path::SIMD_CHUNK_BYTES;
+    if suffix.is_empty() {
+        if start == 0 {
+            return true;
+        }
+        let prev = start - 1;
+        let chunk = crate::simd_path::ChunkedString::chunk_at(
+            arena,
+            unsafe { *path.slot_index(arena, prev / simd) },
+        );
+        return is_path_sep(chunk[prev % simd]);
+    }
+
+    let slot = start / simd;
+    let within = start % simd;
+    let index_start = path.slot_index(arena, slot);
+    let head = crate::simd_path::ChunkedString::chunk_at(arena, unsafe { *index_start });
+    if head[within] & 0xC0 == 0x80 {
+        return false;
+    }
+    let mut index = index_start;
+    let mut chunk = head;
+    let mut at = within;
+    let mut npos = 0usize;
+    while npos < suffix.len() {
+        let n = (simd - at).min(suffix.len() - npos);
+        if !span_eq(&chunk[at..at + n], &suffix[npos..npos + n]) {
+            return false;
+        }
+        npos += n;
+        if npos < suffix.len() {
+            at = 0;
+            index = unsafe { index.add(1) };
+            chunk = crate::simd_path::ChunkedString::chunk_at(arena, unsafe { *index });
+        }
+    }
+    if start == 0 {
+        return true;
+    }
+    let prev = if within == 0 {
+        crate::simd_path::ChunkedString::chunk_at(arena, unsafe { *index_start.sub(1) })[simd - 1]
+    } else {
+        head[within - 1]
+    };
+    is_path_sep(prev)
+}
+
 #[inline]
 pub fn file_has_extension(file_name: &str, ext: &str) -> bool {
     let name_bytes = file_name.as_bytes();
@@ -83,7 +218,8 @@ pub fn file_has_extension(file_name: &str, ext: &str) -> bool {
     if start > 0 && !file_name.is_char_boundary(start) {
         return false;
     }
-    name_bytes.get(start) == Some(&b'.') && name_bytes[start + 1..].eq_ignore_ascii_case(ext_bytes)
+    name_bytes.get(start) == Some(&b'.')
+        && crate::simd_path::eq_ignore_ascii_bytes(&name_bytes[start + 1..], ext_bytes)
 }
 
 /// Matches multi-segment queries like `libswscale/aarch64`.
@@ -154,17 +290,20 @@ pub(crate) type GlobPattern = globset::GlobMatcher;
 #[cfg(feature = "zlob")]
 const GLOB_FLAGS: zlob::ZlobFlags = zlob::ZlobFlags::RECOMMENDED.union(zlob::ZlobFlags::PERIOD);
 
+struct InlineGlob<'q> {
+    pattern: Option<GlobPattern>,
+    needle: Option<&'q str>,
+}
+
 /// How `Constraint::Glob` is evaluated for each item.
-enum GlobStrategy {
-    /// No Glob constraint present.
+enum GlobStrategy<'q> {
     None,
-    /// Pure-glob workload (no Extension filter to reject items first).
-    /// Batch all paths through zlob/globset once; per-item check is a Vec<bool> lookup.
+    // Zlob pure-glob: one batch over a single copy of each path.
     Prepass(Vec<Vec<bool>>),
-    /// Mixed workload (Extension filter present). Compile patterns up front, then
-    /// only run them on items that survive the cheap Extension OR check.
-    /// `None` slot = compile failure -> never matches; preserves index alignment.
-    Inline(Vec<Option<GlobPattern>>),
+    // Compiled patterns. `needle` is a required literal run, if any.
+    Inline(Vec<InlineGlob<'q>>),
+    // `*literal*`: `*` matches any byte, so this is a substring test.
+    Contains(SmallVec<[&'q str; 4]>),
 }
 
 /// Bundles preprocessed constraints for the per-item evaluator.
@@ -173,12 +312,27 @@ pub(crate) struct ConstraintPlan<'q, 'c> {
     extensions: SmallVec<[&'q str; 8]>,
     /// AND semantics — file passes only if ALL match.
     rest: SmallVec<[&'c Constraint<'q>; 8]>,
-    glob: GlobStrategy,
+    glob: GlobStrategy<'q>,
+    /// FilePath and inline globs copy one path. Text and segments do not.
+    needs_path: bool,
 }
 
 pub(crate) struct ConstraintsBuffers {
     fname: String,
     path: String,
+    path_ready: bool,
+    // Query text and segment are stable for the scan. Fold each once per worker.
+    text_ptr: usize,
+    text_len: usize,
+    text_lower: SmallVec<[u8; 64]>,
+    text_plan: PairPlan,
+    seg_ptr: usize,
+    seg_len: usize,
+    seg_lower: SmallVec<[u8; 64]>,
+    // One finder per `*literal*` glob, rebuilt when the literal changes.
+    glob_finders: Vec<memchr::memmem::Finder<'static>>,
+    // Parallel to inline globs. None = no required literal.
+    inline_finders: Vec<Option<memchr::memmem::Finder<'static>>>,
 }
 
 impl ConstraintsBuffers {
@@ -186,7 +340,76 @@ impl ConstraintsBuffers {
         Self {
             fname: String::with_capacity(64),
             path: String::with_capacity(64),
+            path_ready: false,
+            text_ptr: 0,
+            text_len: usize::MAX,
+            text_lower: SmallVec::new(),
+            text_plan: plan_for(b""),
+            seg_ptr: 0,
+            seg_len: usize::MAX,
+            seg_lower: SmallVec::new(),
+            glob_finders: Vec::new(),
+            inline_finders: Vec::new(),
         }
+    }
+
+    fn cache_inline(&mut self, globs: &[InlineGlob<'_>]) {
+        let same = self.inline_finders.len() == globs.len()
+            && self.inline_finders.iter().zip(globs).all(|(slot, glob)| {
+                match (slot, glob.needle) {
+                    (None, None) => true,
+                    (Some(finder), Some(needle)) => finder.needle() == needle.as_bytes(),
+                    _ => false,
+                }
+            });
+        if same {
+            return;
+        }
+        self.inline_finders.clear();
+        self.inline_finders.extend(globs.iter().map(|glob| {
+            glob.needle
+                .map(|needle| memchr::memmem::Finder::new(needle).into_owned())
+        }));
+    }
+
+    fn cache_globs(&mut self, needles: &[&str]) {
+        let same = self.glob_finders.len() == needles.len()
+            && self
+                .glob_finders
+                .iter()
+                .zip(needles)
+                .all(|(finder, needle)| finder.needle() == needle.as_bytes());
+        if same {
+            return;
+        }
+        self.glob_finders.clear();
+        self.glob_finders
+            .extend(needles.iter().map(|n| memchr::memmem::Finder::new(*n).into_owned()));
+    }
+
+    fn cache_text(&mut self, text: &str) {
+        let ptr = text.as_ptr() as usize;
+        if ptr == self.text_ptr && text.len() == self.text_len {
+            return;
+        }
+        self.text_ptr = ptr;
+        self.text_len = text.len();
+        self.text_lower.clear();
+        self.text_lower.extend_from_slice(text.as_bytes());
+        self.text_lower.make_ascii_lowercase();
+        self.text_plan = plan_for(&self.text_lower);
+    }
+
+    fn cache_segment(&mut self, segment: &str) {
+        let ptr = segment.as_ptr() as usize;
+        if ptr == self.seg_ptr && segment.len() == self.seg_len {
+            return;
+        }
+        self.seg_ptr = ptr;
+        self.seg_len = segment.len();
+        self.seg_lower.clear();
+        self.seg_lower.extend_from_slice(segment.as_bytes());
+        self.seg_lower.make_ascii_lowercase();
     }
 }
 
@@ -207,11 +430,16 @@ impl<'q, 'c> ConstraintPlan<'q, 'c> {
         }
         let has_pre_filter = !extensions.is_empty() || rest.iter().any(|&c| !is_glob_node(c));
         let glob = build_glob_strategy(&rest, has_pre_filter, items, base_arena, overflow_arena);
+        // Inline globs and file-path suffixes copy one path. Text, segments,
+        // and `*literal*` globs read arena chunks.
+        let inline_globs = matches!(glob, GlobStrategy::Inline(_));
+        let needs_path = rest.iter().any(|c| touches_item_path(c, inline_globs));
 
         Self {
             extensions,
             rest,
             glob,
+            needs_path,
         }
     }
 
@@ -223,15 +451,29 @@ impl<'q, 'c> ConstraintPlan<'q, 'c> {
     ) -> Vec<&'a T> {
         if items.len() >= PAR_THRESHOLD {
             use rayon::prelude::*;
-            items
-                .par_iter()
-                .enumerate()
-                .map_init(ConstraintsBuffers::new, |scratch, (i, item)| {
-                    self.matches(item, i, base_arean, overflow_arena, scratch)
-                        .then_some(item)
+            // Fixed spans keep the collect indexed; the unindexed fallback
+            // pays per-task buffers plus a serial merge on the caller.
+            let threads = rayon::current_num_threads().max(1);
+            let span = items.len().div_ceil(threads * PAR_CHUNKS_PER_THREAD).max(1);
+            let n_chunks = items.len().div_ceil(span);
+            let parts: Vec<Vec<&'a T>> = (0..n_chunks)
+                .into_par_iter()
+                .map_init(ConstraintsBuffers::new, |scratch, c| {
+                    let lo = c * span;
+                    let hi = ((c + 1) * span).min(items.len());
+                    (lo..hi)
+                        .filter_map(|i| {
+                            self.matches(&items[i], i, base_arean, overflow_arena, scratch)
+                                .then_some(&items[i])
+                        })
+                        .collect()
                 })
-                .flatten()
-                .collect()
+                .collect();
+            let mut out = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+            for mut part in parts {
+                out.append(&mut part);
+            }
+            out
         } else {
             let mut scratch = ConstraintsBuffers::new();
             items
@@ -260,6 +502,14 @@ impl<'q, 'c> ConstraintPlan<'q, 'c> {
             base_arena
         };
 
+        if self.needs_path {
+            scratch.path_ready = false;
+        }
+        if let GlobStrategy::Contains(needles) = &self.glob {
+            scratch.cache_globs(needles);
+        } else if let GlobStrategy::Inline(globs) = &self.glob {
+            scratch.cache_inline(globs);
+        }
         if !self.passes_extensions(item, arena, scratch) {
             return false;
         }
@@ -296,12 +546,25 @@ impl<'q, 'c> ConstraintPlan<'q, 'c> {
 }
 
 #[inline]
+fn item_path<'a, T: Constrainable>(
+    item: &T,
+    arena: ArenaPtr,
+    scratch: &'a mut ConstraintsBuffers,
+) -> &'a str {
+    if !scratch.path_ready {
+        item.write_relative_path(arena, &mut scratch.path);
+        scratch.path_ready = true;
+    }
+    &scratch.path
+}
+
+#[inline]
 #[allow(clippy::too_many_arguments)]
 fn evaluate<T: Constrainable>(
     item: &T,
     index: usize,
     constraint: &Constraint<'_>,
-    glob: &GlobStrategy,
+    glob: &GlobStrategy<'_>,
     glob_idx: &mut usize,
     negate: bool,
     arena: ArenaPtr,
@@ -315,14 +578,28 @@ fn evaluate<T: Constrainable>(
                     .get(*glob_idx)
                     .and_then(|mask| mask.get(index).copied())
                     .unwrap_or(false),
-                GlobStrategy::Inline(patterns) => {
-                    item.write_relative_path(arena, &mut scratch.path);
-                    patterns
+                GlobStrategy::Inline(globs) => {
+                    // Miss cannot match. A hit is not a match.
+                    let miss = scratch
+                        .inline_finders
                         .get(*glob_idx)
-                        .and_then(|p| p.as_ref())
-                        .map(|p| compiled_matches(p, &scratch.path))
-                        .unwrap_or(false)
+                        .and_then(|slot| slot.as_ref())
+                        .is_some_and(|finder| !item.path_contains(arena, finder));
+                    if miss {
+                        false
+                    } else {
+                        let path = item_path(item, arena, scratch);
+                        globs
+                            .get(*glob_idx)
+                            .and_then(|glob| glob.pattern.as_ref())
+                            .map(|pattern| compiled_matches(pattern, path))
+                            .unwrap_or(false)
+                    }
                 }
+                GlobStrategy::Contains(_) => scratch
+                    .glob_finders
+                    .get(*glob_idx)
+                    .is_some_and(|finder| item.path_contains(arena, finder)),
             };
             *glob_idx += 1;
             m
@@ -331,17 +608,15 @@ fn evaluate<T: Constrainable>(
         // up front and handled in `passes_extensions`.
         Constraint::Extension(ext) => item.has_extension(arena, ext, &mut scratch.fname),
         Constraint::PathSegment(segment) => {
-            item.write_relative_path(arena, &mut scratch.path);
-            path_contains_segment(&scratch.path, segment)
+            scratch.cache_segment(segment);
+            item.path_has_segment(arena, &scratch.seg_lower)
         }
-        Constraint::FilePath(suffix) => {
-            item.write_relative_path(arena, &mut scratch.path);
-            path_ends_with_suffix(&scratch.path, suffix)
-        }
+        Constraint::FilePath(suffix) => item.ends_with_path_suffix(arena, suffix),
         Constraint::Text(text) => {
-            // Only meaningful under negation (used as exclude filter).
-            item.write_relative_path(arena, &mut scratch.path);
-            find_case_insensitive_short(scratch.path.as_bytes(), text.as_bytes()).is_some()
+            // `!text` still visits every path. Chunks stay in the arena.
+            scratch.cache_text(text);
+            let plan = scratch.text_plan;
+            item.path_contains_folded(arena, &scratch.text_lower, plan)
         }
         Constraint::GitStatus(filter) => matches_git_status(item.git_status(), filter),
         Constraint::Not(inner) => {
@@ -401,32 +676,43 @@ pub(crate) fn glob_matches_into(p: &GlobPattern, rels: &[&str], out: &mut Vec<us
     out.extend((0..rels.len()).filter(|&i| p.is_match(rels[i])));
 }
 
-/// Decide between batch prepass and inline compiled patterns.
-///
-/// `has_pre_filter` = true when something cheaper than glob can reject items first
-/// (extensions OR non-glob constraints in `rest`). In that case inline pays glob
-/// cost only on survivors and beats prepass on every workload we benched. Pure-glob
-/// (no pre-filter) takes prepass — single batched zlob call beats N inline matches.
-fn build_glob_strategy<T: Constrainable>(
-    rest: &[&Constraint<'_>],
+// Zlob batches a pure glob in one call. Other backends match per path, so
+// materializing every path first only adds a copy.
+fn build_glob_strategy<'q, T: Constrainable>(
+    rest: &[&Constraint<'q>],
     has_pre_filter: bool,
     items: &[T],
     arena: ArenaPtr,
     overflow_arena: ArenaPtr,
-) -> GlobStrategy {
+) -> GlobStrategy<'q> {
     if !contains_glob(rest) {
         return GlobStrategy::None;
     }
-    if has_pre_filter {
-        return GlobStrategy::Inline(compile_globs(rest));
+    // `*literal*` is a substring on both glob backends, so it never copies paths.
+    if let Some(needles) = contains_literals(rest) {
+        return GlobStrategy::Contains(needles);
     }
-    let buf = PathBuffer::collect(items, arena, overflow_arena);
-    let path_refs = buf.as_strs();
-    GlobStrategy::Prepass(precompute_masks(rest, &path_refs))
+    #[cfg(feature = "zlob")]
+    if !has_pre_filter {
+        let buf = PathBuffer::collect(items, arena, overflow_arena);
+        let path_refs = buf.as_strs();
+        return GlobStrategy::Prepass(precompute_masks(rest, &path_refs));
+    }
+    #[cfg(not(feature = "zlob"))]
+    let _ = (has_pre_filter, items, arena, overflow_arena);
+    GlobStrategy::Inline(compile_globs(rest))
 }
 
-/// `Glob` or `Not(Glob)` — the constraint kinds whose evaluation goes through
-/// the GlobStrategy. Everything else can pre-reject items before glob runs.
+fn touches_item_path(c: &Constraint<'_>, inline_globs: bool) -> bool {
+    match c {
+        Constraint::FilePath(_) => false,
+        Constraint::Glob(_) => inline_globs,
+        Constraint::Not(inner) => touches_item_path(inner, inline_globs),
+        _ => false,
+    }
+}
+
+/// `Glob` or `Not(Glob)`. Other constraints can reject a file before a glob runs.
 fn is_glob_node(c: &Constraint<'_>) -> bool {
     match c {
         Constraint::Glob(_) => true,
@@ -439,14 +725,43 @@ fn contains_glob(rest: &[&Constraint<'_>]) -> bool {
     rest.iter().any(|c| is_glob_node(c))
 }
 
-/// Contiguous byte buffer holding every item's `relative_path`. Single allocation
-/// instead of N `String`s. On Windows the in-place pass folds `\\` -> `/` so the
-/// glob library sees a canonical separator.
+// Leading and trailing `*` only, with a metacharacter-free literal between them.
+fn star_literal(pattern: &str) -> Option<&str> {
+    let b = pattern.as_bytes();
+    if b.len() < 3 || b[0] != b'*' || b[b.len() - 1] != b'*' {
+        return None;
+    }
+    let inner = &pattern[1..b.len() - 1];
+    if inner.bytes().any(|c| matches!(c, b'*' | b'?' | b'[' | b'\\' | b'{' | b'}')) {
+        return None;
+    }
+    Some(inner)
+}
+
+fn contains_literals<'q>(rest: &[&Constraint<'q>]) -> Option<SmallVec<[&'q str; 4]>> {
+    let mut needles = SmallVec::new();
+    for c in rest {
+        let mut ok = true;
+        walk_globs(c, &mut |pattern| match star_literal(pattern) {
+            Some(lit) => needles.push(lit),
+            None => ok = false,
+        });
+        if !ok {
+            return None;
+        }
+    }
+    if needles.is_empty() { None } else { Some(needles) }
+}
+
+// One contiguous copy of each relative path for the zlob batch.
+// Stored paths stay `/`-canonical; the matcher sees those bytes.
+#[cfg(feature = "zlob")]
 struct PathBuffer {
     bytes: Vec<u8>,
     offsets: Vec<(usize, usize)>,
 }
 
+#[cfg(feature = "zlob")]
 impl PathBuffer {
     fn collect<T: Constrainable>(items: &[T], arena: ArenaPtr, overflow_arena: ArenaPtr) -> Self {
         let mut bytes = Vec::<u8>::new();
@@ -459,8 +774,7 @@ impl PathBuffer {
                 arena
             };
             let start = bytes.len();
-            item.write_relative_path(item_arena, &mut tmp);
-            bytes.extend_from_slice(tmp.as_bytes());
+            item.append_relative_path(item_arena, &mut bytes, &mut tmp);
             offsets.push((start, bytes.len() - start));
         }
         Self { bytes, offsets }
@@ -476,6 +790,7 @@ impl PathBuffer {
     }
 }
 
+#[cfg(feature = "zlob")]
 fn precompute_masks(rest: &[&Constraint<'_>], paths: &[&str]) -> Vec<Vec<bool>> {
     let mut out = Vec::new();
     for c in rest {
@@ -486,17 +801,184 @@ fn precompute_masks(rest: &[&Constraint<'_>], paths: &[&str]) -> Vec<Vec<bool>> 
     out
 }
 
-fn compile_globs(rest: &[&Constraint<'_>]) -> Vec<Option<GlobPattern>> {
+fn compile_globs<'q>(rest: &[&Constraint<'q>]) -> Vec<InlineGlob<'q>> {
     let mut out = Vec::new();
     for c in rest {
-        walk_globs(c, &mut |pattern| out.push(compile_one(pattern)));
+        walk_globs(c, &mut |pattern| {
+            out.push(InlineGlob {
+                pattern: compile_one(pattern),
+                needle: required_literal(pattern),
+            });
+        });
     }
     out
 }
 
+// Longest case-sensitive literal every match contains (`[]` / `{}` excluded).
+// Shorter than 3 keeps the path copy.
+fn required_literal(pattern: &str) -> Option<&str> {
+    fn consider(
+        pattern: &str,
+        escapes: bool,
+        best_at: &mut usize,
+        best_len: &mut usize,
+        mut start: usize,
+        end: usize,
+    ) {
+        let bytes = pattern.as_bytes();
+        // `**/` can match an empty prefix, so that slash is not required.
+        if start < end
+            && bytes[start] == b'/'
+            && start >= 2
+            && bytes[start - 1] == b'*'
+            && bytes[start - 2] == b'*'
+            && !escaped_meta(bytes, escapes, start - 2)
+        {
+            start += 1;
+        }
+        if end <= start {
+            return;
+        }
+        let len = end - start;
+        if len >= 3 && len > *best_len {
+            *best_at = start;
+            *best_len = len;
+        }
+    }
+
+    let bytes = pattern.as_bytes();
+    let escapes = cfg!(feature = "zlob") || !cfg!(windows);
+    let mut best_at = 0usize;
+    let mut best_len = 0usize;
+    let mut run: Option<usize> = None;
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'\\' {
+            if depth == 0
+                && let Some(start) = run.take()
+            {
+                consider(pattern, escapes, &mut best_at, &mut best_len, start, i);
+            }
+            i += 1;
+            if escapes && i < bytes.len() && is_glob_meta(bytes[i]) {
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'[' {
+            if depth == 0
+                && let Some(start) = run.take()
+            {
+                consider(pattern, escapes, &mut best_at, &mut best_len, start, i);
+            }
+            i = skip_class(bytes, i);
+            continue;
+        }
+        if c == b'{' {
+            if depth == 0
+                && let Some(start) = run.take()
+            {
+                consider(pattern, escapes, &mut best_at, &mut best_len, start, i);
+            }
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if c == b'}' {
+            if depth > 0 {
+                depth -= 1;
+                run = None;
+            } else if let Some(start) = run.take() {
+                consider(pattern, escapes, &mut best_at, &mut best_len, start, i);
+            }
+            i += 1;
+            continue;
+        }
+        if cfg!(feature = "zlob") && c == b'~' && depth == 0 {
+            if let Some(start) = run.take() {
+                consider(pattern, escapes, &mut best_at, &mut best_len, start, i);
+            }
+            let expand = i == 0 || bytes[i - 1] == b'/';
+            i += 1;
+            if expand {
+                while i < bytes.len() && bytes[i] != b'/' && !is_glob_meta(bytes[i]) {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if depth > 0 {
+            run = None;
+            i += 1;
+            continue;
+        }
+        if matches!(c, b'*' | b'?' | b']') {
+            if let Some(start) = run.take() {
+                consider(pattern, escapes, &mut best_at, &mut best_len, start, i);
+            }
+            i += 1;
+            continue;
+        }
+        if run.is_none() {
+            run = Some(i);
+        }
+        i += 1;
+    }
+    if depth == 0
+        && let Some(start) = run
+    {
+        consider(pattern, escapes, &mut best_at, &mut best_len, start, bytes.len());
+    }
+    if best_len >= 3 {
+        Some(&pattern[best_at..best_at + best_len])
+    } else {
+        None
+    }
+}
+
+fn is_glob_meta(b: u8) -> bool {
+    matches!(b, b'*' | b'?' | b'[' | b']' | b'{' | b'}' | b'\\')
+}
+
+fn escaped_meta(bytes: &[u8], escapes: bool, at: usize) -> bool {
+    if !escapes {
+        return false;
+    }
+    let mut n = 0usize;
+    let mut j = at;
+    while j > 0 && bytes[j - 1] == b'\\' {
+        n += 1;
+        j -= 1;
+    }
+    n % 2 == 1
+}
+
+fn skip_class(bytes: &[u8], open: usize) -> usize {
+    let mut i = open + 1;
+    if i < bytes.len() && matches!(bytes[i], b'!' | b'^') {
+        i += 1;
+    }
+    let mut first = true;
+    while i < bytes.len() {
+        if cfg!(feature = "zlob") && bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 2;
+            first = false;
+            continue;
+        }
+        if bytes[i] == b']' && !first {
+            return i + 1;
+        }
+        i += 1;
+        first = false;
+    }
+    bytes.len()
+}
+
 /// Visit every Glob (including ones nested under Not) in constraint walk order.
 /// Order matters: `glob_idx` in the per-item evaluator increments by one per Glob node.
-fn walk_globs<F: FnMut(&str)>(c: &Constraint<'_>, f: &mut F) {
+fn walk_globs<'a, F: FnMut(&'a str)>(c: &Constraint<'a>, f: &mut F) {
     match c {
         Constraint::Glob(p) => f(p),
         Constraint::Not(inner) => walk_globs(inner, f),
@@ -516,8 +998,7 @@ pub(crate) fn compile_one(pattern: &str) -> Option<GlobPattern> {
         .map(|g| g.compile_matcher())
 }
 
-/// Build a `paths.len()`-sized bitmap. Vec<bool> beats AHashSet ~2× in the per-item
-/// filter loop — no hashing, plain array indexing, sequential prefetcher-friendly.
+// Positive-match bits. A missing column stays false, which `Not` flips.
 #[cfg(feature = "zlob")]
 fn match_glob_pattern(pattern: &str, paths: &[&str]) -> Vec<bool> {
     let mut mask = vec![false; paths.len()];
@@ -527,26 +1008,6 @@ fn match_glob_pattern(pattern: &str, paths: &[&str]) -> Vec<bool> {
     for i in hits.to_iter() {
         if i < mask.len() {
             mask[i] = true;
-        }
-    }
-    mask
-}
-
-#[cfg(all(not(feature = "zlob"), feature = "ripgrep"))]
-fn match_glob_pattern(pattern: &str, paths: &[&str]) -> Vec<bool> {
-    let mut mask = vec![false; paths.len()];
-    let Ok(glob) = globset::Glob::new(pattern) else {
-        return mask;
-    };
-    let matcher = glob.compile_matcher();
-    if paths.len() >= PAR_THRESHOLD {
-        use rayon::prelude::*;
-        mask.par_iter_mut()
-            .zip(paths.par_iter())
-            .for_each(|(slot, p)| *slot = matcher.is_match(p));
-    } else {
-        for (slot, p) in mask.iter_mut().zip(paths.iter()) {
-            *slot = matcher.is_match(p);
         }
     }
     mask
@@ -594,6 +1055,35 @@ mod tests {
         assert!(!file_has_extension(".rs", "rs")); // just extension
         assert!(!file_has_extension("file.rsx", "rs")); // different extension
         assert!(!file_has_extension("filers", "rs")); // no dot
+    }
+
+    #[test]
+    fn chunked_path_suffix_matches_the_string_rule() {
+        let paths = [
+            "src/lib.rs",
+            "src/lib.rsx",
+            "SRC/LIB.RS",
+            "src\\lib.rs",
+            "lib.rs",
+            "very/deeply/nested/directory/structure/with/many/levels/lib.rs",
+        ];
+        let files: Vec<crate::types::FileItem> = paths
+            .iter()
+            .map(|_| crate::types::FileItem::new_raw(0, 0, 0, None, false))
+            .collect();
+        let owned: Vec<String> = paths.iter().map(|p| (*p).to_string()).collect();
+        let (store, strings) =
+            crate::simd_path::build_chunked_path_store_from_strings(&owned, &files);
+        let arena = store.as_arena_ptr();
+        for (path, chunked) in paths.iter().zip(&strings) {
+            for suffix in ["lib.rs", "src/lib.rs", "LIB.RS", "src\\lib.rs", "levels/lib.rs"] {
+                assert_eq!(
+                    chunked_ends_with_path_suffix(chunked, arena, suffix),
+                    path_ends_with_suffix(path, suffix),
+                    "{path} / {suffix}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -727,7 +1217,10 @@ mod tests {
             "abc/приветfoo/bar.txt",
             "foo/bar.txt"
         ));
-        assert!(path_ends_with_suffix("abc/привет/foo/bar.txt", "foo/bar.txt"));
+        assert!(path_ends_with_suffix(
+            "abc/привет/foo/bar.txt",
+            "foo/bar.txt"
+        ));
         assert!(path_ends_with_suffix("привет/bar.txt", "bar.txt"));
     }
 

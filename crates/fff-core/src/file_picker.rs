@@ -31,14 +31,17 @@
 use crate::FFFStringStorage;
 use crate::constants::{MAX_OVERFLOW_FILES, PATH_BUF_SIZE};
 use crate::error::Error;
-use crate::frecency::FrecencyTracker;
-use crate::git::GitStatusCache;
+use crate::dbs::frecency::ModificationBasis;
+use crate::frecency::{FrecencyReader, FrecencyTracker};
+use crate::git::{is_modified_status, GitDiscovery, GitStatusCache};
 use crate::git_recency::{self, GitRecencyConfig};
 use crate::grep::{GrepResult, GrepSearchOptions, grep_search, multi_grep_search};
 use crate::index::{BigramFilter, BigramOverlay};
 use crate::query_tracker::QueryTracker;
 use crate::scan::{ScanConfig, ScanJob, ScanSignals};
-use crate::score::{fuzzy_match_and_score_files, fuzzy_match_byte_offsets_for_page};
+use crate::score::{
+    fuzzy_match_and_score_files_presence, fuzzy_match_byte_offsets_for_page,
+};
 use crate::shared::{SharedFilePicker, SharedFrecency};
 use crate::simd_path::ArenaPtr;
 use crate::stable_vec::StableVec;
@@ -46,10 +49,10 @@ use crate::types::{
     ContentCacheBudget, DirItem, DirSearchResult, FileItem, MixedItemRef, MixedSearchResult,
     PaginationArgs, Score, ScoringContext, SearchResult,
 };
-use crate::walk::WalkOutput;
+use crate::walk::WalkSpan;
 use crate::watch::BackgroundWatcher;
 use ahash::{AHashMap, AHashSet};
-use fff_query_parser::FFFQuery;
+use fff_query_parser::{Constraint, FFFQuery};
 use git2::{Repository, Status};
 use rayon::prelude::*;
 use std::fmt::Debug;
@@ -94,7 +97,10 @@ pub struct FuzzySearchOptions<'a> {
 
 #[derive(Debug, Clone)]
 pub(crate) struct FileSync {
-    pub(crate) git_workdir: Option<PathBuf>,
+    pub(crate) git: Option<GitDiscovery>,
+    // Base path re-rooted into the main checkout when indexing a linked git worktree,
+    // frecency and query history are keyed by it so all worktrees share one history
+    shared_base: Option<PathBuf>,
     /// Base files laid out in two partitions, each internally sorted by
     /// (parent_dir, filename):
     ///   `files[..indexable_count]` - indexable
@@ -132,6 +138,8 @@ pub(crate) struct FileSync {
     pub(crate) max_path_len: Arc<PathLenCache>,
     /// Content byte-presence masks, indexed by file position.
     pub(crate) content_masks: Arc<ContentMaskStore>,
+    /// Path-presence masks, indexed like `files`. Same values as `FileItem::presence`.
+    presence: crate::types::PresenceTable,
 }
 
 /// Side table of per-file content byte-presence masks.
@@ -144,8 +152,8 @@ pub(crate) struct ContentMaskStore {
     /// lock-free on grep's per-file path. Uninitialised means 'no masks yet'
     /// and every lookup misses, which is safe.
     slots: std::sync::OnceLock<Vec<std::sync::atomic::AtomicU64>>,
-    /// Set once any non-empty mask lands. Lets grep skip mask work
-    /// entirely when content indexing never ran (all lookups would miss).
+    /// Set once any non-empty mask lands. Grep skips the table when this
+    /// is false. Mask 0 stays unknown either way.
     has_data: AtomicBool,
 }
 
@@ -214,12 +222,14 @@ impl FileSync {
             base_dirs_count: 0,
             live_dirs_count: 0,
             overflow_builder: None,
-            git_workdir: None,
+            git: None,
+            shared_base: None,
             bigram_index: None,
             bigram_overlay: None,
             chunked_paths: None,
             max_path_len: Arc::new(PathLenCache::new()),
             content_masks: Arc::new(ContentMaskStore::with_capacity(0)),
+            presence: crate::types::PresenceTable::default(),
             ignore_rules: None,
         }
     }
@@ -540,7 +550,8 @@ impl FileItem {
             .map(|i| i + 1)
             .unwrap_or(0) as u16;
 
-        let item = Self::new_raw(filename_start, size, modified, git_status, is_binary);
+        let mut item = Self::new_raw(filename_start, size, modified, git_status, is_binary);
+        item.mark_definition_language(&relative_path);
         (item, relative_path)
     }
 
@@ -591,7 +602,8 @@ impl FileItem {
             .map(|i| i + 1)
             .unwrap_or(0) as u16;
 
-        let item = Self::new_raw(fname_offset, size, modified, git_status, is_binary);
+        let mut item = Self::new_raw(fname_offset, size, modified, git_status, is_binary);
+        item.mark_definition_language(&rel_str);
         (item, rel_str)
     }
 
@@ -626,38 +638,59 @@ impl FileItem {
         } else {
             String::from_utf8_lossy(dir_bytes).len() as u16
         };
-        let item = Self::new_raw(basename_offset, size, modified, git_status, is_binary);
+        let mut item = Self::new_raw(basename_offset, size, modified, git_status, is_binary);
+        item.mark_definition_language(&decoded);
         (item, decoded)
     }
 
-    pub(crate) fn update_frecency_scores(
-        &mut self,
-        tracker: &FrecencyTracker,
+    pub(crate) fn update_access_frecency_score(
+        &self,
+        reader: &FrecencyReader,
         arena: ArenaPtr,
         base_path: &Path,
+        shared_base: Option<&Path>,
         mode: FFFMode,
-    ) -> Result<(), Error> {
+    ) -> i32 {
         let mut abs_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
         let abs = self.write_absolute_path(arena, base_path, &mut abs_buf);
-        self.access_frecency_score = tracker.get_access_score(abs, mode) as i16;
-        self.modification_frecency_score =
-            tracker.get_modification_score(self.modified, self.git_status(), mode) as i16;
+        let access_score = match shared_base {
+            Some(shared_base) => {
+                let mut shared_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+                let shared = self.write_absolute_path(arena, shared_base, &mut shared_buf);
+                reader.access_score(abs, Some(shared), mode)
+            }
+            None => reader.access_score(abs, None, mode),
+        };
 
-        Ok(())
+        let stored = access_score as i16;
+        self.set_access_frecency_score(stored);
+        stored as i32
     }
 
-    /// Assign precomputed access score (scan hydration batch path).
-    pub(crate) fn set_access_frecency_score(&mut self, access_score: i64) {
-        self.access_frecency_score = access_score as i16;
+    // Caller holds one basis. A clean file that is already 0 does not store.
+    pub(crate) fn apply_modification_frecency(&self, basis: &ModificationBasis) {
+        let git = self.git_status();
+        if !git.is_some_and(is_modified_status) {
+            if self.modification_frecency_score() != 0 {
+                self.set_modification_frecency_score(0);
+            }
+            return;
+        }
+        self.set_modification_frecency_score(basis.score_modified(self.modified()) as i16);
     }
 
-    pub(crate) fn set_modification_frecency_score(
-        &mut self,
-        tracker: &FrecencyTracker,
+    pub(crate) fn update_frecency_scores(
+        &self,
+        reader: &FrecencyReader,
+        arena: ArenaPtr,
+        base_path: &Path,
+        shared_base: Option<&Path>,
         mode: FFFMode,
-    ) {
-        self.modification_frecency_score =
-            tracker.get_modification_score(self.modified, self.git_status(), mode) as i16;
+        basis: &ModificationBasis,
+    ) -> i32 {
+        let access = self.update_access_frecency_score(reader, arena, base_path, shared_base, mode);
+        self.apply_modification_frecency(basis);
+        access
     }
 }
 
@@ -723,7 +756,18 @@ pub(crate) fn should_skip_git(explicit_skip: bool, live_count: usize, forced: bo
 
 /// `FFF_FORCE_GIT` set disables auto-skip.
 pub(crate) fn git_force() -> bool {
-    std::env::var_os("FFF_FORCE_GIT").is_some()
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("FFF_FORCE_GIT").is_some())
+}
+
+fn arena_stats_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("FFF_ARENA_STATS").is_some())
+}
+
+fn no_prefix_history() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("FFF_NO_TRIE").is_some())
 }
 
 pub struct FilePicker {
@@ -755,10 +799,100 @@ pub struct FilePicker {
     live: parking_lot::Mutex<LiveNarrow>,
     /// Bumped whenever the file set changes so live state is dropped.
     index_generation: std::sync::atomic::AtomicU64,
+    // Status writes do not bump index_generation. A GitStatus hit set
+    // is reusable only while this epoch is unchanged.
+    git_status_epoch: std::sync::atomic::AtomicU64,
+    /// Exact-repeat path-match memo for live-narrow subsets. Keyed by index
+    /// generation, query, and the exact candidate list.
+    match_cache: parking_lot::Mutex<crate::score::MatchCache>,
+    // One completed page. A key hit rebuilds it and skips match, score, and offsets.
+    scored_page: parking_lot::Mutex<Option<ScoredPage>>,
     /// Per-keystroke search epoch: each fuzzy search bumps it at entry,
     /// workers bail their slice when it moves. Per-picker so concurrent
     /// searches on different pickers never abort each other.
     search_epoch: std::sync::atomic::AtomicU64,
+}
+
+// Page path buffers. The last owner on this thread keeps the allocation.
+thread_local! {
+    static PATH_BYTES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PATH_ROWS: std::cell::RefCell<Vec<crate::types::CachedFileRow>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static PAGE_IDX: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn take_path_bytes() -> Vec<u8> {
+    let mut buf = PATH_BYTES.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+    buf.clear();
+    buf
+}
+
+fn take_path_rows() -> Vec<crate::types::CachedFileRow> {
+    let mut buf = PATH_ROWS.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+    buf.clear();
+    buf
+}
+
+fn park_path_bytes(bytes: Arc<Vec<u8>>) {
+    if let Ok(buf) = Arc::try_unwrap(bytes) {
+        PATH_BYTES.with(|slot| park_larger(buf, slot));
+    }
+}
+
+fn park_path_rows(rows: Arc<Vec<crate::types::CachedFileRow>>) {
+    if let Ok(buf) = Arc::try_unwrap(rows) {
+        PATH_ROWS.with(|slot| park_larger(buf, slot));
+    }
+}
+
+fn take_page_idx() -> Vec<u32> {
+    let mut buf = PAGE_IDX.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+    buf.clear();
+    buf
+}
+
+fn park_page_idx(indices: std::sync::Arc<Vec<u32>>) {
+    if let Ok(buf) = std::sync::Arc::try_unwrap(indices) {
+        park_page_idx_vec(buf);
+    }
+}
+
+fn park_page_idx_vec(buf: Vec<u32>) {
+    PAGE_IDX.with(|slot| park_larger(buf, slot));
+}
+
+fn reuse_string(mut buf: String, next: &str) -> String {
+    buf.clear();
+    buf.push_str(next);
+    buf
+}
+
+fn reuse_opt_string(buf: Option<String>, next: Option<&str>) -> Option<String> {
+    match (buf, next) {
+        (Some(buf), Some(next)) => Some(reuse_string(buf, next)),
+        (None, Some(next)) => Some(next.to_string()),
+        (_, None) => None,
+    }
+}
+
+fn reuse_opt_bytes(buf: Option<Vec<u8>>, next: Option<&[u8]>) -> Option<Vec<u8>> {
+    match (buf, next) {
+        (Some(mut buf), Some(next)) => {
+            buf.clear();
+            buf.extend_from_slice(next);
+            Some(buf)
+        }
+        (None, Some(next)) => Some(next.to_vec()),
+        (_, None) => None,
+    }
+}
+
+fn park_larger<T>(mut buf: Vec<T>, slot: &std::cell::RefCell<Vec<T>>) {
+    buf.clear();
+    let mut slot = slot.borrow_mut();
+    if buf.capacity() > slot.capacity() {
+        *slot = buf;
+    }
 }
 
 impl FilePicker {
@@ -769,8 +903,202 @@ impl FilePicker {
 
     #[inline]
     pub(crate) fn bump_index_generation(&self) {
-        self.index_generation.fetch_add(1, Ordering::Relaxed);
-        self.live.lock().active = false;
+        {
+            // Generation and `active` move together. A publish holding this
+            // lock either installs the pre-bump set or sees the new generation.
+            let mut live = self.live.lock();
+            self.index_generation.fetch_add(1, Ordering::Relaxed);
+            live.active = false;
+        }
+        self.match_cache.lock().clear();
+    }
+
+    #[inline]
+    fn current_git_status_epoch(&self) -> u64 {
+        self.git_status_epoch.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn bump_git_status_epoch(&self) {
+        self.git_status_epoch.fetch_add(1, Ordering::Relaxed);
+        crate::types::bump_score_input_epoch();
+    }
+
+    fn replay_scored_page<'a>(
+        &'a self,
+        files: &'a [FileItem],
+        key: &PageKey<'_>,
+    ) -> Option<(
+        Vec<&'a FileItem>,
+        crate::types::SharedScores,
+        usize,
+        crate::types::SharedOffsets,
+        crate::types::PathSnapshot,
+    )> {
+        let (indices, scores, offsets, total_matched, paths) = {
+            let guard = self.scored_page.lock();
+            let page = guard.as_ref()?;
+            if !page.matches(key) {
+                return None;
+            }
+            if page.indices.len() != page.scores.len() || page.indices.len() != page.offsets.len()
+            {
+                return None;
+            }
+            (
+                std::sync::Arc::clone(&page.indices),
+                std::sync::Arc::clone(&page.scores),
+                std::sync::Arc::clone(&page.offsets),
+                page.total_matched,
+                crate::types::PathSnapshot {
+                    bytes: std::sync::Arc::clone(&page.path_bytes),
+                    rows: std::sync::Arc::clone(&page.path_rows),
+                },
+            )
+        };
+        let mut items = Vec::with_capacity(indices.len());
+        for &idx in indices.iter() {
+            items.push(files.get(idx as usize)?);
+        }
+        Some((items, scores, total_matched, offsets, paths))
+    }
+
+    fn snapshot_paths(&self, items: &[&FileItem]) -> crate::types::PathSnapshot {
+        let mut bytes = take_path_bytes();
+        // One reserve from the path cap when the reused byte buffer is shorter.
+        let want = items.len().saturating_mul(self.max_path_len().clamp(1, 512));
+        if bytes.capacity() < want {
+            bytes.reserve(want);
+        }
+        let mut rows = take_path_rows();
+        rows.reserve(items.len());
+        for item in items {
+            let len = item.relative_path_len();
+            let start = bytes.len() as u32;
+            let at = bytes.len();
+            if len > 0 {
+                let arena = self.arena_for(item);
+                // The copy writes every new byte, so the buffer is not zeroed first.
+                bytes.reserve(len);
+                unsafe {
+                    item.path.copy_trimmed_ptr(
+                        arena,
+                        0,
+                        len as u32,
+                        bytes.as_mut_ptr().add(at),
+                    );
+                    bytes.set_len(at + len);
+                }
+            }
+            let hot = item.score_hot();
+            rows.push(crate::types::CachedFileRow {
+                start,
+                len: len as u32,
+                name_off: item.filename_offset_in_relative_path().min(len) as u32,
+                size: item.size(),
+                modified: item.modified(),
+                access_frecency_score: hot.access,
+                modification_frecency_score: hot.modification,
+                total_frecency_score: hot.access as i32 + hot.modification as i32,
+                git_status: crate::git::format_git_status(item.git_status()),
+                git_recency_score: hot.git_recency,
+                is_binary: hot.binary,
+            });
+        }
+        crate::types::PathSnapshot {
+            bytes: std::sync::Arc::new(bytes),
+            rows: std::sync::Arc::new(rows),
+        }
+    }
+
+    fn remember_scored_page(
+        &self,
+        abort: crate::parallelism::AbortToken<'_>,
+        files: &[FileItem],
+        items: &[&FileItem],
+        scores: &crate::types::SharedScores,
+        offsets: &crate::types::SharedOffsets,
+        paths: &crate::types::PathSnapshot,
+        total_matched: usize,
+        key: &PageKey<'_>,
+    ) {
+        // Finished page only: abort, or a generation/epoch move, is a partial result.
+        if abort.aborted()
+            || self.index_generation() != key.generation
+            || crate::types::score_input_epoch() != key.score_epoch
+            || items.len() != scores.len()
+            || items.len() != offsets.len()
+        {
+            return;
+        }
+        let Some(indices) = file_slots(files, items) else {
+            return;
+        };
+        let recycled = {
+            let mut guard = self.scored_page.lock();
+            let old = guard.take();
+            let (query, current_file, combo_path, recycled) = if let Some(mut old) = old {
+                let query = reuse_string(std::mem::take(&mut old.query), key.query);
+                let current_file = reuse_opt_string(old.current_file.take(), key.current_file);
+                let combo_path = reuse_opt_bytes(old.combo_path.take(), key.combo_path);
+                (
+                    query,
+                    current_file,
+                    combo_path,
+                    Some((
+                        old.path_bytes,
+                        old.path_rows,
+                        old.indices,
+                        old.offsets,
+                        old.scores,
+                    )),
+                )
+            } else {
+                (
+                    key.query.to_string(),
+                    key.current_file.map(str::to_string),
+                    key.combo_path.map(|p| p.to_vec()),
+                    None,
+                )
+            };
+            *guard = Some(ScoredPage {
+                generation: key.generation,
+                score_epoch: key.score_epoch,
+                query,
+                max_typos: key.max_typos,
+                constraints_fp: key.constraints_fp,
+                current_file,
+                combo_path,
+                combo_open_count: key.combo_open_count,
+                min_combo_count: key.min_combo_count,
+                combo_multiplier: key.combo_multiplier,
+                offset: key.offset,
+                limit: key.limit,
+                indices: std::sync::Arc::new(indices),
+                scores: std::sync::Arc::clone(scores),
+                offsets: std::sync::Arc::clone(offsets),
+                path_bytes: std::sync::Arc::clone(&paths.bytes),
+                path_rows: std::sync::Arc::clone(&paths.rows),
+                total_matched,
+            });
+            recycled
+        };
+        if let Some((bytes, rows, indices, offsets, scores)) = recycled {
+            park_path_bytes(bytes);
+            park_path_rows(rows);
+            park_page_idx(indices);
+            crate::score::park_offset_rows(offsets);
+            crate::score::park_page_scores(scores);
+        }
+    }
+
+    // Skip the atomic store when the status word is unchanged.
+    fn store_git_status(file: &FileItem, next: Option<Status>) -> bool {
+        if file.git_status() == next {
+            return false;
+        }
+        file.set_git_status(next);
+        true
     }
 
     /// Max path byte length across live files (0 when the index is empty).
@@ -794,8 +1122,12 @@ struct LiveNarrow {
     generation: u64,
     query: String,
     max_typos: u16,
+    /// Parsed filter set for `query`; narrowing may only reuse a hit set
+    /// when the new query has the exact same constraints.
+    constraints_fp: u64,
     /// File indices (into sync_data.files) that matched the previous query.
-    candidates: Vec<u32>,
+    candidates: Arc<Vec<u32>>,
+    git_status_epoch: u64,
     /// Files already scored at previous length — set only when we stored a hit set.
     active: bool,
     /// Recent hit sets by query: shortening the query (backspace) reuses
@@ -808,28 +1140,397 @@ struct LiveNarrow {
 }
 
 struct BackEntry {
-    query: String,
+    query: Arc<str>,
     max_typos: u16,
     generation: u64,
-    candidates: Vec<u32>,
+    constraints_fp: u64,
+    git_status_epoch: u64,
+    candidates: Arc<Vec<u32>>,
 }
 
-// Subset scoring chases an index per file (~7ns) while the gate it
-// skips costs ~100ns/file (sumo cool-pair): only narrow when the set
-// skips at least 1/16 of the corpus, else scan directly.
+struct PageKey<'a> {
+    generation: u64,
+    score_epoch: u64,
+    query: &'a str,
+    max_typos: u16,
+    constraints_fp: u64,
+    current_file: Option<&'a str>,
+    combo_path: Option<&'a [u8]>,
+    combo_open_count: u32,
+    min_combo_count: u32,
+    combo_multiplier: i32,
+    offset: usize,
+    limit: usize,
+}
+
+struct ScoredPage {
+    generation: u64,
+    score_epoch: u64,
+    query: String,
+    max_typos: u16,
+    constraints_fp: u64,
+    current_file: Option<String>,
+    combo_path: Option<Vec<u8>>,
+    combo_open_count: u32,
+    min_combo_count: u32,
+    combo_multiplier: i32,
+    offset: usize,
+    limit: usize,
+    indices: std::sync::Arc<Vec<u32>>,
+    scores: crate::types::SharedScores,
+    offsets: crate::types::SharedOffsets,
+    path_bytes: std::sync::Arc<Vec<u8>>,
+    path_rows: std::sync::Arc<Vec<crate::types::CachedFileRow>>,
+    total_matched: usize,
+}
+
+impl ScoredPage {
+    fn matches(&self, key: &PageKey<'_>) -> bool {
+        self.query == key.query
+            && self.generation == key.generation
+            && self.score_epoch == key.score_epoch
+            && self.max_typos == key.max_typos
+            && self.constraints_fp == key.constraints_fp
+            && self.offset == key.offset
+            && self.limit == key.limit
+            && self.min_combo_count == key.min_combo_count
+            && self.combo_multiplier == key.combo_multiplier
+            && self.combo_open_count == key.combo_open_count
+            && self.current_file.as_deref() == key.current_file
+            && self.combo_path.as_deref() == key.combo_path
+    }
+}
+
+fn file_slots(files: &[FileItem], items: &[&FileItem]) -> Option<Vec<u32>> {
+    let stride = std::mem::size_of::<FileItem>();
+    if stride == 0 {
+        return None;
+    }
+    let base = files.as_ptr() as usize;
+    let mut out = take_page_idx();
+    out.reserve(items.len());
+    for item in items {
+        let addr = std::ptr::from_ref(*item) as usize;
+        if addr < base || (addr - base) % stride != 0 {
+            park_page_idx_vec(out);
+            return None;
+        }
+        let idx = (addr - base) / stride;
+        if idx >= files.len() {
+            park_page_idx_vec(out);
+            return None;
+        }
+        let Ok(idx) = u32::try_from(idx) else {
+            park_page_idx_vec(out);
+            return None;
+        };
+        out.push(idx);
+    }
+    Some(out)
+}
+
+fn hash_bytes(h: &mut u64, bytes: &[u8]) {
+    const PRIME: u64 = 0x100000001b3;
+    let mut i = 0usize;
+    while i + 8 <= bytes.len() {
+        let v = u64::from_le(unsafe {
+            core::ptr::read_unaligned(bytes.as_ptr().add(i) as *const u64)
+        });
+        *h ^= v as u8 as u64;
+        *h = h.wrapping_mul(PRIME);
+        *h ^= (v >> 8) as u8 as u64;
+        *h = h.wrapping_mul(PRIME);
+        *h ^= (v >> 16) as u8 as u64;
+        *h = h.wrapping_mul(PRIME);
+        *h ^= (v >> 24) as u8 as u64;
+        *h = h.wrapping_mul(PRIME);
+        *h ^= (v >> 32) as u8 as u64;
+        *h = h.wrapping_mul(PRIME);
+        *h ^= (v >> 40) as u8 as u64;
+        *h = h.wrapping_mul(PRIME);
+        *h ^= (v >> 48) as u8 as u64;
+        *h = h.wrapping_mul(PRIME);
+        *h ^= (v >> 56) as u8 as u64;
+        *h = h.wrapping_mul(PRIME);
+        i += 8;
+    }
+    for &b in &bytes[i..] {
+        *h ^= b as u64;
+        *h = h.wrapping_mul(PRIME);
+    }
+    *h ^= 0xff;
+    *h = h.wrapping_mul(PRIME);
+}
+
+// Canonical enough for equality: every variant and payload contributes.
+fn hash_constraint(h: &mut u64, c: &Constraint<'_>) {
+    match c {
+        Constraint::Extension(s) => {
+            hash_bytes(h, b"ext");
+            hash_bytes(h, s.as_bytes());
+        }
+        Constraint::Glob(s) => {
+            hash_bytes(h, b"glob");
+            hash_bytes(h, s.as_bytes());
+        }
+        Constraint::Parts(parts) => {
+            hash_bytes(h, b"parts");
+            hash_bytes(h, &(parts.len() as u64).to_le_bytes());
+            for p in parts.iter() {
+                hash_bytes(h, p.as_bytes());
+            }
+        }
+        Constraint::Text(s) => {
+            hash_bytes(h, b"text");
+            hash_bytes(h, s.as_bytes());
+        }
+        Constraint::Exclude(parts) => {
+            hash_bytes(h, b"exclude");
+            hash_bytes(h, &(parts.len() as u64).to_le_bytes());
+            for p in parts.iter() {
+                hash_bytes(h, p.as_bytes());
+            }
+        }
+        Constraint::PathSegment(s) => {
+            hash_bytes(h, b"segment");
+            hash_bytes(h, s.as_bytes());
+        }
+        Constraint::FilePath(s) => {
+            hash_bytes(h, b"filepath");
+            hash_bytes(h, s.as_bytes());
+        }
+        Constraint::FileType(s) => {
+            hash_bytes(h, b"filetype");
+            hash_bytes(h, s.as_bytes());
+        }
+        Constraint::GitStatus(status) => {
+            hash_bytes(h, b"gitstatus");
+            hash_bytes(h, &[*status as u8]);
+        }
+        Constraint::Not(inner) => {
+            hash_bytes(h, b"not");
+            hash_constraint(h, inner);
+        }
+    }
+}
+
+fn constraints_fingerprint(constraints: &[Constraint<'_>]) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    hash_bytes(&mut h, &(constraints.len() as u64).to_le_bytes());
+    for c in constraints {
+        hash_constraint(&mut h, c);
+    }
+    h
+}
+
+// Subset scoring chases an index per file; the gate it skips is much
+// larger. Narrow only when the set drops at least 1/16 of the corpus.
 fn narrow_pays(subset_len: usize, files_len: usize) -> bool {
     (subset_len as u64) * 16 < (files_len as u64) * 15
 }
 
+fn constraints_use_git_status(constraints: &[Constraint<'_>]) -> bool {
+    constraints.iter().any(constraint_uses_git_status)
+}
+
+fn constraint_uses_git_status(c: &Constraint<'_>) -> bool {
+    match c {
+        Constraint::GitStatus(_) => true,
+        Constraint::Not(inner) => constraint_uses_git_status(inner),
+        _ => false,
+    }
+}
+
+#[inline]
+fn git_epoch_ok(constrained: bool, stored: u64, current: u64) -> bool {
+    !constrained || stored == current
+}
+
+// Parts the matcher actually scores. Fold is built once per search.
+struct PartFolds<'a> {
+    nps: [std::mem::MaybeUninit<crate::presence::NeedlePresence>; 8],
+    needles: [&'a [u8]; 8],
+    n: usize,
+}
+
+impl<'a> PartFolds<'a> {
+    fn build(query: &'a FFFQuery<'a>, max_typos: u16) -> Self {
+        let mut folds = Self {
+            // Only `n` slots are written. The rest are never read.
+            nps: unsafe { std::mem::MaybeUninit::uninit().assume_init() },
+            needles: [b""; 8],
+            n: 0,
+        };
+        match &query.fuzzy_query {
+            fff_query_parser::FuzzyQuery::Text(t) => folds.push(t, max_typos),
+            fff_query_parser::FuzzyQuery::Parts(parts) => {
+                for part in parts.iter() {
+                    folds.push(part, max_typos);
+                }
+            }
+            _ => {}
+        }
+        folds
+    }
+
+    fn push(&mut self, part: &'a str, max_typos: u16) {
+        if part.len() < 2 || self.n == self.nps.len() {
+            return;
+        }
+        let typos = max_typos.min(part.len() as u16);
+        let np = crate::presence::NeedlePresence::new(part.as_bytes(), typos);
+        if !np.should_check() {
+            return;
+        }
+        self.needles[self.n] = part.as_bytes();
+        self.nps[self.n].write(np);
+        self.n += 1;
+    }
+
+    #[inline(always)]
+    fn np(&self, i: usize) -> &crate::presence::NeedlePresence {
+        debug_assert!(i < self.n);
+        unsafe { self.nps[i].assume_init_ref() }
+    }
+
+    #[inline(always)]
+    fn allows(&self, mask: u64) -> bool {
+        if mask == 0 || self.n == 0 {
+            return true;
+        }
+        if self.n == 1 {
+            return self.np(0).allows(mask, self.needles[0]);
+        }
+        for i in 0..self.n {
+            if !self.np(i).allows(mask, self.needles[i]) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+// Hit slots increase, but they are not adjacent. The mask eight hits ahead covers that gap.
+#[inline(always)]
+fn prefetch_hit_mask(presence: &[u64], candidates: &[u32], n: usize) {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(&next) = candidates.get(n + 8) {
+        let idx = next as usize;
+        if idx < presence.len() {
+            unsafe {
+                std::arch::x86_64::_mm_prefetch(
+                    presence.as_ptr().add(idx) as *const i8,
+                    std::arch::x86_64::_MM_HINT_T0,
+                );
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = (presence, candidates, n);
+}
+
+fn filter_hits(
+    candidates: &[u32],
+    presence: &[u64],
+    files: &[FileItem],
+    folds: &PartFolds<'_>,
+) -> Vec<u32> {
+    let mut orig = crate::matcher::take_idx_buf();
+    orig.reserve(candidates.len());
+    // Hit indices are file slots. A full mask table is addressed directly.
+    if presence.len() >= files.len() {
+        if folds.n == 1 && folds.np(0).distinct() {
+            let needle_mask = folds.np(0).distinct_mask();
+            let need_hits = folds.np(0).min_hits();
+            let cover = folds.np(0).cover_eq();
+            for (n, &i) in candidates.iter().enumerate() {
+                prefetch_hit_mask(presence, candidates, n);
+                debug_assert!((i as usize) < presence.len());
+                let mask = unsafe { *presence.get_unchecked(i as usize) };
+                let hit = mask & needle_mask;
+                let keep = mask == 0
+                    || if cover {
+                        hit == needle_mask
+                    } else {
+                        hit.count_ones() as usize >= need_hits
+                    };
+                if keep {
+                    orig.push(i);
+                }
+            }
+            return orig;
+        }
+        for (n, &i) in candidates.iter().enumerate() {
+            prefetch_hit_mask(presence, candidates, n);
+            debug_assert!((i as usize) < presence.len());
+            let mask = unsafe { *presence.get_unchecked(i as usize) };
+            if folds.allows(mask) {
+                orig.push(i);
+            }
+        }
+        return orig;
+    }
+    for (n, &i) in candidates.iter().enumerate() {
+        prefetch_hit_mask(presence, candidates, n);
+        let Some(mask) = presence.get(i as usize).copied().or_else(|| {
+            files.get(i as usize).map(|f| f.presence_mask())
+        }) else {
+            continue;
+        };
+        if folds.allows(mask) {
+            orig.push(i);
+        }
+    }
+    orig
+}
+
+enum NarrowPlan {
+    Full,
+    Narrow { orig: crate::matcher::CandList },
+    // Previous hits narrow to nothing: Match(new) is a subset
+    // of old hits (same typos+generation), so it is empty too.
+    Empty,
+}
+
+fn plan_owned(orig: Vec<u32>, files_len: usize) -> NarrowPlan {
+    if orig.is_empty() {
+        crate::matcher::reclaim_idx_buf(orig);
+        NarrowPlan::Empty
+    } else if narrow_pays(orig.len(), files_len) {
+        // The cache holds this same list. A later keystroke does not copy it.
+        NarrowPlan::Narrow {
+            orig: crate::matcher::CandList::Shared(std::sync::Arc::new(orig)),
+        }
+    } else {
+        crate::matcher::reclaim_idx_buf(orig);
+        NarrowPlan::Full
+    }
+}
+
+fn plan_indices(indices: Arc<Vec<u32>>, files_len: usize) -> NarrowPlan {
+    if indices.is_empty() {
+        NarrowPlan::Empty
+    } else if narrow_pays(indices.len(), files_len) {
+        NarrowPlan::Narrow {
+            orig: crate::matcher::CandList::Shared(indices),
+        }
+    } else {
+        NarrowPlan::Full
+    }
+}
+
 // Longest cached prefix of `q` (same typos+generation): serves
 // retype-after-backspace, where history's exact match misses.
-fn longest_prefix<'a>(
-    cache: &'a [BackEntry],
+fn longest_prefix(
+    cache: &[BackEntry],
     q: &str,
     max_typos: u16,
     generation: u64,
-) -> Option<&'a [u32]> {
-    if std::env::var_os("FFF_NO_TRIE").is_some() {
+    constraints_fp: u64,
+    git_constrained: bool,
+    git_epoch: u64,
+) -> Option<Arc<Vec<u32>>> {
+    if no_prefix_history() {
         return None;
     }
     cache
@@ -837,12 +1538,14 @@ fn longest_prefix<'a>(
         .filter(|e| {
             e.generation == generation
                 && e.max_typos == max_typos
+                && e.constraints_fp == constraints_fp
+                && git_epoch_ok(git_constrained, e.git_status_epoch, git_epoch)
                 && !e.query.is_empty()
                 && q.len() > e.query.len()
-                && q.starts_with(e.query.as_str())
+                && q.starts_with(e.query.as_ref())
         })
         .max_by_key(|e| e.query.len())
-        .map(|e| e.candidates.as_slice())
+        .map(|e| Arc::clone(&e.candidates))
 }
 
 impl std::fmt::Debug for FilePicker {
@@ -879,13 +1582,68 @@ impl FFFStringStorage for &FilePicker {
     }
 }
 
+thread_local! {
+    static NARROW_HITS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static NARROW_HIT_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// Working hit indices. Drop parks a larger buffer; publish records capacity for the next take.
+struct ReusedHits(Vec<u32>);
+
+impl ReusedHits {
+    fn take() -> Self {
+        let mut buf = NARROW_HITS.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        buf.clear();
+        let want = NARROW_HIT_CAP.with(|saved| saved.get());
+        if buf.capacity() < want {
+            buf.reserve(want);
+        }
+        Self(buf)
+    }
+
+    fn into_arc(mut self) -> Arc<Vec<u32>> {
+        let cap = self.0.capacity();
+        NARROW_HIT_CAP.with(|saved| {
+            if cap > saved.get() {
+                saved.set(cap);
+            }
+        });
+        Arc::new(std::mem::take(&mut self.0))
+    }
+}
+
+impl std::ops::Deref for ReusedHits {
+    type Target = Vec<u32>;
+    fn deref(&self) -> &Vec<u32> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ReusedHits {
+    fn deref_mut(&mut self) -> &mut Vec<u32> {
+        &mut self.0
+    }
+}
+
+impl Drop for ReusedHits {
+    fn drop(&mut self) {
+        self.0.clear();
+        NARROW_HITS.with(|c| {
+            let mut slot = c.borrow_mut();
+            if self.0.capacity() > slot.capacity() {
+                *slot = std::mem::take(&mut self.0);
+            }
+        });
+    }
+}
+
 impl FilePicker {
     pub fn base_path(&self) -> &Path {
         &self.base_path
     }
 
     pub fn has_git_repo(&self) -> bool {
-        self.sync_data.git_workdir.is_some()
+        self.sync_data.git.is_some()
     }
 
     /// Ignore rules the walker assembled during the last scan (zlob backend
@@ -963,7 +1721,26 @@ impl FilePicker {
     /// Absolute path to the repository root if the indexed tree lives
     /// inside a git working directory. `None` for non-git bases.
     pub fn git_root(&self) -> Option<&Path> {
-        self.sync_data.git_workdir.as_deref()
+        self.sync_data.git.as_ref().map(|git| git.workdir.as_path())
+    }
+
+    /// Path keying the project history: frecency, query history and combo boosts.
+    /// Inside a linked git worktree it is the main checkout twin of the base path.
+    pub fn shared_base_path(&self) -> &Path {
+        self.sync_data
+            .shared_base
+            .as_deref()
+            .unwrap_or(&self.base_path)
+    }
+
+    /// Main checkout twin of `path` when the picker indexes a linked git worktree.
+    pub fn shared_path_for(&self, path: impl AsRef<Path>) -> Option<PathBuf> {
+        let shared_base = self.sync_data.shared_base.as_deref()?;
+        crate::git::shared_twin(path.as_ref(), &self.base_path, shared_base)
+    }
+
+    pub(crate) fn worktree_shared_base(&self) -> Option<&Path> {
+        self.sync_data.shared_base.as_deref()
     }
 
     pub fn has_explicit_cache_budget(&self) -> bool {
@@ -992,6 +1769,9 @@ impl FilePicker {
             acc = acc
                 .wrapping_add(f.presence_mask())
                 .wrapping_add(f.path.byte_len as u64);
+        }
+        for &mask in self.sync_data.presence.as_slice() {
+            acc = acc.wrapping_add(mask);
         }
         std::hint::black_box(acc);
         // Overflow arena FileItems share the same layout.
@@ -1195,6 +1975,9 @@ impl FilePicker {
             trace_id,
             live: parking_lot::Mutex::new(LiveNarrow::default()),
             index_generation: std::sync::atomic::AtomicU64::new(0),
+            git_status_epoch: std::sync::atomic::AtomicU64::new(0),
+            match_cache: parking_lot::Mutex::new(crate::score::MatchCache::default()),
+            scored_page: parking_lot::Mutex::new(None),
             search_epoch: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -1206,7 +1989,10 @@ impl FilePicker {
         shared_frecency: SharedFrecency,
         options: FilePickerOptions,
     ) -> Result<(), Error> {
-        let picker = Self::new(options)?;
+        let mut picker = Self::new(options)?;
+        picker.git_status_worker = crate::git_status_worker::GitStatusWorker::with_pause_flag(
+            shared_picker.git_status_pause_flag(),
+        );
 
         info!(
             "Spawning background threads: base_path={}, warmup={}, content_indexing={}, mode={:?}",
@@ -1286,16 +2072,16 @@ impl FilePicker {
         self.signals.scanning.store(true, Ordering::Relaxed);
         self.scanned_files_count.store(0, Ordering::Relaxed);
 
-        let git_workdir = if self.skip_git {
+        let git = if self.skip_git {
             None
         } else {
-            FileSync::discover_git_workdir(&self.base_path)
+            FileSync::discover_git(&self.base_path)
         };
 
         let empty_frecency = SharedFrecency::default();
         let sync = FileSync::walk_filesystem(
             &self.base_path,
-            git_workdir,
+            git,
             &self.scanned_files_count,
             &empty_frecency,
             self.mode,
@@ -1307,11 +2093,7 @@ impl FilePicker {
 
         // Spawn the status read once the live count is known, so
         // mega-repos skip it instead of joining a uselessly long read.
-        let skip_git = should_skip_git(
-            self.skip_git,
-            self.live_file_count(),
-            git_force(),
-        );
+        let skip_git = should_skip_git(self.skip_git, self.live_file_count(), git_force());
         if !self.skip_git && skip_git {
             info!(
                 live = self.live_file_count(),
@@ -1321,7 +2103,10 @@ impl FilePicker {
         let git_handle = if skip_git {
             None
         } else {
-            self.sync_data.git_workdir.clone().map(FileSync::spawn_git_status)
+            self.sync_data
+                .git
+                .as_ref()
+                .map(|git| FileSync::spawn_git_status(git.workdir.clone()))
         };
 
         if !self.has_explicit_cache_budget {
@@ -1338,20 +2123,30 @@ impl FilePicker {
         if let Some(handle) = git_handle
             && let Ok(Some(git_cache)) = handle.join()
         {
-            let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-
-            let arena = self.arena_base_ptr();
-            for file in self.sync_data.files.iter_mut() {
-                file.set_git_status(git_cache.lookup_status(file.write_absolute_path(
-                    arena,
-                    &self.base_path,
-                    &mut path_buf,
-                )));
+            // Dirty-only cache: a clean file is absent and already starts clean.
+            // An empty map has nothing to store.
+            if git_cache.statuses_len() > 0 {
+                let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+                let arena = self.arena_base_ptr();
+                let mut modified_set_changed = false;
+                for file in self.sync_data.files.iter() {
+                    let next = git_cache.lookup_status(file.write_absolute_path(
+                        arena,
+                        &self.base_path,
+                        &mut path_buf,
+                    ));
+                    if Self::store_git_status(file, next) {
+                        modified_set_changed = true;
+                    }
+                }
+                if modified_set_changed {
+                    self.bump_git_status_epoch();
+                }
             }
         }
 
         if !skip_git
-            && let Some(workdir) = self.sync_data.git_workdir.clone()
+            && let Some(workdir) = self.git_root().map(Path::to_path_buf)
             && let Ok(repo) = Repository::open(&workdir)
                 .inspect_err(|e| debug!(?e, ?workdir, "git recency: failed to open repo"))
         {
@@ -1406,9 +2201,8 @@ impl FilePicker {
         {
             1
         } else if options.max_threads == 0 {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
+            // Same width as the machine profile. The count is read once per process.
+            crate::parallelism::effective_core_count()
         } else {
             options.max_threads
         };
@@ -1427,9 +2221,10 @@ impl FilePicker {
         // Path-store layout stats walk every file, so they are gated separately from
         // FFF_PHASE_TIMING: leaving them on the timing path cost ~560us on a
         // 227k-file query and skewed every phase measurement taken with it.
-        let t_total = std::time::Instant::now();
-        let arena_stats = std::env::var_os("FFF_ARENA_STATS").is_some();
-        if std::env::var_os("FFF_PHASE_TIMING").is_some() {
+        let phase = crate::score::phase_timing();
+        let t_total = phase.then(std::time::Instant::now);
+        let arena_stats = arena_stats_enabled();
+        if phase {
             let m = crate::machine::machine();
             eprintln!(
                 "PHASE machine cores={} phys={} cache_line={} llc_mb={} latency_ns={:.1} read_bytes_per_ns={:.2} work_per_thread={} scan_cap={}",
@@ -1500,7 +2295,7 @@ impl FilePicker {
         // small queries with a large number of results can match absolutely everything
         let max_typos = (effective_query.len() as u16 / 4).clamp(2, 6);
         // Look up the last file selected for this query (combo-boost scoring)
-        let t_tracker = std::time::Instant::now();
+        let t_tracker = phase.then(std::time::Instant::now);
         let last_same_query_entry =
             query_tracker
                 .zip(options.project_path)
@@ -1514,7 +2309,7 @@ impl FilePicker {
                         .ok()
                         .flatten()
                 });
-        let tracker_us = t_tracker.elapsed().as_micros();
+        let tracker_us = t_tracker.map(|t| t.elapsed().as_micros()).unwrap_or(0);
 
         let context = ScoringContext {
             query,
@@ -1526,9 +2321,10 @@ impl FilePicker {
             combo_boost_score_multiplier: options.combo_boost_score_multiplier,
             min_combo_count: options.min_combo_count,
             pagination: options.pagination,
+            check_deleted: self.live_file_count() != files.len(),
         };
 
-        let time = std::time::Instant::now();
+        let time = tracing::enabled!(tracing::Level::INFO).then(std::time::Instant::now);
 
         let base_arena = self.sync_data.arena_base_ptr();
         let overflow_arena = self.sync_data.arena_overflow_ptr();
@@ -1540,123 +2336,139 @@ impl FilePicker {
         // into (file_index, &FileItem) pairs — no clone of the 226k u32
         // candidate vector, and the kept indices stay aligned with the subset
         // so hit mapping is exact even when the presence mask drops items.
-        let mut hit_buf: Vec<u32> = Vec::new();
+        // Narrowing keys on the full raw query: parts[1..] and constraints
+        // change the hit set even when effective_query() does not. The
+        // fingerprint additionally stops an appended constraint (e.g.
+        // `foo` -> `foo *.rs`) from reusing an unfiltered hit set.
+        let query_key = context.query.raw_query;
+        let constraints_fp = constraints_fingerprint(&context.query.constraints);
+        let git_constrained = constraints_use_git_status(&context.query.constraints);
+        // Snapshots taken before the plan. A status refresh moves the git
+        // epoch; those hits must not be published as the next narrow input.
+        let generation_at_start = self.index_generation();
+        let git_epoch_at_start = self.current_git_status_epoch();
+        let (combo_path, combo_open_count) = match context.last_same_query_match.as_ref() {
+            Some(entry) => (
+                Some(entry.file_path.as_os_str().as_encoded_bytes()),
+                entry.open_count,
+            ),
+            None => (None, 0),
+        };
+        let page_key = PageKey {
+            generation: generation_at_start,
+            score_epoch: crate::types::score_input_epoch(),
+            query: query_key,
+            max_typos,
+            constraints_fp,
+            current_file: context.current_file,
+            combo_path,
+            combo_open_count,
+            min_combo_count: context.min_combo_count,
+            combo_multiplier: context.combo_boost_score_multiplier,
+            offset: context.pagination.offset,
+            limit: context.pagination.limit,
+        };
+        // Exact key hit rebuilds the page and skips match, score, and byte offsets.
+        if let Some((items, scores, total_matched, match_byte_offsets, paths)) =
+            self.replay_scored_page(files, &page_key)
+        {
+            info!(
+                ?query,
+                completed_in = ?time.map(|t| t.elapsed()).unwrap_or_default(),
+                total_matched,
+                returned_count = items.len(),
+                pagination = ?options.pagination,
+                "Fuzzy search completed",
+            );
+            return SearchResult {
+                items,
+                scores,
+                match_byte_offsets,
+                paths: Some(paths),
+                total_matched,
+                total_files,
+                location,
+            };
+        }
+        let mut hit_buf = ReusedHits::take();
         // Starts before the narrow plan so the presence-mask prune is included.
-        let t_msa = std::time::Instant::now();
+        let t_msa = phase.then(std::time::Instant::now);
+        // Every matcher part, built once. need < 3 does not read the mask table.
+        let folds = PartFolds::build(context.query, max_typos);
         let (items, scores, total_matched) = {
-            enum NarrowPlan {
+            let masks = self.sync_data.presence.as_slice();
+            // Clone the hit list, then drop the lock before the presence scan.
+            enum Held {
                 Full,
-                Narrow { orig: Vec<u32> },
-                // Previous hits narrow to nothing: Match(new) is a subset
-                // of old hits (same typos+generation), so it is empty too.
-                Empty,
+                Indices(Arc<Vec<u32>>),
+                Filter(Arc<Vec<u32>>),
             }
-            let plan = {
+            let held = {
                 let live = self.live.lock();
                 let can_narrow = live.active
                     && live.max_typos == max_typos
-                    && context.effective_query().len() > live.query.len()
-                    && context.effective_query().starts_with(live.query.as_str())
-                    && live.generation == self.index_generation();
+                    && live.constraints_fp == constraints_fp
+                    && query_key.len() > live.query.len()
+                    && query_key.starts_with(live.query.as_str())
+                    && live.generation == generation_at_start
+                    && git_epoch_ok(
+                        git_constrained,
+                        live.git_status_epoch,
+                        git_epoch_at_start,
+                    );
                 if can_narrow {
-                    // Presence-index prune of the previous hit set before the
-                    // expensive matcher: a longer query only tightens the
-                    // necessary condition, so mask rejects are sound here too.
-                    let new_q = context.effective_query().as_bytes();
-                    let mut orig: Vec<u32> = Vec::with_capacity(live.candidates.len());
-                    for &i in live.candidates.iter() {
-                        if let Some(f) = files.get(i as usize) {
-                            let m = f.presence_mask();
-                            if m == 0 || crate::presence::allows(m, new_q, max_typos) {
-                                orig.push(i);
-                            }
-                        }
-                    }
-                    if cfg!(debug_assertions) || std::env::var_os("FFF_PHASE_TIMING").is_some() {
-                        eprintln!(
-                            "LIVE_NARROW prev={} cand={} masked={}",
-                            live.query,
-                            live.candidates.len(),
-                            orig.len()
-                        );
-                    }
-                    // Narrow on any non-empty subset: even unpruned, the
-                    // subset scorer covers fewer files than a full scan.
-                    // Empty narrows to empty (sound per above); anything
-                    // else falls back to the full corpus scan.
-                    if orig.is_empty() {
-                        NarrowPlan::Empty
-                    } else if orig.len() < live.candidates.len()
-                        && narrow_pays(orig.len(), files.len())
-                    {
-                        NarrowPlan::Narrow { orig }
-                    } else if live.candidates.len() < files.len()
-                        && narrow_pays(live.candidates.len(), files.len())
-                    {
-                        NarrowPlan::Narrow {
-                            orig: live.candidates.clone(),
-                        }
+                    let shared = Arc::clone(&live.candidates);
+                    if folds.n == 0 {
+                        Held::Indices(shared)
                     } else {
-                        NarrowPlan::Full
+                        Held::Filter(shared)
                     }
-                } else if let Some(orig) = live
-                    .history
-                    .iter()
-                    .rfind(|e| {
-                        e.generation == self.index_generation()
-                            && e.max_typos == max_typos
-                            && e.query == context.effective_query()
-                    })
-                    .map(|e| e.candidates.clone())
-                {
-                    // Backspace chain: identical query, typos, and generation
-                    // recompute deterministically over the same hit set.
-                    if orig.is_empty() {
-                        NarrowPlan::Empty
-                    } else if narrow_pays(orig.len(), files.len()) {
-                        NarrowPlan::Narrow { orig }
-                    } else {
-                        NarrowPlan::Full
-                    }
-                } else if let Some(cached) = longest_prefix(
+                } else if let Some(entry) = live.history.iter().rfind(|e| {
+                    e.generation == generation_at_start
+                        && e.max_typos == max_typos
+                        && e.constraints_fp == constraints_fp
+                        && e.query.as_ref() == query_key
+                        && git_epoch_ok(
+                            git_constrained,
+                            e.git_status_epoch,
+                            git_epoch_at_start,
+                        )
+                }) {
+                    Held::Indices(Arc::clone(&entry.candidates))
+                } else if let Some(shared) = longest_prefix(
                     &live.prefix,
-                    context.effective_query(),
+                    query_key,
                     max_typos,
-                    self.index_generation(),
+                    generation_at_start,
+                    constraints_fp,
+                    git_constrained,
+                    git_epoch_at_start,
                 ) {
-                    // Forward retype: a new query extending a visited
-                    // prefix matches a subset of that prefix's hits.
-                    let new_q = context.effective_query().as_bytes();
-                    let mut orig: Vec<u32> = Vec::with_capacity(cached.len());
-                    for &i in cached.iter() {
-                        if let Some(f) = files.get(i as usize) {
-                            let m = f.presence_mask();
-                            if m == 0 || crate::presence::allows(m, new_q, max_typos) {
-                                orig.push(i);
-                            }
-                        }
-                    }
-                    if cfg!(debug_assertions) || std::env::var_os("FFF_PHASE_TIMING").is_some() {
-                        eprintln!("TRIE_NARROW cand={} masked={}", cached.len(), orig.len());
-                    }
-                    if orig.is_empty() {
-                        NarrowPlan::Empty
-                    } else if narrow_pays(orig.len(), files.len()) {
-                        NarrowPlan::Narrow { orig }
+                    if folds.n == 0 {
+                        Held::Indices(shared)
                     } else {
-                        NarrowPlan::Full
+                        Held::Filter(shared)
                     }
                 } else {
-                    NarrowPlan::Full
+                    Held::Full
+                }
+            };
+            let plan = match held {
+                Held::Full => NarrowPlan::Full,
+                Held::Indices(shared) => plan_indices(shared, files.len()),
+                Held::Filter(shared) => {
+                    let orig = filter_hits(&shared, masks, files, &folds);
+                    plan_owned(orig, files.len())
                 }
             };
             match plan {
                 NarrowPlan::Empty => (vec![], vec![], 0),
                 NarrowPlan::Narrow { orig } => {
-                    let mut local_hits: Vec<u32> = Vec::new();
-                    let out = crate::score::with_hit_capture(&mut local_hits, || {
+                    hit_buf.clear();
+                    crate::score::with_hit_capture(&mut hit_buf, || {
                         crate::score::fuzzy_match_and_score_subset(
                             files,
+                            self.sync_data.presence.as_slice(),
                             orig,
                             &context,
                             self.sync_data.base_count,
@@ -1664,15 +2476,15 @@ impl FilePicker {
                             overflow_arena,
                             self.max_path_len(),
                             abort,
+                            Some(&self.match_cache),
+                            generation_at_start,
                         )
-                    });
-                    hit_buf.clear();
-                    hit_buf.extend_from_slice(&local_hits);
-                    out
+                    })
                 }
                 NarrowPlan::Full => crate::score::with_hit_capture(&mut hit_buf, || {
-                    fuzzy_match_and_score_files(
+                    fuzzy_match_and_score_files_presence(
                         files,
+                        self.sync_data.presence.as_slice(),
                         &context,
                         self.sync_data.base_count,
                         base_arena,
@@ -1684,60 +2496,94 @@ impl FilePicker {
             }
         };
 
-        {
+        // A cancelled search returns whatever groups finished. Those indices
+        // are not a superset, so they must not arm the next keystroke.
+        if !abort.aborted() {
             let mut live = self.live.lock();
-            live.generation = self.index_generation();
-            live.query = context.effective_query().to_string();
-            live.max_typos = max_typos;
-            live.active = !hit_buf.is_empty();
-            // Move, don't copy — hit_buf is dead after this.
-            live.candidates = hit_buf;
-            // Backspace chain: remember this hit set under its query.
-            // Depth-bounded (8 x <= full-corpus u32s); stale generations
-            // never match and age out. Full-corpus sets narrow to nothing.
-            let q = context.effective_query();
-            live.history
-                .retain(|e| e.query != q || e.max_typos != max_typos);
-            if fuzzy_ran && narrow_pays(live.candidates.len(), files.len()) {
-                let snapshot = live.candidates.clone();
-                let generation = live.generation;
-                live.history.push(BackEntry {
-                    query: q.to_string(),
-                    max_typos,
-                    generation,
-                    candidates: snapshot,
-                });
-                while live.history.len() > 8 {
-                    live.history.remove(0);
+            let git_hits_current = !git_constrained
+                || self.current_git_status_epoch() == git_epoch_at_start;
+            if self.index_generation() == generation_at_start && git_hits_current {
+                live.generation = generation_at_start;
+                live.git_status_epoch = git_epoch_at_start;
+                // Same keystroke text keeps this buffer and the history Arc.
+                if live.query.as_str() != query_key {
+                    live.query.clear();
+                    live.query.push_str(query_key);
                 }
-            }
-            // Prefix cache for forward retype: small selective sets only
-            // (64k u32s ~= 256KB per entry, 8 entries ~= 2MB worst case).
-            if fuzzy_ran && !live.candidates.is_empty() && live.candidates.len() <= 65_536 {
-                live.prefix
-                    .retain(|e| e.query != q || e.max_typos != max_typos);
-                let generation = live.generation;
-                let snapshot = live.candidates.clone();
-                live.prefix.push(BackEntry {
-                    query: q.to_string(),
-                    max_typos,
-                    generation,
-                    candidates: snapshot,
-                });
-                while live.prefix.len() > 8 {
-                    live.prefix.remove(0);
+                live.max_typos = max_typos;
+                live.constraints_fp = constraints_fp;
+                live.active = !hit_buf.is_empty();
+                // Move the indices into the Arc. The next search does not write that Arc.
+                live.candidates = hit_buf.into_arc();
+                // Backspace reuses this hit set. Stale generations never match.
+                let q = query_key;
+                let store_history = fuzzy_ran && narrow_pays(live.candidates.len(), files.len());
+                let store_prefix = fuzzy_ran
+                    && !live.candidates.is_empty()
+                    && live.candidates.len() <= 65_536;
+                let query_owned = if store_history || store_prefix {
+                    Some(
+                        live.history
+                            .iter()
+                            .chain(live.prefix.iter())
+                            .find(|e| e.query.as_ref() == q)
+                            .map(|e| Arc::clone(&e.query))
+                            .unwrap_or_else(|| Arc::<str>::from(q)),
+                    )
+                } else {
+                    None
+                };
+                live.history
+                    .retain(|e| e.query.as_ref() != q || e.max_typos != max_typos);
+                if let Some(query_owned) = query_owned {
+                    let snapshot = Arc::clone(&live.candidates);
+                    let generation = live.generation;
+                    let git_status_epoch = live.git_status_epoch;
+                    if store_history {
+                        live.history.push(BackEntry {
+                            query: Arc::clone(&query_owned),
+                            max_typos,
+                            generation,
+                            constraints_fp,
+                            git_status_epoch,
+                            candidates: Arc::clone(&snapshot),
+                        });
+                        while live.history.len() > 8 {
+                            live.history.remove(0);
+                        }
+                    }
+                    if store_prefix {
+                        live.prefix
+                            .retain(|e| e.query.as_ref() != q || e.max_typos != max_typos);
+                        live.prefix.push(BackEntry {
+                            query: query_owned,
+                            max_typos,
+                            generation,
+                            constraints_fp,
+                            git_status_epoch,
+                            candidates: snapshot,
+                        });
+                        while live.prefix.len() > 8 {
+                            live.prefix.remove(0);
+                        }
+                    }
                 }
             }
         }
         // `msa_us` covers match+score, including the narrow plan above.
-        let msa_us = t_msa.elapsed().as_micros();
+        let msa_us = t_msa.map(|t| t.elapsed().as_micros()).unwrap_or(0);
         let post_us = msa_us;
-        let t_offsets = std::time::Instant::now();
-        let match_byte_offsets =
-            fuzzy_match_byte_offsets_for_page(query, &items, max_typos, base_arena, overflow_arena);
-        if std::env::var_os("FFF_PHASE_TIMING").is_some() {
-            let now_us = t_total.elapsed().as_micros();
-            let offsets_us = t_offsets.elapsed().as_micros();
+        let paths = self.snapshot_paths(&items);
+        let t_offsets = phase.then(std::time::Instant::now);
+        let match_byte_offsets = fuzzy_match_byte_offsets_for_page(
+            query,
+            &paths.bytes,
+            &paths.rows,
+            max_typos,
+        );
+        if phase {
+            let now_us = t_total.map(|t| t.elapsed().as_micros()).unwrap_or(0);
+            let offsets_us = t_offsets.map(|t| t.elapsed().as_micros()).unwrap_or(0);
             eprintln!(
                 "PHASE total_us={now_us} msa_us={post_us} post_us={} tracker_us={tracker_us} offsets_us={offsets_us} page={}",
                 now_us.saturating_sub(post_us + offsets_us + tracker_us),
@@ -1745,9 +2591,22 @@ impl FilePicker {
             );
         }
 
+        let scores = std::sync::Arc::new(scores);
+        let match_byte_offsets = std::sync::Arc::new(match_byte_offsets);
+        self.remember_scored_page(
+            abort,
+            files,
+            &items,
+            &scores,
+            &match_byte_offsets,
+            &paths,
+            total_matched,
+            &page_key,
+        );
+
         info!(
             ?query,
-            completed_in = ?time.elapsed(),
+            completed_in = ?time.map(|t| t.elapsed()).unwrap_or_default(),
             total_matched,
             returned_count = items.len(),
             pagination = ?options.pagination,
@@ -1758,6 +2617,7 @@ impl FilePicker {
             items,
             scores,
             match_byte_offsets,
+            paths: Some(paths),
             total_matched,
             total_files,
             location,
@@ -1775,9 +2635,7 @@ impl FilePicker {
         let _query = crate::parallelism::QueryActiveGuard::new();
         let dirs = self.get_dirs();
         let max_threads = if options.max_threads == 0 {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
+            crate::parallelism::effective_core_count()
         } else {
             options.max_threads
         };
@@ -1802,18 +2660,19 @@ impl FilePicker {
             combo_boost_score_multiplier: 0,
             min_combo_count: 0,
             pagination: options.pagination,
+            check_deleted: true,
         };
 
         let arena = self.sync_data.arena_base_ptr();
         let overflow_arena = self.sync_data.arena_overflow_ptr();
-        let time = std::time::Instant::now();
+        let time = tracing::enabled!(tracing::Level::INFO).then(std::time::Instant::now);
 
         let (items, scores, total_matched) =
             crate::score::fuzzy_match_and_score_dirs(dirs, &context, arena, overflow_arena);
 
         info!(
             ?query,
-            completed_in = ?time.elapsed(),
+            completed_in = ?time.map(|t| t.elapsed()).unwrap_or_default(),
             total_matched,
             returned_count = items.len(),
             "Directory search completed",
@@ -1908,7 +2767,7 @@ impl FilePicker {
             },
             ..options
         };
-        let file_results = self.fuzzy_search(query, query_tracker, file_options);
+        let mut file_results = self.fuzzy_search(query, query_tracker, file_options);
 
         // Merge by score descending.
         let total_matched = file_results.total_matched + dir_results.total_matched;
@@ -1918,7 +2777,10 @@ impl FilePicker {
         let mut merged: Vec<(MixedItemRef<'_>, Score)> =
             Vec::with_capacity(file_results.items.len() + dir_results.items.len());
 
-        for (file, score) in file_results.items.into_iter().zip(file_results.scores) {
+        for (file, score) in std::mem::take(&mut file_results.items)
+            .into_iter()
+            .zip(file_results.scores.iter().cloned())
+        {
             merged.push((MixedItemRef::File(file), score));
         }
         for (dir, score) in dir_results.items.into_iter().zip(dir_results.scores) {
@@ -1968,7 +2830,7 @@ impl FilePicker {
     ) -> SearchResult<'p> {
         let query = FFFQuery {
             raw_query: pattern,
-            constraints: vec![fff_query_parser::Constraint::Glob(pattern)],
+            constraints: std::iter::once(fff_query_parser::Constraint::Glob(pattern)).collect(),
             fuzzy_query: fff_query_parser::FuzzyQuery::Empty,
             location: None,
         };
@@ -2146,20 +3008,38 @@ impl FilePicker {
 
         let mode = self.mode;
         let bp = self.base_path.clone();
+        let shared_base = self.sync_data.shared_base.clone();
         let frecency = shared_frecency.read()?;
+        let reader = frecency.as_ref().map(FrecencyTracker::reader);
+        let basis = reader.as_ref().map(|r| r.modification_basis(mode));
 
+        let mut modified_set_changed = false;
         status_cache
             .into_iter()
             .try_for_each(|(path, status)| -> Result<(), Error> {
-                if let Some((arena, file)) = self.get_mut_file_by_path(&path) {
-                    file.set_git_status(Some(status));
-                    if let Some(ref f) = *frecency {
-                        file.update_frecency_scores(f, arena, &bp, mode)?;
+                let index = self.sync_data.find_file_index(&path, &self.base_path);
+                if let Some(index) = index
+                    && let Some(file) = self.sync_data.files().get(index)
+                {
+                    let arena = self.sync_data.arena_for_file(file);
+                    if Self::store_git_status(file, Some(status)) {
+                        modified_set_changed = true;
                     }
-                    // Update parent dir frecency inline. `DirItem` has an
-                    // interior-mutable atomic score, so `&self` access is
-                    // enough — no write aliasing against Arc clones.
-                    let score = file.access_frecency_score as i32;
+                    // Score just stored is returned. No tracker: read the word on the file.
+                    let score = if let (Some(reader), Some(basis)) =
+                        (reader.as_ref(), basis.as_ref())
+                    {
+                        file.update_frecency_scores(
+                            reader,
+                            arena,
+                            &bp,
+                            shared_base.as_deref(),
+                            mode,
+                            basis,
+                        )
+                    } else {
+                        file.access_frecency_score() as i32
+                    };
                     let dir_idx = file.parent_dir_index as usize;
                     if let Some(dir) = self.sync_data.dirs.get(dir_idx) {
                         dir.update_frecency_if_larger(score);
@@ -2173,6 +3053,12 @@ impl FilePicker {
                 Ok(())
             })?;
 
+        if modified_set_changed {
+            // Git filters key the status epoch. The file-set generation stays
+            // so the path-match memo and non-git hit sets remain valid.
+            self.bump_git_status_epoch();
+        }
+
         Ok(())
     }
 
@@ -2183,8 +3069,11 @@ impl FilePicker {
             return;
         }
 
-        for file in self.sync_data.files.iter_mut() {
-            file.git_recency_score = 0;
+        for file in self.sync_data.files.iter() {
+            // Most files stay at zero; a relaxed load avoids dirtying the line.
+            if file.git_recency_score() != 0 {
+                file.set_git_recency_score(0);
+            }
         }
 
         let Some(scores) = scores else { return };
@@ -2192,9 +3081,9 @@ impl FilePicker {
         let mut applied = 0usize;
         for (relative_path, score) in scores {
             if let Some(index) = self.sync_data.find_by_relative_path(relative_path)
-                && let Some((_, file)) = self.sync_data.get_file_mut(index)
+                && let Some(file) = self.sync_data.files().get(index)
             {
-                file.git_recency_score = *score;
+                file.set_git_recency_score(*score);
                 applied += 1;
             }
         }
@@ -2213,11 +3102,20 @@ impl FilePicker {
             return Ok(());
         };
 
-        if let Some((arena, file)) = self.sync_data.get_file_mut(index) {
-            file.update_frecency_scores(frecency_tracker, arena, &self.base_path, self.mode)?;
+        let shared_base = self.sync_data.shared_base.clone();
+        if let Some(file) = self.sync_data.files().get(index) {
+            let arena = self.sync_data.arena_for_file(file);
+            let reader = frecency_tracker.reader();
+            let basis = reader.modification_basis(self.mode);
+            let score = file.update_frecency_scores(
+                &reader,
+                arena,
+                &self.base_path,
+                shared_base.as_deref(),
+                self.mode,
+                &basis,
+            );
 
-            // Update parent dir frecency inline (atomic, &self access).
-            let score = file.access_frecency_score as i32;
             let dir_idx = file.parent_dir_index as usize;
             if let Some(dir) = self.sync_data.dirs.get(dir_idx) {
                 dir.update_frecency_if_larger(score);
@@ -2281,7 +3179,7 @@ impl FilePicker {
             }
         };
 
-        let (_arena, file) = self.sync_data.get_file_mut(pos)?;
+        let file = self.sync_data.files().get(pos)?;
 
         let size = metadata.len();
         let modified_time = metadata
@@ -2355,11 +3253,9 @@ impl FilePicker {
         let (mut file_item, rel_path) =
             FileItem::new(path_for_index.to_path_buf(), &self.base_path, None);
 
-        // we have to perform manual classification for every new file this will be
-        // batched during the scan, this is the path when the file is ad-hoc added to the sync
-        file_item.detect_binary_per_byte(
+        // One read classifies and records the mask. Mask 0 stays unknown.
+        let mask = file_item.detect_binary_per_byte(
             path_for_index,
-            // inline chunk buf
             &mut [0u8; crate::types::BINARY_CLASSIFICATION_CHUNK_SIZE],
         );
 
@@ -2369,7 +3265,8 @@ impl FilePicker {
         });
 
         file_item.set_path(builder.add_file_immediate(&rel_path, file_item.path.filename_offset));
-        file_item.set_presence(crate::presence::mask_of(rel_path.as_bytes()));
+        let presence = crate::presence::mask_of(rel_path.as_bytes());
+        file_item.set_presence(presence);
         file_item.set_overflow(true);
 
         // Keep the dir table consistent: register (or revive) the parent dir
@@ -2388,6 +3285,9 @@ impl FilePicker {
         if !self.sync_data.files.push(file_item) {
             return None;
         }
+        let new_index = self.sync_data.files.len() - 1;
+        self.sync_data.content_masks.set(new_index, mask);
+        self.sync_data.presence.push(presence);
         self.sync_data.max_path_len.observe(new_path_len);
 
         self.sync_data.live_count += 1;
@@ -2399,7 +3299,7 @@ impl FilePicker {
     }
 
     fn tombstone_file(&mut self, index: usize) {
-        let file = &mut self.sync_data.files[index];
+        let file = &self.sync_data.files[index];
         if file.is_deleted() {
             return;
         }
@@ -2427,7 +3327,7 @@ impl FilePicker {
     }
 
     fn untombstone_file(&mut self, index: usize) {
-        let file = &mut self.sync_data.files[index];
+        let file = &self.sync_data.files[index];
         if !file.is_deleted() {
             return;
         }
@@ -2529,7 +3429,7 @@ impl FilePicker {
         let base_arena = self.sync_data.arena_base_ptr();
         let overflow_arena = self.sync_data.arena_overflow_ptr();
         let mut tombstoned = 0usize;
-        for (idx, file) in self.sync_data.files.iter_mut().enumerate() {
+        for (idx, file) in self.sync_data.files.iter().enumerate() {
             if file.is_deleted() {
                 continue;
             }
@@ -2610,6 +3510,7 @@ impl FilePicker {
     /// paths that still carry 8.3 short names or a different casing would
     /// fail a naive prefix check. Fall back to canonicalizing (or, when the
     /// file was just deleted, canonicalizing its parent) before stripping.
+    #[allow(clippy::needless_return)]
     fn to_relative_path<'a>(&self, path: &'a Path) -> Option<std::borrow::Cow<'a, str>> {
         if let Ok(stripped) = path.strip_prefix(&self.base_path)
             && let Some(s) = stripped.to_str()
@@ -2725,28 +3626,25 @@ pub struct ScanProgress {
 }
 
 impl FileSync {
-    pub(crate) fn discover_git_workdir(base_path: &Path) -> Option<PathBuf> {
-        // `discover` walks ancestors. A corpus staged under another repo
-        // (e.g. .fff-bench/cache/...) would inherit that parent git and
-        // change hidden/gitignore indexing vs a Temp freeze. Prefer the
-        // repo at base_path itself; otherwise keep monorepo-subdir behavior.
-        if base_path.join(".git").exists() {
-            return Repository::open(base_path).ok().and_then(|r| {
-                r.workdir()
-                    .map(|w| crate::path_utils::normalize(w.to_path_buf()))
-            });
-        }
-        let git_workdir = Repository::discover(base_path)
-            .ok()
-            .and_then(|repo| repo.workdir().map(Path::to_path_buf))
-            .map(crate::path_utils::normalize);
-
-        match &git_workdir {
-            Some(workdir) => debug!("Git repository found at: {}", workdir.display()),
+    pub(crate) fn discover_git(base_path: &Path) -> Option<GitDiscovery> {
+        // `discover` walks ancestors: a corpus staged under another repo would
+        // inherit that parent git and change hidden/gitignore indexing. Prefer
+        // the repo at base_path itself, else keep monorepo-subdir behavior.
+        let git = if base_path.join(".git").exists() {
+            Repository::open(base_path)
+                .ok()
+                .and_then(GitDiscovery::from_repo)
+        } else {
+            GitDiscovery::discover(base_path)
+        };
+        match &git {
+            Some(git) => {
+                debug!(workdir = ?git.workdir, git_dir = ?git.git_dir, "Git repository found")
+            }
             None => warn!("No git repository found for path: {}", base_path.display()),
         }
 
-        git_workdir
+        git
     }
 
     pub(crate) fn spawn_git_status(git_workdir: PathBuf) -> JoinHandle<Option<GitStatusCache>> {
@@ -2764,7 +3662,7 @@ impl FileSync {
     #[tracing::instrument(skip_all, name = "walk_filesystem", level = Level::INFO)]
     pub(crate) fn walk_filesystem(
         base_path: &Path,
-        git_workdir: Option<PathBuf>,
+        git: Option<GitDiscovery>,
         synced_files_count: &Arc<AtomicUsize>,
         shared_frecency: &SharedFrecency,
         mode: FFFMode,
@@ -2774,44 +3672,57 @@ impl FileSync {
         info!("SCAN: Starting filesystem walk and git status (async)");
 
         // Walk files (the fast part, typically 2-3s even on huge repos).
-        let is_git_repo = git_workdir.is_some();
+        let is_git_repo = git.is_some();
+        let shared_base = git.as_ref().and_then(|git| git.shared_base(base_path));
+        if let Some(shared_base) = &shared_base {
+            info!(
+                ?shared_base,
+                "Linked git worktree, sharing the main checkout history"
+            );
+        }
         // Limit walk parallelism: the ignore walker spawns its own workers and
         // coexisting with the BG pool inflates scan peak RSS on flat corpora.
         let bg_threads = BACKGROUND_THREAD_POOL.current_num_threads().min(4);
 
-        let WalkOutput {
-            dirs: mut walked_dirs,
-            mut pairs,
-            ignore_rules,
-        } = crate::walk::walk_collect_files(
+        let (buffers, mut pairs, mut walked_dirs, ignore_rules) = crate::walk::walk_collect_files(
             base_path,
             is_git_repo,
             follow_symlinks,
             bg_threads,
             synced_files_count,
-        )?;
+        )?
+        .into_parts();
         let ignore_rules = ignore_rules.map(Arc::new);
 
         // group walked dirs and files with a dir part to the same order
         crate::parallelism::run_on_bg_pool(|| {
             rayon::join(
                 || {
-                    pairs.par_sort_unstable_by(|(a, path_a), (b, path_b)| {
-                        // SAFETY: `filename_offset` is always at a character boundary
+                    pairs.par_sort_unstable_by(|(a, span_a), (b, span_b)| {
+                        // `filename_offset` is a char boundary in the stored UTF-8.
+                        let path_a = crate::walk::span_bytes(&buffers, *span_a);
+                        let path_b = crate::walk::span_bytes(&buffers, *span_b);
                         let (a_dir, a_file) = path_a.split_at(a.path.filename_offset as usize);
                         let (b_dir, b_file) = path_b.split_at(b.path.filename_offset as usize);
                         a_dir.cmp(b_dir).then_with(|| a_file.cmp(b_file))
                     });
                 },
-                || walked_dirs.par_sort_unstable(),
+                || {
+                    walked_dirs.par_sort_unstable_by(|a, b| {
+                        crate::walk::span_bytes(&buffers, *a).cmp(crate::walk::span_bytes(&buffers, *b))
+                    });
+                },
             );
         });
-        walked_dirs.dedup();
+        walked_dirs.dedup_by(|a, b| {
+            crate::walk::span_bytes(&buffers, *a) == crate::walk::span_bytes(&buffers, *b)
+        });
 
         let mut builder = crate::simd_path::ChunkedPathStoreBuilder::new(pairs.len());
         let (mut files, dirs) =
-            populates_dirs_files_chunked_storage(pairs, &walked_dirs, &mut builder);
+            populates_dirs_files_chunked_storage(&buffers, pairs, &walked_dirs, &mut builder);
         drop(walked_dirs);
+        drop(buffers);
         let chunked_paths = builder.finish();
         let arena = chunked_paths.as_arena_ptr();
 
@@ -2824,31 +3735,22 @@ impl FileSync {
         if let Some(frecency) = frecency.as_ref()
             && !frecency.is_empty()
         {
-            // Batch hydration in chunks: one LMDB read txn per chunk, no
-            // per-file canonicalize. Chunking bounds peak RSS and page-fault
-            // churn on 200k+ trees (4T fault spikes in paired runs).
-            const FREQ_CHUNK: usize = 8 * 1024;
-            let mut offset = 0;
-            while offset < files.len() {
-                let end = (offset + FREQ_CHUNK).min(files.len());
-                let hashes: Vec<[u8; 32]> = crate::parallelism::run_on_bg_pool(|| {
-                    files[offset..end]
-                        .par_iter()
-                        .map(|file| {
-                            let mut abs_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
-                            let abs = file.write_absolute_path(arena, base_path, &mut abs_buf);
-                            FrecencyTracker::path_hash_raw(abs).unwrap_or([0u8; 32])
-                        })
-                        .collect()
-                });
-                let scores = frecency.get_access_scores_for_hashes(&hashes, mode);
+            if let Some(shared_base) = shared_base.as_deref() {
+                // Linked worktree: per-file scoring resolves the main-checkout
+                // twin, which batch-by-hash lookup cannot express.
                 let dirs_ref = &dirs;
-                crate::parallelism::run_on_bg_pool(|| {
-                    files[offset..end].par_iter_mut().zip(scores).for_each(
-                        |(file, access_score)| {
-                            file.set_access_frecency_score(access_score);
-                            file.set_modification_frecency_score(frecency, mode);
-                            let score = file.access_frecency_score as i32;
+                BACKGROUND_THREAD_POOL.install(|| {
+                    files.par_iter_mut().for_each_init(
+                        || frecency.reader(),
+                        |reader, file| {
+                            // Status is unset in this pass; modification stays 0.
+                            let score = file.update_access_frecency_score(
+                                reader,
+                                arena,
+                                base_path,
+                                Some(shared_base),
+                                mode,
+                            );
                             if score > 0 {
                                 let dir_idx = file.parent_dir_index as usize;
                                 if let Some(dir) = dirs_ref.get(dir_idx) {
@@ -2858,7 +3760,44 @@ impl FileSync {
                         },
                     );
                 });
-                offset = end;
+            } else {
+                // Batch hydration in chunks: one LMDB read txn per chunk, no
+                // per-file canonicalize. Chunking bounds peak RSS and page-fault
+                // churn on 200k+ trees (4T fault spikes in paired runs).
+                const FREQ_CHUNK: usize = 8 * 1024;
+                let mut offset = 0;
+                while offset < files.len() {
+                    let end = (offset + FREQ_CHUNK).min(files.len());
+                    let hashes: Vec<[u8; 32]> = crate::parallelism::run_on_bg_pool(|| {
+                        files[offset..end]
+                            .par_iter()
+                            .map(|file| {
+                                let mut abs_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+                                let abs = file.write_absolute_path(arena, base_path, &mut abs_buf);
+                                FrecencyTracker::path_hash_raw(abs).unwrap_or([0u8; 32])
+                            })
+                            .collect()
+                    });
+                    let scores = frecency.get_access_scores_for_hashes(&hashes, mode);
+                    let dirs_ref = &dirs;
+                    crate::parallelism::run_on_bg_pool(|| {
+                        files[offset..end].par_iter_mut().zip(scores).for_each(
+                            |(file, access_score)| {
+                                let stored = access_score as i16;
+                                file.set_access_frecency_score(stored);
+                                // Status is unset here, so the modification word stays 0.
+                                let score = stored as i32;
+                                if score > 0 {
+                                    let dir_idx = file.parent_dir_index as usize;
+                                    if let Some(dir) = dirs_ref.get(dir_idx) {
+                                        dir.update_frecency_if_larger(score);
+                                    }
+                                }
+                            },
+                        );
+                    });
+                    offset = end;
+                }
             }
         }
         drop(frecency);
@@ -2866,21 +3805,18 @@ impl FileSync {
         // un-indexable files that are binary or not fitting the size cap has to beplaced in the end
         let is_indexable = |f: &FileItem| {
             !f.is_binary()
-                && f.size > 0
-                && f.size <= crate::constants::MAX_INDEXABLE_FILE_SIZE as u64
+                && f.size() > 0
+                && f.size() <= crate::constants::MAX_INDEXABLE_FILE_SIZE as u64
         };
 
-        // Sort order is (indexable, parent_dir, filename).
-        // The O(n) compact is not enough: `par_sort_unstable_by` on
-        // file_name(arena) is not the same key as the walk-path sort, and
-        // downstream binary_search / match index maps assume this order.
-        // Thread-local scratch keeps the RSS win vs sort_by_key's O(n) temp.
+        // Sort order is (indexable, parent_dir, filename). Downstream
+        // binary_search assumes this order; filename cmp does not allocate.
         BACKGROUND_THREAD_POOL.install(|| {
             files.par_sort_unstable_by(|a, b| {
                 (!is_indexable(a))
                     .cmp(&(!is_indexable(b)))
                     .then_with(|| a.parent_dir_index.cmp(&b.parent_dir_index))
-                    .then_with(|| a.file_name(arena).cmp(&b.file_name(arena)))
+                    .then_with(|| a.path.cmp_filename(arena, &b.path))
             });
         });
         let indexable_count = files.partition_point(is_indexable);
@@ -2915,7 +3851,12 @@ impl FileSync {
         let scanned_max_path_len = files.iter().map(|f| f.path.byte_len).max().unwrap_or(0);
         let max_path_len = Arc::new(PathLenCache::new());
         max_path_len.observe(scanned_max_path_len);
-        let content_masks = Arc::new(ContentMaskStore::with_capacity(files.len()));
+        // Spare slots so a file added later keeps the mask from its one read.
+        let content_masks = Arc::new(ContentMaskStore::with_capacity(
+            files.len().saturating_add(MAX_OVERFLOW_FILES),
+        ));
+        let mut presence = crate::types::PresenceTable::from_files(&files);
+        presence.reserve_additional(MAX_OVERFLOW_FILES);
 
         Ok(FileSync {
             files: StableVec::from_vec_with_reserve(files, MAX_OVERFLOW_FILES),
@@ -2924,11 +3865,13 @@ impl FileSync {
             live_count: base_count,
             max_path_len,
             content_masks,
+            presence,
             dirs: StableVec::from_vec_with_reserve(dirs, MAX_OVERFLOW_FILES),
             base_dirs_count,
             live_dirs_count: base_dirs_count,
             overflow_builder: None,
-            git_workdir,
+            git,
+            shared_base,
             bigram_index: None,
             bigram_overlay: None,
             chunked_paths: Some(Arc::new(chunked_paths)),
@@ -2951,8 +3894,8 @@ pub(crate) fn warmup_mmaps(
     for file in files.iter() {
         if file.is_likely_hot()
             || file.is_binary()
-            || file.size == 0
-            || file.size > budget.max_file_size
+            || file.size() == 0
+            || file.size() > budget.max_file_size
         {
             continue;
         }
@@ -2971,8 +3914,9 @@ pub(crate) fn warmup_mmaps(
 /// deduped), merging file parents in a single lockstep sweep so dirs with no
 /// files (empty subtrees, pure ancestors) are indexed and searchable too.
 fn populates_dirs_files_chunked_storage(
-    pairs: Vec<(FileItem, String)>,
-    walked_dirs: &[String],
+    buffers: &[Vec<u8>],
+    pairs: Vec<(FileItem, WalkSpan)>,
+    walked_dirs: &[WalkSpan],
     chunk_storage: &mut crate::simd_path::ChunkedPathStoreBuilder,
 ) -> (Vec<FileItem>, Vec<DirItem>) {
     let mut dirs: Vec<DirItem> = Vec::with_capacity(walked_dirs.len() + 1);
@@ -2981,7 +3925,7 @@ fn populates_dirs_files_chunked_storage(
     // Root-level files sort first and their "" parent is never a walker dir.
     if pairs
         .first()
-        .is_some_and(|(f, _): &(FileItem, String)| f.path.filename_offset == 0)
+        .is_some_and(|(f, _)| f.path.filename_offset == 0)
     {
         push_dir_item(&mut dirs, chunk_storage, "");
     }
@@ -2993,27 +3937,40 @@ fn populates_dirs_files_chunked_storage(
     let mut current_dir_idx: u32 = 0;
 
     let mut out_files: Vec<FileItem> = Vec::with_capacity(pairs.len());
-    for (mut file, rel) in pairs {
+    for (mut file, span) in pairs {
+        let rel = crate::walk::span_path(buffers, span);
         let dir_part: &str = &rel[..file.path.filename_offset as usize];
 
         if prev_dir != dir_part {
             // Flush walked dirs up to and including this file's parent,
             // keeping the table sorted for the find_dir_index binary search.
-            while let Some(dir) = dir_iter.peek()
-                && dir.as_str() < dir_part
-            {
-                push_dir_item(&mut dirs, chunk_storage, dir);
+            loop {
+                let Some(span) = dir_iter.peek().map(|s| **s) else {
+                    break;
+                };
+                let dir = crate::walk::span_path(buffers, span);
+                if dir >= dir_part {
+                    break;
+                }
                 dir_iter.next();
+                push_dir_item(&mut dirs, chunk_storage, dir);
             }
 
-            match dir_iter.peek() {
-                Some(dir) if dir.as_str() == dir_part => {
-                    push_dir_item(&mut dirs, chunk_storage, dir);
-                    dir_iter.next();
-                }
+            if dir_iter
+                .peek()
+                .map(|s| **s)
+                .is_some_and(|span| crate::walk::span_path(buffers, span) == dir_part)
+            {
+                let span = dir_iter.next().unwrap();
+                push_dir_item(
+                    &mut dirs,
+                    chunk_storage,
+                    crate::walk::span_path(buffers, *span),
+                );
+            } else {
                 // Parents the walker reported with a non-dir kind
                 // (e.g. followed symlinks) aren't in the list.
-                _ => push_dir_item(&mut dirs, chunk_storage, dir_part),
+                push_dir_item(&mut dirs, chunk_storage, dir_part);
             }
 
             current_dir_idx = (dirs.len() - 1) as u32;
@@ -3031,7 +3988,7 @@ fn populates_dirs_files_chunked_storage(
     }
 
     for dir in dir_iter {
-        push_dir_item(&mut dirs, chunk_storage, dir);
+        push_dir_item(&mut dirs, chunk_storage, crate::walk::span_path(buffers, *dir));
     }
 
     (out_files, dirs)
@@ -3348,28 +4305,50 @@ mod tests {
 
     #[test]
     fn dir_table_merges_walked_dirs_with_file_parents() {
-        let mut pairs: Vec<(FileItem, String)> = ["src/main.rs", "src/deep/lib.rs", "root.txt"]
+        let mut bytes = Vec::new();
+        let mut pairs: Vec<(FileItem, WalkSpan)> = ["src/main.rs", "src/deep/lib.rs", "root.txt"]
             .iter()
             .map(|p| {
                 let (item, rel) = FileItem::new(PathBuf::from(p), Path::new(""), None);
-                (item, rel)
+                let off = bytes.len() as u32;
+                bytes.extend_from_slice(rel.as_bytes());
+                (
+                    item,
+                    WalkSpan {
+                        buf: 0,
+                        off,
+                        len: rel.len() as u32,
+                    },
+                )
             })
             .collect();
-        pairs.sort_by(|(a, pa), (b, pb)| {
-            pa[..a.path.filename_offset as usize]
-                .cmp(&pb[..b.path.filename_offset as usize])
-                .then_with(|| pa.cmp(pb))
-        });
+        {
+            let file_bufs = std::slice::from_ref(&bytes);
+            pairs.sort_by(|(a, sa), (b, sb)| {
+                let pa = crate::walk::span_bytes(file_bufs, *sa);
+                let pb = crate::walk::span_bytes(file_bufs, *sb);
+                pa[..a.path.filename_offset as usize]
+                    .cmp(&pb[..b.path.filename_offset as usize])
+                    .then_with(|| pa.cmp(pb))
+            });
+        }
 
         // Sorted '/'-terminated walker output: file parents + an empty dir +
         // a sibling sharing a prefix with a file parent.
-        let walked: Vec<String> = ["empty/", "src/", "src/deep/", "src/deeper/"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let mut walked = Vec::new();
+        for s in ["empty/", "src/", "src/deep/", "src/deeper/"] {
+            let off = bytes.len() as u32;
+            bytes.extend_from_slice(s.as_bytes());
+            walked.push(WalkSpan {
+                buf: 0,
+                off,
+                len: s.len() as u32,
+            });
+        }
 
         let mut builder = crate::simd_path::ChunkedPathStoreBuilder::new(pairs.len());
-        let (files, dirs) = populates_dirs_files_chunked_storage(pairs, &walked, &mut builder);
+        let (files, dirs) =
+            populates_dirs_files_chunked_storage(std::slice::from_ref(&bytes), pairs, &walked, &mut builder);
         let store = builder.finish();
         let arena = store.as_arena_ptr();
 
@@ -3442,6 +4421,65 @@ mod tests {
         assert!(picker.get_file_by_path(&kept).is_some());
     }
 
+    /// A live post-scan snapshot aliases the file buffer, so `get_file_mut`
+    /// must refuse mutable access. Watcher/frecency paths must still update
+    /// metadata through the per-entry atomics, and appended overflow files
+    /// must remain visible; otherwise the snapshot window silently loses
+    /// filesystem events (C-004).
+    #[test]
+    fn post_scan_snapshot_keeps_watcher_updates_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_buf = crate::path_utils::canonicalize(dir.path()).unwrap();
+        let base = base_buf.as_path();
+        let existing = base.join("src/existing.rs");
+        std::fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        std::fs::write(&existing, b"x").unwrap();
+
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        let idx = picker
+            .sync_data
+            .find_file_index(&existing, base)
+            .expect("scanned file must be indexed");
+        assert_eq!(picker.get_file_by_path(&existing).unwrap().size(), 1);
+
+        let snapshot = unsafe { picker.post_scan_snapshot() }.expect("snapshot");
+        assert!(picker.get_file_mut(idx).is_none());
+
+        std::fs::write(&existing, b"hello").unwrap();
+        let updated = picker
+            .handle_create_or_modify(&existing)
+            .expect("watcher update");
+        assert_eq!(updated.size(), 5);
+        assert_eq!(picker.get_file_by_path(&existing).unwrap().size(), 5);
+        assert!(
+            picker.sync_data.content_masks.get(idx).is_some(),
+            "content mask must refresh while the snapshot is held"
+        );
+        assert_eq!(snapshot.files[idx].size(), 5);
+
+        let added = base.join("src/added.rs");
+        std::fs::write(&added, b"new").unwrap();
+        assert!(picker.add_new_file(&added).is_some());
+        assert_eq!(picker.get_file_by_path(&added).unwrap().size(), 3);
+        assert!(
+            picker
+                .get_overflow_files()
+                .iter()
+                .any(|f| f.relative_path(&picker).ends_with("src/added.rs")),
+            "watcher-added overflow file must be searchable"
+        );
+
+        drop(snapshot);
+        assert!(!picker.signals.post_scan_indexing_active.load(Ordering::Acquire));
+        assert!(picker.get_file_mut(idx).is_some());
+    }
+
     /// Live-narrow caches candidate indices per index generation.
     /// Mutations must bump the generation and disarm narrow, or extended
     /// queries search a stale set.
@@ -3472,14 +4510,23 @@ mod tests {
             project_path: None,
             combo_boost_score_multiplier: 0,
             min_combo_count: 0,
-            pagination: PaginationArgs { offset: 0, limit: 50 },
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 50,
+            },
         };
         let parser = fff_query_parser::QueryParser::default();
         let names_of = |picker: &FilePicker, text: &str| {
             let parsed = parser.parse(text);
             let out = picker.fuzzy_search(&parsed, None, opts());
-            let names: Vec<String> =
-                out.items.iter().map(|f| f.relative_path(picker)).collect();
+            let names: Vec<String> = out.items.iter().map(|f| f.relative_path(picker)).collect();
+            if let Some(paths) = &out.paths {
+                for (item, row) in out.items.iter().zip(paths.rows.iter()) {
+                    let start = row.start as usize;
+                    let end = start + row.len as usize;
+                    assert_eq!(&paths.bytes[start..end], item.relative_path(picker).as_bytes());
+                }
+            }
             (out.total_matched, names)
         };
 
@@ -3505,7 +4552,10 @@ mod tests {
         assert!(picker.index_generation() > g1);
         let (total, names) = names_of(&picker, "alpha");
         assert_eq!(total, 2);
-        assert!(!names.iter().any(|n| n.ends_with("alpha_3.rs")), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.ends_with("alpha_3.rs")),
+            "{names:?}"
+        );
     }
 
     /// Extended queries narrow the previous hit set instead of rescanning,
@@ -3544,14 +4594,16 @@ mod tests {
             project_path: None,
             combo_boost_score_multiplier: 0,
             min_combo_count: 0,
-            pagination: PaginationArgs { offset: 0, limit: 50 },
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 50,
+            },
         };
         let parser = fff_query_parser::QueryParser::default();
         let run = |picker: &FilePicker, text: &str| {
             let parsed = parser.parse(text);
             let out = picker.fuzzy_search(&parsed, None, opts());
-            let names: Vec<String> =
-                out.items.iter().map(|f| f.relative_path(picker)).collect();
+            let names: Vec<String> = out.items.iter().map(|f| f.relative_path(picker)).collect();
             let totals: Vec<i32> = out.scores.iter().map(|s| s.total).collect();
             (out.total_matched, names, totals)
         };
@@ -3566,6 +4618,162 @@ mod tests {
                 "narrow diverged for {text:?}"
             );
         }
+    }
+
+    /// A raw-query extension must gate narrowing, not just `parts[0]`.
+    /// `a zzz` -> `ab yyy` grows the effective first part but is not a raw
+    /// prefix; reusing the old (zzz-filtered) set would drop `ab_yyy.rs`.
+    /// Multipart extensions that *are* raw prefixes must still match a full
+    /// scan.
+    #[test]
+    fn live_narrow_multipart_identity_matches_full_search() {
+        use crate::types::PaginationArgs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_buf = crate::path_utils::canonicalize(dir.path()).unwrap();
+        let base = base_buf.as_path();
+        for rel in [
+            "src/aa_zzz.rs",
+            "src/ab_yyy.rs",
+            "src/alpha_one.rs",
+            "src/alpha_two.rs",
+            "src/beta.rs",
+        ] {
+            let path = base.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+        let mut fresh = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        fresh.collect_files().unwrap();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+
+        let opts = || FuzzySearchOptions {
+            max_threads: 1,
+            current_file: None,
+            project_path: None,
+            combo_boost_score_multiplier: 0,
+            min_combo_count: 0,
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 50,
+            },
+        };
+        let parser = fff_query_parser::QueryParser::default();
+        let run = |picker: &FilePicker, text: &str| {
+            let parsed = parser.parse(text);
+            let out = picker.fuzzy_search(&parsed, None, opts());
+            let names: Vec<String> = out.items.iter().map(|f| f.relative_path(picker)).collect();
+            let totals: Vec<i32> = out.scores.iter().map(|s| s.total).collect();
+            (out.total_matched, names, totals)
+        };
+        let force_full = |picker: &FilePicker| {
+            let mut live = picker.live.lock();
+            live.active = false;
+            live.history.clear();
+            live.prefix.clear();
+        };
+
+        // Multipart change disguised as a first-part extension.
+        let _ = run(&picker, "a zzz");
+        assert!(picker.live.lock().active);
+        let narrowed = run(&picker, "ab yyy");
+        force_full(&fresh);
+        assert_eq!(narrowed, run(&fresh, "ab yyy"));
+        assert!(
+            narrowed.1.iter().any(|n| n.ends_with("ab_yyy.rs")),
+            "new match was dropped: {:?}",
+            narrowed.1
+        );
+
+        // A true multipart raw extension should narrow and still match full.
+        let _ = run(&picker, "src alpha");
+        assert!(picker.live.lock().active);
+        let narrowed = run(&picker, "src alpha one");
+        force_full(&fresh);
+        assert_eq!(narrowed, run(&fresh, "src alpha one"));
+        assert!(
+            narrowed.1.iter().any(|n| n.ends_with("alpha_one.rs")),
+            "{:?}",
+            narrowed.1
+        );
+    }
+
+    /// Overflow files live in a second arena, and an appended constraint
+    /// changes the filter even when the raw query is a prefix extension.
+    #[test]
+    fn live_narrow_overflow_and_constraint_extension_match_full_search() {
+        use crate::types::PaginationArgs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_buf = crate::path_utils::canonicalize(dir.path()).unwrap();
+        let base = base_buf.as_path();
+        for rel in ["src/alpha_1.rs", "src/alpha_2.rs", "src/beta.rs"] {
+            let path = base.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+        let added = base.join("src/alpha_3.rs");
+        std::fs::write(&added, b"x").unwrap();
+        assert!(picker.add_new_file(&added).is_some());
+        assert!(!picker.get_overflow_files().is_empty());
+
+        let opts = || FuzzySearchOptions {
+            max_threads: 1,
+            current_file: None,
+            project_path: None,
+            combo_boost_score_multiplier: 0,
+            min_combo_count: 0,
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 50,
+            },
+        };
+        let parser = fff_query_parser::QueryParser::default();
+        let run = |picker: &FilePicker, text: &str| {
+            let parsed = parser.parse(text);
+            let out = picker.fuzzy_search(&parsed, None, opts());
+            let names: Vec<String> = out.items.iter().map(|f| f.relative_path(picker)).collect();
+            let totals: Vec<i32> = out.scores.iter().map(|s| s.total).collect();
+            (out.total_matched, names, totals)
+        };
+        let force_full = |picker: &FilePicker| {
+            let mut live = picker.live.lock();
+            live.active = false;
+            live.history.clear();
+            live.prefix.clear();
+        };
+
+        // Prime with an unfiltered prefix, then narrow across the overflow
+        // boundary. alpha_3.rs must survive.
+        let _ = run(&picker, "alph");
+        let narrow_alpha = run(&picker, "alpha");
+        assert!(narrow_alpha.1.iter().any(|n| n.ends_with("alpha_3.rs")));
+        force_full(&picker);
+        assert_eq!(narrow_alpha, run(&picker, "alpha"));
+
+        // Same prefix plus a new constraint must not reuse the old hit set.
+        let _ = run(&picker, "alph");
+        let narrow_filtered = run(&picker, "alph *.rs");
+        force_full(&picker);
+        assert_eq!(narrow_filtered, run(&picker, "alph *.rs"));
     }
 
     /// Shortening the query reuses the matching history entry instead of
@@ -3603,14 +4811,16 @@ mod tests {
             project_path: None,
             combo_boost_score_multiplier: 0,
             min_combo_count: 0,
-            pagination: PaginationArgs { offset: 0, limit: 50 },
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 50,
+            },
         };
         let parser = fff_query_parser::QueryParser::default();
         let run = |picker: &FilePicker, text: &str| {
             let parsed = parser.parse(text);
             let out = picker.fuzzy_search(&parsed, None, opts());
-            let names: Vec<String> =
-                out.items.iter().map(|f| f.relative_path(picker)).collect();
+            let names: Vec<String> = out.items.iter().map(|f| f.relative_path(picker)).collect();
             let totals: Vec<i32> = out.scores.iter().map(|s| s.total).collect();
             (out.total_matched, names, totals)
         };
@@ -3649,41 +4859,72 @@ mod tests {
                 query: "al".into(),
                 max_typos: 2,
                 generation: 7,
-                candidates: vec![1],
+                constraints_fp: 0,
+                git_status_epoch: 0,
+                candidates: vec![1].into(),
             },
             BackEntry {
                 query: "alph".into(),
                 max_typos: 2,
                 generation: 7,
-                candidates: vec![1, 2],
+                constraints_fp: 0,
+                git_status_epoch: 0,
+                candidates: vec![1, 2].into(),
             },
             BackEntry {
                 query: "alph".into(),
                 max_typos: 3,
                 generation: 7,
-                candidates: vec![9],
+                constraints_fp: 0,
+                git_status_epoch: 0,
+                candidates: vec![9].into(),
             },
             BackEntry {
                 query: "alph".into(),
                 max_typos: 2,
                 generation: 8,
-                candidates: vec![8],
+                constraints_fp: 0,
+                git_status_epoch: 0,
+                candidates: vec![8].into(),
             },
         ];
         assert_eq!(
-            longest_prefix(&cache, "alphax", 2, 7),
+            longest_prefix(&cache, "alphax", 2, 7, 0, false, 0)
+                .as_deref()
+                .map(Vec::as_slice),
             Some(vec![1, 2].as_slice())
         );
         assert_eq!(
-            longest_prefix(&cache, "alph", 2, 7),
+            longest_prefix(&cache, "alph", 2, 7, 0, false, 0)
+                .as_deref()
+                .map(Vec::as_slice),
             Some(vec![1].as_slice())
         );
-        assert_eq!(longest_prefix(&cache, "beta", 2, 7), None);
         assert_eq!(
-            longest_prefix(&cache, "alphax", 3, 7),
+            longest_prefix(&cache, "beta", 2, 7, 0, false, 0)
+                .as_deref()
+                .map(Vec::as_slice),
+            None
+        );
+        assert_eq!(
+            longest_prefix(&cache, "alphax", 3, 7, 0, false, 0)
+                .as_deref()
+                .map(Vec::as_slice),
             Some(vec![9].as_slice())
         );
-        assert_eq!(longest_prefix(&cache, "alphax", 2, 9), None);
+        assert_eq!(
+            longest_prefix(&cache, "alphax", 2, 9, 0, false, 0)
+                .as_deref()
+                .map(Vec::as_slice),
+            None
+        );
+        // A changed constraint set must never reuse an unfiltered hit set.
+        assert_eq!(
+            longest_prefix(&cache, "alphax", 2, 7, 1, false, 0)
+                .as_deref()
+                .map(Vec::as_slice),
+            None
+        );
     }
 
     /// Forward retype after a sideways move reuses the cached prefix
@@ -3773,7 +5014,10 @@ mod tests {
             project_path: None,
             combo_boost_score_multiplier: 0,
             min_combo_count: 0,
-            pagination: PaginationArgs { offset: 0, limit: 50 },
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 50,
+            },
         };
         let parser = fff_query_parser::QueryParser::default();
         let run = |picker: &FilePicker, text: &str| {
@@ -3953,7 +5197,10 @@ mod tests {
                         project_path: None,
                         combo_boost_score_multiplier: 0,
                         min_combo_count: 0,
-                        pagination: crate::types::PaginationArgs { offset: 0, limit: 50 },
+                        pagination: crate::types::PaginationArgs {
+                            offset: 0,
+                            limit: 50,
+                        },
                     },
                 )
                 .total_matched

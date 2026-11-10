@@ -1,7 +1,9 @@
-use super::prefilter::prefilter_with_filepath_retry_indexed;
-use super::prefilter::{chunk_plan, prefilter_with_filepath_retry};
+use super::prefilter::{chunk_plan, prefilter_with_filepath_retry_indexed};
 use super::regex::{RegexMatcher, RegexSink, build_regex};
-use super::sink::{SinkState, debug_assert_newline_terminator, lossy_owned};
+use super::sink::{
+    SinkState, debug_assert_newline_terminator, lossy_owned, strip_line_terminators,
+    truncate_display_bytes,
+};
 use super::types::{GrepMatch, GrepMode, GrepResult, GrepSearchOptions, PageFillGate};
 use crate::index::{
     BigramFilter, BigramOverlay, bigram_boundary, fuzzy_candidates, literal_candidates,
@@ -24,14 +26,20 @@ use tracing::Level;
 #[allow(clippy::large_enum_variant)]
 pub(super) enum NeedleFinder<'a> {
     CaseSensitive(memchr::memmem::Finder<'a>),
-    /// Pre-lowered needle bytes for the SIMD case-insensitive search.
-    CaseInsensitive(&'a [u8]),
+    /// Pre-lowered needle plus the rare-pair plan built once per search.
+    CaseInsensitive {
+        needle: &'a [u8],
+        plan: crate::simd_string_utils::memmem::PairPlan,
+    },
 }
 
 impl<'a> NeedleFinder<'a> {
     fn new(needle: &'a [u8], case_insensitive: bool) -> Self {
         if case_insensitive {
-            Self::CaseInsensitive(needle)
+            Self::CaseInsensitive {
+                needle,
+                plan: memmem::plan_for(needle),
+            }
         } else {
             Self::CaseSensitive(memchr::memmem::Finder::new(needle))
         }
@@ -41,7 +49,7 @@ impl<'a> NeedleFinder<'a> {
     fn find(&self, haystack: &[u8]) -> Option<usize> {
         match self {
             Self::CaseSensitive(finder) => finder.find(haystack),
-            Self::CaseInsensitive(needle_lower) => memmem::find(haystack, needle_lower),
+            Self::CaseInsensitive { needle, plan } => memmem::find_planned(haystack, needle, *plan),
         }
     }
 
@@ -49,7 +57,7 @@ impl<'a> NeedleFinder<'a> {
     fn needle(&self) -> &[u8] {
         match self {
             Self::CaseSensitive(finder) => finder.needle(),
-            Self::CaseInsensitive(needle_lower) => needle_lower,
+            Self::CaseInsensitive { needle, .. } => needle,
         }
     }
 
@@ -59,13 +67,14 @@ impl<'a> NeedleFinder<'a> {
     fn eq_fold(&self, haystack: &[u8], needle_seg: &[u8]) -> bool {
         match self {
             Self::CaseSensitive(_) => haystack == needle_seg,
-            Self::CaseInsensitive(_) => haystack.eq_ignore_ascii_case(needle_seg),
+            Self::CaseInsensitive { .. } => {
+                haystack.len() == needle_seg.len()
+                    && crate::simd_path::eq_ignore_ascii_bytes(haystack, needle_seg)
+            }
         }
     }
 
-    /// Collect highlight spans for every needle occurrence within a line.
-    // Steps by needle length (non-overlapping); reslicing per hit keeps
-    // memmem's skip tables effective instead of degrading to pos+1.
+/// Non-overlapping highlight spans. The next search starts after the previous hit.
     #[inline]
     fn for_each_occurrence(&self, haystack: &[u8], mut on_match: impl FnMut(usize)) {
         let step = self.needle().len().max(1);
@@ -75,9 +84,9 @@ impl<'a> NeedleFinder<'a> {
                     on_match(pos);
                 }
             }
-            Self::CaseInsensitive(needle_lower) => {
+            Self::CaseInsensitive { needle, plan } => {
                 let mut start_pos = 0usize;
-                while let Some(pos) = memmem::find(&haystack[start_pos..], needle_lower) {
+                while let Some(pos) = memmem::find_planned(&haystack[start_pos..], needle, *plan) {
                     on_match(start_pos + pos);
                     start_pos += pos + step;
                     if start_pos >= haystack.len() {
@@ -114,7 +123,7 @@ impl Matcher for PlainTextMatcher<'_> {
 }
 
 struct PlainTextSink<'r> {
-    state: SinkState,
+    state: SinkState<'r>,
     finder: &'r NeedleFinder<'r>,
     pattern_len: u32,
     multiline_segment_len: Option<usize>,
@@ -129,15 +138,10 @@ impl Sink for PlainTextSink<'_> {
         sink_match: &SinkMatch<'_>,
     ) -> Result<bool, Self::Error> {
         debug_assert_newline_terminator(searcher);
-        if self.state.max_matches != 0 && self.state.matches.len() >= self.state.max_matches {
-            return Ok(false);
-        }
-
         let line_bytes = sink_match.bytes();
         let (display_bytes, display_len, line_number, byte_offset) =
             SinkState::prepare_line(line_bytes, sink_match);
 
-        let line_content = lossy_owned(display_bytes);
         let mut match_byte_offsets: SmallVec<[(u32, u32); 4]> = SmallVec::new();
         let mut col = 0usize;
         let mut first = true;
@@ -168,17 +172,27 @@ impl Sink for PlainTextSink<'_> {
             });
         }
 
+        let Some(is_definition) = self.state.definition_mode.classify_match(
+            self.state.file,
+            strip_line_terminators(line_bytes),
+            &match_byte_offsets,
+            false,
+        ) else {
+            return Ok(true);
+        };
+        // Rejected lines never become matches, so the display string is built after the filter.
+        let line_content = lossy_owned(display_bytes);
         let (context_before, context_after) = self.state.extract_context(sink_match);
-        self.state.push_match(
+        Ok(self.state.push_match(
             line_number,
             col,
             byte_offset,
             line_content,
             match_byte_offsets,
+            is_definition,
             context_before,
             context_after,
-        );
-        Ok(true)
+        ))
     }
 
     fn finish(&mut self, _: &Searcher, _: &fff_grep::SinkFinish) -> Result<(), Self::Error> {
@@ -227,8 +241,39 @@ pub(crate) fn grep_search<'a>(
     // for later pages: an empty full scan at offset 0 stays empty at any offset,
     // so paging offsets consistently index the literal search's file list.
     let full_scan_empty = result.matches.is_empty() && result.next_file_offset == 0;
-    if !full_scan_empty || query.constraints.is_empty() || abort_signal.load(Ordering::Relaxed) {
+    if !full_scan_empty
+        || query.constraints.is_empty()
+        || options.classify_definitions == super::DefinitionMode::DefinitionOnly
+        || abort_signal.load(Ordering::Relaxed)
+    {
         return result;
+    }
+
+    // An empty section must not trigger a literal retry when the query matched the other section.
+    if options.classify_definitions.is_filtered() {
+        let probe = GrepSearchOptions {
+            file_offset: 0,
+            page_limit: 1,
+            classify_definitions: Default::default(),
+            ..options.clone()
+        };
+        let unfiltered = grep_search_parsed(
+            files,
+            query,
+            &probe,
+            total_files,
+            budget,
+            bigram_index,
+            bigram_overlay,
+            abort_signal,
+            base_path,
+            arena,
+            overflow_arena,
+            content_masks,
+        );
+        if !unfiltered.matches.is_empty() || unfiltered.next_file_offset != 0 {
+            return result;
+        }
     }
 
     let raw = query.raw_query.trim();
@@ -364,13 +409,20 @@ fn grep_search_parsed<'a>(
         options.after_context
     };
 
-    let finder_pattern: Vec<u8> = if case_insensitive {
-        effective_pattern.as_bytes().to_ascii_lowercase()
+    // ASCII fold is a no-op when no byte changes; borrowing keeps the same needle.
+    let lowered = if case_insensitive
+        && crate::simd_path::needle_has_ascii_upper(effective_pattern.as_bytes())
+    {
+        let bytes = effective_pattern.as_bytes();
+        let mut lower = vec![0u8; bytes.len()];
+        crate::simd_path::fold_ascii_needle(bytes, &mut lower);
+        Some(lower)
     } else {
-        effective_pattern.as_bytes().to_vec()
+        None
     };
-    let finder = NeedleFinder::new(&finder_pattern, case_insensitive);
-    let pattern_len = finder_pattern.len() as u32;
+    let needle_bytes = lowered.as_deref().unwrap_or(effective_pattern.as_bytes());
+    let finder = NeedleFinder::new(needle_bytes, case_insensitive);
+    let pattern_len = needle_bytes.len() as u32;
 
     // PlainText (or regex-fallback-to-plain): literal bigram query.
     // Regex: decompose the pattern HIR into an AND/OR bigram query tree.
@@ -380,7 +432,7 @@ fn grep_search_parsed<'a>(
         regex_candidates(bigram_index, bigram_overlay, &effective_pattern)
     };
 
-    let (files_to_search, filtered_file_count) = prefilter_with_filepath_retry(
+    let (files_to_search, filtered_file_count) = prefilter_with_filepath_retry_indexed(
         files,
         constraints_from_query,
         bigram_candidates.as_deref(),
@@ -418,6 +470,9 @@ fn grep_search_parsed<'a>(
         _ => None,
     };
     let should_prefilter = regex.is_none();
+    // Literal, one line, no context: one pass, no searcher line walk.
+    let direct_plain =
+        should_prefilter && !is_multiline && options.before_context == 0 && after_context == 0;
     let mut result = perform_grep(
         &files_to_search,
         options,
@@ -432,18 +487,19 @@ fn grep_search_parsed<'a>(
             abort_signal,
             content_masks,
             mask_needle,
-            files,
+            direct_plain,
         },
         // The single sink-selection point: every mode's matcher/sink pairing
         // is decided here based on the compiled pattern.
-        |file_bytes: &[u8], max_matches: usize| {
+        |file: &FileItem, file_bytes: &[u8], max_matches: usize| {
             let state = SinkState {
+                file,
+                definition_mode: options.classify_definitions,
                 file_index: 0,
                 matches: Vec::with_capacity(4),
                 max_matches,
                 before_context: options.before_context,
                 after_context,
-                classify_definitions: options.classify_definitions,
             };
 
             match regex {
@@ -565,9 +621,8 @@ pub(super) struct GrepContext<'a, 'b> {
     // Needle with its byte classes precomputed, so the per-file check is one
     // AND + popcount instead of a scan over the needle bytes.
     pub(super) mask_needle: Option<crate::types::MaskNeedle>,
-    // The picker's contiguous FileItem slice, used to recover original
-    // positions from the prefilter's filtered output.
-    pub(super) files: &'a [FileItem],
+    // Literal, single line, no context: harvest hits without the line searcher.
+    pub(super) direct_plain: bool,
 }
 
 // Files skipped by the content-mask prefilter since process start.
@@ -579,34 +634,6 @@ pub(crate) static CONTENT_MASK_REJECTS: std::sync::atomic::AtomicU64 =
 // memmem skips mean "opened but needle absent".
 pub(crate) static MEMMEM_PREFILTER_REJECTS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-
-// Recover a file's original position in the picker's contiguous `FileItem`
-// slice from its address.
-//
-// The grep prefilter returns a *filtered* `Vec<&FileItem>`, so its loop index
-// is not the file's position, and `GrepMatch::file_index` indexes
-// `result_files` rather than the index either. Using either as a mask index
-// would make grep skip files that do match.
-//
-// The slice is contiguous - `FileSync` lays out base and overflow files in one
-// allocation, partitioned by `base_count` - so the offset is exact. Returning
-// `None` for anything outside the slice keeps the caller safe if that layout
-// ever changes.
-#[inline]
-pub(super) fn original_index(files: &[FileItem], f: &FileItem) -> Option<usize> {
-    let base = files.as_ptr() as usize;
-    let addr = f as *const FileItem as usize;
-    let stride = std::mem::size_of::<FileItem>();
-    if stride == 0 || addr < base {
-        return None;
-    }
-    let off = addr - base;
-    if off % stride != 0 {
-        return None;
-    }
-    let idx = off / stride;
-    (idx < files.len()).then_some(idx)
-}
 
 impl GrepContext<'_, '_> {
     #[inline]
@@ -625,13 +652,13 @@ impl GrepContext<'_, '_> {
     fields(prefiltered_count = files_to_search.len())
 )]
 pub(super) fn perform_grep<'a, F>(
-    files_to_search: &[&'a FileItem],
+    files_to_search: &[(&'a FileItem, usize)],
     options: &GrepSearchOptions,
     ctx: &GrepContext<'_, '_>,
     search_file: F,
 ) -> GrepResult<'a>
 where
-    F: Fn(&[u8], usize) -> Vec<GrepMatch> + Sync,
+    F: Fn(&FileItem, &[u8], usize) -> Vec<GrepMatch> + Sync,
 {
     let time_budget = if options.time_budget_ms > 0 {
         Some(std::time::Duration::from_millis(options.time_budget_ms))
@@ -687,15 +714,6 @@ where
         let use_gate = gate_enabled && page_limit != 0 && chunk.len() >= threads.saturating_mul(2);
         let gate = use_gate.then(|| PageFillGate::new(chunk.len(), all_matches.len(), page_limit));
 
-        // Carry original positions once per chunk so workers skip pointer
-        // div/mod in the hot parallel path. Skipped when masks are off.
-        let mask_on = ctx.content_masks.is_some() && ctx.mask_needle.is_some();
-        let chunk_orig: Vec<Option<usize>> = if mask_on {
-            chunk.iter().map(|f| original_index(ctx.files, f)).collect()
-        } else {
-            Vec::new()
-        };
-
         let chunk_results: Vec<(usize, &'a FileItem, Vec<GrepMatch>, u64, u64)> = chunk
             .par_iter()
             .enumerate()
@@ -711,7 +729,7 @@ where
                         0u64,
                     )
                 },
-                |(buf, mmap_slot, aborted, read_ns, scan_ns), (local_idx, file)| {
+                |(buf, mmap_slot, aborted, read_ns, scan_ns), (local_idx, &(file, orig_idx))| {
                     let idx = chunk_offset + local_idx;
                     let found = (|| -> Option<Vec<GrepMatch>> {
                         // Page already full from lower-indexed files: skip. This
@@ -733,13 +751,9 @@ where
                         }
 
                         let t_read = phase_timing.then(std::time::Instant::now);
-                        // Content-mask pre-check: skip the open+read entirely for
-                        // files whose indexed byte classes cannot contain the
-                        // needle. Uses the carried original position, not the
-                        // filtered loop index.
+                        // Content masks are keyed by picker position from the prefilter.
                         if let (Some(masks), Some(needle)) = (ctx.content_masks, ctx.mask_needle)
-                            && let Some(pos) = chunk_orig.get(local_idx).copied().flatten()
-                            && let Some(mask) = masks.get(pos)
+                            && let Some(mask) = masks.get(orig_idx)
                             && needle.allows(mask) == Some(false)
                         {
                             // Diagnostic only, and gated: an unconditional
@@ -753,6 +767,13 @@ where
                             }
                             return None;
                         }
+                        // A literal longer than the file cannot match. Skip the open.
+                        if let Some(pf) = ctx.prefilter {
+                            let n = pf.needle().len() as u64;
+                            if n > 0 && file.size() < n {
+                                return None;
+                            }
+                        }
                         let content = file.get_content_for_search(
                             buf,
                             mmap_slot,
@@ -763,6 +784,33 @@ where
                         )?;
                         if let Some(t) = t_read {
                             *read_ns += t.elapsed().as_nanos() as u64;
+                        }
+
+                        if ctx.direct_plain {
+                            let t_scan = phase_timing.then(std::time::Instant::now);
+                            let harvested = ctx.prefilter.and_then(|pf| {
+                                collect_plain_lines(
+                                    file,
+                                    content,
+                                    pf,
+                                    options.classify_definitions,
+                                    options.max_matches_per_file,
+                                )
+                            });
+                            if let Some(t) = t_scan {
+                                *scan_ns += t.elapsed().as_nanos() as u64;
+                            }
+                            return match harvested {
+                                None => {
+                                    if phase_timing || cfg!(test) {
+                                        MEMMEM_PREFILTER_REJECTS
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                    None
+                                }
+                                Some(file_matches) if file_matches.is_empty() => None,
+                                Some(file_matches) => Some(file_matches),
+                            };
                         }
 
                         // Fast whole-file memmem check before entering the
@@ -780,7 +828,7 @@ where
                         }
 
                         let t_scan = phase_timing.then(std::time::Instant::now);
-                        let file_matches = search_file(content, options.max_matches_per_file);
+                        let file_matches = search_file(file, content, options.max_matches_per_file);
                         if let Some(t) = t_scan {
                             *scan_ns += t.elapsed().as_nanos() as u64;
                         }
@@ -802,7 +850,7 @@ where
                         g.record_done(local_idx, found.as_ref().map_or(0, Vec::len));
                     }
 
-                    found.map(|m| (idx, *file, m, *read_ns, *scan_ns))
+                    found.map(|m| (idx, file, m, *read_ns, *scan_ns))
                 },
             )
             .flatten()
@@ -897,5 +945,153 @@ where
         next_file_offset,
         regex_fallback_error: None,
         literal_fallback: false,
+    }
+}
+
+// One forward pass. Line bounds are taken only around hits, with the same
+// columns, per-file cap, and definition filter as the searcher sink.
+fn collect_plain_lines(
+    file: &FileItem,
+    content: &[u8],
+    finder: &NeedleFinder<'_>,
+    definition_mode: super::DefinitionMode,
+    max_matches: usize,
+) -> Option<Vec<GrepMatch>> {
+    let mut matches = Vec::new();
+    let mut pos = 0usize;
+    let mut line_number = 1u64;
+    let mut counted = 0usize;
+    let mut saw = false;
+    let pattern_len = finder.needle().len() as u32;
+    while pos < content.len() {
+        let Some(rel) = finder.find(&content[pos..]) else {
+            break;
+        };
+        saw = true;
+        let abs = pos + rel;
+        let line_start = memchr::memrchr(b'\n', &content[..abs]).map_or(0, |i| i + 1);
+        if line_start > counted {
+            line_number +=
+                memchr::memchr_iter(b'\n', &content[counted..line_start]).count() as u64;
+            counted = line_start;
+        }
+        let line_end = memchr::memchr(b'\n', &content[line_start..])
+            .map_or(content.len(), |i| line_start + i + 1);
+        let stripped = strip_line_terminators(&content[line_start..line_end]);
+        let display = truncate_display_bytes(stripped);
+        let display_len = display.len() as u32;
+        let mut offsets: SmallVec<[(u32, u32); 4]> = SmallVec::new();
+        let mut col = 0usize;
+        let mut first = true;
+        finder.for_each_occurrence(display, |hit| {
+            let start = hit as u32;
+            let end = (start + pattern_len).min(display_len);
+            if first {
+                col = hit;
+                first = false;
+            }
+            offsets.push((start, end));
+        });
+        let advanced = line_end > pos;
+        pos = line_end;
+        if let Some(is_definition) = definition_mode.classify_match(file, stripped, &offsets, false)
+        {
+            if matches.is_empty() {
+                matches.reserve(4);
+            }
+            matches.push(GrepMatch {
+                file_index: 0,
+                line_number,
+                col,
+                byte_offset: line_start as u64,
+                line_content: lossy_owned(display),
+                match_byte_offsets: offsets,
+                fuzzy_score: None,
+                is_definition,
+                context_before: Vec::new(),
+                context_after: Vec::new(),
+            });
+            if max_matches != 0 && matches.len() >= max_matches {
+                break;
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+    saw.then_some(matches)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grep::DefinitionMode;
+
+    #[test]
+    fn sinks_stop_when_the_retained_match_limit_is_reached() {
+        struct Counted<'a> {
+            inner: PlainTextSink<'a>,
+            candidates: usize,
+        }
+
+        impl Sink for Counted<'_> {
+            type Error = std::io::Error;
+
+            fn matched(
+                &mut self,
+                searcher: &Searcher,
+                mat: &SinkMatch<'_>,
+            ) -> Result<bool, Self::Error> {
+                self.candidates += 1;
+                self.inner.matched(searcher, mat)
+            }
+        }
+
+        let file =
+            FileItem::new_from_walk_parts(Path::new("file.rs"), Path::new("."), None, 100, 0).0;
+        let finder = NeedleFinder::new(b"Needle", false);
+        let matcher = PlainTextMatcher { finder: &finder };
+        for source in [
+            "Needle();\nfn Needle() {}\nNeedle();\n",
+            "fn Needle() {}\nNeedle();\nfn NeedleMore() {}\n",
+        ] {
+            for mode in [
+                DefinitionMode::Off,
+                DefinitionMode::Classify,
+                DefinitionMode::DefinitionOnly,
+                DefinitionMode::UsageOnly,
+            ] {
+                let first_is_definition = source.starts_with("fn ");
+                let expected_candidates = if mode.retains(first_is_definition) {
+                    1
+                } else {
+                    2
+                };
+                let mut sink = Counted {
+                    inner: PlainTextSink {
+                        state: SinkState {
+                            file: &file,
+                            definition_mode: mode,
+                            file_index: 0,
+                            matches: Vec::new(),
+                            max_matches: 1,
+                            before_context: 0,
+                            after_context: 0,
+                        },
+                        finder: &finder,
+                        pattern_len: 6,
+                        multiline_segment_len: None,
+                    },
+                    candidates: 0,
+                };
+                SearcherBuilder::new()
+                    .line_number(true)
+                    .build()
+                    .search_slice(&matcher, source.as_bytes(), &mut sink)
+                    .unwrap();
+                assert_eq!(sink.candidates, expected_candidates, "{mode:?}: {source}");
+                assert_eq!(sink.inner.state.matches.len(), 1);
+            }
+        }
     }
 }

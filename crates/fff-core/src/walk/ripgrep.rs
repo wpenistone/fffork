@@ -1,7 +1,6 @@
 use crate::ignore::non_git_repo_overrides;
 use crate::types::FileItem;
-use crate::walk::WalkOutput;
-use crate::watch::is_git_file;
+use crate::walk::{WalkOutput, WalkSpan};
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -34,30 +33,33 @@ pub(crate) fn walk_collect_files(
 
     let walker = walk_builder.build_parallel();
 
-    // Single lock for both collections: every entry is either a file or a
-    // dir. Workers accumulate into thread-local batches and merge on drop so
-    // the walk stays parallel with minimal contention.
-    type Collected = (Vec<(FileItem, String)>, Vec<String>);
-    let collected = parking_lot::Mutex::new(Collected::default());
+    // Threads merge once, on drop. The hot path only appends to thread-local bytes.
+    struct Collected {
+        buffers: Vec<Vec<u8>>,
+        pairs: Vec<(FileItem, WalkSpan)>,
+        dirs: Vec<WalkSpan>,
+    }
+    let collected = parking_lot::Mutex::new(Collected {
+        buffers: Vec::new(),
+        pairs: Vec::new(),
+        dirs: Vec::new(),
+    });
 
     struct FffVisitor<'a> {
         collected: &'a parking_lot::Mutex<Collected>,
         synced_files_count: &'a Arc<AtomicUsize>,
         base_path: PathBuf,
-        local_pairs: Vec<(FileItem, String)>,
-        local_dirs: Vec<String>,
+        local_bytes: Vec<u8>,
+        local_pairs: Vec<(FileItem, u32, u32)>,
+        local_dirs: Vec<(u32, u32)>,
         local_count: usize,
     }
 
     impl<'a> FffVisitor<'a> {
-        fn flush_local(&mut self) {
-            if self.local_pairs.is_empty() && self.local_dirs.is_empty() {
+        fn flush_progress(&mut self) {
+            if self.local_count == 0 {
                 return;
             }
-            let mut guard = self.collected.lock();
-            guard.0.append(&mut self.local_pairs);
-            guard.1.append(&mut self.local_dirs);
-            drop(guard);
             self.synced_files_count
                 .fetch_add(self.local_count, Ordering::Relaxed);
             self.local_count = 0;
@@ -78,16 +80,11 @@ pub(crate) fn walk_collect_files(
                     return ignore::WalkState::Continue;
                 }
 
-                // Fast path: `strip_prefix` (no `pathdiff` component walk)
-                // + one `to_string_lossy`; basename offset from the last
-                // slash in the same pass.
                 let rel = path.strip_prefix(&self.base_path).unwrap_or(path);
-                let rel_str =
-                    crate::path_utils::to_canonical_slashes(&rel.to_string_lossy()).into_owned();
-                if rel_str.is_empty() {
+                let Some((off, len, base_off)) = push_canonical(&mut self.local_bytes, rel, false)
+                else {
                     return ignore::WalkState::Continue;
-                }
-                let off = rel_str.rfind('/').map(|i| i + 1).unwrap_or(0) as u16;
+                };
                 let (size, modified) = match entry.metadata().ok() {
                     Some(m) => (
                         m.len(),
@@ -98,21 +95,27 @@ pub(crate) fn walk_collect_files(
                     ),
                     None => (0, 0),
                 };
-                let item = FileItem::new_raw(
-                    off,
+                let mut item = FileItem::new_raw(
+                    base_off,
                     size,
                     modified,
                     None,
                     crate::file_picker::is_known_binary_extension(path),
                 );
+                {
+                    let rel_bytes =
+                        &self.local_bytes[off as usize..off as usize + len as usize];
+                    // Canonical text is UTF-8; basename starts at `base_off`.
+                    let name = unsafe {
+                        std::str::from_utf8_unchecked(&rel_bytes[base_off as usize..])
+                    };
+                    item.mark_definition_language(name);
+                }
 
-                self.local_pairs.push((item, rel_str));
+                self.local_pairs.push((item, off, len));
                 self.local_count += 1;
-                // Flush before the local batch grows unbounded under bursty
-                // closed-loop walkers, so the final append is not one huge
-                // critical section and peak RSS stays flatter.
-                if self.local_pairs.len() >= 512 {
-                    self.flush_local();
+                if self.local_count >= 512 {
+                    self.flush_progress();
                 }
             } else if entry.depth() > 0 && entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 let path = entry.path();
@@ -123,10 +126,9 @@ pub(crate) fn walk_collect_files(
                     return ignore::WalkState::Skip;
                 }
                 if let Ok(rel) = path.strip_prefix(&self.base_path) {
-                    let mut rel = crate::path_utils::to_canonical_slashes(&rel.to_string_lossy())
-                        .into_owned();
-                    rel.push('/');
-                    self.local_dirs.push(rel);
+                    let _ = push_canonical(&mut self.local_bytes, rel, true).map(|(off, len, _)| {
+                        self.local_dirs.push((off, len));
+                    });
                 }
             }
             ignore::WalkState::Continue
@@ -135,7 +137,30 @@ pub(crate) fn walk_collect_files(
 
     impl<'a> Drop for FffVisitor<'a> {
         fn drop(&mut self) {
-            self.flush_local();
+            self.flush_progress();
+            if self.local_pairs.is_empty() && self.local_dirs.is_empty() {
+                return;
+            }
+            let mut guard = self.collected.lock();
+            let buf_i = guard.buffers.len() as u16;
+            guard.buffers.push(std::mem::take(&mut self.local_bytes));
+            for (item, off, len) in self.local_pairs.drain(..) {
+                guard.pairs.push((
+                    item,
+                    WalkSpan {
+                        buf: buf_i,
+                        off,
+                        len,
+                    },
+                ));
+            }
+            for (off, len) in self.local_dirs.drain(..) {
+                guard.dirs.push(WalkSpan {
+                    buf: buf_i,
+                    off,
+                    len,
+                });
+            }
         }
     }
 
@@ -151,6 +176,7 @@ pub(crate) fn walk_collect_files(
                 collected: self.collected,
                 synced_files_count: self.synced_files_count,
                 base_path: self.base_path.clone(),
+                local_bytes: Vec::with_capacity(64 * 1024),
                 local_pairs: Vec::with_capacity(512),
                 local_dirs: Vec::with_capacity(64),
                 local_count: 0,
@@ -165,10 +191,37 @@ pub(crate) fn walk_collect_files(
     };
     walker.visit(&mut visitor_builder);
 
-    let (pairs, dirs) = collected.into_inner();
-    Ok(WalkOutput {
-        pairs,
-        dirs,
-        ignore_rules: None,
-    })
+    let collected = collected.into_inner();
+    synced_files_count.store(collected.pairs.len(), Ordering::Relaxed);
+    Ok(WalkOutput::from_parts(
+        collected.buffers,
+        collected.pairs,
+        collected.dirs,
+        None,
+    ))
+}
+
+fn is_git_file(path: &Path) -> bool {
+    crate::watch::is_git_file(path)
+}
+
+// Append canonical `/` text. `slash` marks a directory. Empty paths are skipped.
+fn push_canonical(buf: &mut Vec<u8>, rel: &Path, slash: bool) -> Option<(u32, u32, u16)> {
+    let lossy = rel.to_string_lossy();
+    let canonical = crate::path_utils::to_canonical_slashes(&lossy);
+    if canonical.is_empty() {
+        return None;
+    }
+    let start = buf.len();
+    buf.extend_from_slice(canonical.as_bytes());
+    let path_end = buf.len();
+    if slash {
+        buf.push(b'/');
+    }
+    let base = buf[start..path_end]
+        .iter()
+        .rposition(|b| *b == b'/')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    Some((start as u32, (buf.len() - start) as u32, base as u16))
 }

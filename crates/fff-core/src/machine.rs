@@ -1,8 +1,5 @@
-//! Machine calibration: topology first, latency probed once.
-//!
-//! Core, cache, NUMA and cgroup facts derive dispatch constants; only latency
-//! is measured. Overrides: `FFF_MATCH_WORK_PER_THREAD`, `FFF_SCAN_THREAD_CAP`,
-//! `FFF_FORK_JOIN_NS`, `FFF_NO_PROBE`.
+//! Topology plus one latency probe. `FFF_NO_PROBE` skips the measurement.
+//! Overrides: `FFF_MATCH_WORK_PER_THREAD`, `FFF_SCAN_THREAD_CAP`, `FFF_FORK_JOIN_NS`.
 
 use std::sync::LazyLock;
 
@@ -19,6 +16,7 @@ pub(crate) struct Machine {
     /// Last-level data cache, bytes. 0 when unknown.
     pub llc_bytes: usize,
     /// Nominal core clock, Hz. 0 when unknown.
+    #[allow(dead_code)]
     pub clock_hz: f64,
     /// NUMA nodes visible to this process (a cgroup cpuset counts as one).
     pub numa_nodes: usize,
@@ -64,6 +62,7 @@ impl Machine {
         } else {
             (self.llc_bytes / (2 * 1024 * 1024)).max(1)
         };
+        #[allow(clippy::manual_checked_ops)]
         let by_numa = if self.numa_nodes > 0 {
             (by_physical / self.numa_nodes).max(1)
         } else {
@@ -83,12 +82,13 @@ impl Machine {
     fn bandwidth_knee(&self) -> usize {
         static KNEE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         *KNEE.get_or_init(|| {
+            #[allow(unused_mut, unused_assignments)]
             let mut by_cores = self.physical_cores.max(1);
             #[cfg(target_os = "linux")]
             if let Some(cap) = crate::parallelism::cgroup_cpu_count() {
                 by_cores = by_cores.min(cap).max(1);
             }
-            if by_cores < 4 || std::env::var_os("FFF_NO_PROBE").is_some() {
+            if by_cores < 4 || probe_disabled() {
                 return by_cores;
             }
             let mut want = if self.llc_bytes > 0 {
@@ -193,9 +193,7 @@ fn pin_thread_to_core(t: usize, allowed: Option<&[usize]>) {
     let cpu = match allowed {
         Some(list) if !list.is_empty() => list[t % list.len()],
         _ => {
-            let ncpu = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1);
+            let ncpu = crate::parallelism::effective_core_count().max(1);
             if ncpu <= 1 {
                 return;
             }
@@ -273,13 +271,25 @@ pub(crate) fn scan_thread_cap() -> usize {
     *C
 }
 
+// Search-pool width. `current_num_threads` walks the registry; one load after open.
+pub(crate) fn search_threads() -> usize {
+    static N: LazyLock<usize> =
+        LazyLock::new(|| crate::parallelism::search_pool_threads().max(1));
+    *N
+}
+
 // Run probe + derived caps now (open path). Lazy statics would otherwise
 // fire inside the first query (~30ms of buffers and bandwidth samples).
 pub(crate) fn warm_calibration() {
-    let _ = (match_work_per_thread(), scan_thread_cap());
+    let _ = (match_work_per_thread(), scan_thread_cap(), search_threads());
     // Dispatch probes (empty fan-out median) join the open path so no
     // measurement fires inside the first query.
-    let _ = (crate::dispatch::fork_join_ns(), crate::dispatch::bytes_to_amortize());
+    let _ = (
+        crate::dispatch::fork_join_ns(),
+        crate::dispatch::bytes_to_amortize(),
+        crate::dispatch::sw_chunk_override(),
+        crate::dispatch::batch_par_disabled(),
+    );
 }
 impl Machine {
     fn probe() -> Self {
@@ -343,9 +353,9 @@ fn x86_topology(t: &mut Topology) {
     // AMD exposes the cache hierarchy through the topology-extensions leaf;
     // leaf 4 is only a compatibility surface there and under-reports on some
     // parts. Prefer 0x8000001D when the vendor reports it.
-    let ext = unsafe { __cpuid_count(0x8000_0000, 0) }.eax;
-    if ext >= 0x8000_000D {
-        let (l, l2, llc) = cpuid_cache_leaf(0x8000_000D);
+    let ext = __cpuid_count(0x8000_0000, 0).eax;
+    if ext >= 0x8000_001D {
+        let (l, l2, llc) = cpuid_cache_leaf(0x8000_001D);
         if l != 0 {
             t.cache_line = Some(l);
         }
@@ -386,7 +396,7 @@ fn cpuid_cache_leaf(leaf: u32) -> (usize, usize, usize) {
     let mut llc = 0usize;
     let mut sub = 0u32;
     loop {
-        let r = unsafe { __cpuid_count(leaf, sub) };
+        let r = __cpuid_count(leaf, sub);
         let ty = r.eax & 0x1f;
         if ty == 0 {
             break;
@@ -403,7 +413,7 @@ fn cpuid_cache_leaf(leaf: u32) -> (usize, usize, usize) {
             if level == 2 || level == 6 {
                 l2 = size;
             }
-            if level == 3 || (leaf == 0x8000_000D && level >= 8) {
+            if level == 3 {
                 llc = llc.max(size);
             }
         }
@@ -417,12 +427,11 @@ fn cpuid_cache_leaf(leaf: u32) -> (usize, usize, usize) {
 
 #[cfg(target_arch = "x86_64")]
 fn cpuid_max_freq_mhz() -> Option<f64> {
-    use core::arch::x86_64::__cpuid_count;
-    let ext = unsafe { __cpuid_count(0x8000_0000, 0) }.eax;
-    if ext < 0x8000_0008 {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    if __cpuid(0).eax < 0x16 {
         return None;
     }
-    let mhz = unsafe { __cpuid_count(0x8000_0008, 0) }.ecx >> 16;
+    let mhz = __cpuid_count(0x16, 0).eax & 0xffff;
     if mhz == 0 { None } else { Some(mhz as f64) }
 }
 
@@ -431,13 +440,13 @@ fn cpuid_max_freq_mhz() -> Option<f64> {
 #[cfg(target_arch = "x86_64")]
 fn cpuid_physical_cores() -> Option<usize> {
     use core::arch::x86_64::{__cpuid, __cpuid_count};
-    if unsafe { __cpuid(0) }.eax < 0xB {
+    if __cpuid(0).eax < 0xB {
         return None;
     }
     let mut subleaves = [(0u32, 0u32, 0u32); 4];
     let mut n = 0usize;
     for sub in 0..4u32 {
-        let r = unsafe { __cpuid_count(0xB, sub) };
+        let r = __cpuid_count(0xB, sub);
         subleaves[n] = (r.eax, r.ebx, r.ecx);
         n += 1;
         if r.ebx & 0xffff == 0 || (r.ecx >> 8) & 0xff == 0 {
@@ -510,6 +519,7 @@ fn arch_cache_line() -> usize {
 }
 
 #[cfg(not(target_arch = "aarch64"))]
+#[allow(dead_code)]
 fn arch_cache_line() -> usize {
     64
 }
@@ -586,6 +596,7 @@ fn linux_topology(t: &mut Topology) {
         t.numa_nodes = Some(nodes.len());
     }
     // Fall back to the reported clock when CPUID had none.
+    #[allow(clippy::collapsible_if)]
     if t.clock_hz == 0.0 {
         if let Ok(s) =
             std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
@@ -613,15 +624,19 @@ fn parse_cache_size(s: &str) -> Option<usize> {
     num.trim().parse::<usize>().ok().map(|n| n * mult)
 }
 
-// Latency probe: pointer-chase a buffer sized past the last-level cache
-// with a dependent load chain. Returns 0 when probing is disabled
-// (`FFF_NO_PROBE`) or allocation fails; the caller uses the default.
+// One env read. Set before calibration; both probes honor it.
+fn probe_disabled() -> bool {
+    static OFF: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FFF_NO_PROBE").is_some());
+    *OFF
+}
+
+// Pointer-chase past the LLC. Returns 0 when probing is disabled,
+// allocation fails, or the sample falls outside 40..2000 ns.
 fn measure_latency_ns(cache_sizes: &[usize; 2]) -> f64 {
-    if std::env::var_os("FFF_NO_PROBE").is_some() {
+    if probe_disabled() {
         return 0.0;
     }
-    // Past LLC, but never a huge allocation in a plugin host: capped at
-    // 32 MB and additionally clamped by any cgroup limit.
+    // Past the LLC, capped at 32 MB and by any cgroup limit.
     let llc = cache_sizes[1];
     let mut want = if llc > 0 {
         llc.saturating_mul(2)
@@ -632,10 +647,7 @@ fn measure_latency_ns(cache_sizes: &[usize; 2]) -> f64 {
     if let Some(limit) = cgroup_memory_limit() {
         want = want.min(limit / 8).max(1 << 20);
     }
-    // Slots are spread across the whole buffer and each stores the *byte offset*
-    // of the next, so the chase walks the entire allocation. A previous version
-    // indexed the first 128KB directly and therefore measured L2 latency
-    // (24.9ns here) while claiming to measure memory.
+    // Each slot stores the next byte offset so the chase spans the buffer.
     const SLOTS: usize = 8192;
     if want < (SLOTS + 1) * 64 {
         return 0.0;
@@ -644,6 +656,9 @@ fn measure_latency_ns(cache_sizes: &[usize; 2]) -> f64 {
         return 0.0;
     };
     let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+    if raw.is_null() {
+        return 0.0;
+    }
     let buf = unsafe { std::slice::from_raw_parts_mut(raw, want) };
     let stride = want / SLOTS;
     // Random permutation over the slots so consecutive hops are not sequential.
@@ -667,8 +682,9 @@ fn measure_latency_ns(cache_sizes: &[usize; 2]) -> f64 {
     for _ in 0..hops {
         let mut word = [0u8; 8];
         word.copy_from_slice(&buf[off..off + 8]);
-        acc = acc.wrapping_add(u64::from_le_bytes(word));
-        off = acc as usize % want & !(63usize);
+        let next = u64::from_le_bytes(word) as usize;
+        acc = acc.wrapping_add(next as u64);
+        off = next;
         if off + 8 > buf.len() {
             break;
         }
@@ -681,12 +697,7 @@ fn measure_latency_ns(cache_sizes: &[usize; 2]) -> f64 {
     if std::env::var_os("FFF_LATENCY_DEBUG").is_some() {
         eprintln!("LATENCY raw_ns={ns:.2} want={want} slots={SLOTS}");
     }
-    // Plausible range guards against a descheduled thread inflating the mean.
-
-    // We are after *DRAM* latency, so both tails are rejected: too slow means the
-    // thread was descheduled mid-probe, too fast means the chase stayed in cache
-    // (measured 9.7ns on a box whose real DRAM latency is ~80ns, which inflated
-    // work_per_thread 8x). The documented default is safer than either tail.
+    // Reject both tails: a deschedule inflates, an in-cache chase under-reports.
     if (40.0..2000.0).contains(&ns) {
         ns
     } else {

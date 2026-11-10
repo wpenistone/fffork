@@ -1,4 +1,6 @@
-use super::sink::{SinkState, debug_assert_newline_terminator, split_multiline_blob};
+use super::sink::{
+    SinkState, debug_assert_newline_terminator, split_multiline_blob, strip_line_terminators,
+};
 use super::types::Casing;
 use fff_grep::{
     Searcher, Sink, SinkMatch,
@@ -58,7 +60,7 @@ impl Matcher for RegexMatcher<'_> {
 }
 
 pub(super) struct RegexSink<'r> {
-    pub(super) state: SinkState,
+    pub(super) state: SinkState<'r>,
     pub(super) re: &'r regex::bytes::Regex,
 }
 
@@ -71,19 +73,17 @@ impl Sink for RegexSink<'_> {
         sink_match: &SinkMatch<'_>,
     ) -> Result<bool, Self::Error> {
         debug_assert_newline_terminator(searcher);
-        if self.state.max_matches != 0 && self.state.matches.len() >= self.state.max_matches {
-            return Ok(false);
-        }
-
         let line_bytes = sink_match.bytes();
         let (display_bytes, _, line_number, byte_offset) =
             SinkState::prepare_line(line_bytes, sink_match);
 
         // MultiLine strategy hands over all matched lines as one blob: keep
         // `line_content` single-line, the remaining lines become after-context.
-        let (first_line, extra_after) = split_multiline_blob(display_bytes);
+        let first_end = memchr::memchr(b'\n', display_bytes);
+        let first_line =
+            strip_line_terminators(&display_bytes[..first_end.unwrap_or(display_bytes.len())]);
         let first_len = first_line.len() as u32;
-        let line_content = String::from_utf8_lossy(first_line).into_owned();
+        let line_content = String::from_utf8_lossy(first_line);
         let mut match_byte_offsets: SmallVec<[(u32, u32); 4]> = SmallVec::new();
         let mut col = 0usize;
         let mut first = true;
@@ -101,6 +101,15 @@ impl Sink for RegexSink<'_> {
             match_byte_offsets.push((abs_start, abs_end));
         }
 
+        let Some(is_definition) = self.state.definition_mode.classify_match(
+            self.state.file,
+            strip_line_terminators(&line_bytes[..first_end.unwrap_or(line_bytes.len())]),
+            &match_byte_offsets,
+            false,
+        ) else {
+            return Ok(true);
+        };
+        let (_, extra_after) = split_multiline_blob(display_bytes);
         let (context_before, context_after) = self.state.extract_context(sink_match);
         let context_after = if extra_after.is_empty() {
             context_after
@@ -109,16 +118,16 @@ impl Sink for RegexSink<'_> {
             combined.extend(context_after);
             combined
         };
-        self.state.push_match(
+        Ok(self.state.push_match(
             line_number,
             col,
             byte_offset,
-            line_content,
+            line_content.into_owned(),
             match_byte_offsets,
+            is_definition,
             context_before,
             context_after,
-        );
-        Ok(true)
+        ))
     }
 
     fn finish(&mut self, _: &Searcher, _: &fff_grep::SinkFinish) -> Result<(), Self::Error> {

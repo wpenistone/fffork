@@ -2,6 +2,31 @@ local M = {}
 
 local set_cursor_line_mark
 
+-- Parsed needle for this query string. Highlight passes share it.
+local parsed_queries = {}
+local parsed_query_n = 0
+
+-- Match columns stay valid while this buffer tick and query cover the window.
+local scan_cache = nil
+
+local function grep_needle(query)
+  -- Needle comes from Rust GrepConfig. Do not re-strip constraints here.
+  if type(query) ~= 'string' then return '' end
+  local hit = parsed_queries[query]
+  if hit then return hit end
+  local fuzzy = require('fff.fuzzy')
+  local parsed = fuzzy.parse_grep_query(query)
+  local search_text = parsed.grep_text
+  if search_text == '' then search_text = query end
+  if parsed_query_n >= 64 then
+    parsed_queries = {}
+    parsed_query_n = 0
+  end
+  parsed_queries[query] = search_text
+  parsed_query_n = parsed_query_n + 1
+  return search_text
+end
+
 --- Jump to a location in the current buffer
 --- @param location table|nil Location data from search results
 function M.jump_to_location(location)
@@ -192,14 +217,7 @@ function M.highlight_grep_matches(bufnr, location, namespace)
   end
 
   local query = location.grep_query
-
-  -- Use the Rust GrepConfig parser as the single source of truth for
-  -- stripping constraint tokens. This avoids duplicating constraint
-  -- detection in Lua, which would break whenever a new token type is added.
-  local fuzzy = require('fff.fuzzy')
-  local parsed = fuzzy.parse_grep_query(query)
-  local search_text = parsed.grep_text
-  if search_text == '' then search_text = query end
+  local search_text = grep_needle(query)
 
   if not search_text or search_text == '' then return nil end
 
@@ -214,24 +232,56 @@ function M.highlight_grep_matches(bufnr, location, namespace)
     scan_start = math.max(1, location.line - 200)
     scan_end = math.min(line_count, location.line + 200)
   end
-  local lines = vim.api.nvim_buf_get_lines(bufnr, scan_start - 1, scan_end, false)
-  for idx, line in ipairs(lines) do
-    local i = scan_start + idx - 1
-    local search_line = has_upper and line or line:lower()
-    local search_pat = has_upper and search_text or search_text:lower()
-    local start_pos = 1
-    while true do
-      local s, e = search_line:find(search_pat, start_pos, true)
-      if not s then break end
-      -- s and e are 1-based byte positions; extmarks need 0-based
-      local ok, mark_id = pcall(vim.api.nvim_buf_set_extmark, bufnr, namespace, i - 1, s - 1, {
-        end_col = e,
-        hl_group = grep_hl,
-        priority = 1000,
-      })
-      if ok then table.insert(extmarks, { id = mark_id, line = i - 1 }) end
-      start_pos = e + 1
+
+  local tick = vim.api.nvim_buf_get_changedtick(bufnr)
+  local matches
+  local cache = scan_cache
+  if
+    cache
+    and cache.bufnr == bufnr
+    and cache.tick == tick
+    and cache.query == query
+    and cache.scan_start <= scan_start
+    and cache.scan_end >= scan_end
+  then
+    matches = {}
+    for _, m in ipairs(cache.matches) do
+      local line = m[1] + 1
+      if line >= scan_start and line <= scan_end then matches[#matches + 1] = m end
     end
+  else
+    matches = {}
+    local search_pat = has_upper and search_text or search_text:lower()
+    local lines = vim.api.nvim_buf_get_lines(bufnr, scan_start - 1, scan_end, false)
+    for idx, line in ipairs(lines) do
+      local i = scan_start + idx - 1
+      local search_line = has_upper and line or line:lower()
+      local start_pos = 1
+      while true do
+        local s, e = search_line:find(search_pat, start_pos, true)
+        if not s then break end
+        -- s and e are 1-based byte positions; extmarks need 0-based start
+        matches[#matches + 1] = { i - 1, s - 1, e }
+        start_pos = e + 1
+      end
+    end
+    scan_cache = {
+      bufnr = bufnr,
+      tick = tick,
+      query = query,
+      scan_start = scan_start,
+      scan_end = scan_end,
+      matches = matches,
+    }
+  end
+
+  for _, m in ipairs(matches) do
+    local ok, mark_id = pcall(vim.api.nvim_buf_set_extmark, bufnr, namespace, m[1], m[2], {
+      end_col = m[3],
+      hl_group = grep_hl,
+      priority = 1000,
+    })
+    if ok then table.insert(extmarks, { id = mark_id, line = m[1] }) end
   end
 
   return #extmarks > 0 and extmarks or nil

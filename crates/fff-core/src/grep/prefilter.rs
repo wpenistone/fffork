@@ -5,31 +5,8 @@ use crate::sort_buffer::sort_with_buffer;
 use crate::types::FileItem;
 use fff_query_parser::Constraint;
 
-/// Prefilter with a FilePath-constraint fallback: when constraints yield 0
-/// files and the query had FilePath constraints, retry without them (the path
-/// token was likely part of the search text).
-#[allow(clippy::too_many_arguments)]
-pub(super) fn prefilter_with_filepath_retry<'a>(
-    files: &'a [FileItem],
-    constraints: &[Constraint<'_>],
-    bigram_candidates: Option<&[u64]>,
-    base_count: usize,
-    options: &GrepSearchOptions,
-    arena: crate::simd_path::ArenaPtr,
-    overflow_arena: crate::simd_path::ArenaPtr,
-) -> (Vec<&'a FileItem>, usize) {
-    let (indexed, total) = prefilter_with_filepath_retry_indexed(
-        files,
-        constraints,
-        bigram_candidates,
-        base_count,
-        options,
-        arena,
-        overflow_arena,
-    );
-    (indexed.into_iter().map(|(f, _)| f).collect(), total)
-}
-
+/// On an empty FilePath-constrained result, retry without those path tokens.
+/// Each item is `(file, picker index)` for the content mask.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prefilter_with_filepath_retry_indexed<'a>(
     files: &'a [FileItem],
@@ -50,7 +27,9 @@ pub(super) fn prefilter_with_filepath_retry_indexed<'a>(
         overflow_arena,
     );
 
-    if !files_to_search.is_empty() {
+    if !files_to_search.is_empty()
+        || options.classify_definitions == super::DefinitionMode::DefinitionOnly
+    {
         return (files_to_search, filtered_file_count);
     }
 
@@ -138,6 +117,7 @@ pub(super) fn prefilter_files_indexed<'a>(
     overflow_arena: crate::simd_path::ArenaPtr,
 ) -> (Vec<(&'a FileItem, usize)>, usize) {
     let max_file_size = options.max_file_size;
+    let definition_only = options.classify_definitions == super::DefinitionMode::DefinitionOnly;
     let plan = if constraints.is_empty() {
         None
     } else {
@@ -152,8 +132,12 @@ pub(super) fn prefilter_files_indexed<'a>(
     let mut scratch = ConstraintsBuffers::new();
 
     #[inline(always)]
-    fn basic_prefilter(file: &FileItem, max: u64) -> bool {
-        !file.is_deleted() && !file.is_binary() && file.size > 0 && file.size <= max
+    fn basic_prefilter(file: &FileItem, max: u64, definition_only: bool) -> bool {
+        !file.is_deleted()
+            && !file.is_binary()
+            && file.size() > 0
+            && file.size() <= max
+            && (!definition_only || file.supports_definitions())
     }
 
     // squeeze as much prefilters into a single loop as possible
@@ -179,7 +163,7 @@ pub(super) fn prefilter_files_indexed<'a>(
                         bits &= bits - 1;
 
                         let f = unsafe { indexed.get_unchecked(file_idx) };
-                        if !basic_prefilter(f, max_file_size) {
+                        if !basic_prefilter(f, max_file_size, definition_only) {
                             continue;
                         }
                         if let Some(plan) = plan.as_ref()
@@ -211,7 +195,7 @@ pub(super) fn prefilter_files_indexed<'a>(
 
             // Sequential processing for non-bigrammable files: they are always in the end
             for (offset, f) in tail.iter().enumerate() {
-                if !basic_prefilter(f, max_file_size) {
+                if !basic_prefilter(f, max_file_size, definition_only) {
                     continue;
                 }
                 if let Some(ref p) = plan
@@ -230,7 +214,7 @@ pub(super) fn prefilter_files_indexed<'a>(
         None => {
             let mut out: Vec<(&FileItem, usize)> = Vec::new();
             for (idx, f) in files.iter().enumerate() {
-                if !basic_prefilter(f, max_file_size) {
+                if !basic_prefilter(f, max_file_size, definition_only) {
                     continue;
                 }
                 if let Some(ref p) = plan
@@ -245,12 +229,7 @@ pub(super) fn prefilter_files_indexed<'a>(
     };
 
     let total_count = prefiltered.len();
-
-    sort_with_buffer(&mut prefiltered, |a, b| {
-        b.0.total_frecency_score()
-            .cmp(&a.0.total_frecency_score())
-            .then(b.0.modified.cmp(&a.0.modified))
-    });
+    sort_candidates_once(&mut prefiltered);
 
     if options.file_offset > 0 && options.file_offset < total_count {
         let paginated = prefiltered.split_off(options.file_offset);
@@ -279,4 +258,105 @@ fn strip_file_path_constraint_if_present<'a>(
         .collect();
 
     Some(filtered)
+}
+
+// One sequential load of frecency/mtime. The stable sort compares those keys
+// and does not reload FileItem atomics on each comparison.
+fn sort_candidates_once(items: &mut Vec<(&FileItem, usize)>) {
+    let n = items.len();
+    if n < 2 {
+        return;
+    }
+    let mut keys: Vec<(i32, u64)> = Vec::with_capacity(n);
+    for (file, _) in items.iter() {
+        keys.push((file.total_frecency_score(), file.modified()));
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    sort_with_buffer(&mut order, |&a, &b| {
+        keys[b].0.cmp(&keys[a].0).then(keys[b].1.cmp(&keys[a].1))
+    });
+    // `order[i]` is the source index for position `i`.
+    for i in 0..n {
+        if order[i] == i {
+            continue;
+        }
+        let mut current = i;
+        loop {
+            let next = order[current];
+            if next == i {
+                order[current] = current;
+                break;
+            }
+            items.swap(current, next);
+            order[current] = current;
+            current = next;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::grep::DefinitionMode;
+    use crate::simd_path::ArenaPtr;
+
+    #[test]
+    fn definition_only_prefilters_before_sorting_and_offsets() {
+        let files: Vec<_> = (0..70)
+            .map(|idx| {
+                let size = match idx {
+                    9 => 0,
+                    12 => 101,
+                    _ => 10,
+                };
+                let mut file = FileItem::new_raw(0, size, 1000 - idx, None, idx == 6);
+                file.mark_definition_language(["file.rs", "file.txt", "file.py"][idx as usize % 3]);
+                file.set_deleted(idx == 8);
+                file.set_overflow(idx >= 65);
+                file
+            })
+            .collect();
+        let all = [u64::MAX, 1];
+        let even = [0x5555_5555_5555_5555, 1];
+        for candidates in [None, Some(all.as_slice()), Some(even.as_slice())] {
+            for mode in [
+                DefinitionMode::Off,
+                DefinitionMode::Classify,
+                DefinitionMode::DefinitionOnly,
+                DefinitionMode::UsageOnly,
+            ] {
+                let expected: Vec<_> = (0..70)
+                    .filter(|idx| ![6, 8, 9, 12].contains(idx))
+                    .filter(|idx| mode != DefinitionMode::DefinitionOnly || idx % 3 != 1)
+                    .filter(|idx| {
+                        *idx >= 65
+                            || candidates.is_none_or(|bits| bits[idx / 64] & (1 << (idx % 64)) != 0)
+                    })
+                    .map(|idx| 1000 - idx as u64)
+                    .collect();
+                for offset in [0, 2, expected.len(), expected.len() + 1] {
+                    let options = GrepSearchOptions {
+                        max_file_size: 100,
+                        classify_definitions: mode,
+                        file_offset: offset,
+                        ..Default::default()
+                    };
+                    let (result, count) = prefilter_files(
+                        &files,
+                        &[],
+                        candidates,
+                        65,
+                        &options,
+                        ArenaPtr::null(),
+                        ArenaPtr::null(),
+                    );
+                    assert_eq!(count, expected.len());
+                    assert_eq!(
+                        result.iter().map(|file| file.modified()).collect::<Vec<_>>(),
+                        expected[offset.min(expected.len())..],
+                    );
+                }
+            }
+        }
+    }
 }

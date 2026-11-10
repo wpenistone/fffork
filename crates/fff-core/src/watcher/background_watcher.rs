@@ -1,6 +1,7 @@
 use crate::constants::MAX_OVERFLOW_FILES;
 use crate::error::Error;
 use crate::file_picker::FFFMode;
+use crate::git::GitDiscovery;
 use crate::git_status_worker::GitStatusWorker;
 use crate::rescan_stats::RescanReason;
 use crate::shared::{SharedFilePicker, SharedFrecency};
@@ -45,7 +46,7 @@ impl BackgroundWatcher {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         base_path: PathBuf,
-        git_workdir: Option<PathBuf>,
+        git: Option<GitDiscovery>,
         shared_picker: SharedFilePicker,
         shared_frecency: SharedFrecency,
         mode: FFFMode,
@@ -92,12 +93,13 @@ impl BackgroundWatcher {
 
         let owner_weak_picker = shared_picker.weaken();
         let owner_frecency = shared_frecency.clone();
-        let owner_git_workdir = git_workdir.clone();
+        let owner_git_workdir = git.as_ref().map(|git| git.workdir.clone());
+        let owner_git_dir = git.as_ref().map(|git| git.git_dir.clone());
         let owner_git_worker = Arc::clone(&git_status_worker);
 
         let debouncer = Self::create_debouncer(
             base_path,
-            git_workdir,
+            git,
             shared_picker,
             shared_frecency,
             mode,
@@ -144,6 +146,7 @@ impl BackgroundWatcher {
                             &strong_picker,
                             &owner_frecency,
                             &owner_git_workdir,
+                            &owner_git_dir,
                             &owner_git_worker,
                         );
 
@@ -176,7 +179,7 @@ impl BackgroundWatcher {
     #[allow(clippy::too_many_arguments)]
     fn create_debouncer(
         base_path: PathBuf,
-        git_workdir: Option<PathBuf>,
+        git: Option<GitDiscovery>,
         shared_picker: SharedFilePicker,
         shared_frecency: SharedFrecency,
         mode: FFFMode,
@@ -190,10 +193,13 @@ impl BackgroundWatcher {
             // our own grep calls and preview window rendering
             .with_event_kinds(EventKindMask::CORE);
 
-        let git_workdir_for_handler = git_workdir.clone();
+        let git_workdir_for_handler = git.as_ref().map(|git| git.workdir.clone());
+        let git_dir_for_handler = git.as_ref().map(|git| git.git_dir.clone());
         let base_path_for_handler = base_path.clone();
         let shared_picker_for_watching = shared_picker.clone();
         let file_picker = shared_picker.weaken();
+        // One libgit2 repo for the handler thread. Ignore-file batches drop it.
+        let mut cached_repo: Option<Repository> = None;
         let mut debouncer = new_debouncer_opt(
             DEBOUNCE_TIMEOUT,
             Some(DEBOUNCE_TIMEOUT / 2), // tick rate for the event span
@@ -209,6 +215,8 @@ impl BackgroundWatcher {
                             events,
                             &base_path_for_handler,
                             &git_workdir_for_handler,
+                            git_dir_for_handler.as_deref(),
+                            &mut cached_repo,
                             &file_picker,
                             &shared_frecency,
                             &git_status_worker,
@@ -293,7 +301,10 @@ impl BackgroundWatcher {
         // The .git directory is excluded from the file list but we still need
         // to observe changes that affect git status (staging, unstaging,
         // committing, branch switches, merges, etc)
-        watch_git_status_paths(&mut debouncer, git_workdir.as_ref());
+        watch_git_status_paths(
+            &mut debouncer,
+            git.as_ref().map(|git| git.git_dir.as_path()),
+        );
 
         Ok(debouncer)
     }
@@ -326,25 +337,47 @@ impl Drop for BackgroundWatcher {
     }
 }
 
-#[tracing::instrument(name = "fs_events", skip(events, shared_picker, shared_frecency, git_status_worker), level = Level::DEBUG)]
+#[tracing::instrument(name = "fs_events", skip(events, shared_picker, shared_frecency, git_status_worker, cached_repo), level = Level::DEBUG)]
 pub(crate) fn handle_debounced_events(
     mode: FFFMode,
     events: Vec<DebouncedEvent>,
     base_path: &Path,
     git_workdir: &Option<PathBuf>,
+    git_dir: Option<&Path>,
+    cached_repo: &mut Option<Repository>,
     shared_picker: &SharedFilePicker,
     shared_frecency: &SharedFrecency,
     git_status_worker: &Arc<GitStatusWorker>,
 ) -> Vec<PathBuf> {
-    // this will be called very often, we have to minimiy the lock time for file picker
-    let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
-    // Prefer the walker's own ignore rules (zlob); grab a cheap Arc clone once
-    // per batch so we don't hold the picker lock during filtering.
+    // Walker rules already encode gitignore, so libgit2 stays closed.
+    // Without them, reuse one repo and drop it when ignore files change.
     let walker_rules = shared_picker
         .read()
         .ok()
         .and_then(|g| g.as_ref().and_then(|p| p.ignore_rules()));
-    let filter = IgnoreFilter::new(base_path, walker_rules, repo.as_ref());
+    let rules_present = walker_rules.is_some();
+    if rules_present {
+        let _ = cached_repo.take();
+    } else {
+        if cached_repo.is_some() && batch_edits_ignore(&events) {
+            let _ = cached_repo.take();
+        }
+        if cached_repo.is_none() && git_workdir.is_some() {
+            *cached_repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
+        }
+    }
+    let repo = if rules_present {
+        None
+    } else {
+        cached_repo.as_ref()
+    };
+    let owned_git_dir = if git_dir.is_none() {
+        repo.as_ref().map(|repo| repo.path().to_path_buf())
+    } else {
+        None
+    };
+    let git_dir = git_dir.or(owned_git_dir.as_deref());
+    let filter = IgnoreFilter::new(base_path, walker_rules, repo);
     let mut need_full_git_rescan = false;
     let mut batch_overflow_attempted = false;
     let mut paths_to_remove = Vec::new();
@@ -414,6 +447,16 @@ pub(crate) fn handle_debounced_events(
             explicit_renames.push((from.clone(), to.clone()));
         }
 
+        let explicit_removal = matches!(debounced_event.event.kind, EventKind::Remove(_));
+        let is_folder_removal = matches!(
+            debounced_event.event.kind,
+            EventKind::Remove(notify::event::RemoveKind::Folder)
+        );
+        let maybe_directory = !matches!(
+            debounced_event.event.kind,
+            EventKind::Remove(notify::event::RemoveKind::File)
+        );
+
         for path in &debounced_event.event.paths {
             if matches!(
                 path.file_name().and_then(|f| f.to_str()),
@@ -439,61 +482,32 @@ pub(crate) fn handle_debounced_events(
                 // indexed; the stale rules heal on the next admitted rescan.
             }
 
-            if is_dotgit_change_affecting_status(path, &repo) {
+            if is_dotgit_change_affecting_status(path, git_dir) {
                 need_full_git_rescan = true;
             }
 
-            if is_git_file(path) {
+            // bare repos keep worktree git dirs outside of any `.git` component
+            if is_git_file(path) || git_dir.is_some_and(|dir| path.starts_with(dir)) {
                 continue;
             }
 
-            // Use a combination of event kind and filesystem state to decide
-            // whether a path is an addition/modification or a removal.
-            //
-            // We cannot rely on `path.exists()` alone because:
-            //   - A freshly created file might not be visible yet (race).
-            //   - macOS FSEvents uses Modify(Name(Any)) for both rename-in
-            //     and rename-out, so we must stat the path to disambiguate.
-            //
-            // We cannot rely on event kind alone because:
-            //   - Remove events are not always emitted (macOS often sends
-            //     Modify(Name(Any)) instead of Remove).
-            let is_removal = matches!(debounced_event.event.kind, EventKind::Remove(_));
-
-            // Directory-level remove: both fsevents and inotify delivers a single
-            // `Remove(Folder)` event for a whole directory tree (e.g.
-            // after `git reset --hard` wipes a dir full of staged-but-
-            // uncommitted files).
-            let is_folder_removal = matches!(
-                debounced_event.event.kind,
-                EventKind::Remove(notify::event::RemoveKind::Folder)
-            );
-
-            let is_removed = is_folder_removal || is_removal || !path.exists();
-
-            let (is_dir, is_ignored) = if is_removed {
-                (false, true)
-            } else {
-                (path.is_dir(), filter.is_ignored(path))
-            };
-
-            if is_folder_removal {
-                dirs_to_remove.push(path.to_path_buf());
-            } else if is_removed {
-                // best effort but doesn't require a stat and generally correct
-                let maybe_directory = !matches!(
-                    debounced_event.event.kind,
-                    EventKind::Remove(notify::event::RemoveKind::File)
-                );
-
-                paths_to_remove.push((path.as_path(), maybe_directory));
-            } else if is_dir {
-                if !is_ignored {
+            match classify_live(path, explicit_removal) {
+                LiveClass::Gone if is_folder_removal => {
+                    dirs_to_remove.push(path.to_path_buf());
+                }
+                LiveClass::Gone => {
+                    paths_to_remove.push((path.as_path(), maybe_directory));
+                }
+                LiveClass::Dir if !filter.is_ignored(path) => {
                     new_dirs_to_watch.push(path.to_path_buf());
                 }
-            } else if !is_ignored {
-                // For additions/modifications, still filter gitignored files.
-                paths_to_add_or_modify.push(path.as_path());
+                LiveClass::File(identity) if !filter.is_ignored(path) => {
+                    paths_to_add_or_modify.push(PendingAdd {
+                        path: path.as_path(),
+                        identity,
+                    });
+                }
+                LiveClass::Dir | LiveClass::File(_) => {}
             }
         }
 
@@ -512,11 +526,12 @@ pub(crate) fn handle_debounced_events(
         }
     }
 
-    // It's important to get the allocated sort
-    sort_with_buffer(paths_to_add_or_modify.as_mut_slice(), |a, b| {
-        a.as_os_str().cmp(b.as_os_str())
-    });
-    paths_to_add_or_modify.dedup_by(|a, b| a.as_os_str().eq(b.as_os_str()));
+    if paths_to_add_or_modify.len() > 1 {
+        sort_with_buffer(paths_to_add_or_modify.as_mut_slice(), |a, b| {
+            a.path.as_os_str().cmp(b.path.as_os_str())
+        });
+        paths_to_add_or_modify.dedup_by(|a, b| a.path.as_os_str().eq(b.path.as_os_str()));
+    }
 
     info!(
         "Event processing summary: {} to remove, {} dirs to remove, {} to add/modify, {} new dirs",
@@ -591,8 +606,10 @@ pub(crate) fn handle_debounced_events(
         }
 
         // Single index scan for all dirs; misses (never-indexed paths) are free.
-        dirs_to_remove.sort_unstable();
-        dirs_to_remove.dedup();
+        if dirs_to_remove.len() > 1 {
+            dirs_to_remove.sort_unstable();
+            dirs_to_remove.dedup();
+        }
         if !dirs_to_remove.is_empty() {
             let dirs = dirs_to_remove.iter().map(PathBuf::as_path);
             if need_events_propagation {
@@ -611,8 +628,13 @@ pub(crate) fn handle_debounced_events(
         }
 
         files_to_update_git_status.reserve(paths_to_add_or_modify.len());
-        let mut landed_renames = ahash::AHashSet::with_capacity(renames.len());
-        for path in &paths_to_add_or_modify {
+        let mut landed_renames = if renames.is_empty() {
+            ahash::AHashSet::new()
+        } else {
+            ahash::AHashSet::with_capacity(renames.len())
+        };
+        for add in &paths_to_add_or_modify {
+            let path = add.path;
             if picker.get_overflow_files().len() >= MAX_OVERFLOW_FILES
                 && picker.get_file_by_path(path).is_none()
             {
@@ -624,11 +646,11 @@ pub(crate) fn handle_debounced_events(
 
             if picker.handle_create_or_modify(path).is_some() {
                 files_to_update_git_status.push(path.to_path_buf());
-                if renames.contains_key(*path) {
+                if renames.contains_key(path) {
                     landed_renames.insert(path.to_path_buf());
                 }
                 if need_events_propagation {
-                    let event = match renames.get(*path) {
+                    let event = match renames.get(path) {
                         Some(from) => (WatchEventKind::Renamed, Some(from.clone())),
                         None if existed => (WatchEventKind::Modified, None),
                         None => (WatchEventKind::Created, None),
@@ -729,10 +751,17 @@ pub(crate) fn handle_debounced_events(
     // This runs after apply_changes so the picker write lock is released.
     if mode.is_ai() && !paths_to_add_or_modify.is_empty() {
         let mut tracked_count = 0usize;
+        let shared_base = shared_picker.read().ok().and_then(|guard| {
+            guard
+                .as_ref()?
+                .worktree_shared_base()
+                .map(Path::to_path_buf)
+        });
         if let Ok(frecency_guard) = shared_frecency.read()
             && let Some(ref frecency) = *frecency_guard
         {
-            for path in &paths_to_add_or_modify {
+            for add in &paths_to_add_or_modify {
+                let path = add.path;
                 // Skip if this file was tracked less than 5 minutes ago
                 let should_track = match frecency.seconds_since_last_access(path) {
                     Ok(Some(secs)) => secs >= AI_MODE_COOLDOWN_SECS,
@@ -743,7 +772,10 @@ pub(crate) fn handle_debounced_events(
                     continue;
                 }
 
-                if let Err(e) = frecency.track_access(path) {
+                let shared = shared_base
+                    .as_deref()
+                    .and_then(|shared_base| crate::git::shared_twin(path, base_path, shared_base));
+                if let Err(e) = frecency.track_access_shared(path, shared.as_deref()) {
                     error!("Failed to track frecency for {:?}: {:?}", path, e);
                 } else {
                     tracked_count += 1;
@@ -761,15 +793,15 @@ pub(crate) fn handle_debounced_events(
             && let Ok(frecency_guard) = shared_frecency.read()
             && let Some(ref frecency) = *frecency_guard
         {
-            for path in &paths_to_add_or_modify {
-                let _ = picker.update_single_file_frecency(path, frecency);
+            for add in &paths_to_add_or_modify {
+                let _ = picker.update_single_file_frecency(add.path, frecency);
             }
         }
     }
 
     // do not try to update the paths if we anyway going to rescan everything from scratch
     // no repo => no consumer thread, so don't accumulate paths nobody will drain
-    if !index_update_rejected && repo.is_some() {
+    if !index_update_rejected && git_dir.is_some() {
         if need_full_git_rescan {
             // A full git rescan re-reads every tracked path (including ones that just
             // went clean after a commit), so it already subsumes the per-path update.
@@ -787,9 +819,9 @@ fn index_new_directory(
     shared_picker: &SharedFilePicker,
     shared_frecency: &SharedFrecency,
     git_workdir: &Option<PathBuf>,
+    git_dir: &Option<PathBuf>,
     git_status_worker: &Arc<GitStatusWorker>,
 ) -> Vec<PathBuf> {
-    let repo = git_workdir.as_ref().and_then(|p| Repository::open(p).ok());
     // Prefer the walker's ignore rules; read base_path + rules from the picker.
     let (base_path, walker_rules, follow_symlinks) = match shared_picker.read().ok().and_then(|g| {
         g.as_ref().map(|p| {
@@ -804,9 +836,21 @@ fn index_new_directory(
         None => return Vec::new(),
     };
 
+    // Rules already apply gitignore. Open libgit2 only for the fallback filter.
+    let repo = if walker_rules.is_none() {
+        git_workdir.as_ref().and_then(|p| Repository::open(p).ok())
+    } else {
+        None
+    };
+    let has_git = if walker_rules.is_some() {
+        git_workdir.is_some() || git_dir.is_some()
+    } else {
+        repo.is_some()
+    };
+
     let walk = match crate::walk::walk_collect_files(
         dir,
-        repo.is_some(),
+        has_git,
         follow_symlinks,
         1,
         &Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -829,13 +873,13 @@ fn index_new_directory(
     let files_to_add: Vec<PathBuf> = walk
         .pairs
         .iter()
-        .filter_map(|(_, path)| join_unless_ignored(path))
+        .filter_map(|(_, span)| join_unless_ignored(walk.path(*span)))
         .collect();
 
     let subdirs: Vec<PathBuf> = walk
         .dirs
         .iter()
-        .filter_map(|path| join_unless_ignored(path.trim_end_matches('/')))
+        .filter_map(|span| join_unless_ignored(walk.path(*span).trim_end_matches('/')))
         .collect();
 
     if files_to_add.is_empty() {
@@ -895,7 +939,7 @@ fn index_new_directory(
         watch_registry.dispatch(&base_path, events);
     }
 
-    if !rescan_started && repo.is_some() {
+    if !rescan_started && has_git {
         git_status_worker.enqueue_paths(indexed_files);
     }
 
@@ -983,12 +1027,10 @@ pub(crate) fn is_git_file(path: &Path) -> bool {
         .any(|component| component.as_os_str() == ".git")
 }
 
-fn is_dotgit_change_affecting_status(changed: &Path, repo: &Option<Repository>) -> bool {
-    let Some(repo) = repo.as_ref() else {
+fn is_dotgit_change_affecting_status(changed: &Path, git_dir: Option<&Path>) -> bool {
+    let Some(git_dir) = git_dir else {
         return false;
     };
-
-    let git_dir = repo.path();
 
     if let Ok(path_in_git_dir) = changed.strip_prefix(git_dir) {
         // Only react to changes that rewrite the worktree state: commits,
@@ -1022,20 +1064,16 @@ fn is_dotgit_change_affecting_status(changed: &Path, repo: &Option<Repository>) 
     false
 }
 
-fn watch_git_status_paths(debouncer: &mut Debouncer, git_workdir: Option<&PathBuf>) {
-    let Some(workdir) = git_workdir else {
+// `git_dir` is `.git/worktrees/<name>` for linked worktrees, whose `.git` is a file.
+fn watch_git_status_paths(debouncer: &mut Debouncer, git_dir: Option<&Path>) {
+    let Some(git_dir) = git_dir.filter(|git_dir| git_dir.is_dir()) else {
         return;
     };
-
-    let git_dir = workdir.join(".git");
-    if !git_dir.is_dir() {
-        return;
-    }
 
     // We have tried to be smart about the internal git state but
     // it appeared more harmful that it's worth it, so we just watch
     // for the most obvious paths like HEAD, MERGE_HEAD, index.lock
-    if let Err(e) = debouncer.watch(&git_dir, RecursiveMode::NonRecursive) {
+    if let Err(e) = debouncer.watch(git_dir, RecursiveMode::NonRecursive) {
         warn!("Failed to watch .git directory: {}", e);
     }
 
@@ -1058,15 +1096,62 @@ struct FileIdentity {
     mtime: u64,
 }
 
-// Returns destination -> source. Explicit pairs from the OS win outright; the
-// rest is inferred from files that kept their exact size and mtime. Call while
-// the removed paths are still indexed — that is the only source of their
-// metadata once they are gone from disk.
+#[derive(Clone, Copy)]
+struct PendingAdd<'a> {
+    path: &'a Path,
+    identity: Option<FileIdentity>,
+}
+
+enum LiveClass {
+    Gone,
+    Dir,
+    File(Option<FileIdentity>),
+}
+
+// Explicit removals skip the stat. Otherwise one `metadata` follows symlinks
+// and is both the liveness check and the rename identity.
+fn classify_live(path: &Path, explicit_removal: bool) -> LiveClass {
+    if explicit_removal {
+        return LiveClass::Gone;
+    }
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => LiveClass::Dir,
+        Ok(meta) => LiveClass::File(file_identity(&meta)),
+        Err(_) => LiveClass::Gone,
+    }
+}
+
+fn file_identity(meta: &std::fs::Metadata) -> Option<FileIdentity> {
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(FileIdentity {
+        size: meta.len(),
+        mtime,
+    })
+}
+
+fn batch_edits_ignore(events: &[DebouncedEvent]) -> bool {
+    events.iter().any(|event| {
+        event.event.paths.iter().any(|path| {
+            matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some(".gitignore") | Some(".ignore")
+            )
+        })
+    })
+}
+
+// Destination -> source. Explicit OS pairs win. Otherwise pair on size and
+// mtime; removed paths still have to be indexed, which is their only metadata.
 fn detect_renames(
     picker: &crate::file_picker::FilePicker,
     base_path: &Path,
     paths_to_remove: &[(&Path, bool)],
-    paths_to_add_or_modify: &[&Path],
+    paths_to_add_or_modify: &[PendingAdd<'_>],
     explicit: &[(PathBuf, PathBuf)],
 ) -> ahash::AHashMap<PathBuf, PathBuf> {
     // Subscribers only ever see paths relative to the base, so a move that
@@ -1090,8 +1175,8 @@ fn detect_renames(
             Some((
                 path.to_path_buf(),
                 FileIdentity {
-                    size: file.size,
-                    mtime: file.modified,
+                    size: file.size(),
+                    mtime: file.modified(),
                 },
             ))
         })
@@ -1099,29 +1184,14 @@ fn detect_renames(
 
     let added: Vec<(PathBuf, FileIdentity)> = paths_to_add_or_modify
         .iter()
-        .filter(|path| !renames.contains_key(**path))
+        .filter(|add| !renames.contains_key(add.path))
         // A path already live in the index was edited, not moved into place.
-        .filter(|path| {
+        .filter(|add| {
             picker
-                .get_file_by_path(path)
+                .get_file_by_path(add.path)
                 .is_none_or(|file| file.is_deleted())
         })
-        .filter_map(|path| {
-            let meta = std::fs::metadata(path).ok()?;
-            let mtime = meta
-                .modified()
-                .ok()?
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?
-                .as_secs();
-            Some((
-                path.to_path_buf(),
-                FileIdentity {
-                    size: meta.len(),
-                    mtime,
-                },
-            ))
-        })
+        .filter_map(|add| add.identity.map(|identity| (add.path.to_path_buf(), identity)))
         .collect();
 
     for (from, to) in pair_renames_by_identity(&removed, &added) {
@@ -1251,6 +1321,7 @@ mod tests {
             &shared_picker,
             &SharedFrecency::noop(),
             &None,
+            &None,
             &GitStatusWorker::new(),
         );
         {
@@ -1336,11 +1407,14 @@ mod tests {
             ),
         ];
 
+        let mut cached_repo = None;
         handle_debounced_events(
             FFFMode::Neovim,
             events,
             &base,
             &None,
+            None,
+            &mut cached_repo,
             &shared_picker,
             &shared_frecency,
             &GitStatusWorker::new(),
@@ -1463,12 +1537,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = git2::Repository::init(tmp.path()).unwrap();
         let git_dir = repo.path().to_path_buf();
-        let repo = Some(repo);
 
         let affecting = ["index", "index.lock", "HEAD", "logs/HEAD", "MERGE_HEAD"];
         for p in affecting {
             assert!(
-                is_dotgit_change_affecting_status(&git_dir.join(p), &repo),
+                is_dotgit_change_affecting_status(&git_dir.join(p), Some(&git_dir)),
                 "{p} must trigger a git status rescan"
             );
         }
@@ -1483,7 +1556,7 @@ mod tests {
         ];
         for p in non_affecting {
             assert!(
-                !is_dotgit_change_affecting_status(&git_dir.join(p), &repo),
+                !is_dotgit_change_affecting_status(&git_dir.join(p), Some(&git_dir)),
                 "{p} must NOT trigger a git status rescan"
             );
         }
@@ -1491,11 +1564,11 @@ mod tests {
         // Worktree paths outside .git never match.
         assert!(!is_dotgit_change_affecting_status(
             &tmp.path().join("src/main.rs"),
-            &repo
+            Some(&git_dir)
         ));
         assert!(!is_dotgit_change_affecting_status(
             &git_dir.join("index"),
-            &None
+            None
         ));
     }
 }

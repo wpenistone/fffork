@@ -1,0 +1,626 @@
+{
+  "ablation": {
+    "evidence_bonus": {
+      "10": {
+        "ablate": [
+          "evidence_bonus"
+        ],
+        "hit_rate": 0.8,
+        "k": 10,
+        "mrr": 0.8,
+        "ndcg": 0.6009311402260086,
+        "per_query": [
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 66,
+            "n_relevant": 66,
+            "ndcg": 0.35664813133100276,
+            "query": "score",
+            "recall": 0.15151515151515152
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 103,
+            "n_relevant": 103,
+            "ndcg": 1.0,
+            "query": "controller",
+            "recall": 0.0970873786407767
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 13,
+            "n_relevant": 13,
+            "ndcg": 0.9510895999789226,
+            "query": "file_picke",
+            "recall": 0.6923076923076923
+          },
+          {
+            "first_relevant_rank": null,
+            "mrr": 0.0,
+            "n_judged": 101,
+            "n_relevant": 101,
+            "ndcg": 0.0,
+            "query": "index",
+            "recall": 0.0
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 114,
+            "n_relevant": 114,
+            "ndcg": 0.6969179698201174,
+            "query": "netconvert",
+            "recall": 0.06140350877192982
+          }
+        ],
+        "queries": 5,
+        "recall": 0.20046274624711008
+      },
+      "100": {
+        "ablate": [
+          "evidence_bonus"
+        ],
+        "hit_rate": 1.0,
+        "k": 100,
+        "mrr": 0.8166666666666667,
+        "ndcg": 0.6246459746975477,
+        "per_query": [
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 66,
+            "n_relevant": 66,
+            "ndcg": 0.40176446766820756,
+            "query": "score",
+            "recall": 0.3333333333333333
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 103,
+            "n_relevant": 103,
+            "ndcg": 0.7741797966463703,
+            "query": "controller",
+            "recall": 0.6019417475728155
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 13,
+            "n_relevant": 13,
+            "ndcg": 0.9818327959963377,
+            "query": "file_picke",
+            "recall": 1.0
+          },
+          {
+            "first_relevant_rank": 12,
+            "mrr": 0.08333333333333333,
+            "n_judged": 101,
+            "n_relevant": 101,
+            "ndcg": 0.37149117244986124,
+            "query": "index",
+            "recall": 0.43564356435643564
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 114,
+            "n_relevant": 114,
+            "ndcg": 0.5939616407269619,
+            "query": "netconvert",
+            "recall": 0.3157894736842105
+          }
+        ],
+        "queries": 5,
+        "recall": 0.537341623789359
+      }
+    },
+    "filename_bonus": {
+      "10": {
+        "ablate": [
+          "filename_bonus"
+        ],
+        "hit_rate": 0.8,
+        "k": 10,
+        "mrr": 0.8,
+        "ndcg": 0.6009311402260086,
+        "per_query": [
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 66,
+            "n_relevant": 66,
+            "ndcg": 0.35664813133100276,
+            "query": "score",
+            "recall": 0.15151515151515152
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 103,
+            "n_relevant": 103,
+            "ndcg": 1.0,
+            "query": "controller",
+            "recall": 0.0970873786407767
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 13,
+            "n_relevant": 13,
+            "ndcg": 0.9510895999789226,
+            "query": "file_picke",
+            "recall": 0.6923076923076923
+          },
+          {
+            "first_relevant_rank": null,
+            "mrr": 0.0,
+            "n_judged": 101,
+            "n_relevant": 101,
+            "ndcg": 0.0,
+            "query": "index",
+            "recall": 0.0
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 114,
+            "n_relevant": 114,
+            "ndcg": 0.6969179698201174,
+            "query": "netconvert",
+            "recall": 0.06140350877192982
+          }
+        ],
+        "queries": 5,
+        "recall": 0.20046274624711008
+      },
+      "100": {
+        "ablate": [
+          "filename_bonus"
+        ],
+        "hit_rate": 1.0,
+        "k": 100,
+        "mrr": 0.8166666666666667,
+        "ndcg": 0.6250545664395062,
+        "per_query": [
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 66,
+            "n_relevant": 66,
+            "ndcg": 0.40176446766820756,
+            "query": "score",
+            "recall": 0.3333333333333333
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 103,
+            "n_relevant": 103,
+            "ndcg": 0.7684315301313296,
+            "query": "controller",
+            "recall": 0.6019417475728155
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 13,
+            "n_relevant": 13,
+            "ndcg": 0.9818327959963377,
+            "query": "file_picke",
+            "recall": 1.0
+          },
+          {
+            "first_relevant_rank": 12,
+            "mrr": 0.08333333333333333,
+            "n_judged": 101,
+            "n_relevant": 101,
+            "ndcg": 0.37149117244986124,
+            "query": "index",
+            "recall": 0.43564356435643564
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 114,
+            "n_relevant": 114,
+            "ndcg": 0.6017528659517948,
+            "query": "netconvert",
+            "recall": 0.3157894736842105
+          }
+        ],
+        "queries": 5,
+        "recall": 0.537341623789359
+      }
+    }
+  },
+  "ablation_terms_nonzero": [
+    "evidence_bonus",
+    "filename_bonus"
+  ],
+  "ablation_terms_zero": [
+    "combo_match_boost",
+    "current_file_penalty",
+    "distance_penalty",
+    "frecency_boost",
+    "git_recency_boost",
+    "git_status_boost",
+    "path_alignment_bonus",
+    "special_filename_bonus"
+  ],
+  "caveat": "Synthetic filename-stem judgments, not real user queries or clicks. Top-k overlap is ranking-change detection, not parity or quality. Unjudged pooled candidates count as grade 0 by convention.",
+  "corpus": "C:\\Users\\kanal\\Projects",
+  "deltas_fork_minus_upstream": {
+    "10": {
+      "hit_rate": 0.0,
+      "mrr": 0.0,
+      "ndcg": 0.1078252259039757,
+      "recall": -0.03252361673414306
+    },
+    "100": {
+      "hit_rate": 0.0,
+      "mrr": 0.0,
+      "ndcg": 0.02905931091349101,
+      "recall": -0.00877192982456132
+    }
+  },
+  "dump_date": "2026-11-05",
+  "dumps": {
+    "fork": {
+      "binary_sha256": "5194357E7672E9FAB950994AC404C9E3C548173E25DA19D22CFCB493C7035417",
+      "commit": "d0740a9",
+      "file": "fork-top100.jsonl",
+      "sha256": "ECC58FB62753F3BA718FCFFAF07349F3DA44B2387FCE4001FF0C07CF0A99CF4C"
+    },
+    "upstream": {
+      "binary_sha256": "A21DD5D680106BFC01CD0F81A257BDD1A021CE2095840AF2215EEAA3CF51AF6C",
+      "commit": "51649e1",
+      "file": "upstream-top100.jsonl",
+      "sha256": "8D381B1B62BFAD3090E696BE1AD66888390E7E73068DA2EDC8D77D9534A989C3"
+    }
+  },
+  "evaluated_utc": "2026-11-09T15:44:11.257568+00:00",
+  "interpretation": "Synthetic labels reward exact/prefix filename matches. The fork's NDCG is higher on controller/netconvert; its recall is lower on file_picke/netconvert. That is a trade-off under a synthetic rule, not evidence that the fork ranks better for users.",
+  "kind": "synthetic-filename-stem",
+  "label_counts": {
+    "controller": {
+      "grade1": 74,
+      "grade2": 14,
+      "grade3": 15,
+      "pool": 103,
+      "relevant": 103
+    },
+    "file_picke": {
+      "grade1": 10,
+      "grade2": 3,
+      "grade3": 0,
+      "pool": 145,
+      "relevant": 13
+    },
+    "index": {
+      "grade1": 49,
+      "grade2": 9,
+      "grade3": 43,
+      "pool": 101,
+      "relevant": 101
+    },
+    "netconvert": {
+      "grade1": 89,
+      "grade2": 13,
+      "grade3": 12,
+      "pool": 119,
+      "relevant": 114
+    },
+    "score": {
+      "grade1": 52,
+      "grade2": 11,
+      "grade3": 3,
+      "pool": 100,
+      "relevant": 66
+    }
+  },
+  "label_rule": {
+    "grade0": "unjudged; pooled convention",
+    "grade1": "query appears in basename stem or anywhere in the relative path",
+    "grade2": "basename stem starts with query, or query starts with stem (stem len >= 4)",
+    "grade3": "basename stem exactly equals query (case-insensitive)",
+    "pool": "union of fork and upstream top-100 paths"
+  },
+  "overlap": {
+    "10": {
+      "jaccard": 0.6493506493506493,
+      "k": 10,
+      "n": 5,
+      "per_query": [
+        {
+          "jaccard": 1.0,
+          "query": "score"
+        },
+        {
+          "jaccard": 0.3333333333333333,
+          "query": "controller"
+        },
+        {
+          "jaccard": 0.6666666666666666,
+          "query": "file_picke"
+        },
+        {
+          "jaccard": 0.8181818181818182,
+          "query": "index"
+        },
+        {
+          "jaccard": 0.42857142857142855,
+          "query": "netconvert"
+        }
+      ]
+    },
+    "100": {
+      "jaccard": 0.7963856412705327,
+      "k": 100,
+      "n": 5,
+      "per_query": [
+        {
+          "jaccard": 1.0,
+          "query": "score"
+        },
+        {
+          "jaccard": 0.941747572815534,
+          "query": "controller"
+        },
+        {
+          "jaccard": 0.3793103448275862,
+          "query": "file_picke"
+        },
+        {
+          "jaccard": 0.9801980198019802,
+          "query": "index"
+        },
+        {
+          "jaccard": 0.680672268907563,
+          "query": "netconvert"
+        }
+      ]
+    }
+  },
+  "queries": [
+    "score",
+    "controller",
+    "file_picke",
+    "index",
+    "netconvert"
+  ],
+  "results": {
+    "fork": {
+      "10": {
+        "ablate": [],
+        "hit_rate": 0.8,
+        "k": 10,
+        "mrr": 0.8,
+        "ndcg": 0.5861948006714074,
+        "per_query": [
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 66,
+            "n_relevant": 66,
+            "ndcg": 0.35664813133100276,
+            "query": "score",
+            "recall": 0.15151515151515152
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 103,
+            "n_relevant": 103,
+            "ndcg": 1.0,
+            "query": "controller",
+            "recall": 0.0970873786407767
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 13,
+            "n_relevant": 13,
+            "ndcg": 0.8774079022059167,
+            "query": "file_picke",
+            "recall": 0.5384615384615384
+          },
+          {
+            "first_relevant_rank": null,
+            "mrr": 0.0,
+            "n_judged": 101,
+            "n_relevant": 101,
+            "ndcg": 0.0,
+            "query": "index",
+            "recall": 0.0
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 114,
+            "n_relevant": 114,
+            "ndcg": 0.6969179698201174,
+            "query": "netconvert",
+            "recall": 0.06140350877192982
+          }
+        ],
+        "queries": 5,
+        "recall": 0.1696935154778793
+      },
+      "100": {
+        "ablate": [],
+        "hit_rate": 1.0,
+        "k": 100,
+        "mrr": 0.8166666666666667,
+        "ndcg": 0.6202906716229319,
+        "per_query": [
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 66,
+            "n_relevant": 66,
+            "ndcg": 0.40176446766820756,
+            "query": "score",
+            "recall": 0.3333333333333333
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 103,
+            "n_relevant": 103,
+            "ndcg": 0.7684315301313296,
+            "query": "controller",
+            "recall": 0.6019417475728155
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 13,
+            "n_relevant": 13,
+            "ndcg": 0.9658045471382999,
+            "query": "file_picke",
+            "recall": 1.0
+          },
+          {
+            "first_relevant_rank": 12,
+            "mrr": 0.08333333333333333,
+            "n_judged": 101,
+            "n_relevant": 101,
+            "ndcg": 0.37149117244986124,
+            "query": "index",
+            "recall": 0.43564356435643564
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 114,
+            "n_relevant": 114,
+            "ndcg": 0.5939616407269619,
+            "query": "netconvert",
+            "recall": 0.3157894736842105
+          }
+        ],
+        "queries": 5,
+        "recall": 0.537341623789359
+      }
+    },
+    "upstream": {
+      "10": {
+        "ablate": [],
+        "hit_rate": 0.8,
+        "k": 10,
+        "mrr": 0.8,
+        "ndcg": 0.4783695747674317,
+        "per_query": [
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 66,
+            "n_relevant": 66,
+            "ndcg": 0.35664813133100276,
+            "query": "score",
+            "recall": 0.15151515151515152
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 103,
+            "n_relevant": 103,
+            "ndcg": 0.5017432420153364,
+            "query": "controller",
+            "recall": 0.0970873786407767
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 13,
+            "n_relevant": 13,
+            "ndcg": 0.9595468207283594,
+            "query": "file_picke",
+            "recall": 0.6923076923076923
+          },
+          {
+            "first_relevant_rank": null,
+            "mrr": 0.0,
+            "n_judged": 101,
+            "n_relevant": 101,
+            "ndcg": 0.0,
+            "query": "index",
+            "recall": 0.0
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 114,
+            "n_relevant": 114,
+            "ndcg": 0.5739096797624601,
+            "query": "netconvert",
+            "recall": 0.07017543859649122
+          }
+        ],
+        "queries": 5,
+        "recall": 0.20221713221202237
+      },
+      "100": {
+        "ablate": [],
+        "hit_rate": 1.0,
+        "k": 100,
+        "mrr": 0.8166666666666667,
+        "ndcg": 0.5912313607094409,
+        "per_query": [
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 66,
+            "n_relevant": 66,
+            "ndcg": 0.40176446766820756,
+            "query": "score",
+            "recall": 0.3333333333333333
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 103,
+            "n_relevant": 103,
+            "ndcg": 0.6170367562181853,
+            "query": "controller",
+            "recall": 0.6019417475728155
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 13,
+            "n_relevant": 13,
+            "ndcg": 0.9895761087925328,
+            "query": "file_picke",
+            "recall": 1.0
+          },
+          {
+            "first_relevant_rank": 12,
+            "mrr": 0.08333333333333333,
+            "n_judged": 101,
+            "n_relevant": 101,
+            "ndcg": 0.37215114622177653,
+            "query": "index",
+            "recall": 0.43564356435643564
+          },
+          {
+            "first_relevant_rank": 1,
+            "mrr": 1.0,
+            "n_judged": 114,
+            "n_relevant": 114,
+            "ndcg": 0.5756283246465024,
+            "query": "netconvert",
+            "recall": 0.35964912280701755
+          }
+        ],
+        "queries": 5,
+        "recall": 0.5461135536139203
+      }
+    }
+  },
+  "schema": "g04-synthetic-ranking-v1"
+}

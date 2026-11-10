@@ -1,12 +1,10 @@
 //! Output formatting for MCP grep/search results.
 
 use fff::GrepMatch;
-use fff::file_picker::FilePicker;
 use fff::git::format_git_status_opt;
 use fff::grep::is_import_line;
-use fff::types::FileItem;
 
-use crate::cursor::CursorStore;
+use crate::cursor::{CursorStore, GrepCursor};
 
 fn frecency_word(score: i32) -> Option<&'static str> {
     if score >= 100 {
@@ -143,38 +141,39 @@ fn ceil_char_boundary(s: &str, index: usize) -> usize {
 }
 
 struct FileMeta<'a> {
-    file: &'a FileItem,
+    path: &'a str,
+    size: u64,
     line_number: u64,
-    line_content: String,
+    line_content: &'a str,
     is_definition: bool,
-    match_ranges: Vec<(u32, u32)>,
-    context_after: Vec<String>,
+    match_ranges: &'a [(u32, u32)],
+    context_after: &'a [String],
 }
 
 pub struct GrepFormatter<'a> {
     pub matches: &'a [GrepMatch],
-    pub files: &'a [&'a FileItem],
+    pub paths: &'a [String],
+    pub sizes: &'a [u64],
     pub total_matched: usize,
-    pub next_file_offset: usize,
+    pub cursor: GrepCursor,
     pub output_mode: OutputMode,
     pub max_results: usize,
     pub show_context: bool,
     pub auto_expand_defs: bool,
-    pub picker: &'a FilePicker,
 }
 
 impl GrepFormatter<'_> {
     pub fn format(&self, cursor_store: &mut CursorStore) -> String {
         let GrepFormatter {
             matches,
-            files,
+            paths,
+            sizes,
             total_matched,
-            next_file_offset,
+            cursor,
             output_mode,
             max_results,
             show_context,
             auto_expand_defs,
-            picker,
         } = *self;
 
         let items = if matches.len() > max_results {
@@ -186,16 +185,16 @@ impl GrepFormatter<'_> {
         if output_mode == OutputMode::FilesWithMatches {
             return format_files_with_matches(
                 items,
-                files,
-                next_file_offset,
+                paths,
+                sizes,
+                cursor,
                 auto_expand_defs,
                 cursor_store,
-                picker,
             );
         }
 
         if output_mode == OutputMode::Count {
-            return format_count(items, files, next_file_offset, cursor_store, picker);
+            return format_count(items, paths, cursor, cursor_store);
         }
 
         // output_mode == usage
@@ -217,15 +216,15 @@ impl GrepFormatter<'_> {
         };
 
         // File overview: collect first match per file
-        let file_preview = collect_file_preview(items, files, picker);
+        let file_preview = collect_file_preview(items, paths, sizes);
         let mut content_def_file = String::new();
         let mut content_first_file = String::new();
         for fm in &file_preview {
             if content_first_file.is_empty() {
-                content_first_file = fm.file.relative_path(picker);
+                content_first_file = fm.path.to_owned();
             }
             if content_def_file.is_empty() && fm.is_definition {
-                content_def_file = fm.file.relative_path(picker);
+                content_def_file = fm.path.to_owned();
             }
         }
 
@@ -277,13 +276,13 @@ impl GrepFormatter<'_> {
 
         for &idx in &sorted_items {
             let m = &items[idx];
-            let file = files[m.file_index];
+            let file_rel_path = paths[m.file_index].as_str();
             let mut match_lines: Vec<String> = Vec::new();
 
-            let file_rel_path = file.relative_path(picker);
             if file_rel_path != current_file {
-                current_file = file_rel_path;
-                match_lines.push(current_file.to_string());
+                current_file.clear();
+                current_file.push_str(file_rel_path);
+                match_lines.push(current_file.clone());
             }
 
             // Skip import-only lines when we already have definitions
@@ -329,19 +328,18 @@ impl GrepFormatter<'_> {
             }
 
             // Auto-expand definitions with body context
-            let file_rel_for_expand = file.relative_path(picker);
             if auto_expand_defs
                 && !show_context
                 && m.is_definition
                 && !m.context_after.is_empty()
-                && !def_expanded_files.contains(&file_rel_for_expand)
+                && !def_expanded_files.contains(&m.file_index)
             {
                 let expand_limit = if def_expanded_files.is_empty() {
                     MAX_DEF_EXPAND_FIRST
                 } else {
                     MAX_DEF_EXPAND
                 };
-                def_expanded_files.insert(file_rel_for_expand);
+                def_expanded_files.insert(m.file_index);
                 let start_line = m.line_number + 1;
                 for (i, ctx) in m.context_after.iter().take(expand_limit).enumerate() {
                     if ctx.trim().is_empty() {
@@ -365,8 +363,8 @@ impl GrepFormatter<'_> {
             shown_count += 1;
         }
 
-        if next_file_offset > 0 {
-            let cursor_id = cursor_store.store(next_file_offset);
+        if cursor.file_offset > 0 {
+            let cursor_id = cursor_store.store_grep(cursor);
             lines.push(format!("\ncursor: {}", cursor_id));
         }
 
@@ -376,13 +374,13 @@ impl GrepFormatter<'_> {
 
 fn format_files_with_matches(
     items: &[GrepMatch],
-    files: &[&FileItem],
-    next_file_offset: usize,
+    paths: &[String],
+    sizes: &[u64],
+    cursor: GrepCursor,
     auto_expand_defs: bool,
     cursor_store: &mut CursorStore,
-    picker: &FilePicker,
 ) -> String {
-    let file_map = collect_file_preview(items, files, picker);
+    let file_map = collect_file_preview(items, paths, sizes);
 
     let mut lines: Vec<String> = Vec::new();
     let file_count = file_map.len();
@@ -392,10 +390,10 @@ fn format_files_with_matches(
     let mut first_file = String::new();
     for fm in &file_map {
         if first_file.is_empty() {
-            first_file = fm.file.relative_path(picker);
+            first_file = fm.path.to_owned();
         }
         if first_def_file.is_empty() && fm.is_definition {
-            first_def_file = fm.file.relative_path(picker);
+            first_def_file = fm.path.to_owned();
         }
     }
     let suggest_path = if !first_def_file.is_empty() {
@@ -429,9 +427,9 @@ fn format_files_with_matches(
         let def_tag = if is_def { " [def]" } else { "" };
         lines.push(format!(
             "{}{}{}",
-            fm.file.relative_path(picker),
+            fm.path,
             def_tag,
-            size_tag(fm.file.size)
+            size_tag(fm.size)
         ));
 
         // Show preview
@@ -439,7 +437,7 @@ fn format_files_with_matches(
             let ranges_ref: Option<&[(u32, u32)]> = if fm.match_ranges.is_empty() {
                 None
             } else {
-                Some(&fm.match_ranges)
+                Some(fm.match_ranges)
             };
             lines.push(format!(
                 "  {}: {}",
@@ -482,8 +480,8 @@ fn format_files_with_matches(
         }
     }
 
-    if next_file_offset > 0 {
-        let cursor_id = cursor_store.store(next_file_offset);
+    if cursor.file_offset > 0 {
+        let cursor_id = cursor_store.store_grep(cursor);
         lines.push(format!("\ncursor: {}", cursor_id));
     }
 
@@ -492,51 +490,48 @@ fn format_files_with_matches(
 
 fn format_count(
     items: &[GrepMatch],
-    files: &[&FileItem],
-    next_file_offset: usize,
+    paths: &[String],
+    cursor: GrepCursor,
     cursor_store: &mut CursorStore,
-    picker: &FilePicker,
 ) -> String {
-    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut order: Vec<String> = Vec::new();
+    let mut counts: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut order: Vec<usize> = Vec::new();
     for m in items {
-        let file = files[m.file_index];
-        let path = file.relative_path(picker);
-        let count = counts.entry(path.to_string()).or_insert_with(|| {
-            order.push(path.to_string());
+        let count = counts.entry(m.file_index).or_insert_with(|| {
+            order.push(m.file_index);
             0
         });
         *count += 1;
     }
 
     let mut lines: Vec<String> = Vec::new();
-    for path in &order {
-        lines.push(format!("{}: {}", path, counts[path.as_str()]));
+    for index in order {
+        lines.push(format!("{}: {}", paths[index], counts[&index]));
     }
-    if next_file_offset > 0 {
-        let cursor_id = cursor_store.store(next_file_offset);
+    if cursor.file_offset > 0 {
+        let cursor_id = cursor_store.store_grep(cursor);
         lines.push(format!("\ncursor: {}", cursor_id));
     }
     lines.join("\n")
 }
 
 fn collect_file_preview<'a>(
-    items: &[GrepMatch],
-    files: &[&'a FileItem],
-    picker: &FilePicker,
+    items: &'a [GrepMatch],
+    paths: &'a [String],
+    sizes: &'a [u64],
 ) -> Vec<FileMeta<'a>> {
     let mut file_preview: Vec<FileMeta<'a>> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for m in items {
-        let file = files[m.file_index];
-        if seen.insert(file.relative_path(picker)) {
+        if seen.insert(m.file_index) {
             file_preview.push(FileMeta {
-                file,
+                path: paths[m.file_index].as_str(),
+                size: sizes[m.file_index],
                 line_number: m.line_number,
-                line_content: m.line_content.clone(),
+                line_content: m.line_content.as_str(),
                 is_definition: m.is_definition,
-                match_ranges: m.match_byte_offsets.iter().copied().collect(),
-                context_after: m.context_after.clone(),
+                match_ranges: m.match_byte_offsets.as_slice(),
+                context_after: m.context_after.as_slice(),
             });
         }
     }

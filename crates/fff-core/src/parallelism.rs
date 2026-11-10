@@ -34,31 +34,43 @@ pub static BACKGROUND_THREAD_POOL: LazyLock<rayon::ThreadPool> = LazyLock::new(|
         .expect("failed to create background rayon pool")
 });
 
-/// Cores worth using: performance cores on Apple silicon, cgroup-capped on Linux.
-/// Single source of truth for pool and machine sizing.
+/// Process-stable core count for pool size and match partitioning.
+/// Apple performance cores, otherwise cgroup-capped parallelism.
 pub fn effective_core_count() -> usize {
+    static N: LazyLock<usize> = LazyLock::new(detect_effective_cores);
+    *N
+}
+
+fn detect_effective_cores() -> usize {
     #[cfg(target_os = "macos")]
     {
-        // Walk every perf level; level 0 alone undercounts Super/Performance tiers.
-        if let Some(n) = non_efficiency_core_count() {
-            return n;
-        }
+        // Unknown topology falls back inside; level 0 alone undercounts.
+        return non_efficiency_core_count();
     }
-    let base = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(4);
-    #[cfg(target_os = "linux")]
+    #[cfg(not(target_os = "macos"))]
     {
-        if let Some(cap) = cgroup_cpu_count() {
-            return base.min(cap).max(1);
+        let base = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4);
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(cap) = cgroup_cpu_count() {
+                return base.min(cap).max(1);
+            }
         }
+        base
     }
-    base
 }
 
 // Linux cgroup CPU cap: min of quota and cpuset size. `None` when uncapped.
 #[cfg(target_os = "linux")]
 pub(crate) fn cgroup_cpu_count() -> Option<usize> {
+    static C: LazyLock<Option<usize>> = LazyLock::new(read_cgroup_cpu_count);
+    *C
+}
+
+#[cfg(target_os = "linux")]
+fn read_cgroup_cpu_count() -> Option<usize> {
     let mut cap: Option<usize> = None;
     let tighten = |cap: &mut Option<usize>, n: usize| {
         if n >= 1 {
@@ -107,6 +119,12 @@ fn parse_cpuset_len(s: &str) -> Option<usize> {
 // Container-local CPUs for pinning; host indexing can address forbidden cores.
 #[cfg(target_os = "linux")]
 pub(crate) fn cpuset_cpus() -> Option<Vec<usize>> {
+    static C: LazyLock<Option<Vec<usize>>> = LazyLock::new(read_cpuset_cpus);
+    C.clone()
+}
+
+#[cfg(target_os = "linux")]
+fn read_cpuset_cpus() -> Option<Vec<usize>> {
     [
         "/sys/fs/cgroup/cpuset.cpus.effective",
         "/sys/fs/cgroup/cpuset/cpuset.cpus",
@@ -207,6 +225,7 @@ pub(crate) struct AbortToken<'a> {
 }
 
 impl<'a> AbortToken<'a> {
+    #[allow(dead_code)]
     pub(crate) fn disabled() -> Self {
         Self {
             epoch: 0,
@@ -218,7 +237,7 @@ impl<'a> AbortToken<'a> {
     pub(crate) fn live(counter: &'a std::sync::atomic::AtomicU64) -> Self {
         Self {
             epoch: begin_search(counter),
-            enabled: std::env::var_os("FFF_NO_CANCEL").is_none(),
+            enabled: cancel_enabled(),
             counter: Some(counter),
         }
     }
@@ -255,6 +274,52 @@ where
     } else {
         SEARCH_THREAD_POOL.install(f)
     }
+}
+
+// One join and at most `width` workers. Results stay in job order.
+// `width` caps concurrency; the caller owns the index partition.
+pub(crate) fn map_search_width<T, F>(n: usize, width: usize, f: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(usize) -> T + Sync,
+{
+    if n == 0 {
+        return Vec::new();
+    }
+    let width = width.max(1).min(n);
+    if width == 1 {
+        return (0..n).map(f).collect();
+    }
+    run_on_search_pool(|| {
+        let f = &f;
+        let mut bags: Vec<Vec<T>> = (0..width).map(|_| Vec::new()).collect();
+        rayon::scope(|s| {
+            for (w, bag) in bags.iter_mut().enumerate() {
+                s.spawn(move |_| {
+                    let mut i = w;
+                    while i < n {
+                        bag.push(f(i));
+                        i += width;
+                    }
+                });
+            }
+        });
+        let mut iters = bags.into_iter().map(Vec::into_iter).collect::<Vec<_>>();
+        let mut out = Vec::with_capacity(n);
+        loop {
+            let mut progressed = false;
+            for it in &mut iters {
+                if let Some(v) = it.next() {
+                    out.push(v);
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        out
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -458,21 +523,25 @@ pub fn default_max_threads() -> usize {
     effective_core_count().max(1)
 }
 
+// One parse of `FFF_AFFINITY`. Unset or zero leaves workers unpinned.
+fn affinity_mask() -> Option<usize> {
+    static M: LazyLock<Option<usize>> = LazyLock::new(|| {
+        let raw = std::env::var("FFF_AFFINITY").ok()?;
+        #[cfg(windows)]
+        {
+            static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            LOGGED.get_or_init(|| {
+                eprintln!("AFFINITY probe active (mask from FFF_AFFINITY)");
+            });
+        }
+        parse_affinity_mask(raw.trim())
+    });
+    *M
+}
+
 // Opt-in search-thread affinity (`FFF_AFFINITY=mask`, hex or decimal).
-// Pins workers into the mask; default off, full mask is a no-op.
 pub(crate) fn maybe_pin_search_thread() {
-    let raw = match std::env::var("FFF_AFFINITY") {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    #[cfg(windows)]
-    {
-        static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        LOGGED.get_or_init(|| {
-            eprintln!("AFFINITY probe active (mask from FFF_AFFINITY)");
-        });
-    }
-    let Some(mask) = parse_affinity_mask(raw.trim()) else {
+    let Some(mask) = affinity_mask() else {
         return;
     };
     #[cfg(windows)]
@@ -482,6 +551,12 @@ pub(crate) fn maybe_pin_search_thread() {
     }
     #[cfg(not(windows))]
     let _ = mask;
+}
+
+// One env read. `FFF_NO_CANCEL` disables abort for the whole process.
+fn cancel_enabled() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("FFF_NO_CANCEL").is_none());
+    *ON
 }
 
 fn parse_affinity_mask(s: &str) -> Option<usize> {

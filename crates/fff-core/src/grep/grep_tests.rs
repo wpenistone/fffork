@@ -110,6 +110,277 @@ fn sparse_matches_after_empty_batches_preserve_pagination() {
 }
 
 #[test]
+fn definition_only_keeps_unknown_language_files_out_of_fallbacks() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("docs.txt"), "Needle\n").unwrap();
+    std::fs::write(dir.path().join("definition.rs"), "fn Needle() {}\n").unwrap();
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: dir.path().to_string_lossy().into_owned(),
+        enable_content_indexing: false,
+        enable_mmap_cache: false,
+        watch: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+    let parser = fff_query_parser::QueryParser::new(fff_query_parser::AiGrepConfig);
+    for mode in [GrepMode::PlainText, GrepMode::Regex, GrepMode::Fuzzy] {
+        let options = GrepSearchOptions {
+            mode,
+            classify_definitions: DefinitionMode::DefinitionOnly,
+            time_budget_ms: 0,
+            ..Default::default()
+        };
+        for raw in ["docs.txt Needle", "missing.rs Needle", "*.txt Needle"] {
+            let parsed = parser.parse(raw);
+            let result = picker.grep(&parsed, &options);
+            assert!(result.matches.is_empty(), "{raw}");
+            assert_eq!(result.filtered_file_count, 0, "{raw}");
+            assert_eq!(result.total_files_searched, 0, "{raw}");
+            assert_eq!(result.next_file_offset, 0, "{raw}");
+        }
+        let parsed = parser.parse("Needle");
+        let result = picker.grep(&parsed, &options);
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.filtered_file_count, 1);
+        assert!(result.matches[0].is_definition);
+    }
+}
+
+#[test]
+fn pagination_keeps_unreturned_files_before_abort() {
+    let file = crate::types::FileItem::new_raw(0, 1, 0, None, false);
+    for (page_limit, next_offset) in [(1, 11), (2, 12), (10, 13)] {
+        let options = GrepSearchOptions {
+            file_offset: 10,
+            page_limit,
+            classify_definitions: DefinitionMode::DefinitionOnly,
+            ..Default::default()
+        };
+        let results = (0..3)
+            .map(|idx| {
+                let matched = GrepMatch {
+                    file_index: 0,
+                    line_number: 1,
+                    col: 3,
+                    byte_offset: 0,
+                    line_content: "fn needle() {}".into(),
+                    match_byte_offsets: smallvec::smallvec![(3, 9)],
+                    fuzzy_score: Some(100),
+                    is_definition: true,
+                    context_before: Vec::new(),
+                    context_after: Vec::new(),
+                };
+                (idx, &file, vec![matched])
+            })
+            .collect();
+        let result = GrepResult::collect(results, 5, &options, 15, 15, Some(3));
+        assert_eq!(result.matches.len(), page_limit.min(3));
+        assert_eq!(result.next_file_offset, next_offset);
+    }
+}
+
+#[test]
+fn filtered_match_limits_keep_late_definitions_and_pagination() {
+    let root = tempfile::tempdir().unwrap();
+    let source = format!(
+        "{}  fn NeedleFirst() {{}}\n  fn NeedleSecond() {{}}\n",
+        "  Needle();\n".repeat(50)
+    );
+    for index in 0..3 {
+        std::fs::write(root.path().join(format!("file{index}.rs")), &source).unwrap();
+    }
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: root.path().to_string_lossy().into_owned(),
+        watch: false,
+        enable_mmap_cache: false,
+        enable_content_indexing: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+    let query = parse_grep_query("Needle");
+    for mode in [
+        Some(GrepMode::PlainText),
+        Some(GrepMode::Regex),
+        Some(GrepMode::Fuzzy),
+        None,
+    ] {
+        for definition_mode in [
+            DefinitionMode::Off,
+            DefinitionMode::Classify,
+            DefinitionMode::DefinitionOnly,
+            DefinitionMode::UsageOnly,
+        ] {
+            let mut options = GrepSearchOptions {
+                classify_definitions: definition_mode,
+                mode: mode.unwrap_or(GrepMode::PlainText),
+                max_matches_per_file: 1,
+                page_limit: 1,
+                before_context: 1,
+                after_context: 1,
+                trim_whitespace: true,
+                time_budget_ms: 0,
+                ..Default::default()
+            };
+            let mut seen = std::collections::HashSet::new();
+            loop {
+                let result = if mode.is_some() {
+                    picker.grep(&query, &options)
+                } else {
+                    picker.multi_grep(&["Needle", "Absent"], &[], &options)
+                };
+                assert_eq!(result.matches.len(), 1, "{mode:?} {definition_mode:?}");
+                let matched = &result.matches[0];
+                let definition_only = definition_mode == DefinitionMode::DefinitionOnly;
+                assert_eq!(matched.line_number, if definition_only { 51 } else { 1 });
+                assert_eq!(matched.is_definition, definition_only);
+                assert!(!matched.line_content.starts_with(' '));
+                if mode != Some(GrepMode::Fuzzy) {
+                    assert_eq!(matched.context_after.len(), 1);
+                    assert_eq!(matched.context_before.len(), usize::from(definition_only));
+                }
+                assert!(seen.insert(result.files[matched.file_index].relative_path(&picker)));
+                if result.next_file_offset == 0 {
+                    break;
+                }
+                assert!(result.next_file_offset > options.file_offset);
+                options.file_offset = result.next_file_offset;
+            }
+            assert_eq!(seen.len(), 3);
+        }
+    }
+}
+
+#[test]
+fn definition_line_limit_uses_source_bytes_before_display_changes() {
+    let root = tempfile::tempdir().unwrap();
+    let declaration = "fn Needle() {}";
+    let prefix = format!("{declaration} //");
+    let unicode = format!(
+        "{prefix}{}{}",
+        "é".repeat((256 - prefix.len()) / 2),
+        " ".repeat((256 - prefix.len()) % 2)
+    );
+    assert_eq!(unicode.len(), 256);
+    let lines = [
+        (format!("{declaration:<255}"), true),
+        (format!("{declaration:<256}"), true),
+        (format!("{declaration:<257}"), false),
+        (format!("{declaration:<1024}"), false),
+        (unicode.clone(), true),
+        (format!("{unicode} "), false),
+        (format!("{declaration:>256}"), true),
+        (format!("{declaration:>257}"), false),
+        (declaration.into(), true),
+    ];
+    for (filename, ending) in [("lf.rs", "\n"), ("crlf.rs", "\r\n")] {
+        let source: String = lines
+            .iter()
+            .map(|(line, _)| format!("{line}{ending}"))
+            .collect();
+        std::fs::write(root.path().join(filename), source).unwrap();
+    }
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: root.path().to_string_lossy().into_owned(),
+        watch: false,
+        enable_mmap_cache: false,
+        enable_content_indexing: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+    let query = parse_grep_query("Needle");
+    for mode in [
+        Some(GrepMode::PlainText),
+        Some(GrepMode::Regex),
+        Some(GrepMode::Fuzzy),
+        None,
+    ] {
+        for definition_mode in [
+            DefinitionMode::Off,
+            DefinitionMode::Classify,
+            DefinitionMode::DefinitionOnly,
+            DefinitionMode::UsageOnly,
+        ] {
+            for trim_whitespace in [false, true] {
+                let options = GrepSearchOptions {
+                    classify_definitions: definition_mode,
+                    mode: mode.unwrap_or(GrepMode::PlainText),
+                    max_matches_per_file: 0,
+                    page_limit: usize::MAX,
+                    trim_whitespace,
+                    time_budget_ms: 0,
+                    ..Default::default()
+                };
+                let result = if mode.is_some() {
+                    picker.grep(&query, &options)
+                } else {
+                    picker.multi_grep(&["Needle", "Absent"], &[], &options)
+                };
+                let expected = lines
+                    .iter()
+                    .filter(|(_, definition)| definition_mode.retains(*definition))
+                    .count();
+                assert_eq!(
+                    result.matches.len(),
+                    expected * 2,
+                    "{mode:?} {definition_mode:?}"
+                );
+                for matched in &result.matches {
+                    let (_, definition) = &lines[matched.line_number as usize - 1];
+                    assert!(definition_mode.retains(*definition));
+                    assert_eq!(
+                        matched.is_definition,
+                        definition_mode.is_enabled() && *definition,
+                        "{mode:?} {definition_mode:?}: line {}",
+                        matched.line_number
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn definition_line_limit_counts_only_the_first_multiline_regex_line() {
+    let root = tempfile::tempdir().unwrap();
+    for length in [256, 257, 1024] {
+        let declaration = "fn Needle() {}";
+        let source = format!("{declaration:<length$}\r\n{}\r\n", "x".repeat(300));
+        std::fs::write(root.path().join(format!("line{length}.rs")), source).unwrap();
+    }
+    let mut picker = FilePicker::new(FilePickerOptions {
+        base_path: root.path().to_string_lossy().into_owned(),
+        watch: false,
+        enable_mmap_cache: false,
+        enable_content_indexing: false,
+        ..Default::default()
+    })
+    .unwrap();
+    picker.collect_files().unwrap();
+    let result = picker.grep(
+        &parse_grep_query(r"Needle[^\n]*\nxxx"),
+        &GrepSearchOptions {
+            mode: GrepMode::Regex,
+            classify_definitions: DefinitionMode::DefinitionOnly,
+            time_budget_ms: 0,
+            ..Default::default()
+        },
+    );
+    assert!(result.regex_fallback_error.is_none());
+    assert_eq!(result.matches.len(), 1);
+    let matched = &result.matches[0];
+    assert_eq!(
+        result.files[matched.file_index].relative_path(&picker),
+        "line256.rs"
+    );
+    assert_eq!(matched.line_content.len(), 256);
+    assert!(matched.is_definition);
+    assert!(!matched.context_after.is_empty());
+}
+
+#[test]
 fn test_replace_newline_escapes() {
     // Single \n → multiline: replaced with a real newline at byte 3
     assert_eq!(
@@ -258,7 +529,7 @@ fn test_multi_grep_search() {
         enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
-        classify_definitions: false,
+        classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: None,
     };
@@ -532,7 +803,7 @@ fn test_grep_no_duplicates_with_overflow_trailing_bits() {
         enforce_time_budget: false,
         before_context: 0,
         after_context: 0,
-        classify_definitions: false,
+        classify_definitions: Default::default(),
         trim_whitespace: false,
         abort_signal: Some(std::sync::Arc::new(AtomicBool::new(false))),
     };
@@ -913,8 +1184,11 @@ fn mask_prefilter_skips_counted() {
     let root = tempfile::tempdir().unwrap();
     // No 'z' anywhere: every file is rejected unopened at the mask check.
     for index in 0..64 {
-        std::fs::write(root.path().join(format!("file_{index}.txt")), "ordinary content\n")
-            .unwrap();
+        std::fs::write(
+            root.path().join(format!("file_{index}.txt")),
+            "ordinary content\n",
+        )
+        .unwrap();
     }
     let mut picker = FilePicker::new(FilePickerOptions {
         base_path: root.path().to_string_lossy().into_owned(),
@@ -945,7 +1219,11 @@ fn memmem_prefilter_skips_counted_separately() {
     let root = tempfile::tempdir().unwrap();
     // 'z' present (mask allows) but no "zzz" run: memmem performs the skip.
     for index in 0..64 {
-        std::fs::write(root.path().join(format!("file_{index}.txt")), "zebra zone\n").unwrap();
+        std::fs::write(
+            root.path().join(format!("file_{index}.txt")),
+            "zebra zone\n",
+        )
+        .unwrap();
     }
     let mut picker = FilePicker::new(FilePickerOptions {
         base_path: root.path().to_string_lossy().into_owned(),
