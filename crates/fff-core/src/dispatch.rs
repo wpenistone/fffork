@@ -53,15 +53,7 @@ pub(crate) fn bytes_to_amortize() -> usize {
         {
             return v;
         }
-        let m = crate::machine::machine();
-        let b = (m.read_bytes_per_ns() * fork_join_ns() as f64) as usize;
-        let lo = m.cache_line.max(1);
-        let hi = if m.llc_bytes > 0 {
-            m.llc_bytes
-        } else {
-            8 << 20
-        };
-        b.clamp(lo, hi)
+        crate::machine::machine().match_work_per_thread()
     });
     *B
 }

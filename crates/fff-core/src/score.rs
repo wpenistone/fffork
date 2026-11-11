@@ -128,6 +128,51 @@ fn walk_candidates<'a>(
     }
 }
 
+// One presence walk. `bits16` is that needle's accept set; `miss` is the same test for the tail.
+#[inline(always)]
+fn walk_present<const TIMING: bool>(
+    files: &[FileItem],
+    presence: &[u64],
+    lo: usize,
+    hi: usize,
+    arena: ArenaPtr,
+    mut bits16: impl FnMut(usize) -> u16,
+    mut miss: impl FnMut(u64) -> bool,
+    mut visit: impl FnMut(&FileItem, u32),
+    rejects: &mut u64,
+) {
+    debug_assert!(hi <= files.len() && hi <= presence.len());
+    let mut k = lo;
+    while k + 16 <= hi {
+        prefetch_presence_ahead(presence, k, 32);
+        let mut bits = bits16(k);
+        if TIMING {
+            *rejects += (16 - bits.count_ones()) as u64;
+        }
+        while bits != 0 {
+            let dk = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let file = unsafe { files.get_unchecked(k + dk) };
+            if bits != 0 {
+                let next = unsafe { files.get_unchecked(k + bits.trailing_zeros() as usize) };
+                prefetch_next_accepted(file, next, arena);
+            }
+            visit(file, (k + dk) as u32);
+        }
+        k += 16;
+    }
+    for k in k..hi {
+        let mask = unsafe { *presence.get_unchecked(k) };
+        if miss(mask) {
+            if TIMING {
+                *rejects += 1;
+            }
+            continue;
+        }
+        visit(unsafe { files.get_unchecked(k) }, k as u32);
+    }
+}
+
 // The presence line `dist` masks ahead. Sixteen masks are two lines.
 #[inline(always)]
 fn prefetch_presence_ahead(presence: &[u64], k: usize, dist: usize) {
@@ -147,18 +192,8 @@ fn prefetch_presence_ahead(presence: &[u64], k: usize, dist: usize) {
     let _ = (presence, k, dist);
 }
 
-// A full cover is a compare. Fewer required letters still count the bits.
-#[inline(always)]
-fn distinct_miss(mask: u64, needle_mask: u64, need: usize, cover: bool) -> bool {
-    let hit = mask & needle_mask;
-    if cover {
-        hit != needle_mask
-    } else {
-        (hit.count_ones() as usize) < need
-    }
-}
-
 // Distinct letters, unrolled so the sixteen tests stay independent.
+// Each lane matches `NeedlePresence::misses_distinct`, and mask 0 accepts.
 #[inline(always)]
 fn presence_bits16_distinct(
     presence: &[u64],
@@ -378,6 +413,120 @@ fn split_presence(presence: &[u64], base_count: usize) -> (&[u64], &[u64]) {
     }
 }
 
+// Positions are indexes into `files`. The returned view's own indexes are 0..n,
+// so a later part's hit maps straight back onto the previous match list.
+fn subset_files<'a>(files: &FileItems<'a>, positions: Vec<u32>) -> FileItems<'a> {
+    let base = match files {
+        FileItems::All(base) => *base,
+        FileItems::Filtered { base, .. } => *base,
+    };
+    let idx = match files {
+        FileItems::All(_) => positions,
+        FileItems::Filtered { idx, .. } => positions.iter().map(|&p| idx[p as usize]).collect(),
+    };
+    FileItems::Filtered {
+        base,
+        idx: CandList::Owned(idx),
+    }
+}
+
+// Each part is `match_fuzzy_scanned` on one needle. The stored score is the
+// sum of those scores divided by the part count, once, at the end.
+fn combine_scored_parts(
+    valid_parts: &[&str],
+    working_files: &FileItems<'_>,
+    presence: &[u64],
+    options: &neo_frizbee::Config,
+    max_threads: usize,
+    arena: ArenaPtr,
+    max_path_len: usize,
+    abort: crate::parallelism::AbortToken<'_>,
+    before_filename: Option<&std::sync::atomic::AtomicBool>,
+    check_deleted: bool,
+) -> Vec<neo_frizbee::Match> {
+    // Two parts: score the longer one first. It rejects more. The end column
+    // stays the query-order first part, which is what the filename bonus reads.
+    let reverse_pair = valid_parts.len() == 2 && valid_parts[1].len() > valid_parts[0].len();
+    let mut order: SmallVec<[&str; 4]> = SmallVec::new();
+    if reverse_pair {
+        order.push(valid_parts[1]);
+        order.push(valid_parts[0]);
+    } else {
+        order.extend(valid_parts.iter().copied());
+    }
+
+    let score_part = |part: &str,
+                      files: &FileItems<'_>,
+                      before: Option<&std::sync::atomic::AtomicBool>,
+                      threads: usize|
+     -> Vec<neo_frizbee::Match> {
+        let mut part_options = *options;
+        part_options.max_typos = options.max_typos.map(|t| t.min(part.len() as u16));
+        match_fuzzy_scanned(
+            std::slice::from_ref(&part),
+            files,
+            presence,
+            &part_options,
+            threads,
+            arena,
+            max_path_len,
+            abort,
+            before,
+            check_deleted,
+        )
+    };
+
+    let first = score_part(order[0], working_files, before_filename, max_threads);
+    if first.is_empty() {
+        return first;
+    }
+    let mut matches = first;
+    let mut sums: Vec<u32> = matches.iter().map(|m| m.score as u32).collect();
+    for (ord, part) in order[1..].iter().enumerate() {
+        let parts_done = (ord + 2) as u32;
+        let positions: Vec<u32> = matches.iter().map(|m| m.index).collect();
+        let view = subset_files(working_files, positions);
+        let sub_threads = effective_match_threads(
+            view.len(),
+            part.len(),
+            max_path_len,
+            options.max_typos.map(|t| t.min(part.len() as u16)),
+            max_threads.max(1),
+        );
+        let sub_matches = score_part(part, &view, None, sub_threads);
+        drop(view);
+        if sub_matches.is_empty() {
+            reclaim_match_buf(matches);
+            return vec![];
+        }
+        let prev_matches = std::mem::take(&mut matches);
+        let prev_sums = std::mem::take(&mut sums);
+        let mut next_sums = Vec::with_capacity(sub_matches.len());
+        matches = sub_matches
+            .into_iter()
+            .map(|sm| {
+                let i = sm.index as usize;
+                let prev = &prev_matches[i];
+                let sum = prev_sums[i].saturating_add(sm.score as u32);
+                next_sums.push(sum);
+                neo_frizbee::Match {
+                    index: prev.index,
+                    score: (sum / parts_done).min(u16::MAX as u32) as u16,
+                    end_col: if reverse_pair {
+                        sm.end_col
+                    } else {
+                        prev.end_col
+                    },
+                    exact: prev.exact && sm.exact,
+                }
+            })
+            .collect();
+        sums = next_sums;
+        reclaim_match_buf(prev_matches);
+    }
+    matches
+}
+
 fn match_fuzzy_parts(
     fuzzy_parts: &[&str],
     working_files: &FileItems<'_>,
@@ -428,14 +577,25 @@ fn match_fuzzy_scanned(
         return vec![];
     }
 
-    // Requested width bounds the matcher; the work estimate below narrows it further.
-    // Narrow from the longer part (rejects more); each part keeps its own typo cap.
-    let reverse_pair = valid_parts.len() == 2 && valid_parts[1].len() > valid_parts[0].len();
-    let first_part: &str = if reverse_pair {
-        valid_parts[1]
-    } else {
-        valid_parts[0]
-    };
+    // One part is the gate+SW body below. Several parts each take that body;
+    // their scores are one mean. A second engine would not be on that scale.
+    if valid_parts.len() > 1 {
+        return combine_scored_parts(
+            &valid_parts,
+            working_files,
+            presence,
+            options,
+            max_threads,
+            arena,
+            max_path_len,
+            abort,
+            before_filename,
+            check_deleted,
+        );
+    }
+
+    // One needle. Part order lives in `combine_scored_parts`.
+    let first_part: &str = valid_parts[0];
     let mut first_options = *options;
     first_options.max_typos = options.max_typos.map(|t| t.min(first_part.len() as u16));
     // Thread count from the work estimate alone; cached max path length keeps it O(1).
@@ -571,7 +731,6 @@ fn match_fuzzy_scanned(
             _ => &[],
         };
         let t_gate_us = std::sync::atomic::AtomicU64::new(0);
-        let t_exact_us = std::sync::atomic::AtomicU64::new(0);
         let t_gate_files = std::sync::atomic::AtomicU64::new(0);
         let t_gate_accepts = std::sync::atomic::AtomicU64::new(0);
         let t_gate_path_bytes = std::sync::atomic::AtomicU64::new(0);
@@ -1606,34 +1765,7 @@ fn match_fuzzy_scanned(
                     }};
                 }
                 macro_rules! visit_file {
-                    ($timing:tt, $pos:expr, $idx:expr, cached) => {{
-                        let file = working_files.index($pos);
-                        record_hit!(
-                            $timing,
-                            file,
-                            gate_state.hit_file_cached(file, arena, &mut pcache),
-                            $idx
-                        );
-                    }};
-                    ($timing:tt, $pos:expr, $idx:expr, live) => {{
-                        let file = working_files.index($pos);
-                        record_hit!(
-                            $timing,
-                            file,
-                            gate_state.hit_file_live::<false>(file, arena, &mut pcache),
-                            $idx
-                        );
-                    }};
-                    ($timing:tt, $pos:expr, $idx:expr, live_del) => {{
-                        let file = working_files.index($pos);
-                        record_hit!(
-                            $timing,
-                            file,
-                            gate_state.hit_file_live::<true>(file, arena, &mut pcache),
-                            $idx
-                        );
-                    }};
-                    ($timing:tt, raw $file:expr, $idx:expr, cached) => {{
+                    ($timing:tt, $file:expr, $idx:expr, cached) => {{
                         let file = $file;
                         record_hit!(
                             $timing,
@@ -1642,7 +1774,7 @@ fn match_fuzzy_scanned(
                             $idx
                         );
                     }};
-                    ($timing:tt, raw $file:expr, $idx:expr, live) => {{
+                    ($timing:tt, $file:expr, $idx:expr, live) => {{
                         let file = $file;
                         record_hit!(
                             $timing,
@@ -1651,7 +1783,7 @@ fn match_fuzzy_scanned(
                             $idx
                         );
                     }};
-                    ($timing:tt, raw $file:expr, $idx:expr, live_del) => {{
+                    ($timing:tt, $file:expr, $idx:expr, live_del) => {{
                         let file = $file;
                         record_hit!(
                             $timing,
@@ -1667,193 +1799,85 @@ fn match_fuzzy_scanned(
                         if direct_mask {
                     // Needle shape and tombstones are fixed for the whole scan.
                     if gate_state.live_scan() {
-                        if gate_state.deletes_checked() {
-                            if np.distinct() {
-                                let needle_mask = np.distinct_mask();
-                                let need_hits = np.min_hits();
-                                let cover = np.cover_eq();
-                                let mut k = lo;
-                                while k + 16 <= hi {
-                                    prefetch_presence_ahead(presence, k, 32);
-                                    let mut bits = presence_bits16_distinct(
-                                        presence, k, needle_mask, need_hits, cover,
-                                    );
-                                    if $timing {
-                                        g_prej += (16 - bits.count_ones()) as u64;
-                                    }
-                                    while bits != 0 {
-                                        let dk = bits.trailing_zeros() as usize;
-                                        bits &= bits - 1;
-                                        let file = unsafe { all_files.get_unchecked(k + dk) };
-                                        if bits != 0 {
-                                            let next = unsafe {
-                                                all_files.get_unchecked(k + bits.trailing_zeros() as usize)
-                                            };
-                                            prefetch_next_accepted(file, next, arena);
-                                        }
-                                        visit_file!($timing, raw file, (k + dk) as u32, live_del);
-                                    }
-                                    k += 16;
-                                }
-                                for k in k..hi {
-                                    let mask = unsafe { *presence.get_unchecked(k) };
-                                    if mask != 0
-                                        && distinct_miss(mask, needle_mask, need_hits, cover)
-                                    {
-                                        if $timing {
-                                            g_prej += 1;
-                                        }
-                                        continue;
-                                    }
-                                    let file = unsafe { all_files.get_unchecked(k) };
-                                    visit_file!($timing, raw file, k as u32, live_del);
-                                }
-                            } else {
-                                let mut k = lo;
-                                while k + 16 <= hi {
-                                    prefetch_presence_ahead(presence, k, 32);
-                                    let mut bits =
-                                        presence_bits16_repeated(presence, k, &np, needle);
-                                    if $timing {
-                                        g_prej += (16 - bits.count_ones()) as u64;
-                                    }
-                                    while bits != 0 {
-                                        let dk = bits.trailing_zeros() as usize;
-                                        bits &= bits - 1;
-                                        let file = unsafe { all_files.get_unchecked(k + dk) };
-                                        if bits != 0 {
-                                            let next = unsafe {
-                                                all_files
-                                                    .get_unchecked(k + bits.trailing_zeros() as usize)
-                                            };
-                                            prefetch_next_accepted(file, next, arena);
-                                        }
-                                        visit_file!($timing, raw file, (k + dk) as u32, live_del);
-                                    }
-                                    k += 16;
-                                }
-                                for k in k..hi {
-                                    let mask = unsafe { *presence.get_unchecked(k) };
-                                    if mask != 0 && !np.allows_repeated(mask, needle) {
-                                        if $timing {
-                                            g_prej += 1;
-                                        }
-                                        continue;
-                                    }
-                                    let file = unsafe { all_files.get_unchecked(k) };
-                                    visit_file!($timing, raw file, k as u32, live_del);
-                                }
-                            }
-                        } else if np.distinct() {
+                        let deletes = gate_state.deletes_checked();
+                        if np.distinct() {
                             let needle_mask = np.distinct_mask();
                             let need_hits = np.min_hits();
                             let cover = np.cover_eq();
-                            // Eight masks are one cache line. The next line is fetched while they popcnt.
-                            let mut k = lo;
-                            while k + 16 <= hi {
-                                prefetch_presence_ahead(presence, k, 32);
-                                let mut bits =
-                                    presence_bits16_distinct(
-                                        presence, k, needle_mask, need_hits, cover,
-                                    );
-                                if $timing {
-                                    g_prej += (16 - bits.count_ones()) as u64;
-                                }
-                                while bits != 0 {
-                                    let dk = bits.trailing_zeros() as usize;
-                                    bits &= bits - 1;
-                                    let file = unsafe { all_files.get_unchecked(k + dk) };
-                                    if bits != 0 {
-                                        let next = unsafe {
-                                            all_files.get_unchecked(k + bits.trailing_zeros() as usize)
-                                        };
-                                        prefetch_next_accepted(file, next, arena);
-                                    }
-                                    visit_file!($timing, raw file, (k + dk) as u32, live);
-                                }
-                                k += 16;
-                            }
-                            for k in k..hi {
-                                let mask = unsafe { *presence.get_unchecked(k) };
-                                if mask != 0
-                                    && distinct_miss(mask, needle_mask, need_hits, cover)
-                                {
-                                    if $timing {
-                                        g_prej += 1;
-                                    }
-                                    continue;
-                                }
-                                let file = unsafe { all_files.get_unchecked(k) };
-                                visit_file!($timing, raw file, k as u32, live);
+                            let bits = |k: usize| {
+                                presence_bits16_distinct(
+                                    presence, k, needle_mask, need_hits, cover,
+                                )
+                            };
+                            let miss = |mask: u64| mask != 0 && np.misses_distinct(mask);
+                            if deletes {
+                                walk_present::<$timing>(
+                                    all_files,
+                                    presence,
+                                    lo,
+                                    hi,
+                                    arena,
+                                    bits,
+                                    miss,
+                                    |file, idx| visit_file!($timing, file, idx, live_del),
+                                    &mut g_prej,
+                                );
+                            } else {
+                                walk_present::<$timing>(
+                                    all_files,
+                                    presence,
+                                    lo,
+                                    hi,
+                                    arena,
+                                    bits,
+                                    miss,
+                                    |file, idx| visit_file!($timing, file, idx, live),
+                                    &mut g_prej,
+                                );
                             }
                         } else {
-                            let mut k = lo;
-                            while k + 16 <= hi {
-                                prefetch_presence_ahead(presence, k, 32);
-                                let mut bits = presence_bits16_repeated(presence, k, &np, needle);
-                                if $timing {
-                                    g_prej += (16 - bits.count_ones()) as u64;
-                                }
-                                while bits != 0 {
-                                    let dk = bits.trailing_zeros() as usize;
-                                    bits &= bits - 1;
-                                    let file = unsafe { all_files.get_unchecked(k + dk) };
-                                    if bits != 0 {
-                                        let next = unsafe {
-                                            all_files
-                                                .get_unchecked(k + bits.trailing_zeros() as usize)
-                                        };
-                                        prefetch_next_accepted(file, next, arena);
-                                    }
-                                    visit_file!($timing, raw file, (k + dk) as u32, live);
-                                }
-                                k += 16;
-                            }
-                            for k in k..hi {
-                                let mask = unsafe { *presence.get_unchecked(k) };
-                                if mask != 0 && !np.allows_repeated(mask, needle) {
-                                    if $timing {
-                                        g_prej += 1;
-                                    }
-                                    continue;
-                                }
-                                let file = unsafe { all_files.get_unchecked(k) };
-                                visit_file!($timing, raw file, k as u32, live);
+                            let bits =
+                                |k: usize| presence_bits16_repeated(presence, k, &np, needle);
+                            let miss =
+                                |mask: u64| mask != 0 && !np.allows_repeated(mask, needle);
+                            if deletes {
+                                walk_present::<$timing>(
+                                    all_files,
+                                    presence,
+                                    lo,
+                                    hi,
+                                    arena,
+                                    bits,
+                                    miss,
+                                    |file, idx| visit_file!($timing, file, idx, live_del),
+                                    &mut g_prej,
+                                );
+                            } else {
+                                walk_present::<$timing>(
+                                    all_files,
+                                    presence,
+                                    lo,
+                                    hi,
+                                    arena,
+                                    bits,
+                                    miss,
+                                    |file, idx| visit_file!($timing, file, idx, live),
+                                    &mut g_prej,
+                                );
                             }
                         }
                     } else {
-                        let mut k = lo;
-                        while k + 16 <= hi {
-                            prefetch_presence_ahead(presence, k, 32);
-                            let mut bits = presence_bits16_unknown(presence, k, &np, needle);
-                            if $timing {
-                                g_prej += (16 - bits.count_ones()) as u64;
-                            }
-                            while bits != 0 {
-                                let dk = bits.trailing_zeros() as usize;
-                                bits &= bits - 1;
-                                let file = unsafe { all_files.get_unchecked(k + dk) };
-                                if bits != 0 {
-                                    let next = unsafe {
-                                        all_files.get_unchecked(k + bits.trailing_zeros() as usize)
-                                    };
-                                    prefetch_next_accepted(file, next, arena);
-                                }
-                                visit_file!($timing, raw file, (k + dk) as u32, cached);
-                            }
-                            k += 16;
-                        }
-                        for k in k..hi {
-                            let mask = unsafe { *presence.get_unchecked(k) };
-                            if !crate::presence::allows_or_unknown(&np, mask, needle) {
-                                if $timing {
-                                    g_prej += 1;
-                                }
-                                continue;
-                            }
-                            let file = unsafe { all_files.get_unchecked(k) };
-                            visit_file!($timing, raw file, k as u32, cached);
-                        }
+                        walk_present::<$timing>(
+                            all_files,
+                            presence,
+                            lo,
+                            hi,
+                            arena,
+                            |k| presence_bits16_unknown(presence, k, &np, needle),
+                            |mask| !crate::presence::allows_or_unknown(&np, mask, needle),
+                            |file, idx| visit_file!($timing, file, idx, cached),
+                            &mut g_prej,
+                        );
                     }
                 } else if use_cand {
                     // Candidates already passed presence. The list shape is fixed for the group.
@@ -1864,7 +1888,7 @@ fn match_fuzzy_scanned(
                             &cand,
                             arena,
                             |i| crate::matcher::FileItems::at_all(files, i),
-                            |file, idx| visit_file!($timing, raw file, idx, cached),
+                            |file, idx| visit_file!($timing, file, idx, cached),
                         ),
                         crate::matcher::FileItems::Filtered { base, idx } => walk_candidates(
                             lo,
@@ -1872,7 +1896,7 @@ fn match_fuzzy_scanned(
                             &cand,
                             arena,
                             |i| crate::matcher::FileItems::at_filtered(base, idx, i),
-                            |file, idx| visit_file!($timing, raw file, idx, cached),
+                            |file, idx| visit_file!($timing, file, idx, cached),
                         ),
                     }
                 } else {
@@ -1904,7 +1928,7 @@ fn match_fuzzy_scanned(
                             arena,
                             |k| crate::matcher::FileItems::at_all(files, k),
                             skip_file!(),
-                            |file, k| visit_file!($timing, raw file, k, cached),
+                            |file, k| visit_file!($timing, file, k, cached),
                         ),
                         crate::matcher::FileItems::Filtered { base, idx } => walk_span(
                             lo,
@@ -1913,7 +1937,7 @@ fn match_fuzzy_scanned(
                             arena,
                             |k| crate::matcher::FileItems::at_filtered(base, idx, k),
                             skip_file!(),
-                            |file, k| visit_file!($timing, raw file, k, cached),
+                            |file, k| visit_file!($timing, file, k, cached),
                         ),
                     }
                 }
@@ -1999,13 +2023,9 @@ fn match_fuzzy_scanned(
                 let cand_ms = _cand_clock
                     .map(|t| t.elapsed().as_secs_f64() * 1e3)
                     .unwrap_or(0.0);
-                eprintln!(
-                    "PHASE cand_ms={cand_ms:.1} wins_ms=0.0 samp_ms=0.0 collapsed=false n={}",
-                    matches.len()
-                );
+                eprintln!("PHASE cand_ms={cand_ms:.1} n={}", matches.len());
                 let sw_us = t_sw.map(|t| t.elapsed().as_micros()).unwrap_or(0);
                 let gate_us = t_gate_us.load(std::sync::atomic::Ordering::Relaxed);
-                let exact_us = t_exact_us.load(std::sync::atomic::Ordering::Relaxed);
                 let swslice_us = t_swslice_us.load(std::sync::atomic::Ordering::Relaxed);
                 let prefix_hit = t_prefix_hits.load(std::sync::atomic::Ordering::Relaxed);
                 let prefix_fill = t_prefix_fills.load(std::sync::atomic::Ordering::Relaxed);
@@ -2016,7 +2036,7 @@ fn match_fuzzy_scanned(
                 let gate_walk_kb = t_gate_walked.load(std::sync::atomic::Ordering::Relaxed) / 1024;
                 let gate_path_kb = t_gate_path_bytes.load(std::sync::atomic::Ordering::Relaxed) / 1024;
                 eprintln!(
-                    "PHASE parts gate_us={gate_us} exact_us={exact_us} swslice_us={swslice_us} fuse_us={sw_us} threads={threads} n={} files_n={n_files} use_cand={use_cand} cand_n={gate_n} gate_files={gate_files} gate_acc={gate_acc} pres_rej={pres_rej} gate_walk_kb={gate_walk_kb} gate_path_kb={gate_path_kb} prefix_hit={prefix_hit} prefix_fill={prefix_fill} prefix_skip_kb={prefix_skip_kb}",
+                    "PHASE parts gate_us={gate_us} swslice_us={swslice_us} fuse_us={sw_us} threads={threads} n={} files_n={n_files} use_cand={use_cand} cand_n={gate_n} gate_files={gate_files} gate_acc={gate_acc} pres_rej={pres_rej} gate_walk_kb={gate_walk_kb} gate_path_kb={gate_path_kb} prefix_hit={prefix_hit} prefix_fill={prefix_fill} prefix_skip_kb={prefix_skip_kb}",
                     matches.len()
                 );
                 // Census: mean trimmed bytes per acceptor sizes the SW prize.
@@ -2050,102 +2070,7 @@ fn match_fuzzy_scanned(
         }
     };
 
-    if valid_parts.len() == 1 {
-        return first_part_matches;
-    }
-
-    let total_parts = valid_parts.len() as u32;
-    let mut matches = first_part_matches;
-    // Narrowing order affects only speed; keep the query-order first part's end_col.
-    let rest: &[&str] = if reverse_pair {
-        &valid_parts[..1]
-    } else {
-        &valid_parts[1..]
-    };
-    for part in rest.iter() {
-        let mut part_options = *options;
-        part_options.max_typos = options.max_typos.map(|t| t.min(part.len() as u16));
-
-        // Match only survivors, addressed through previous matches without a subset.
-        // Serial cutoff lives in the estimator, not here.
-        let survivors = &matches;
-        let sub_threads = effective_match_threads(
-            survivors.len(),
-            part.len(),
-            max_path_len,
-            part_options.max_typos,
-            max_threads.max(1),
-        );
-        let part_bytes = part.as_bytes();
-        let sub_np = crate::presence::NeedlePresence::new(
-            part_bytes,
-            part_options.max_typos.unwrap_or(u16::MAX),
-        );
-        let sub_matches = match &working_files {
-            crate::matcher::FileItems::All(files) => {
-                with_cached_matcher(part, &part_options, |matcher| {
-                    matcher.match_range_parallel_resolved(
-                        survivors.len(),
-                        &|index, buf: &mut [*const u8; MAX_FRIZBEE_CHUNKS]| {
-                            let file = crate::matcher::FileItems::at_all(
-                                files,
-                                survivors[index as usize].index as usize,
-                            );
-                            resolve_file_chunks_prefiltered(file, arena, buf, &sub_np, part_bytes)
-                        },
-                        sub_threads,
-                    )
-                })
-            }
-            crate::matcher::FileItems::Filtered { base, idx } => {
-                with_cached_matcher(part, &part_options, |matcher| {
-                    matcher.match_range_parallel_resolved(
-                        survivors.len(),
-                        &|index, buf: &mut [*const u8; MAX_FRIZBEE_CHUNKS]| {
-                            let file = crate::matcher::FileItems::at_filtered(
-                                base,
-                                idx,
-                                survivors[index as usize].index as usize,
-                            );
-                            resolve_file_chunks_prefiltered(file, arena, buf, &sub_np, part_bytes)
-                        },
-                        sub_threads,
-                    )
-                })
-            }
-        };
-
-        if sub_matches.is_empty() {
-            reclaim_match_buf(matches);
-            return vec![]; // break early!
-        }
-
-        // Map back to original indices; average scores across parts.
-        let prev_matches = std::mem::take(&mut matches);
-        matches = sub_matches
-            .into_iter()
-            .map(|sm| {
-                let prev = &prev_matches[sm.index as usize];
-                let sum = (prev.score as u32).saturating_add(sm.score as u32);
-                let avg = sum / total_parts;
-
-                neo_frizbee::Match {
-                    index: prev.index,
-                    score: avg.min(u16::MAX as u32) as u16,
-                    // Query-order first part's position for filename bonus.
-                    end_col: if reverse_pair {
-                        sm.end_col
-                    } else {
-                        prev.end_col
-                    },
-                    exact: prev.exact && sm.exact,
-                }
-            })
-            .collect();
-        reclaim_match_buf(prev_matches);
-    }
-
-    matches
+    first_part_matches
 }
 
 // The last query's match list. The next keystroke reuses the allocation.
@@ -2868,7 +2793,8 @@ fn resolve_dir_chunks(
     crate::matcher::resolve_frizbee_bytes(&dir.path, arena, buf)
 }
 
-// Dir matching: same pipeline as file matching, narrowed per query part.
+// Frizbee, not the file gate: a directory is not a `FileItem` window.
+// Part scores are one mean: the sum, divided by the part count.
 fn match_fuzzy_parts_dirs(
     fuzzy_parts: &[&str],
     working_dirs: &[&DirItem],
@@ -2916,8 +2842,9 @@ fn match_fuzzy_parts_dirs(
     }
 
     let mut matches = first_part_matches;
-    let total_parts = valid_parts.len() as u32;
-    for part in valid_parts[1..].iter() {
+    let mut sums: Vec<u32> = matches.iter().map(|m| m.score as u32).collect();
+    for (ord, part) in valid_parts[1..].iter().enumerate() {
+        let parts_done = (ord + 2) as u32;
         let mut part_options = *options;
         part_options.max_typos = options.max_typos.map(|t| t.min(part.len() as u16));
 
@@ -2945,22 +2872,25 @@ fn match_fuzzy_parts_dirs(
             return vec![];
         }
 
-        // Map back to original indices; average scores across parts.
+        let prev_matches = std::mem::take(&mut matches);
+        let prev_sums = std::mem::take(&mut sums);
+        let mut next_sums = Vec::with_capacity(sub_matches.len());
         matches = sub_matches
             .into_iter()
             .map(|sm| {
-                let prev = &matches[sm.index as usize];
-                let sum = (prev.score as u32).saturating_add(sm.score as u32);
-                let avg = sum / total_parts;
-
+                let i = sm.index as usize;
+                let prev = &prev_matches[i];
+                let sum = prev_sums[i].saturating_add(sm.score as u32);
+                next_sums.push(sum);
                 neo_frizbee::Match {
                     index: prev.index,
-                    score: avg.min(u16::MAX as u32) as u16,
-                    end_col: prev.end_col, // keep first part's position for dirname bonus
+                    score: (sum / parts_done).min(u16::MAX as u32) as u16,
+                    end_col: prev.end_col,
                     exact: prev.exact && sm.exact,
                 }
             })
             .collect();
+        sums = next_sums;
     }
 
     matches
@@ -3613,7 +3543,8 @@ fn match_and_score_scanned<'a>(
                     }
                 });
             }
-            // Thread count from the work estimate (lengths + typo budget), not a bare count.
+            // The gate window is one accepting span, not the filename match,
+            // so this second score is still frizbee's.
             let fb_threads = effective_match_threads(
                 filename_strs.len(),
                 fuzzy_parts[0].len(),
@@ -5753,8 +5684,8 @@ mod tests {
     use crate::types::PaginationArgs;
     use fff_query_parser::QueryParser;
 
-    // Cross-engine equality cannot hold: this engine SW-rescores, mixing scales by design.
-    #[ignore = "cross-path SW-vs-frizbee equality; engine mixes scales by design"]
+    // Every part is the same scorer, so the combination is the mean of the
+    // separate runs, including a third part where a stepwise divide would drift.
     #[test]
     fn longer_second_part_preserves_matches_and_first_part_positions() {
         let paths: Vec<_> = [
@@ -5840,6 +5771,62 @@ mod tests {
                 expected.sort_unstable();
                 actual.sort_unstable();
                 assert_eq!(actual, expected, "{parts:?}, typos={max_typos}");
+            }
+        }
+        for parts in [["src", "controller", "rs"], ["no", "absent", "zz"]] {
+            for max_typos in [0u16, 2] {
+                let options = neo_frizbee::Config {
+                    max_typos: Some(max_typos),
+                    sort: neo_frizbee::SortStrategy::Unsorted,
+                    ..Default::default()
+                };
+                let max_path = crate::matcher::max_path_len_of(&files);
+                let alone: Vec<Vec<neo_frizbee::Match>> = parts
+                    .iter()
+                    .map(|part| {
+                        let one = [*part];
+                        match_fuzzy_parts(
+                            &one,
+                            &working,
+                            &options,
+                            1,
+                            arena,
+                            max_path,
+                            crate::parallelism::AbortToken::disabled(),
+                        )
+                    })
+                    .collect();
+                let mut expected = Vec::new();
+                for a in &alone[0] {
+                    let Some(b) = alone[1].iter().find(|m| m.index == a.index) else {
+                        continue;
+                    };
+                    let Some(c) = alone[2].iter().find(|m| m.index == a.index) else {
+                        continue;
+                    };
+                    let sum = (a.score as u32) + (b.score as u32) + (c.score as u32);
+                    expected.push((
+                        a.index,
+                        (sum / 3) as u16,
+                        a.end_col,
+                        a.exact && b.exact && c.exact,
+                    ));
+                }
+                let mut actual: Vec<_> = match_fuzzy_parts(
+                    &parts,
+                    &working,
+                    &options,
+                    4,
+                    arena,
+                    max_path,
+                    crate::parallelism::AbortToken::disabled(),
+                )
+                .iter()
+                .map(|m| (m.index, m.score, m.end_col, m.exact))
+                .collect();
+                expected.sort_unstable();
+                actual.sort_unstable();
+                assert_eq!(actual, expected, "3 {parts:?}, typos={max_typos}");
             }
         }
     }

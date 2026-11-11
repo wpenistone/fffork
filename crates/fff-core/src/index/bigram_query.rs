@@ -232,9 +232,8 @@ impl HirInfo {
     }
 }
 
-/// Prefilter fuzzy query. The algorithm is the following:
-/// we allow max_typos = min(len/3,2) every typo destroys at most 2 consecutive bigrams
-/// So out of N bigrams at least N - 2 * max_typos have to present in the matching fil
+/// Prefilter fuzzy query. max_typos = min(len/3, 2). One typo destroys at most
+/// two consecutive bigrams, but haystack gaps are free, so this only samples probes.
 pub(crate) fn fuzzy_to_bigram_query(query: &str, num_probes: usize) -> BigramQuery {
     let mut lower = vec![0u8; query.len()];
     crate::simd_path::fold_ascii_needle(query.as_bytes(), &mut lower);
@@ -245,7 +244,6 @@ pub(crate) fn fuzzy_to_bigram_query(query: &str, num_probes: usize) -> BigramQue
 
     let max_typos = (lower.len() / 3).min(2);
 
-    // Extract all consecutive bigram keys.
     let bigram_keys: Vec<u16> = lower
         .windows(2)
         .filter_map(|w| consec_key(w[0], w[1]))
@@ -255,7 +253,6 @@ pub(crate) fn fuzzy_to_bigram_query(query: &str, num_probes: usize) -> BigramQue
         return BigramQuery::Any;
     }
 
-    // the simplest case, just check that every bigram is present either consec or not
     if max_typos == 0 {
         return simplify_and(
             bigram_keys
@@ -265,11 +262,9 @@ pub(crate) fn fuzzy_to_bigram_query(query: &str, num_probes: usize) -> BigramQue
         );
     }
 
-    // Pick evenly-spaced probe bigrams, capped so C(n, required)
-    // stays small (C(5,3)=10 max). Fewer probes only widens the filter.
+    // Fewer probes only widen the filter. C(5, 3) = 10.
     let n = num_probes.min(bigram_keys.len()).min(5);
     if n <= max_typos {
-        // Too few probes to require anything useful.
         return simplify_or(
             bigram_keys
                 .iter()
@@ -291,13 +286,10 @@ pub(crate) fn fuzzy_to_bigram_query(query: &str, num_probes: usize) -> BigramQue
 
     let required = n - max_typos;
 
-    // If required == n, just AND all probes.
     if required >= n {
         return simplify_and(probes.iter().map(|&k| BigramQuery::Consec(k)).collect());
     }
 
-    // Generate all C(n, required) subsets as OR(AND(subset), ...).
-    // n <= 5 bounds this at 10 branches; larger n costs bitset ANDs.
     let mut branches = Vec::new();
     let mut combo = vec![0u16; required];
     combine(&probes, required, 0, 0, &mut combo, &mut branches);
@@ -308,7 +300,6 @@ pub(crate) fn fuzzy_to_bigram_query(query: &str, num_probes: usize) -> BigramQue
     simplify_or(branches)
 }
 
-/// Build C(n, k) combination branches in-place on a fixed-size slice.
 fn combine(
     items: &[u16],
     k: usize,

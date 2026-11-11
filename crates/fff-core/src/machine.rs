@@ -44,12 +44,17 @@ impl Machine {
         (self.cache_line as f64 * MLP / latency).clamp(0.05, 64.0)
     }
 
-    // Bytes of path data one match thread should own: enough to amortize
-    // the fork/join; scales with the machine's walk rate.
+    // Bytes one match thread should own before a fork/join pays.
+    // `dispatch::bytes_to_amortize` plans with this same clamp.
     pub fn match_work_per_thread(&self) -> usize {
         let bytes = (self.read_bytes_per_ns() * fork_join_ns() as f64) as usize;
-        // Clamped so a paused VM or a bad probe cannot pick 0 or saturate.
-        bytes.clamp(8 * 1024, 8 * 1024 * 1024)
+        let lo = self.cache_line.max(1);
+        let hi = if self.llc_bytes > 0 {
+            self.llc_bytes
+        } else {
+            8 << 20
+        };
+        bytes.clamp(lo, hi)
     }
 
     // Upper bound on scan threads from topology: physical cores, LLC capacity
@@ -227,14 +232,7 @@ pub(crate) fn machine() -> &'static Machine {
 }
 
 pub(crate) fn match_work_per_thread() -> usize {
-    static W: LazyLock<usize> = LazyLock::new(|| {
-        std::env::var("FFF_MATCH_WORK_PER_THREAD")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or_else(|| machine().match_work_per_thread())
-    });
-    *W
+    crate::dispatch::bytes_to_amortize()
 }
 
 /// Point-in-time calibration values for paired runs; attributes
@@ -820,7 +818,13 @@ mod tests {
     fn derived_values_are_sane_on_any_machine() {
         let real = machine();
         let w = real.match_work_per_thread();
-        assert!((8 * 1024..=8 * 1024 * 1024).contains(&w), "work {w}");
+        let lo = real.cache_line.max(1);
+        let hi = if real.llc_bytes > 0 {
+            real.llc_bytes
+        } else {
+            8 << 20
+        };
+        assert!((lo..=hi).contains(&w), "work {w}");
         let cap = real.scan_thread_cap();
         assert!((1..=64).contains(&cap), "cap {cap}");
         assert!(cap <= real.logical_cores.max(1), "cap exceeds cores");

@@ -1440,21 +1440,12 @@ fn filter_hits(
     // Hit indices are file slots. A full mask table is addressed directly.
     if presence.len() >= files.len() {
         if folds.n == 1 && folds.np(0).distinct() {
-            let needle_mask = folds.np(0).distinct_mask();
-            let need_hits = folds.np(0).min_hits();
-            let cover = folds.np(0).cover_eq();
+            let np = folds.np(0);
             for (n, &i) in candidates.iter().enumerate() {
                 prefetch_hit_mask(presence, candidates, n);
                 debug_assert!((i as usize) < presence.len());
                 let mask = unsafe { *presence.get_unchecked(i as usize) };
-                let hit = mask & needle_mask;
-                let keep = mask == 0
-                    || if cover {
-                        hit == needle_mask
-                    } else {
-                        hit.count_ones() as usize >= need_hits
-                    };
-                if keep {
+                if mask == 0 || !np.misses_distinct(mask) {
                     orig.push(i);
                 }
             }
@@ -1546,6 +1537,79 @@ fn longest_prefix(
         })
         .max_by_key(|e| e.query.len())
         .map(|e| Arc::clone(&e.candidates))
+}
+
+// Longest history/prefix query that is a proved subsequence of `q`.
+// Letters must sit inside one plain token; meta and non-ASCII stay Full.
+fn longest_subseq(
+    history: &[BackEntry],
+    prefix: &[BackEntry],
+    q: &str,
+    max_typos: u16,
+    generation: u64,
+    constraints_fp: u64,
+    git_constrained: bool,
+    git_epoch: u64,
+) -> Option<Arc<Vec<u32>>> {
+    if !proved_subseq_query(q) {
+        return None;
+    }
+    history
+        .iter()
+        .chain(prefix.iter())
+        .filter(|e| {
+            e.generation == generation
+                && e.max_typos == max_typos
+                && e.constraints_fp == constraints_fp
+                && git_epoch_ok(git_constrained, e.git_status_epoch, git_epoch)
+                && proved_subseq(e.query.as_ref(), q)
+        })
+        .max_by_key(|e| e.query.len())
+        .map(|e| Arc::clone(&e.candidates))
+}
+
+// Cached letters in order, each token inside one new token.
+// That is Match(new) ⊆ Match(cached) for one fuzzy needle per token.
+fn proved_subseq(cached: &str, new: &str) -> bool {
+    !cached.is_empty()
+        && proved_subseq_query(cached)
+        && proved_subseq_query(new)
+        && chars_in_order(cached, new)
+        && cached.split_whitespace().all(|ct| {
+            new.split_whitespace()
+                .any(|nt| chars_in_order(ct, nt))
+        })
+}
+
+fn proved_subseq_query(q: &str) -> bool {
+    let mut any = false;
+    for tok in q.split_whitespace() {
+        any = true;
+        if !plain_ascii_token(tok) {
+            return false;
+        }
+    }
+    any
+}
+
+fn plain_ascii_token(tok: &str) -> bool {
+    let b = tok.as_bytes();
+    if b.is_empty() {
+        return false;
+    }
+    let first = b[0];
+    let last = b[b.len() - 1];
+    if first == b'!' || first == b'/' || last == b'/' {
+        return false;
+    }
+    b.iter().all(|&c| {
+        c.is_ascii() && !matches!(c, b':' | b'(' | b')' | b'*' | b'?' | b'[' | b'{' | b'!')
+    })
+}
+
+fn chars_in_order(needle: &str, hay: &str) -> bool {
+    let mut rest = hay.chars();
+    needle.chars().all(|c| rest.any(|h| h == c))
 }
 
 impl std::fmt::Debug for FilePicker {
@@ -2449,6 +2513,17 @@ impl FilePicker {
                     } else {
                         Held::Filter(shared)
                     }
+                } else if let Some(shared) = longest_subseq(
+                    &live.history,
+                    &live.prefix,
+                    query_key,
+                    max_typos,
+                    generation_at_start,
+                    constraints_fp,
+                    git_constrained,
+                    git_epoch_at_start,
+                ) {
+                    Held::Filter(shared)
                 } else {
                     Held::Full
                 }
@@ -4841,6 +4916,204 @@ mod tests {
                 "backspace diverged for {text:?}"
             );
         }
+    }
+
+    /// `file` is a subsequence of `profile`, so the cached hits may narrow.
+    #[test]
+    fn live_narrow_subsequence_file_to_profile() {
+        use crate::types::PaginationArgs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_buf = crate::path_utils::canonicalize(dir.path()).unwrap();
+        let base = base_buf.as_path();
+        for rel in ["src/profile.rs", "src/file_name.rs", "src/beta.rs"] {
+            let path = base.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+        let mut fresh = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        fresh.collect_files().unwrap();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+
+        let opts = || FuzzySearchOptions {
+            max_threads: 1,
+            current_file: None,
+            project_path: None,
+            combo_boost_score_multiplier: 0,
+            min_combo_count: 0,
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 50,
+            },
+        };
+        let parser = fff_query_parser::QueryParser::default();
+        let run = |picker: &FilePicker, text: &str| {
+            let parsed = parser.parse(text);
+            let out = picker.fuzzy_search(&parsed, None, opts());
+            let names: Vec<String> = out.items.iter().map(|f| f.relative_path(picker)).collect();
+            let totals: Vec<i32> = out.scores.iter().map(|s| s.total).collect();
+            (out.total_matched, names, totals)
+        };
+
+        let _ = run(&picker, "file");
+        {
+            let live = picker.live.lock();
+            assert!(
+                live.history
+                    .iter()
+                    .chain(live.prefix.iter())
+                    .any(|e| e.query.as_ref() == "file")
+            );
+        }
+        let narrowed = run(&picker, "profile");
+        assert!(
+            narrowed.1.iter().any(|n| n.ends_with("profile.rs")),
+            "{:?}",
+            narrowed.1
+        );
+        assert_eq!(narrowed, run(&fresh, "profile"));
+    }
+
+    /// `score` is not a subsequence of `controller`, so a poisoned list must not apply.
+    #[test]
+    fn live_narrow_subsequence_score_not_controller() {
+        use crate::types::PaginationArgs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_buf = crate::path_utils::canonicalize(dir.path()).unwrap();
+        let base = base_buf.as_path();
+        for rel in ["src/controller.rs", "src/score_board.rs", "src/beta.rs"] {
+            let path = base.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+        let mut fresh = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        fresh.collect_files().unwrap();
+        let mut picker = FilePicker::new(FilePickerOptions {
+            base_path: base.to_str().unwrap().into(),
+            watch: false,
+            ..Default::default()
+        })
+        .unwrap();
+        picker.collect_files().unwrap();
+
+        let opts = || FuzzySearchOptions {
+            max_threads: 1,
+            current_file: None,
+            project_path: None,
+            combo_boost_score_multiplier: 0,
+            min_combo_count: 0,
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 50,
+            },
+        };
+        let parser = fff_query_parser::QueryParser::default();
+        let run = |picker: &FilePicker, text: &str| {
+            let parsed = parser.parse(text);
+            let out = picker.fuzzy_search(&parsed, None, opts());
+            let names: Vec<String> = out.items.iter().map(|f| f.relative_path(picker)).collect();
+            let totals: Vec<i32> = out.scores.iter().map(|s| s.total).collect();
+            (out.total_matched, names, totals)
+        };
+
+        let _ = run(&picker, "score");
+        {
+            let mut live = picker.live.lock();
+            assert!(
+                live.history
+                    .iter()
+                    .chain(live.prefix.iter())
+                    .any(|e| e.query.as_ref() == "score")
+            );
+            let empty = Arc::<Vec<u32>>::new(Vec::new());
+            for e in live.history.iter_mut() {
+                e.candidates = Arc::clone(&empty);
+            }
+            for e in live.prefix.iter_mut() {
+                e.candidates = Arc::clone(&empty);
+            }
+            live.candidates = empty;
+            live.active = true;
+        }
+        let found = run(&picker, "controller");
+        assert!(
+            found.1.iter().any(|n| n.ends_with("controller.rs")),
+            "{:?}",
+            found.1
+        );
+        assert_eq!(found, run(&fresh, "controller"));
+    }
+
+    #[test]
+    fn proved_subseq_file_covers_profile_not_score() {
+        assert!(proved_subseq("file", "profile"));
+        assert!(!proved_subseq("score", "controller"));
+        assert!(!proved_subseq("", "profile"));
+        assert!(!proved_subseq("file", "f ile"));
+        assert!(!proved_subseq("file99", "profile:99"));
+        assert!(!proved_subseq("File", "profile"));
+        assert!(proved_subseq("file", "xx profile"));
+        let history = vec![
+            BackEntry {
+                query: "fi".into(),
+                max_typos: 2,
+                generation: 7,
+                constraints_fp: 0,
+                git_status_epoch: 0,
+                candidates: vec![1, 2, 3].into(),
+            },
+            BackEntry {
+                query: "score".into(),
+                max_typos: 2,
+                generation: 7,
+                constraints_fp: 0,
+                git_status_epoch: 0,
+                candidates: vec![9].into(),
+            },
+        ];
+        let prefix = vec![BackEntry {
+            query: "file".into(),
+            max_typos: 2,
+            generation: 7,
+            constraints_fp: 0,
+            git_status_epoch: 0,
+            candidates: vec![1].into(),
+        }];
+        assert_eq!(
+            longest_subseq(&history, &prefix, "profile", 2, 7, 0, false, 0)
+                .as_deref()
+                .map(Vec::as_slice),
+            Some(vec![1].as_slice())
+        );
+        assert_eq!(
+            longest_subseq(&history, &prefix, "controller", 2, 7, 0, false, 0)
+                .as_deref()
+                .map(Vec::as_slice),
+            None
+        );
+        assert_eq!(
+            longest_subseq(&history, &prefix, "profile", 3, 7, 0, false, 0)
+                .as_deref()
+                .map(Vec::as_slice),
+            None
+        );
     }
 
     #[test]

@@ -120,7 +120,6 @@ pub(crate) fn fold_mask(mut m: u64, path: &[u8]) -> (u64, bool) {
 #[derive(Clone, Copy)]
 pub(crate) struct NeedlePresence {
     need: usize,
-    min_len: usize,
     needle_mask: u64,
     dup: bool,
     /// Masks for folded bits occurring once / twice; counts >= 3 use scalar.
@@ -140,7 +139,6 @@ impl NeedlePresence {
     pub(crate) fn new(needle: &[u8], max_typos: u16) -> Self {
         let typos = max_typos as usize;
         let need = needle.len().saturating_sub(typos);
-        let min_len = need; // LCS ≤ path_len
         let mut needle_mask = 0u64;
         let mut dup = false;
         let mut once_mask = 0u64;
@@ -171,7 +169,6 @@ impl NeedlePresence {
         }
         Self {
             need,
-            min_len,
             needle_mask,
             dup,
             once_mask,
@@ -185,12 +182,6 @@ impl NeedlePresence {
         }
     }
 
-    // Shortest path that can still match (LCS ≤ path_len).
-    #[inline(always)]
-    pub(crate) fn min_path_len(&self) -> usize {
-        self.min_len
-    }
-
     // False when the presence check is not worth running (need < 3:
     // short queries match almost every path, so the check is overhead).
     #[inline(always)]
@@ -202,6 +193,19 @@ impl NeedlePresence {
     #[inline(always)]
     pub(crate) fn distinct(&self) -> bool {
         !self.dup
+    }
+
+    // Scalar form of the distinct lane test. Mask 0 is a miss; a caller
+    // that treats 0 as unknown checks that before this.
+    #[inline(always)]
+    pub(crate) fn misses_distinct(&self, mask: u64) -> bool {
+        debug_assert!(!self.dup);
+        let hit = mask & self.needle_mask;
+        if self.cover {
+            hit != self.needle_mask
+        } else {
+            (hit.count_ones() as usize) < self.need
+        }
     }
 
     #[inline(always)]
@@ -226,11 +230,7 @@ impl NeedlePresence {
             return true;
         }
         if !self.dup {
-            let hit = path_mask & self.needle_mask;
-            if self.cover {
-                return hit == self.needle_mask;
-            }
-            return hit.count_ones() as usize >= self.need;
+            return !self.misses_distinct(path_mask);
         }
         self.allows_repeated(path_mask, needle)
     }

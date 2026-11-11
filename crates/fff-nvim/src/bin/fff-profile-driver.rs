@@ -260,6 +260,10 @@ fn main() {
         shared_picker.wait_for_scan(Duration::from_secs(600)),
         "scan timed out"
     );
+    let file_count = {
+        let guard = shared_picker.read().expect("picker lock");
+        guard.as_ref().expect("picker").get_files().len()
+    };
 
     let parser = QueryParser::<FileSearchConfig>::default();
     let parsed = parser.parse(query);
@@ -287,15 +291,15 @@ fn main() {
         );
         last_total = result.total_matched;
         last_len = result.items.len();
+        let us = t.elapsed().as_secs_f64() * 1_000_000.0;
+        let cyc = sensors::cycles().saturating_sub(c0);
+        let u1 = sensors::usage();
         let mut h = 0xcbf29ce484222325u64;
         for item in &result.items {
             item.write_relative_path(picker, &mut path_buf);
             h = fnv1a(h, &[0xFF]);
             h = fnv1a(h, path_buf.as_bytes());
         }
-        let us = t.elapsed().as_secs_f64() * 1_000_000.0;
-        let cyc = sensors::cycles().saturating_sub(c0);
-        let u1 = sensors::usage();
         hash_ordered = h;
         (
             us,
@@ -411,7 +415,7 @@ fn main() {
     let timed_query = encode_timed(query);
     let query_json = json_escape(query);
     println!(
-        "query={query} timed={timed_query} threads={threads} iterations={iterations} cold={} us_per_op={us_per_op:.3} p50_us={p50:.3} p90_us={p90:.3} p99_us={p99:.3} max_us={max_us:.3} cycles_per_op={cycles_per_op:.0} read_b_op={read_b_op:.2} faults_per_100k={faults_per_100k:.1} peak_rss_mb={query_rss_mb:.2} checksum={checksum} total_matched={last_total} items_len={last_len} hash_ordered={hash_ordered:016x}",
+        "query={query} timed={timed_query} threads={threads} iterations={iterations} cold={} us_per_op={us_per_op:.3} p50_us={p50:.3} p90_us={p90:.3} p99_us={p99:.3} max_us={max_us:.3} cycles_per_op={cycles_per_op:.0} read_b_op={read_b_op:.2} faults_per_100k={faults_per_100k:.1} peak_rss_mb={query_rss_mb:.2} checksum={checksum} total_matched={last_total} items_len={last_len} hash_ordered={hash_ordered:016x} files={file_count}",
         cold as u8
     );
 

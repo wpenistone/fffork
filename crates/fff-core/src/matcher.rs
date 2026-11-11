@@ -89,27 +89,6 @@ pub(crate) fn decode_match_window(m: &neo_frizbee::Match, hay_len: usize) -> Mat
     }
 }
 
-pub(crate) fn resolve_file_chunks_prefiltered(
-    file: &FileItem,
-    arena: ArenaPtr,
-    buf: &mut [*const u8; MAX_FRIZBEE_CHUNKS],
-    np: &crate::presence::NeedlePresence,
-    needle: &[u8],
-) -> Option<(usize, u16)> {
-    // Sound length reject: LCS ≤ path_len, so shorter paths cannot match.
-    if (file.path.byte_len as usize) < np.min_path_len() {
-        return None;
-    }
-    // need < 3 cannot use the mask; mask 0 stays unknown.
-    if np.should_check() {
-        let mask = file.presence_mask();
-        if mask != 0 && !np.allows(mask, needle) {
-            return None;
-        }
-    }
-    resolve_file_chunks(file, arena, buf)
-}
-
 // One compiled matcher per needle and config on this thread.
 // A prior run returns the same hits: SW row 0 and column 0 stay zero.
 #[inline]
@@ -280,20 +259,6 @@ impl<'a> FileItems<'a> {
         unsafe { base.get_unchecked(file_idx) }
     }
 
-}
-
-// Resolve a FileItem's chunked path into frizbee's pointer buffer.
-// Returns `Some((chunk_count, byte_len))` or `None` for deleted files.
-#[inline]
-pub(crate) fn resolve_file_chunks(
-    file: &FileItem,
-    arena: ArenaPtr,
-    buf: &mut [*const u8; MAX_FRIZBEE_CHUNKS],
-) -> Option<(usize, u16)> {
-    if file.is_deleted() {
-        return None;
-    }
-    resolve_frizbee_bytes(&file.path, arena, buf)
 }
 
 // `FFF_MATCH_THREADS` forces width and is still capped by `max_threads`. Read once.
